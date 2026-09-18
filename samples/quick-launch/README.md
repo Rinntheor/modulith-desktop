@@ -103,6 +103,35 @@ Compress-Archive -Path .\quick-launch\* -DestinationPath .\quick-launch.lcp
 顺带一个容易踩的坑：存储键只允许字母数字与 `.` `_` `-`，所以用 `icon.` 前缀而不是
 `icon:` —— 冒号会被后端直接拒绝。
 
+### 弹窗必须自己限制在模块区域内
+
+`position: fixed` 是相对**窗口**定位的。插件写在模块里的弹窗如果直接 `inset: 0`，
+就会盖住标题栏与二级标题栏 —— 那些是宿主的外壳，不该被模块内容压住。
+
+宿主的布局是「每个标签一个独立的滚动容器」（这是滚动位置保活的前提），
+**那个容器的可见矩形就是模块可见区域**。因此正确做法是：找到最近的可滚动祖先，
+实测它的 `getBoundingClientRect()`，再拿它当固定定位弹窗的 `top/left/width/height`：
+
+```js
+function findScrollAncestor(node) {
+  let el = node && node.parentElement;
+  while (el && el !== document.body) {
+    const overflowY = getComputedStyle(el).overflowY;
+    if (overflowY === 'auto' || overflowY === 'scroll') return el;
+    el = el.parentElement;
+  }
+  return null;
+}
+```
+
+这里刻意**按计算样式判断，而不是 `closest('.lc-tab-panel')`**：插件不该依赖宿主的
+内部类名，「最近的可滚动祖先」是通用的 CSS 语义，宿主换布局也不会失效。
+
+实测而不是写死 `76px`（标题栏 40 + 二级标题栏 36）还有一个好处：初始化告警条出现、
+侧边栏折叠等情况下内容区的起点会变，实测会自动跟上。
+
+同一个边界也用在右键菜单与备注提示上 —— 根因相同：固定定位不认识模块的边界。
+
 ### 拖放只在模块可见时订阅
 
 `ctx.fileDrop` 的事件是**窗口级**的：只要有文件被拖进窗口就会触发，与当前显示哪个

@@ -84,6 +84,27 @@
     return i > 0 && i < base.length - 1;
   }
 
+  /**
+   * 找到包裹本模块的滚动容器 —— 它的可见矩形就是「模块视图」的范围。
+   *
+   * 为什么需要它：`position: fixed` 是相对**窗口**定位的，直接 `inset: 0` 会让
+   * 对话框盖住标题栏与二级标题栏。而模块真正的可见区域是那个滚动容器
+   * （宿主为每个标签各建一个，以实现滚动位置保活），它的
+   * `getBoundingClientRect()` 恰好等于屏幕上的可见范围。
+   *
+   * 这里刻意**按计算样式判断**（overflow-y 为 auto / scroll）而不是 `closest('.lc-tab-panel')`：
+   * 插件不该依赖宿主的类名，那是内部实现；「最近的可滚动祖先」是通用的 CSS 语义。
+   */
+  function findScrollAncestor(node) {
+    var el = node && node.parentElement;
+    while (el && el !== document.body) {
+      var style = window.getComputedStyle(el);
+      if (style.overflowY === 'auto' || style.overflowY === 'scroll') return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
   function emptyState() {
     return {
       version: 1,
@@ -227,14 +248,23 @@
         var node = ref.current;
         if (!node) return;
         var rect = node.getBoundingClientRect();
+
+        // 限制在**模块可见区域**内，而不是整个窗口 —— 否则贴着顶部右键时，
+        // 菜单会压到标题栏与二级标题栏上。拿不到矩形时退回窗口范围。
+        var box = props.box;
+        var left = box ? box.left : 0;
+        var top = box ? box.top : 0;
+        var right = box ? box.left + box.width : window.innerWidth;
+        var bottom = box ? box.top + box.height : window.innerHeight;
+
+        var margin = 8;
         var x = props.x;
         var y = props.y;
-        var margin = 8;
-        if (x + rect.width + margin > window.innerWidth) x = window.innerWidth - rect.width - margin;
-        if (y + rect.height + margin > window.innerHeight) y = window.innerHeight - rect.height - margin;
-        setPos({ x: Math.max(margin, x), y: Math.max(margin, y) });
+        if (x + rect.width + margin > right) x = right - rect.width - margin;
+        if (y + rect.height + margin > bottom) y = bottom - rect.height - margin;
+        setPos({ x: Math.max(left + margin, x), y: Math.max(top + margin, y) });
       },
-      [props.x, props.y]
+      [props.x, props.y, props.box]
     );
 
     React.useEffect(
@@ -331,10 +361,25 @@
       );
     }
 
+    // 覆盖层要**只盖住模块的可见区域**，而不是整个窗口 —— 否则它会压住标题栏
+    // 与二级标题栏。做法是固定定位 + 实测出来的可见矩形（见 props.box）。
+    // 拿不到矩形时退回 CSS 的 `inset: 0`，至少不会不可用。
+    var overlayStyle = props.box
+      ? {
+          top: props.box.top + 'px',
+          left: props.box.left + 'px',
+          width: props.box.width + 'px',
+          height: props.box.height + 'px',
+          right: 'auto',
+          bottom: 'auto',
+        }
+      : undefined;
+
     return h(
       'div',
       {
         className: 'ql-overlay',
+        style: overlayStyle,
         onMouseDown: function (event) {
           if (event.target === event.currentTarget) props.onCancel();
         },
@@ -477,6 +522,12 @@
     var tooltip = tooltipPair[0];
     var setTooltip = tooltipPair[1];
 
+    // 模块可见区域的实测矩形，供对话框把自己限制在二级标题栏之下
+    var overlayPair = React.useState(null);
+    var overlayBox = overlayPair[0];
+    var setOverlayBox = overlayPair[1];
+    var rootRef = React.useRef(null);
+
     // 最新状态放进 ref，供拖放订阅者读取 —— 否则每次状态变化都要重建订阅
     var stateRef = React.useRef(null);
     React.useEffect(
@@ -596,6 +647,41 @@
         });
       },
       [active]
+    );
+
+    // ---- 对话框的覆盖范围 ----
+    // 只在对话框打开时测量：平时不需要，也就不必让窗口尺寸变化触发重渲染。
+    // 用 useLayoutEffect 而不是 useEffect —— 要在浏览器绘制之前就把矩形算好，
+    // 否则对话框会先在错误的位置闪一帧再跳回正确位置。
+    React.useLayoutEffect(
+      function () {
+        // 对话框、右键菜单与备注提示都要被限制在同一范围内，因此任一打开就测量
+        if (!dialog && !menu && !tooltip) return undefined;
+
+        function measure() {
+          var viewport = findScrollAncestor(rootRef.current);
+          if (!viewport) {
+            // 找不到滚动祖先（例如模块被内嵌到别处）：退回 inset:0，
+            // 覆盖整个窗口虽然不理想，但比对话框跑到屏幕外好。
+            setOverlayBox(null);
+            return;
+          }
+          var rect = viewport.getBoundingClientRect();
+          setOverlayBox({
+            top: rect.top,
+            left: rect.left,
+            width: rect.width,
+            height: rect.height,
+          });
+        }
+
+        measure();
+        window.addEventListener('resize', measure);
+        return function () {
+          window.removeEventListener('resize', measure);
+        };
+      },
+      [dialog, menu, tooltip]
     );
 
     // ---- 派生数据 ----
@@ -846,6 +932,7 @@
       menuNode = h(ContextMenu, {
         x: menu.x,
         y: menu.y,
+        box: overlayBox,
         items: entries,
         onClose: function () {
           setMenu(null);
@@ -978,7 +1065,12 @@
               onMouseEnter: function (event) {
                 if (!item.note) return;
                 var rect = event.currentTarget.getBoundingClientRect();
-                setTooltip({ text: item.note, x: rect.left + rect.width / 2, y: rect.top });
+                setTooltip({
+                  text: item.note,
+                  x: rect.left + rect.width / 2,
+                  y: rect.top,
+                  bottom: rect.bottom,
+                });
               },
               onMouseLeave: function () {
                 setTooltip(null);
@@ -1009,6 +1101,7 @@
           draft: dialog.draft,
           groups: groups,
           error: error,
+          box: overlayBox,
           onCancel: function () {
             setDialog(null);
           },
@@ -1026,21 +1119,29 @@
         })
       : null;
 
-    var tooltipNode =
-      tooltip && tooltip.text
-        ? h(
-            'div',
-            {
-              className: 'ql-tooltip',
-              style: { left: tooltip.x + 'px', top: tooltip.y + 'px' },
-            },
-            tooltip.text
-          )
-        : null;
+    var tooltipNode = null;
+    if (tooltip && tooltip.text) {
+      // 提示语默认在卡片上方。卡片贴着内容区顶部时改为放在下方 ——
+      // 否则它同样会压到二级标题栏上（同一个根因）。
+      var boundaryTop = overlayBox ? overlayBox.top : 0;
+      var placeBelow = tooltip.y - 48 < boundaryTop;
+      tooltipNode = h(
+        'div',
+        {
+          className: 'ql-tooltip' + (placeBelow ? ' ql-tooltip-below' : ''),
+          style: {
+            left: tooltip.x + 'px',
+            top: (placeBelow ? tooltip.bottom : tooltip.y) + 'px',
+          },
+        },
+        tooltip.text
+      );
+    }
 
     return h(
       'div',
       {
+        ref: rootRef,
         className: 'ql-root' + (dropping ? ' ql-dropping' : ''),
         onContextMenu: backgroundMenu,
       },
