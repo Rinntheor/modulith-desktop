@@ -801,7 +801,14 @@ function warnIfDirty(): void {
  */
 function tagCurrentVersion(force: boolean): number {
   if (!isGitRepo()) {
-    printError('Not a git repository', 'cannot create tag');
+    // 「不在仓库里」与「git 跑不起来」是两回事，处理方式也完全不同。
+    // 混成一句话会让人去检查仓库，而问题其实在环境上。
+    if (existsSync(join(PROJECT_ROOT, '.git'))) {
+      printError('git is not usable', 'the repository exists, but git could not be executed');
+      printDim('受限环境（沙箱、PATH 里没有 git）会出现这种情况 —— 请在普通终端里重跑。');
+    } else {
+      printError('Not a git repository', 'cannot create tag');
+    }
     return 1;
   }
 
