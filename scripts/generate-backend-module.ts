@@ -312,7 +312,13 @@ pub fn run() -> Result<(), tauri::Error> {
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init());
+        .plugin(tauri_plugin_dialog::init())
+        // 应用更新器。
+        //
+        // endpoints 与 pubkey 不在代码里，而在 tauri.conf.json 的 plugins.updater ——
+        // 公钥必须随应用一起发布（它是"这个更新包确实由我们签发"的唯一依据），
+        // 放进配置文件才能跟着版本走。
+        .plugin(tauri_plugin_updater::Builder::new().build());
 
     // setup 中初始化模块
     builder = builder.setup(move |app| {

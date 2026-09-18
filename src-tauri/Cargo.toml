@@ -47,6 +47,7 @@ zeroize = "1"
 hmac = "0.12"
 # 采集硬件指纹（MAC / 主机名 / CPU / 核心数）
 sysinfo = "0.29"
+tauri-plugin-updater = "2.11.0"
 
 # ---- Windows 平台专属：提取可执行文件图标（src/modules/plugins/icon.rs）----
 # 用 windows-sys 而不是 windows：这里只需要几个 Win32 函数的裸声明，
