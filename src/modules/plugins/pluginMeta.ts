@@ -36,17 +36,13 @@ export const STATUS_INFO: Record<PluginStatus, StatusInfo> = {
   },
 };
 
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let value = bytes;
-  let index = 0;
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024;
-    index += 1;
-  }
-  return `${value >= 10 || index === 0 ? Math.round(value) : value.toFixed(1)} ${units[index]}`;
-}
+/**
+ * 字节数格式化。
+ *
+ * 实现已移到 `src/utils/format.ts`：市场页与设置里的软件更新卡片也要用它，而它们都不该
+ * 因此依赖插件模块。这里保留转发，调用方无需改动。
+ */
+export { formatBytes } from '../../utils/format';
 
 export function formatRelativeTime(iso: string | null | undefined): string {
   if (!iso) return '未知';

@@ -35,3 +35,10 @@ src/generated/
 
 # TypeScript 增量编译缓存，属构建产物
 *.tsbuildinfo
+
+# 发布产物 staging 目录
+#
+# `scripts/generate-latest-json.ts` 把更新清单写到 release/latest.json，随后它连同安装包
+# 一起上传到 GitHub Release。它是发布产物而不是源码：入库只会带来"提交了却没人更新"的
+# 陈旧副本，而真正的更新源是那次 Release 上的那一份。
+release/
