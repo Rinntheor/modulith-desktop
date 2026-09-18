@@ -44,6 +44,11 @@ export interface AppSettings {
   openTabs: string[];
   /** 当前激活的标签页；不在 `openTabs` 中时由 `tabStore` 丢弃该值 */
   activeTab: string | null;
+  /**
+   * 是否显示二级标题栏（标签栏）。关掉之后应用只剩标题栏 + 模块内容，
+   * 用于「沉浸」体验。默认 `true`。
+   */
+  tabBarVisible: boolean;
 }
 
 /**
@@ -82,6 +87,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   // 首次启动不该凭空打开任何标签
   openTabs: [],
   activeTab: null,
+  // 与后端 default_tab_bar_visible() 一致：隐藏是用户主动选择，不是默认体验
+  tabBarVisible: true,
 };
 
 let cache: AppSettings = { ...DEFAULT_APP_SETTINGS };
@@ -128,6 +135,8 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     // 保住用户已经打开的东西。
     openTabs: normalizeOpenTabs(raw?.openTabs),
     activeTab: typeof raw?.activeTab === 'string' && raw.activeTab ? raw.activeTab : null,
+    // 只有显式写成 false 才隐藏；缺失或非法值都回到「显示」
+    tabBarVisible: raw?.tabBarVisible !== false,
   };
 }
 

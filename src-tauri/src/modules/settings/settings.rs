@@ -89,6 +89,17 @@ pub struct AppSettings {
     /// 这是安全的降级，而在这里报错只会让一次无害的状态错位变成保存失败。
     #[serde(default)]
     pub active_tab: Option<String>,
+    /// 是否显示二级标题栏（标签栏）
+    ///
+    /// 关掉它是为了「沉浸」：标签栏属于应用外壳，某些场景下（例如全屏看一个模块）
+    /// 它就是多余的。默认 `true` —— 隐藏入口应当是用户主动选择的结果，而不该是
+    /// 新用户的默认体验。
+    ///
+    /// **只隐藏标签栏，不隐藏标题栏。** 窗口是无边框的（`decorations: false`），
+    /// 标题栏承载最小化 / 最大化 / 关闭按钮，隐藏它会让用户没法关掉窗口 ——
+    /// 而「关不掉窗口」不是一个可以用设置项换取的体验。
+    #[serde(default = "default_tab_bar_visible")]
+    pub tab_bar_visible: bool,
 }
 
 /// 同时打开的标签页数量上限
@@ -108,6 +119,11 @@ fn default_theme() -> String {
 }
 
 fn default_defer_plugin_loading() -> bool {
+    true
+}
+
+/// 标签栏默认可见。理由见 `tab_bar_visible` 字段上的说明。
+fn default_tab_bar_visible() -> bool {
     true
 }
 
@@ -160,6 +176,7 @@ impl Default for AppSettings {
             accent: default_accent(),
             open_tabs: Vec::new(),
             active_tab: None,
+            tab_bar_visible: default_tab_bar_visible(),
         }
     }
 }
