@@ -203,7 +203,11 @@ function describeSource(url: string): string {
 }
 
 /**
- * 依次尝试候选地址取回索引。
+ * 依次尝试候选地址取回索引，**验签通过后才解析**。
+ *
+ * 顺序不能反。索引是插件分发的信任根（它同时给出「装什么」与「校验哪个哈希」），先解析
+ * 一份不可信的索引等于让攻击者的内容先进入解析器；而且解析失败与验签失败给出的提示完全
+ * 不同，混在一起会让排查方向跑偏。
  *
  * 不做 JS 侧的额外超时：后端 reqwest 客户端已经配了 30 秒超时，前端再加一层只会产生
  * 两处不一致的超时，且先到期的那个会让另一个 promise 悬空。
@@ -211,13 +215,18 @@ function describeSource(url: string): string {
 async function fetchIndex(): Promise<MarketIndex> {
   const failures: string[] = [];
 
-  for (const url of pluginIndexSources()) {
+  for (const source of pluginIndexSources()) {
     try {
-      const text = await invoke<string>('fetch_registry_text', { url });
+      const text = await invoke<string>('fetch_registry_text', { url: source.index });
+      const signature = await invoke<string>('fetch_registry_text', {
+        url: source.signature,
+      });
+
+      await invoke('verify_plugin_index', { index: text, signature });
       return parseIndex(text);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      failures.push(`${describeSource(url)}：${reason}`);
+      failures.push(`${describeSource(source.index)}：${reason}`);
     }
   }
 

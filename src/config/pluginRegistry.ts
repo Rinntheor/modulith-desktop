@@ -13,6 +13,16 @@ export const PLUGIN_REPO = 'Rinntheor/modulith-plugins';
 /** 索引在仓库内的路径 */
 export const PLUGIN_INDEX_PATH = 'index.json';
 
+/**
+ * 索引签名的路径。
+ *
+ * 与索引放在同一个仓库、同一个目录，因此两者一定来自同一次提交 —— 签名给的是索引的
+ * 字节，分开存放迟早会出现"索引换了、签名没换"的错配。
+ *
+ * 由 `tauri signer sign index.json` 生成（写在同名 `.sig` 文件里）。
+ */
+export const PLUGIN_INDEX_SIGNATURE_PATH = `${PLUGIN_INDEX_PATH}.sig`;
+
 /** 仓库主页，用于「源码可见」与「报告问题」入口 */
 export const PLUGIN_REPO_URL = `https://github.com/${PLUGIN_REPO}`;
 
@@ -46,21 +56,40 @@ export function registrySources(ref: string, path: string): string[] {
 }
 
 /**
- * 索引的候选地址，按顺序尝试。
+ * 索引与它的签名，成对返回的候选地址。
  *
- * 两个细节是刻意的：
+ * 为什么成对返回而不是让调用方自己拼 `.sig`：jsDelivr 那条带查询串，直接往后接 `.sig`
+ * 会得到 `index.json?t=123.sig` —— 一个既不是索引也不是签名的地址，而它失败的方式是
+ * 404，看起来像"索引不存在"。把两件事绑在一起，这类拼接就不可能写错。
+ *
+ * 三个细节是刻意的：
  *
  * 1. **jsDelivr 那条带 `?t=` 查询串。** jsDelivr 对分支引用的缓存是若干小时，而索引
  *    必须"发布后立刻可见"（新插件、新版本都靠它被发现）。查询串让每次请求构成不同的
  *    缓存键，从而绕过缓存 —— 索引只有几 KB，不需要 CDN 的缓存收益。
  * 2. **保留 GitHub 直连作为兜底。** CDN 可能被墙或临时故障，宁可慢也不要完全不可用。
+ * 3. **签名与索引走同一个来源。** 一条源的索引配另一条源的签名没有意义：签名是给那份
+ *    具体的字节签的，混搭只会得到一个必然失败的组合。
  *
  * 索引是唯一**可变**的取用对象（它取 `main`），因此只有它需要绕缓存；包与 README 都按
  * 不可变 tag 取，走 registrySources 即可。
  */
-export function pluginIndexSources(now: number = Date.now()): string[] {
+export interface PluginIndexSource {
+  /** 索引地址 */
+  index: string;
+  /** 对应签名的地址。签名是给索引的**字节**签的，因此必须与它同源 */
+  signature: string;
+}
+
+export function pluginIndexSources(now: number = Date.now()): PluginIndexSource[] {
   return [
-    `${jsdelivrUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH)}?t=${now}`,
-    rawGithubUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH),
+    {
+      index: `${jsdelivrUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH)}?t=${now}`,
+      signature: `${jsdelivrUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_SIGNATURE_PATH)}?t=${now}`,
+    },
+    {
+      index: rawGithubUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH),
+      signature: rawGithubUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_SIGNATURE_PATH),
+    },
   ];
 }
