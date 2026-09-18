@@ -28,6 +28,7 @@ import {
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import ModuleEmbed from '../ModuleEmbed';
 import SecuritySettings from './SecuritySettings';
+import UpdateChecker from './UpdateChecker';
 import { getCatalogModules } from '../../services/moduleCatalog';
 import { getHostVersion, getInstalledPlugins } from '../../services/pluginRuntime';
 import { APP_INFO, APP_LINKS } from '../../config/appInfo';
@@ -584,6 +585,10 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
 
                 {section === 'about' && (
                   <div className="px-6 py-5">
+                    {/* 软件更新。放在身份卡之前：它是这一页唯一"可以操作"的东西，
+                        其余部分都是只读信息。 */}
+                    <UpdateChecker />
+
                     {/* 身份卡：应用名 + 作者 + 外链 */}
                     <section className="bg-white rounded-xl border border-gray-200 px-5 py-5 mb-5">
                       <div className="flex items-start gap-4">
