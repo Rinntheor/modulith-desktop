@@ -40,7 +40,7 @@
 
 | 导出 | 签名 | 说明 |
 | --- | --- | --- |
-| `AppSettings` | 接口 | 设置结构（含 `theme`、`reduceMotion`、`deferPluginLoading`、`pluginLoadTimeoutMs`、`accent`、`openTabs`、`activeTab`） |
+| `AppSettings` | 接口 | 设置结构（含 `theme`、`reduceMotion`、`deferPluginLoading`、`pluginLoadTimeoutMs`、`accent`、`openTabs`、`activeTab`、`tabBarVisible`、`autoCheckUpdates`、`lastUpdateCheckAt`） |
 | `DEFAULT_APP_SETTINGS` | 常量 | 默认设置，各字段与后端 `settings.rs` 的默认值一致 |
 | `MAX_OPEN_TABS` | 常量 | 标签页上限，值为 12，必须与后端 `settings.rs` 的同名常量一致 |
 | `loadAppSettings()` | `Promise<AppSettings>` | 从后端载入并缓存 |
@@ -327,9 +327,11 @@ interface EngineAdvisory {
 | `markNotificationRead(id)` / `markAllNotificationsRead()` | `Promise<void>` | 标记已读 |
 | `dismissNotification(id)` / `clearNotifications()` | `Promise<void>` | 移除 / 清空 |
 
-`PushNotificationInput` 字段：`title`、`body?`、`level?`（`info` / `success` / `warning` / `error`）、`source?`、`dedupeKey?`、`silent?`。
+`PushNotificationInput` 字段：`title`、`body?`、`level?`（`info` / `success` / `warning` / `error`）、`category?`（`general` / `app-update`）、`source?`、`dedupeKey?`、`silent?`。
 
 浮层的展示规则由这里决定：`silent` 为真时不弹；**合并键命中已有未读时不弹**（只增加计数），因为模块很容易在重试循环里反复推同一条；其余情况弹一次，时长由级别决定（错误级不自动消失）。后端不可用时推送仍会弹一次浮层，只是这条不会进通知中心。
+
+`category` 在这里被翻译成浮层的 `variant`（见第 14 节）：`app-update` 的浮层**不自动消失**，并带「查看更新」入口。映射写在这一层而不是让调用方自己传变体 —— 类别是持久化在通知里的信息，变体是它的呈现结果，分开传迟早会出现「存的是更新、弹的是普通」。之所以不让 `toast.ts` 直接认识 `NotificationCategory`，是因为 `notifications.ts` 已经 import 了 `toast.ts`，反向依赖会成环。
 
 ## 14. toast
 
@@ -338,9 +340,12 @@ interface EngineAdvisory {
 | 导出 | 签名 | 说明 |
 | --- | --- | --- |
 | `MAX_VISIBLE_TOASTS` | 常量 | 同时显示上限，值为 5，超出丢弃最旧的 |
+| `ToastVariant` | 类型 | `'default' \| 'update'`。与 `level` 正交：`level` 说有多严重，变体说是不是一件要用户做决定的事 |
 | `showToast(input)` | `Toast` | 显示一条 |
 | `dismissToast(id)` / `clearToasts()` | `void` | 关闭 / 清空 |
 | `getToasts()` / `subscribeToasts(listener)` | `Toast[]` / `() => void` | 读取与订阅 |
+
+时长优先级是 `durationMs` > 变体规则 > 级别默认值。`'update'` 变体的规则是**不自动消失**（0）：这类提示不该在用户看到之前走掉。之所以用变体而不是新增一个 level：level 在后端是严格反序列化的枚举，加值会让旧的通知文件解析失败，而这是一个纯呈现层的需求。
 
 **定时器不在这个服务里，而在 `ToastLayer`**。自动消失需要支持「鼠标悬停时暂停」，那是纯粹的界面行为；服务层只维护「当前该显示哪些」。浮层实现的是「按剩余时间继续」而不是「移开后重新计时」——后者等于没暂停。
 

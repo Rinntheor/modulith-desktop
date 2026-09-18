@@ -11,7 +11,17 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { AlertTriangle, BellOff, CheckCheck, CheckCircle2, Info, Trash2, X, XCircle } from 'lucide-react';
+import {
+  AlertTriangle,
+  BellOff,
+  CheckCheck,
+  CheckCircle2,
+  Download,
+  Info,
+  Trash2,
+  X,
+  XCircle,
+} from 'lucide-react';
 import {
   clearNotifications,
   dismissNotification,
@@ -75,16 +85,34 @@ const NotificationRow: React.FC<{
   sourceLabel: string;
   canJump: boolean;
   onJump: (source: string) => void;
-}> = ({ notification, sourceLabel, canJump, onJump }) => {
-  const Icon = LEVEL_ICON[notification.level];
+  onOpenUpdate: () => void;
+}> = ({ notification, sourceLabel, canJump, onJump, onOpenUpdate }) => {
+  /*
+   * 更新通知单独一套外观。
+   *
+   * 为什么值得特殊对待：它是一条**有明确后续动作**的通知（去下载安装），而且
+   * 用户没看到就等于不知道有新版本。混在插件日志里，它唯一的命运是被一起扫过去。
+   * 特殊化只体现在呈现上 —— 数据仍是一条普通通知，因此未读、合并、清空这些
+   * 既有机制对它同样生效。
+   */
+  const isUpdate = notification.category === 'app-update';
+  const Icon = isUpdate ? Download : LEVEL_ICON[notification.level];
 
   return (
     <div
-      className={`group relative flex items-start gap-2.5 border-b border-gray-100 px-3.5 py-2.5 transition-colors hover:bg-gray-50 ${
-        notification.read ? '' : 'bg-indigo-50/40'
+      className={`group relative flex items-start gap-2.5 border-b border-gray-100 px-3.5 py-2.5 transition-colors ${
+        isUpdate
+          ? 'bg-indigo-50/60 hover:bg-indigo-50'
+          : `hover:bg-gray-50 ${notification.read ? '' : 'bg-indigo-50/40'}`
       }`}
     >
-      <Icon className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${LEVEL_CLASS[notification.level]}`} />
+      {isUpdate && <span className="absolute inset-y-0 left-0 w-0.5 bg-indigo-500" />}
+
+      <Icon
+        className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${
+          isUpdate ? 'text-indigo-600' : LEVEL_CLASS[notification.level]
+        }`}
+      />
 
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-1.5">
@@ -97,6 +125,11 @@ const NotificationRow: React.FC<{
               </span>
             )}
           </p>
+          {isUpdate && (
+            <span className="shrink-0 rounded bg-indigo-600 px-1 text-[10px] font-medium leading-4 text-white">
+              更新
+            </span>
+          )}
           {!notification.read && (
             <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-500" aria-label="未读" />
           )}
@@ -112,6 +145,18 @@ const NotificationRow: React.FC<{
           <span className="truncate">{sourceLabel}</span>
           <span>·</span>
           <span className="shrink-0">{formatRelativeTime(notification.createdAt)}</span>
+          {isUpdate && (
+            <>
+              <span>·</span>
+              <button
+                type="button"
+                onClick={onOpenUpdate}
+                className="shrink-0 font-medium text-indigo-700 hover:text-indigo-800"
+              >
+                查看更新
+              </button>
+            </>
+          )}
           {canJump && (
             <>
               <span>·</span>
@@ -143,9 +188,15 @@ const NotificationRow: React.FC<{
 export interface NotificationCenterProps {
   open: boolean;
   onClose: () => void;
+  /** 更新通知里「查看更新」的去处：设置 → 关于 的更新卡片 */
+  onOpenUpdate: () => void;
 }
 
-const NotificationCenter: React.FC<NotificationCenterProps> = ({ open, onClose }) => {
+const NotificationCenter: React.FC<NotificationCenterProps> = ({
+  open,
+  onClose,
+  onOpenUpdate,
+}) => {
   const [notifications, setNotifications] = useState<AppNotification[]>(() => getNotifications());
   const catalog = useCatalog();
 
@@ -174,6 +225,12 @@ const NotificationCenter: React.FC<NotificationCenterProps> = ({ open, onClose }
     openTab(target);
     onClose();
   }, [onClose]);
+
+  // 点「查看更新」之后要关掉通知中心：否则设置对话框会被这个浮层压住
+  const handleOpenUpdate = useCallback(() => {
+    onOpenUpdate();
+    onClose();
+  }, [onOpenUpdate, onClose]);
 
   return (
     <AnimatePresence>
@@ -258,6 +315,7 @@ const NotificationCenter: React.FC<NotificationCenterProps> = ({ open, onClose }
                         sourceLabel={sourceLabel}
                         canJump={canJump}
                         onJump={handleJump}
+                        onOpenUpdate={handleOpenUpdate}
                       />
                     </div>
                   );

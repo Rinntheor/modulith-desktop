@@ -100,6 +100,24 @@ pub struct AppSettings {
     /// 而「关不掉窗口」不是一个可以用设置项换取的体验。
     #[serde(default = "default_tab_bar_visible")]
     pub tab_bar_visible: bool,
+    /// 启动时是否自动检查应用更新
+    ///
+    /// 默认 `true`：这是让「有新版本」能被发现的唯一途径 —— 不主动检查的话，
+    /// 用户除非自己去「关于」页点一次，否则永远不会知道。检查本身只是向
+    /// GitHub 的 release 地址发一次 GET，不携带任何本机信息。
+    ///
+    /// 用户可以关掉它。关掉后仍然可以手动检查，且**不会**在启动时发任何请求。
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
+    /// 上次**得到确定结论**的自动检查时间（RFC3339，由前端写入）
+    ///
+    /// 存在的理由是节流：启动时检查一次是对 GitHub 的请求，一天开十次应用
+    /// 不该发十次。前端据此判断 24 小时内是否已经查过。
+    ///
+    /// 只记录「拿到结论」的时刻，不记录「尝试过」：检查因断网失败时留空，
+    /// 下次启动会重试 —— 否则一次离线启动就会让自动检查静默失效一整天。
+    #[serde(default)]
+    pub last_update_check_at: Option<String>,
 }
 
 /// 同时打开的标签页数量上限
@@ -124,6 +142,11 @@ fn default_defer_plugin_loading() -> bool {
 
 /// 标签栏默认可见。理由见 `tab_bar_visible` 字段上的说明。
 fn default_tab_bar_visible() -> bool {
+    true
+}
+
+/// 自动检查更新默认开启。理由见 `auto_check_updates` 字段上的说明。
+fn default_auto_check_updates() -> bool {
     true
 }
 
@@ -177,6 +200,8 @@ impl Default for AppSettings {
             open_tabs: Vec::new(),
             active_tab: None,
             tab_bar_visible: default_tab_bar_visible(),
+            auto_check_updates: default_auto_check_updates(),
+            last_update_check_at: None,
         }
     }
 }
@@ -261,6 +286,20 @@ impl AppSettings {
                 return Err(format!(
                     "Invalid activeTab \"{}\": only letters, digits, '.', '_', '/', '-' are allowed (max {} characters, must start with a letter or digit)",
                     id, MAX_MODULE_ID_LEN
+                ));
+            }
+        }
+
+        // 自动检查的时间戳只校验格式。
+        //
+        // 不做「不能是未来」这类语义校验：那由前端在判断节流时处理（未来的时间戳
+        // 会被当作「没检查过」而不是「刚检查过」）。放在这里拒绝反而是错的 ——
+        // 系统时钟被往回调一下就会让设置无法保存。
+        if let Some(raw) = &self.last_update_check_at {
+            if chrono::DateTime::parse_from_rfc3339(raw).is_err() {
+                return Err(format!(
+                    "Invalid lastUpdateCheckAt \"{}\": expected an RFC3339 timestamp",
+                    raw
                 ));
             }
         }
@@ -423,6 +462,41 @@ mod tests {
         // 标签页默认为空：首次启动不该凭空打开任何标签
         assert!(defaults.open_tabs.is_empty());
         assert_eq!(defaults.active_tab, None);
+        // 自动检查更新默认开启；还没有检查过
+        assert!(defaults.auto_check_updates);
+        assert_eq!(defaults.last_update_check_at, None);
+    }
+
+    /// 引入更新检查之前写下的 settings.json 没有这两个字段：
+    /// 自动检查默认**开启**，而不是因为字段缺失变成关闭。
+    #[test]
+    fn update_fields_default_to_enabled_on_old_settings_files() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("empty object should load");
+        assert!(
+            settings.auto_check_updates,
+            "缺失 autoCheckUpdates 时应当按默认开启处理"
+        );
+        assert_eq!(settings.last_update_check_at, None);
+    }
+
+    /// 只接受 RFC3339，拒绝随便一个字符串 —— 它会被拿去算时间差。
+    #[test]
+    fn rejects_malformed_last_update_check_at() {
+        let mut settings = AppSettings::default();
+
+        settings.last_update_check_at = Some("2026-09-18T22:00:00.000Z".to_string());
+        assert!(settings.validate().is_ok(), "合法的时间戳应当通过");
+
+        settings.last_update_check_at = Some("昨天".to_string());
+        assert!(settings.validate().is_err(), "非 RFC3339 应当被拒绝");
+
+        settings.last_update_check_at = Some("2026-09-18".to_string());
+        assert!(settings.validate().is_err(), "只有日期没有时间也应当被拒绝");
+
+        // 未来时间不在后端拒绝：时钟回拨不该让设置无法保存，
+        // 「未来时间戳按未检查处理」是前端的判断（见 updateCheck.ts）
+        settings.last_update_check_at = Some("2099-01-01T00:00:00Z".to_string());
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

@@ -49,6 +49,20 @@ export interface AppSettings {
    * 用于「沉浸」体验。默认 `true`。
    */
   tabBarVisible: boolean;
+  /**
+   * 启动时是否自动检查应用更新。
+   *
+   * 默认 `true`：这是「有新版本」能被用户发现的唯一途径。检查只是向 GitHub 的
+   * release 地址发一次 GET，不携带任何本机信息；用户可以关掉。
+   */
+  autoCheckUpdates: boolean;
+  /**
+   * 上次**得到确定结论**的自动检查时间（RFC3339），由应用自动写入。
+   *
+   * 只记录拿到结论的时刻，不记录「尝试过」—— 检查因断网失败时留空，下次启动
+   * 会重试。节流窗口见 `src/utils/updateCheck.ts`。
+   */
+  lastUpdateCheckAt: string | null;
 }
 
 /**
@@ -89,6 +103,10 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   activeTab: null,
   // 与后端 default_tab_bar_visible() 一致：隐藏是用户主动选择，不是默认体验
   tabBarVisible: true,
+  // 与后端 default_auto_check_updates() 一致
+  autoCheckUpdates: true,
+  // 首次启动必然要查一次：没有时间戳意味着"从没查过"
+  lastUpdateCheckAt: null,
 };
 
 let cache: AppSettings = { ...DEFAULT_APP_SETTINGS };
@@ -137,6 +155,14 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     activeTab: typeof raw?.activeTab === 'string' && raw.activeTab ? raw.activeTab : null,
     // 只有显式写成 false 才隐藏；缺失或非法值都回到「显示」
     tabBarVisible: raw?.tabBarVisible !== false,
+    // 同理：只有显式写成 false 才关闭自动检查
+    autoCheckUpdates: raw?.autoCheckUpdates !== false,
+    // 非法（非字符串或解析不出时间）时一律当作「没检查过」，由 updateCheck.ts
+    // 的 isUpdateCheckDue 统一处理；这里只保证类型干净
+    lastUpdateCheckAt:
+      typeof raw?.lastUpdateCheckAt === 'string' && raw.lastUpdateCheckAt
+        ? raw.lastUpdateCheckAt
+        : null,
   };
 }
 

@@ -28,6 +28,7 @@ import {
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import ModuleEmbed from '../ModuleEmbed';
 import SecuritySettings from './SecuritySettings';
+import Toggle from './Toggle';
 import UpdateChecker from './UpdateChecker';
 import { getCatalogModules } from '../../services/moduleCatalog';
 import { getHostVersion, getInstalledPlugins } from '../../services/pluginRuntime';
@@ -67,30 +68,8 @@ const SECTIONS: SectionDef[] = [
 // 基础控件
 // ============================================================
 
-const Toggle: React.FC<{
-  checked: boolean;
-  onChange: (next: boolean) => void;
-  disabled?: boolean;
-}> = ({ checked, onChange, disabled }) => (
-  <button
-    type="button"
-    role="switch"
-    aria-checked={checked}
-    disabled={disabled}
-    onClick={() => onChange(!checked)}
-    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors duration-200 disabled:opacity-40 ${
-      checked ? 'bg-indigo-600' : 'bg-gray-300'
-    }`}
-  >
-    <motion.span
-      initial={false}
-      animate={{ x: checked ? 16 : 2 }}
-      transition={{ type: 'spring', stiffness: 600, damping: 35 }}
-      className="inline-block h-4 w-4 rounded-full bg-white shadow"
-    />
-  </button>
-);
-
+// Toggle 已抽到 ./Toggle.tsx：更新卡片也要用它，而它 import 这个文件
+// 会形成循环依赖。见该文件头部说明。
 const SettingRow: React.FC<{
   title: string;
   description?: string;

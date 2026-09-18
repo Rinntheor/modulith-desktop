@@ -51,6 +51,25 @@ pub enum NotificationLevel {
     Error,
 }
 
+/// 通知类别
+///
+/// 与 `level`（重要程度）正交：`level` 决定图标与配色，`category` 决定这条通知
+/// **是不是一类特殊的东西** —— 需要有别于普通通知的呈现，并对应一个明确的后续动作。
+///
+/// 目前只有「应用更新」一种：它由宿主自己发起的一次检查产生，用户看完之后要做的事
+/// 也很具体（去下载安装）。把它平平地混在插件日志里，正是「容易错过」的成因。
+///
+/// 缺省为 `General`（`#[serde(default)]`），因此引入本字段之前写下的
+/// `notifications.json` 仍然能解析。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotificationCategory {
+    #[default]
+    General,
+    /// 应用有可用更新
+    AppUpdate,
+}
+
 /// 一条通知
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +80,9 @@ pub struct Notification {
     #[serde(default)]
     pub body: String,
     pub level: NotificationLevel,
+    /// 类别，见 `NotificationCategory`
+    #[serde(default)]
+    pub category: NotificationCategory,
     /// 来源模块 ID，宿主自身的通知固定为 `host`
     ///
     /// 用于在侧边栏与标签页上按模块显示未读徽标，因此必须能直接当模块 ID 用。
@@ -132,6 +154,7 @@ pub fn sanitize(
     title: &str,
     body: &str,
     level: NotificationLevel,
+    category: NotificationCategory,
     source: &str,
     dedupe_key: Option<&str>,
 ) -> Result<Notification, String> {
@@ -158,6 +181,7 @@ pub fn sanitize(
         title,
         body: truncate_chars(body.trim(), MAX_BODY_LEN),
         level,
+        category,
         source,
         created_at: now_rfc3339(),
         read: false,
@@ -308,13 +332,37 @@ mod tests {
     use super::*;
 
     fn make(title: &str, source: &str, dedupe: Option<&str>) -> Notification {
-        sanitize(title, "", NotificationLevel::Info, source, dedupe).expect("应当构造成功")
+        sanitize(
+            title,
+            "",
+            NotificationLevel::Info,
+            NotificationCategory::General,
+            source,
+            dedupe,
+        )
+        .expect("应当构造成功")
     }
 
     #[test]
     fn sanitize_rejects_empty_title() {
-        assert!(sanitize("", "", NotificationLevel::Info, "host", None).is_err());
-        assert!(sanitize("   ", "", NotificationLevel::Info, "host", None).is_err());
+        assert!(sanitize(
+            "",
+            "",
+            NotificationLevel::Info,
+            NotificationCategory::General,
+            "host",
+            None
+        )
+        .is_err());
+        assert!(sanitize(
+            "   ",
+            "",
+            NotificationLevel::Info,
+            NotificationCategory::General,
+            "host",
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -326,6 +374,7 @@ mod tests {
             &long_title,
             &long_body,
             NotificationLevel::Warning,
+            NotificationCategory::General,
             "dashboard",
             None,
         )
@@ -339,8 +388,31 @@ mod tests {
 
     #[test]
     fn sanitize_defaults_empty_source_to_host() {
-        let item = sanitize("标题", "", NotificationLevel::Info, "   ", None).expect("应当成功");
+        let item = sanitize(
+            "标题",
+            "",
+            NotificationLevel::Info,
+            NotificationCategory::General,
+            "   ",
+            None,
+        )
+        .expect("应当成功");
         assert_eq!(item.source, "host");
+    }
+
+    /// 类别由调用方给出，`sanitize` 不负责推断 —— 它是入参，不是从内容推出来的。
+    #[test]
+    fn sanitize_keeps_the_given_category() {
+        let item = sanitize(
+            "发现新版本",
+            "",
+            NotificationLevel::Info,
+            NotificationCategory::AppUpdate,
+            "host",
+            Some("app-update-available"),
+        )
+        .expect("应当成功");
+        assert_eq!(item.category, NotificationCategory::AppUpdate);
     }
 
     #[test]
@@ -506,11 +578,30 @@ mod tests {
         assert_eq!(file.notifications[0].count, 1, "count 缺省应为 1");
         assert!(!file.notifications[0].read);
         assert_eq!(file.notifications[0].body, "");
+        assert_eq!(
+            file.notifications[0].category,
+            NotificationCategory::General,
+            "category 缺省应为 general"
+        );
     }
 
     #[test]
     fn level_serializes_lowercase() {
         let json = serde_json::to_string(&NotificationLevel::Warning).expect("serialize");
         assert_eq!(json, "\"warning\"");
+    }
+
+    /// 类别用 kebab-case：`app-update` 而不是 `appupdate`。
+    /// 它是前后端共同遵守的字面量，写错了前端就认不出更新通知。
+    #[test]
+    fn category_serializes_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&NotificationCategory::AppUpdate).expect("serialize"),
+            "\"app-update\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NotificationCategory::General).expect("serialize"),
+            "\"general\""
+        );
     }
 }

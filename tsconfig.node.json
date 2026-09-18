@@ -32,11 +32,18 @@
     "noFallthroughCasesInSwitch": true
   },
   /*
-   * `src/types/**` 与 `src/utils/semver.ts` 只保留脚本真正引用的类型/实现文件：
+   * `src/types/**` 与 `src/utils/*.ts` 只保留脚本真正引用的类型/实现文件：
    * generate-modules.ts 会 `import type { ModuleToml } from '../src/types/module.ts'`，
-   * check-semver.ts 会 `import { ... } from '../src/utils/semver.ts'`，
-   * 这两个文件必须属于本 project，否则整次检查以 TS6307 直接失败 ——
+   * check-semver.ts / check-update-throttle.ts 会分别引入
+   * `src/utils/semver.ts` 与 `src/utils/updateCheck.ts`，
+   * 这些文件必须属于本 project，否则整次检查以 TS6307 直接失败 ——
    * 而失败会盖住后面所有的真实错误，等于脚本从来没有被检查过。
    */
-  "include": ["vite.config.ts", "scripts/**/*.ts", "src/types/module.ts", "src/utils/semver.ts"]
+  "include": [
+    "vite.config.ts",
+    "scripts/**/*.ts",
+    "src/types/module.ts",
+    "src/utils/semver.ts",
+    "src/utils/updateCheck.ts"
+  ]
 }

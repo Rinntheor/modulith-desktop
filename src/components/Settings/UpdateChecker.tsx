@@ -2,7 +2,7 @@
 //
 // 「关于」分页里的软件更新卡片。
 //
-// 三处刻意的呈现选择：
+// 四处刻意的呈现选择：
 //
 // 1. **「检查失败」与「已是最新」必须分开。** 断网时若显示"已是最新"，用户会以为
 //    自己拿到了一个结论，而实际什么都没验证。
@@ -10,17 +10,28 @@
 //    安装程序后结束本进程 —— 不预告的话，用户看到窗口突然消失会以为是崩溃。
 // 3. **当前版本号只在相关时才出现。** 身份卡里已经写了版本号，这里再固定显示一遍
 //    是重复；但"已是最新（1.0.3）"里的那个版本号是有信息量的。
+// 4. **自动检查的开关放在这张卡片里**（而不是"通用"页）：它管的就是这件事，
+//    放在别处会让"为什么会弹更新提示"变成一个要翻设置才能回答的问题。
 
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { AlertCircle, CheckCircle, Download, RefreshCw } from 'lucide-react';
 
 import {
   checkForAppUpdate,
+  describeUpdateError,
   installPendingAppUpdate,
+  noteUpdateCheckCompleted,
   type AvailableUpdate,
   type DownloadProgress,
 } from '../../services/appUpdater';
+import {
+  getCachedSettings,
+  saveAppSettings,
+  subscribeSettings,
+} from '../../services/appSettings';
+import { showToast } from '../../services/toast';
 import { formatBytes } from '../../utils/format';
+import Toggle from './Toggle';
 
 type Status = 'idle' | 'checking' | 'latest' | 'available' | 'installing' | 'error';
 
@@ -36,6 +47,13 @@ const UpdateChecker: React.FC = () => {
   const [available, setAvailable] = useState<AvailableUpdate | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState('');
+  const [autoCheck, setAutoCheck] = useState(() => getCachedSettings().autoCheckUpdates);
+
+  // 设置是唯一事实来源：别处改了它（或保存失败被回滚），这个开关跟着变
+  useEffect(
+    () => subscribeSettings(() => setAutoCheck(getCachedSettings().autoCheckUpdates)),
+    []
+  );
 
   const runCheck = useCallback(async () => {
     setStatus('checking');
@@ -45,6 +63,9 @@ const UpdateChecker: React.FC = () => {
     try {
       const result = await checkForAppUpdate();
       setCurrentVersion(result.currentVersion);
+      // 手动查过就等于查过了：不该在下次启动时立刻又自动查一次。
+      // 写时间戳失败不会抛错（只影响节流），因此不会污染这里的成功路径。
+      await noteUpdateCheckCompleted();
       if (result.available) {
         setAvailable(result.available);
         setStatus('available');
@@ -52,8 +73,22 @@ const UpdateChecker: React.FC = () => {
         setStatus('latest');
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeUpdateError(err));
       setStatus('error');
+    }
+  }, []);
+
+  const updateAutoCheck = useCallback(async (next: boolean) => {
+    try {
+      await saveAppSettings({ autoCheckUpdates: next });
+    } catch (err) {
+      // 保存失败时 saveAppSettings 已经把缓存回滚了，订阅会把开关拨回去；
+      // 这里只需要说明为什么
+      showToast({
+        title: '保存失败',
+        body: err instanceof Error ? err.message : String(err),
+        level: 'error',
+      });
     }
   }, []);
 
@@ -171,6 +206,21 @@ const UpdateChecker: React.FC = () => {
           <p className="text-[11px] leading-relaxed whitespace-pre-wrap">{error}</p>
         </div>
       )}
+
+      {/*
+        自动检查的开关。它管的是「以后要不要自己查」，与上面这次检查的结果是
+        两件事，因此放在卡片最后、用一条分隔线断开。
+      */}
+      <div className="mt-4 flex items-start justify-between gap-4 border-t border-gray-100 pt-3.5">
+        <div className="min-w-0">
+          <p className="text-xs font-medium text-gray-800">启动时自动检查更新</p>
+          <p className="mt-0.5 text-[11px] leading-relaxed text-gray-500">
+            每天最多检查一次，只向 GitHub 查询版本号，不发送任何本机信息。
+            发现新版本会放进通知里提醒。关闭后仍然可以在这里手动检查。
+          </p>
+        </div>
+        <Toggle checked={autoCheck} onChange={(next) => void updateAutoCheck(next)} />
+      </div>
     </section>
   );
 };

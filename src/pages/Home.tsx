@@ -55,6 +55,7 @@ import { useTabs } from '../hooks/useTabs';
 import { useCatalog } from '../hooks/useCatalog';
 import { getFallbackModule, initializeTabs, openFallbackTab } from '../services/tabStore';
 import { loadNotifications } from '../services/notifications';
+import { autoCheckForAppUpdate } from '../services/appUpdater';
 import { useGlobalShortcuts } from '../hooks/useGlobalShortcuts';
 import { registerHostCommands } from '../services/commandRegistry';
 import { registerHostShortcuts } from '../services/hostShortcuts';
@@ -103,15 +104,18 @@ const EmptyTabs: React.FC = () => {
 const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
   const { isOpen, canGoBack, canGoForward, goBack, goForward } = useSidebar();
   const { openTabs, activeTab, mountedTabs } = useTabs();
+  // 设置对话框当前显示的分页，以及它是否打开。
+  //
+  // settingsSection 现在确实是 state：更新通知里的「查看更新」必须把设置切到
+  // 「关于」才能看到下载按钮。此前它是一个恒定值冒充 state（`const [...] =
+  // useState(...)`，setter 被丢弃、没有任何路径能改它），那时"不需要 state"
+  // 是对的，现在不是了。
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId>('general');
   // 全局右键菜单的位置；null 表示未打开
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   // 二级标题栏是否显示（持久化在设置里，因此重启后保持）
   const [showTabBar, setShowTabBar] = useState(() => getCachedSettings().tabBarVisible);
-  // 设置对话框固定从「通用」页打开。此前这里是一个丢弃了 setter 的 state
-  // （`const [settingsSection] = useState(...)`），即一个恒定值冒充 state ——
-  // 没有任何路径能改它，因此不需要 state。
-  const settingsSection: SettingsSectionId = 'general';
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshToken, setRefreshToken] = useState(0);
@@ -139,15 +143,36 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
     }
   }, []);
 
+  /**
+   * 打开设置对话框。
+   *
+   * 缺省落回「通用」：标题栏齿轮、快捷键、全局菜单这些入口都不关心分页，
+   * 上一次被更新通知带到「关于」的状态不该被它们继承 —— 那会让人以为设置
+   * 默认就开在「关于」。
+   */
+  const openSettings = useCallback((section: SettingsSectionId = 'general') => {
+    setSettingsSection(section);
+    setSettingsOpen(true);
+  }, []);
+
+  const handleOpenSettings = useCallback(() => openSettings('general'), [openSettings]);
+
+  /**
+   * 更新通知的去处。
+   *
+   * 只把用户送到「关于」的更新卡片，**不替他点下载安装** —— 安装会关闭并重启
+   * 应用，那不该由一次通知点击触发。选择权与时机留给用户。
+   */
+  const handleOpenUpdate = useCallback(() => openSettings('about'), [openSettings]);
+
   // 一次性初始化：通知、宿主命令
   // （标签状态在 Home 里、首次渲染之前就已初始化，见那里的说明）
   useEffect(() => {
     if (bootstrappedRef.current) return;
     bootstrappedRef.current = true;
 
-    void loadNotifications();
     registerHostCommands({
-      onOpenSettings: () => setSettingsOpen(true),
+      onOpenSettings: handleOpenSettings,
       onOpenNotifications: () => setNotificationsOpen(true),
       onRefreshPlugins: handleRefresh,
     });
@@ -155,7 +180,22 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
     // 「快捷键」，于是 Ctrl+K / Ctrl+W / Ctrl+Tab / Ctrl+1..9 全都没有反应
     // （注册表写好了，却从来没有人往里注册）。
     registerHostShortcuts();
-  }, [handleRefresh]);
+
+    /*
+     * 启动时自动检查更新。
+     *
+     * **放在界面就绪之后，而不是放进启动步骤表**：这一步要联网，放进
+     * boot 会让启动界面多等一次网络超时，而"有没有新版本"不该拖慢进入应用。
+     *
+     * 不 await、也不处理返回值：检查结果通过通知送达（见 appUpdater.ts），
+     * 失败只写日志 —— 用户没有发起这个动作，不该被它打扰。
+     *
+     * 串在 `loadNotifications` 之后：反过来（并发）的话，检查到的新版本可能
+     * 先写进缓存，再被 `list_notifications` 的旧快照覆盖掉。概率极低
+     * （一次网络往返对一次本地 IPC），但把顺序写对是免费的。
+     */
+    void loadNotifications().then(() => autoCheckForAppUpdate());
+  }, [handleRefresh, handleOpenSettings]);
 
   useGlobalShortcuts();
 
@@ -170,7 +210,6 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
     return () => clearTimeout(timer);
   }, [activeTab]);
 
-  const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
   const handleOpenNotifications = useCallback(() => setNotificationsOpen(true), []);
 
   // 设置里的 tabBarVisible 是唯一事实来源：别的入口（设置页、快捷键）改了它，
@@ -370,9 +409,10 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
       <NotificationCenter
         open={notificationsOpen}
         onClose={() => setNotificationsOpen(false)}
+        onOpenUpdate={handleOpenUpdate}
       />
 
-      <ToastLayer onOpenCenter={handleOpenNotifications} />
+      <ToastLayer onOpenCenter={handleOpenNotifications} onOpenUpdate={handleOpenUpdate} />
 
       <SettingsDialog
         open={settingsOpen}

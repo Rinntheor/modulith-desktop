@@ -18,9 +18,16 @@
 // 用户反而错过真正的新信息。合并只影响浮层，通知中心里那条的计数仍会增长。
 
 import { invoke } from '@tauri-apps/api/core';
-import { showToast, type ToastLevel } from './toast';
+import { showToast, type ToastLevel, type ToastVariant } from './toast';
 
 export type NotificationLevel = 'info' | 'success' | 'warning' | 'error';
+
+/**
+ * 通知类别。与 `level`（重要程度）正交：类别决定这条通知**是不是一类特殊的东西**，
+ * 需要有别于普通通知的呈现与动作。取值必须与后端
+ * `modules/notifications/store.rs` 的 `NotificationCategory` 一致（kebab-case）。
+ */
+export type NotificationCategory = 'general' | 'app-update';
 
 /** 宿主自身（而非某个模块）发出的通知，`source` 固定为这个值 */
 export const HOST_SOURCE = 'host';
@@ -30,6 +37,7 @@ export interface AppNotification {
   title: string;
   body: string;
   level: NotificationLevel;
+  category: NotificationCategory;
   /** 来源模块 ID，或 `host` */
   source: string;
   /** RFC3339（UTC） */
@@ -50,6 +58,7 @@ export interface PushNotificationInput {
   title: string;
   body?: string;
   level?: NotificationLevel;
+  category?: NotificationCategory;
   /** 来源模块 ID，缺省为 `host` */
   source?: string;
   dedupeKey?: string;
@@ -131,10 +140,11 @@ export function getNotificationSummary(): NotificationSummary {
  * 推送一条通知。
  *
  * 浮层提示的展示规则：`silent` 为真时完全不弹；合并键命中已有未读时不弹
- * （见文件头说明）。其他情况都会弹一次，时长由级别决定。
+ * （见文件头说明）。其他情况都会弹一次，时长由级别与变体决定。
  */
 export async function pushNotification(input: PushNotificationInput): Promise<void> {
   const level = input.level ?? 'info';
+  const category = input.category ?? 'general';
 
   // 先判断这次推送是否会被后端合并进已有条目 —— 必须在调用之前判断，
   // 因为调用之后缓存里已经是合并后的状态了
@@ -149,6 +159,7 @@ export async function pushNotification(input: PushNotificationInput): Promise<vo
         title: input.title,
         body: input.body ?? '',
         level,
+        category,
         source: input.source ?? HOST_SOURCE,
         dedupeKey: input.dedupeKey ?? null,
       },
@@ -158,7 +169,13 @@ export async function pushNotification(input: PushNotificationInput): Promise<vo
     // 落盘失败时仍然弹一次浮层：用户至少该知道刚才发生了什么，
     // 只是这条不会出现在通知中心里
     if (!input.silent) {
-      showToast({ title: input.title, body: input.body, level, source: input.source });
+      showToast({
+        title: input.title,
+        body: input.body,
+        level,
+        variant: toastVariantFor(category),
+        source: input.source,
+      });
     }
     return;
   }
@@ -171,8 +188,21 @@ export async function pushNotification(input: PushNotificationInput): Promise<vo
     title: input.title,
     body: input.body,
     level: level as ToastLevel,
+    variant: toastVariantFor(category),
     source: input.source ?? HOST_SOURCE,
   });
+}
+
+/**
+ * 类别 → 浮层变体。
+ *
+ * 映射写在这里而不是让调用方自己传变体：类别是持久化在通知里的信息，
+ * 变体是它的呈现结果，两者分开传迟早会出现「存的是更新、弹的是普通」。
+ * 之所以不让 `toast.ts` 直接认识 `NotificationCategory`，是因为
+ * `notifications.ts` 已经 import 了 `toast.ts` —— 反向依赖会成环。
+ */
+function toastVariantFor(category: NotificationCategory): ToastVariant {
+  return category === 'app-update' ? 'update' : 'default';
 }
 
 /** 标记单条已读 */

@@ -18,7 +18,7 @@
 // 每次多传几十 KB 换取「前端只需整个替换缓存」是划算的。
 
 use super::store::{
-    self, Notification, NotificationLevel, MAX_STORED_NOTIFICATIONS,
+    self, Notification, NotificationCategory, NotificationLevel, MAX_STORED_NOTIFICATIONS,
 };
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
@@ -40,6 +40,9 @@ pub struct PushNotificationInput {
     #[serde(default)]
     pub body: String,
     pub level: NotificationLevel,
+    /// 类别，缺省为 `general`，见 `store::NotificationCategory`
+    #[serde(default)]
+    pub category: NotificationCategory,
     /// 来源模块 ID，缺省为 `host`
     #[serde(default)]
     pub source: String,
@@ -134,6 +137,7 @@ pub fn push_notification(
         &input.title,
         &input.body,
         input.level,
+        input.category,
         &input.source,
         input.dedupe_key.as_deref(),
     )?;
@@ -215,6 +219,7 @@ mod tests {
             title: format!("通知 {id}"),
             body: String::new(),
             level: NotificationLevel::Info,
+            category: NotificationCategory::General,
             source: "host".to_string(),
             created_at: created_at.to_string(),
             read,
