@@ -293,6 +293,19 @@ impl PluginManager {
     fn version_dir(&self, entry: &RegistryEntry) -> PathBuf {
         self.plugins_dir.join(&entry.id).join(&entry.version)
     }
+
+    /// 该插件当前实际生效的根目录：开发链接优先，否则是安装目录。
+    ///
+    /// **所有读取插件文件的地方都必须走这里**（清单、bundle、样式、图标、
+    /// README、导出、权限判定），否则就会出现「一部分内容来自源目录、另一部分
+    /// 来自旧副本」的割裂状态 —— 那比全部用旧的更难排查。
+    fn asset_root(&self, entry: &RegistryEntry) -> PathBuf {
+        resolve_asset_root(
+            &self.version_dir(entry),
+            entry.source_path.as_deref(),
+            &entry.id,
+        )
+    }
 }
 
 // ============================================================
@@ -326,7 +339,9 @@ impl PluginManager {
 
     /// 从注册表条目 + 磁盘上的 manifest.json 重建 InstalledPlugin
     fn to_installed(&self, entry: &RegistryEntry) -> PluginResult<InstalledPlugin> {
-        let dir = self.version_dir(entry);
+        // 开发链接优先：清单、样式、README、体积都跟着源目录走，
+        // 界面上看到的版本/权限与运行时实际执行的内容才是一致的。
+        let dir = self.asset_root(entry);
 
         let (manifest, loaded) = match read_manifest(&dir) {
             Ok(m) => (m, true),
@@ -372,6 +387,13 @@ impl PluginManager {
             status,
             installed_at: entry.installed_at.clone(),
             source: entry.source.clone(),
+            // 只有开发目录**实际生效**时才报告它：源目录被删掉后这里必须是 None，
+            // 否则界面会显示一个名不副实的「开发模式」标记。
+            dev_source: if dir != self.version_dir(entry) {
+                Some(dir.to_string_lossy().to_string())
+            } else {
+                None
+            },
             engine_advisory,
         })
     }
@@ -382,7 +404,9 @@ impl PluginManager {
             .registry
             .get(id)
             .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
-        read_manifest(&self.version_dir(entry))
+        // 权限判定必须与运行时读到的清单是同一份 —— 否则开发目录里新加/去掉的
+        // 权限声明不会影响判定，插件就会按旧清单被放行或拒绝。
+        read_manifest(&self.asset_root(entry))
     }
 
     /// 强制插件已声明某权限，未声明则拒绝。
@@ -423,7 +447,7 @@ impl PluginManager {
         let result = (|| -> PluginResult<InstalledPlugin> {
             std::fs::create_dir_all(&staging)?;
             extract_zip(path, &staging)?;
-            self.install_from_root(&staging, "file")
+            self.install_from_root(&staging, "file", None)
         })();
 
         // 无论如何都清理暂存目录
@@ -437,6 +461,10 @@ impl PluginManager {
     }
 
     /// 从本地文件夹安装（递归复制，跳过符号链接）
+    ///
+    /// 复制之外还会**记录源目录**（`source_path`），使该插件成为「开发链接」：
+    /// 之后读取清单与资源都直接走源目录，开发者在源目录里改完代码点刷新即生效。
+    /// 复制这一步仍然保留 —— 源目录被删除或改名时，插件还能靠副本继续工作。
     pub fn install_from_folder(&mut self, path: &Path) -> PluginResult<InstalledPlugin> {
         if !path.is_dir() {
             return Err(PluginError::NotFound(format!(
@@ -445,16 +473,22 @@ impl PluginManager {
             )));
         }
 
+        // 先归一化源路径：注册表里存的必须是绝对路径，否则应用换个工作目录启动
+        // 就再也找不到它了。canonicalize 同时消掉 `..` 与符号链接的歧义。
+        let source_dir = path.canonicalize().map_err(|e| {
+            PluginError::NotFound(format!("无法解析插件目录 {}（{}）", path.display(), e))
+        })?;
+
         std::fs::create_dir_all(self.staging_dir())?;
         let staging = self.staging_dir().join(uuid::Uuid::new_v4().to_string());
 
         let result = (|| -> PluginResult<InstalledPlugin> {
-            copy_tree(path, &staging)?;
+            copy_tree(&source_dir, &staging)?;
             // 兜底补一份规范化清单，避免源目录清单缺少默认字段
             let manifest = read_manifest(&staging)?;
             let serialized = serde_json::to_string_pretty(&manifest)?;
             std::fs::write(staging.join("manifest.json"), serialized)?;
-            self.install_from_root(&staging, "folder")
+            self.install_from_root(&staging, "folder", Some(source_dir))
         })();
 
         if staging.exists() {
@@ -504,7 +538,15 @@ impl PluginManager {
     }
 
     /// 校验暂存目录中的插件，然后移动到 <plugins_dir>/<id>/<version>/
-    fn install_from_root(&mut self, root: &Path, source: &str) -> PluginResult<InstalledPlugin> {
+    ///
+    /// `dev_source` 只在「从本地目录安装」时给出，会被记进注册表，
+    /// 使该插件在之后读取内容时优先使用源目录（见 `resolve_asset_root`）。
+    fn install_from_root(
+        &mut self,
+        root: &Path,
+        source: &str,
+        dev_source: Option<PathBuf>,
+    ) -> PluginResult<InstalledPlugin> {
         let manifest = read_manifest(root)?;
         validator::validate_manifest(&manifest, root)?;
 
@@ -556,11 +598,23 @@ impl PluginManager {
             enabled: true,
             installed_at: chrono::Utc::now().to_rfc3339(),
             source: source.to_string(),
+            // 存「可读」形式：canonicalize 的 `\\?\` 前缀不该进注册表与界面
+            source_path: dev_source.map(|p| normalize_source_path(&p)),
         };
         self.registry.insert(id.clone(), entry.clone());
         self.save_registry()?;
 
-        log::info!("插件 {} v{} 安装完成（来源 {}）", id, version, source);
+        log::info!(
+            "插件 {} v{} 安装完成（来源 {}{}）",
+            id,
+            version,
+            source,
+            entry
+                .source_path
+                .as_deref()
+                .map(|p| format!("，开发目录 {}", p))
+                .unwrap_or_default()
+        );
         self.to_installed(&entry)
     }
 }
@@ -620,10 +674,12 @@ impl PluginManager {
 impl PluginManager {
     /// 读取插件目录内的文本资源
     pub fn read_asset(&self, id: &str, rel: &str) -> PluginResult<String> {
-        let plugin = self
+        let entry = self
+            .registry
             .get(id)
             .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
-        let root = PathBuf::from(&plugin.path);
+        // 开发链接优先：这就是「在源目录改代码 → 点刷新即生效」成立的地方。
+        let root = self.asset_root(entry);
 
         let target = validator::resolve_within(&root, rel)?;
 
@@ -656,11 +712,17 @@ impl PluginManager {
         let plugin = self
             .get(id)
             .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
-        let root = PathBuf::from(&plugin.path);
+        // 导出的是**当前生效**的那份内容：开发链接下就是源目录，
+        // 因此「改完直接导出成包」拿到的是最新代码，而不是第一次安装时的副本。
+        let root = self.asset_root(
+            self.registry
+                .get(id)
+                .ok_or_else(|| PluginError::NotFound(id.to_string()))?,
+        );
         if !root.is_dir() {
             return Err(PluginError::NotFound(format!(
                 "插件目录不存在: {}",
-                plugin.path
+                root.display()
             )));
         }
 
@@ -1106,6 +1168,77 @@ impl PluginManager {
 // 辅助函数
 // ============================================================
 
+/// 去掉 Windows `canonicalize` 加上的 `\\?\` verbatim 前缀。
+///
+/// 为什么需要：`canonicalize()` 在 Windows 上返回 `\\?\C:\...`（UNC 则是
+/// `\\?\UNC\server\share\...`）。这个前缀对文件操作是好事（绕过路径长度限制与
+/// 多余的规范化），但它会被写进注册表、并经由 `devSource` 显示在界面上 ——
+/// 用户看到 `\\?\C:\...` 只会当成乱码。
+///
+/// 纯字符串变换，单独抽出来是为了能在任何平台上测试（CI 未必跑 Windows）。
+fn strip_verbatim_prefix(raw: &str) -> Option<String> {
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{}", rest));
+    }
+    raw.strip_prefix(r"\\?\").map(|rest| rest.to_string())
+}
+
+/// 把路径规范成「可持久化、可展示」的字符串形式
+fn normalize_source_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    strip_verbatim_prefix(&raw).unwrap_or_else(|| raw.to_string())
+}
+
+/// 解析某个已安装插件当前应当从哪里读取资源与清单。
+///
+/// 正常情况是安装目录 `<plugins_dir>/<id>/<version>`；「从本地目录安装」的插件
+/// 则优先用注册表里记下的**源目录**，这样开发者在源目录里改完代码，应用刷新后
+/// 立刻读到新内容，不必卸载重装。
+///
+/// 三道回退，任何一道不成立就退回安装目录 —— 宁可读到旧副本，也不能让插件
+/// 因为一个陈旧或非法的路径而彻底打不开：
+///
+/// 1. **必须是绝对路径且确实存在一个目录。** 源目录可能被删掉、被移走，或者
+///    注册表被手工改成了相对路径。
+/// 2. **清单必须能读出来，且 `name` 与注册表里的插件 ID 一致。** 这一条防的是
+///    「身份漂移」：源目录被改成了另一个插件、或者路径被指向了别的插件目录时，
+///    若照读不误，A 插件的 ID 就会被 B 插件的代码与权限清单顶替 ——
+///    权限检查读的也是这份清单，那等于绕过了权限声明。
+/// 3. 其余情况（无 `source_path`）自然走安装目录。
+///
+/// 纯函数：不接触 `PluginManager`（它持有 `AppHandle`，单测里造不出来），
+/// 因此上面的回退规则可以被测试直接锁定。
+fn resolve_asset_root(installed: &Path, dev_source: Option<&str>, expected_id: &str) -> PathBuf {
+    let Some(raw) = dev_source.map(str::trim).filter(|s| !s.is_empty()) else {
+        return installed.to_path_buf();
+    };
+
+    let candidate = Path::new(raw);
+    if !candidate.is_absolute() || !candidate.is_dir() {
+        return installed.to_path_buf();
+    }
+
+    match read_manifest(candidate) {
+        Ok(manifest) if manifest.name == expected_id => candidate.to_path_buf(),
+        Ok(manifest) => {
+            log::warn!(
+                "插件 {} 的开发目录清单声明的是 {}，与插件 ID 不一致，已退回安装目录",
+                expected_id,
+                manifest.name
+            );
+            installed.to_path_buf()
+        }
+        Err(e) => {
+            log::warn!(
+                "插件 {} 的开发目录无法读取清单（{}），已退回安装目录",
+                expected_id,
+                e
+            );
+            installed.to_path_buf()
+        }
+    }
+}
+
 /// 读取并规范化插件根目录下的 manifest.json
 fn read_manifest(root: &Path) -> PluginResult<PluginManifest> {
     let path = root.join("manifest.json");
@@ -1427,6 +1560,154 @@ mod tests {
         }
 
         zip.finish().unwrap();
+    }
+
+    /// 写一份最小可用的 manifest.json（`read_manifest` 会补默认值）
+    fn write_manifest(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let json = format!(
+            r#"{{
+  "name": "{name}",
+  "displayName": "测试插件",
+  "version": "1.0.0",
+  "main": "index.js"
+}}"#
+        );
+        std::fs::write(dir.join("manifest.json"), json).unwrap();
+    }
+
+    // ============================================================
+    // 开发链接（从本地目录安装）的根目录解析
+    // ============================================================
+
+    /// 源目录有效且清单同名时，必须读源目录 —— 这是「改完点刷新即生效」的前提。
+    #[test]
+    fn dev_link_prefers_source_directory() {
+        let root = temp_dir("devlink-ok");
+        let installed = root.join("installed");
+        let source = root.join("source");
+        write_manifest(&installed, "com.test.dev");
+        write_manifest(&source, "com.test.dev");
+
+        let resolved = resolve_asset_root(
+            &installed,
+            Some(source.to_string_lossy().as_ref()),
+            "com.test.dev",
+        );
+
+        assert_eq!(resolved, source);
+    }
+
+    /// 没有 `source_path`（.lcp / URL 安装）时必须用安装目录。
+    #[test]
+    fn dev_link_absent_uses_installed_directory() {
+        let root = temp_dir("devlink-none");
+        let installed = root.join("installed");
+        write_manifest(&installed, "com.test.dev");
+
+        assert_eq!(
+            resolve_asset_root(&installed, None, "com.test.dev"),
+            installed
+        );
+        // 空串等同于「没有」，不能把安装目录解析成一个空路径
+        assert_eq!(
+            resolve_asset_root(&installed, Some("   "), "com.test.dev"),
+            installed
+        );
+    }
+
+    /// 源目录被删除 / 改名后必须退回安装目录，而不是让插件直接打不开。
+    #[test]
+    fn dev_link_missing_source_falls_back() {
+        let root = temp_dir("devlink-gone");
+        let installed = root.join("installed");
+        write_manifest(&installed, "com.test.dev");
+        let missing = root.join("no-such-dir");
+
+        assert_eq!(
+            resolve_asset_root(
+                &installed,
+                Some(missing.to_string_lossy().as_ref()),
+                "com.test.dev"
+            ),
+            installed
+        );
+    }
+
+    /// **安全约束**：源目录里的清单声明的是别的插件 ID 时必须拒绝。
+    ///
+    /// 否则 A 插件的身份会被 B 插件的代码与权限清单顶替 —— 权限判定读的正是
+    /// 这份清单，等于绕过了权限声明。
+    #[test]
+    fn dev_link_rejects_identity_mismatch() {
+        let root = temp_dir("devlink-mismatch");
+        let installed = root.join("installed");
+        let source = root.join("source");
+        write_manifest(&installed, "com.test.dev");
+        write_manifest(&source, "com.test.other");
+
+        assert_eq!(
+            resolve_asset_root(
+                &installed,
+                Some(source.to_string_lossy().as_ref()),
+                "com.test.dev"
+            ),
+            installed
+        );
+    }
+
+    /// 源目录存在但没有可读清单时必须退回安装目录（而不是失败）。
+    #[test]
+    fn dev_link_unreadable_manifest_falls_back() {
+        let root = temp_dir("devlink-nomanifest");
+        let installed = root.join("installed");
+        let source = root.join("source");
+        write_manifest(&installed, "com.test.dev");
+        std::fs::create_dir_all(&source).unwrap();
+
+        assert_eq!(
+            resolve_asset_root(
+                &installed,
+                Some(source.to_string_lossy().as_ref()),
+                "com.test.dev"
+            ),
+            installed
+        );
+    }
+
+    /// 注册表里的相对路径必须被拒绝：它依赖进程当前工作目录，
+    /// 换个启动方式就会指向完全不同的地方。
+    #[test]
+    fn dev_link_rejects_relative_path() {
+        let root = temp_dir("devlink-relative");
+        let installed = root.join("installed");
+        write_manifest(&installed, "com.test.dev");
+
+        assert_eq!(
+            resolve_asset_root(&installed, Some("some/relative/dir"), "com.test.dev"),
+            installed
+        );
+    }
+
+    /// Windows 的 `canonicalize` 会加 `\\?\` 前缀，它不该被写进注册表或界面。
+    #[test]
+    fn verbatim_prefix_is_stripped_for_storage() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\dev\my-plugin").as_deref(),
+            Some(r"C:\dev\my-plugin")
+        );
+        // UNC 路径要还原成 `\\server\share\...`，而不是 `\server\share\...`
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\plugin").as_deref(),
+            Some(r"\\server\share\plugin")
+        );
+        // 普通路径不该被改动
+        assert_eq!(strip_verbatim_prefix(r"C:\dev\my-plugin"), None);
+        // 前缀只去一次，剩余部分原样保留
+        assert_eq!(
+            normalize_source_path(Path::new(r"\\?\C:\a\b")),
+            r"C:\a\b".to_string()
+        );
     }
 
     /// 回归测试：带子目录的条目必须能正常解压。

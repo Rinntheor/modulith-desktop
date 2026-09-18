@@ -559,6 +559,12 @@ pub struct InstalledPlugin {
     pub size_bytes: u64,
     pub has_style: bool,
     pub readme: Option<String>,
+    /// 开发链接：该插件正在从哪个源目录实时读取（「从目录安装」才有）。
+    ///
+    /// 界面据此显示「开发模式」标记，让用户明白为什么改完源目录点刷新就生效、
+    /// 以及为什么卸载插件不会删掉他的源目录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_source: Option<String>,
     /// 引擎范围不匹配时的提示；`None` 表示要么没声明、要么匹配
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_advisory: Option<EngineAdvisory>,
@@ -573,6 +579,17 @@ pub struct RegistryEntry {
     pub enabled: bool,
     pub installed_at: String,
     pub source: String,
+    /// 「从本地目录安装」时记录的**源目录绝对路径**（开发链接）。
+    ///
+    /// 为什么必须记下来：从目录安装原先只是把文件复制进插件目录，源路径就此
+    /// 丢失。于是开发者在源目录里改代码，应用读到的仍是那份旧副本 ——
+    /// 「刷新无效，必须删掉插件重装」。
+    ///
+    /// 记下源目录后，只要它还是一片有效的、同名的插件目录，读取资源与清单就都
+    /// 走源目录，改完点刷新即生效（见 `resolve_asset_root`）。
+    /// 旧注册表里没有这个字段，`serde(default)` 让它们照常加载。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 /// registry.json 文件结构
