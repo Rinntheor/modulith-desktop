@@ -40,7 +40,8 @@
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1fr minmax(260px, 340px);
+  /* 窄屏时设置列取下限，宽屏时给它稍多一点但不再继续变宽 —— 设置项不需要更宽 */
+  grid-template-columns: 1fr minmax(280px, 360px);
   gap: 12px;
 }
 
@@ -60,6 +61,8 @@
   display: flex;
   flex-direction: column;
   align-items: center;
+  /* 垂直居中：卡片会随窗口一起变高，内容顶在上面会让全屏时下方空一大片 */
+  justify-content: center;
   gap: 14px;
   overflow-y: auto;
 }
@@ -96,10 +99,18 @@
 
 /* ---- 进度环 ---- */
 
+/* 进度环随窗口高度伸缩。
+ *
+ * 之前固定 200×200，于是窗口一放大，卡片里就只有中间那一小块内容、四周全是空白 ——
+ * 那看起来像没做完，而不像「本来就是这么大」。
+ *
+ * 用 vh 而不是固定像素：模块可见区域的高度基本跟着窗口走。上界 300px 是避免在超长
+ * 屏上把环拉满整屏；下界 170px 保证最小窗口下仍能看清时间。28vh 是按「环 + 上下
+ * 其它内容」在最小窗口高度（560px）下仍放得下选的。 */
 .pm-ring {
   position: relative;
-  width: 200px;
-  height: 200px;
+  width: clamp(170px, 28vh, 300px);
+  height: clamp(170px, 28vh, 300px);
   flex: 0 0 auto;
 }
 
@@ -142,7 +153,8 @@
 }
 
 .pm-clock {
-  font-size: 40px;
+  /* 与环同步缩放，否则环变大了、时间还是那么小 */
+  font-size: clamp(30px, 5vh, 54px);
   font-weight: 600;
   line-height: 1;
   color: #111827;
