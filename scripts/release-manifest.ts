@@ -13,10 +13,15 @@
 // 五件必须说清的事：
 //
 // 1. **签名文件从哪来。** 只有当 `tauri.conf.json` 的 `bundle.createUpdaterArtifacts`
-//    为 true（默认是 false）且构建时设置了 `TAURI_SIGNING_PRIVATE_KEY_PATH`（或
-//    `TAURI_SIGNING_PRIVATE_KEY`）与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，tauri 才会在
-//    安装包旁边写出 `<安装包>.sig`。缺任何一项，构建照样成功、安装包照样产出，
-//    只是没有 `.sig` —— 所以这里坚持直接失败，而不是生成一份装不上的清单。
+//    为 true（默认是 false）且构建时设置了 `TAURI_SIGNING_PRIVATE_KEY` 与
+//    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，tauri 才会在安装包旁边写出 `<安装包>.sig`。
+//    缺任何一项，构建照样成功、安装包照样产出，只是没有 `.sig` —— 所以这里坚持直接失败，
+//    而不是生成一份装不上的清单。
+//
+//    注意变量名：`TAURI_SIGNING_PRIVATE_KEY` 的值**可以是密钥文件的路径**，tauri 自己
+//    判断「这是路径还是内容」。而 `TAURI_SIGNING_PRIVATE_KEY_PATH` 是 `tauri signer sign`
+//    和 `tauri plugin init` 用的，**构建链路完全不读** —— 设了它只会得到
+//    「A public key has been found, but no private key」。
 //
 // 2. **只写具体的 target 键，不写 `windows-x86_64` 兜底键。**
 //    tauri 在构建时把安装包类型以**二进制补丁**写进可执行文件（`__TAURI_BUNDLE_TYPE`），
@@ -153,7 +158,7 @@ export function collectInstaller(
       `缺少签名文件：${basename(sigPath)}\n` +
         '它由带签名的构建产出，需要同时满足三个条件：\n' +
         '  1. tauri.conf.json 的 bundle.createUpdaterArtifacts 为 true；\n' +
-        '  2. 设置了 TAURI_SIGNING_PRIVATE_KEY_PATH（或 TAURI_SIGNING_PRIVATE_KEY）；\n' +
+        '  2. 设置了 TAURI_SIGNING_PRIVATE_KEY（值可以是密钥文件路径）；\n' +
         '  3. 设置了 TAURI_SIGNING_PRIVATE_KEY_PASSWORD。\n' +
         '没有签名的更新包会被客户端拒绝安装，因此这里直接失败。',
     );

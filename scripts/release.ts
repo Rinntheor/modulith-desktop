@@ -125,24 +125,43 @@ function gitWorks(): boolean {
  *
  * 这一项值得单独前置：缺少私钥时 `tauri build` **照样成功**，安装包照样产出，
  * 只是旁边没有 `.sig`。等到生成清单时才失败，用户已经白等了一次完整构建。
+ *
+ * 这里的判断依据是实测结论，不是文档印象：
+ *
+ * - `tauri build` / `tauri bundle` 只读 `TAURI_SIGNING_PRIVATE_KEY`；
+ * - 该变量的值**可以是密钥文件的路径**，tauri 会自己判断「这是路径还是内容」；
+ * - `TAURI_SIGNING_PRIVATE_KEY_PATH` 是 `tauri signer sign` 与 `tauri plugin init` 用的，
+ *   **构建链路完全不读它**。
+ *
+ * 实测方式（前提是已有构建产物，`tauri bundle` 不会重新编译）：
+ *
+ *   只设 TAURI_SIGNING_PRIVATE_KEY = <密钥路径>   → 产出 .sig，成功
+ *   只设 TAURI_SIGNING_PRIVATE_KEY_PATH = <密钥路径> → Error: A public key has been found,
+ *                                                    but no private key.
  */
 function checkSigningEnv(noPassword: boolean): string[] {
   const problems: string[] = [];
-  const keyPath = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH?.trim();
-  const keyInline = process.env.TAURI_SIGNING_PRIVATE_KEY?.trim();
+  const key = process.env.TAURI_SIGNING_PRIVATE_KEY?.trim();
+  const keyPathOnly = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH?.trim();
 
-  if (keyPath && keyInline) {
-    problems.push(
-      '同时设置了 TAURI_SIGNING_PRIVATE_KEY_PATH 与 TAURI_SIGNING_PRIVATE_KEY —— 只能设一个。',
-    );
-  } else if (keyPath) {
-    if (!existsSync(keyPath)) {
-      problems.push(`TAURI_SIGNING_PRIVATE_KEY_PATH 指向的文件不存在：${keyPath}`);
+  if (!key) {
+    if (keyPathOnly) {
+      // 这是最容易踩、也最耗时的一个：变量名看起来更"正确"，构建却当它不存在
+      problems.push(
+        '只设置了 TAURI_SIGNING_PRIVATE_KEY_PATH —— tauri build 不读这个变量。\n' +
+          '    改设 TAURI_SIGNING_PRIVATE_KEY，值填密钥文件的路径即可。',
+      );
+    } else {
+      problems.push(
+        '没有设置 TAURI_SIGNING_PRIVATE_KEY。\n' +
+          '    构建会成功，但不会生成 .sig，更新清单随即无从生成。',
+      );
     }
-  } else if (!keyInline) {
+  } else if (!existsSync(key) && !key.includes('untrusted comment')) {
+    // 值既不是已存在的文件，也不像密钥内容。只报长度 —— 不要把可能是密钥的字符串写进日志
     problems.push(
-      '没有设置私钥（TAURI_SIGNING_PRIVATE_KEY_PATH 或 TAURI_SIGNING_PRIVATE_KEY）。\n' +
-        '    构建会成功，但不会生成 .sig，更新清单随即无从生成。',
+      `TAURI_SIGNING_PRIVATE_KEY 既不是存在的文件路径，也不像密钥内容（长度 ${key.length}）。\n` +
+        '    把它设成密钥文件的路径，或该文件的完整内容（含 untrusted comment 那一行）。',
     );
   }
 
@@ -197,14 +216,13 @@ function main(): number {
     }
     console.log();
     printDim('设置方式（PowerShell）：');
-    printDim('  $env:TAURI_SIGNING_PRIVATE_KEY_PATH = "$env:USERPROFILE\\.tauri\\modulith.key"');
+    printDim('  $env:TAURI_SIGNING_PRIVATE_KEY = "$env:USERPROFILE\\.tauri\\modulith.key"');
     printDim('  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "<口令>"');
+    printDim('注意第一个变量名里没有 _PATH —— 值填路径，但变量就叫 TAURI_SIGNING_PRIVATE_KEY。');
     return 1;
   }
-  const keySource = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH?.trim()
-    ? 'TAURI_SIGNING_PRIVATE_KEY_PATH'
-    : 'TAURI_SIGNING_PRIVATE_KEY';
-  printSuccess('私钥与口令就绪', keySource);
+  const key = (process.env.TAURI_SIGNING_PRIVATE_KEY ?? '').trim();
+  printSuccess('私钥与口令就绪', existsSync(key) ? `文件 ${key}` : '内联内容');
 
   // ---- 3. 工作区状态 ----
   const gitAvailable = gitWorks();
