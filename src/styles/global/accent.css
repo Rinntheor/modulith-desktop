@@ -168,60 +168,79 @@
  *
  * 品牌渐变原先多为 indigo → violet。重定向后两端都指向同一套变量，
  * 因此渐变自然变成单色 —— 这正是想要的效果：主色只有一个。
- * ============================================================ */
+ *
+ * ---------------------------------------------------------------------------
+ * 这里只允许覆盖 `--tw-gradient-from` / `--tw-gradient-to` 的**颜色本身**。
+ * 两个坑都必须避开，否则渐变会整条失效：
+ *
+ * 1. **不要在后面拼位置。** Tailwind 用
+ *    `@property --tw-gradient-from { syntax: "<color>" }` 注册了这两个变量，
+ *    所以 `var(--accent-600) var(--tw-gradient-from-position)` 这种「颜色 + 位置」
+ *    的值**不符合声明的语法**，会在计算值阶段被判为无效，渐变整条失效
+ *    （要么两端回退成初始值 `#0000`，要么 `linear-gradient()` 语法不成立而使
+ *    `background-image` 退回 `none` —— 两种结果都是「没有背景」）。
+ *
+ *    用户看到的现象取决于按钮底下是什么：深色授权界面上只剩白字与实际背景
+ *    贴在一起；而在**浅色**页面（例如设置 → 安全里重新生成恢复码后的那个
+ *    「我已保存，继续」按钮）就变成白字落在白底上 —— 文字像是消失了，只剩
+ *    `shadow-*` 的一点阴影。位置本来就由 `--tw-gradient-stops` 负责，
+ *    不需要在这里写。
+ *
+ * 2. **不要重新声明 `--tw-gradient-stops`。** Tailwind 的 `.from-*` / `.to-*`
+ *    已经把它拼好了，而它通过 `var()` 引用上面两个变量，替换发生在计算值阶段 ——
+ *    也就是说我们改颜色，它自动就跟着变。若在这里重写一份，很容易漏掉
+ *    `var(--tw-gradient-position)`，渐变方向会悄悄退化成默认的从上到下。
+ * ---------------------------------------------------------------------------
+ */
 
 [class~='from-indigo-500'],
 [class~='from-purple-500'],
 [class~='from-violet-500'] {
-  --tw-gradient-from: var(--accent-500) var(--tw-gradient-from-position);
-  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+  --tw-gradient-from: var(--accent-500);
 }
 
 [class~='from-indigo-600'],
 [class~='from-purple-600'],
 [class~='from-violet-600'] {
-  --tw-gradient-from: var(--accent-600) var(--tw-gradient-from-position);
-  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+  --tw-gradient-from: var(--accent-600);
 }
 
 [class~='to-indigo-500'],
 [class~='to-purple-500'],
 [class~='to-violet-500'],
 [class~='to-fuchsia-500'] {
-  --tw-gradient-to: var(--accent-500) var(--tw-gradient-to-position);
+  --tw-gradient-to: var(--accent-500);
 }
 
 [class~='to-indigo-600'],
 [class~='to-purple-600'],
 [class~='to-violet-600'],
 [class~='to-fuchsia-600'] {
-  --tw-gradient-to: var(--accent-600) var(--tw-gradient-to-position);
+  --tw-gradient-to: var(--accent-600);
 }
 
 [class~='from-indigo-500/10'],
 [class~='from-purple-500/10'],
 [class~='from-violet-500/10'] {
-  --tw-gradient-from: rgb(from var(--accent-500) r g b / 0.1) var(--tw-gradient-from-position);
-  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+  --tw-gradient-from: rgb(from var(--accent-500) r g b / 0.1);
 }
 
 [class~='from-indigo-500/20'],
 [class~='from-purple-500/20'],
 [class~='from-violet-500/20'] {
-  --tw-gradient-from: rgb(from var(--accent-500) r g b / 0.2) var(--tw-gradient-from-position);
-  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+  --tw-gradient-from: rgb(from var(--accent-500) r g b / 0.2);
 }
 
 [class~='to-indigo-500/10'],
 [class~='to-purple-500/10'],
 [class~='to-violet-500/10'] {
-  --tw-gradient-to: rgb(from var(--accent-500) r g b / 0.1) var(--tw-gradient-to-position);
+  --tw-gradient-to: rgb(from var(--accent-500) r g b / 0.1);
 }
 
 [class~='to-indigo-500/20'],
 [class~='to-purple-500/20'],
 [class~='to-violet-500/20'] {
-  --tw-gradient-to: rgb(from var(--accent-500) r g b / 0.2) var(--tw-gradient-to-position);
+  --tw-gradient-to: rgb(from var(--accent-500) r g b / 0.2);
 }
 
 /* ============================================================
