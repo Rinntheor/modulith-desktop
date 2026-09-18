@@ -45,6 +45,7 @@ import {
   type UpdateState,
 } from '../../services/pluginMarket';
 import { reloadPluginRuntime, subscribePlugins } from '../../services/pluginRuntime';
+import { formatBytes } from '../../utils/format';
 
 const RISK_TONE: Record<PermissionRisk, string> = {
   low: 'bg-gray-50 text-gray-600 border-gray-200',
@@ -251,25 +252,6 @@ const InstallConfirm: React.FC<{
     </div>
   );
 };
-
-/**
- * 字节数格式化。
- *
- * 刻意**不**从 `modules/plugins/pluginMeta` 引入：那会让市场模块依赖插件模块，删掉
- * 插件模块就会连带编译失败 —— 而「删除任意模块都不影响其它部分」是这个项目的一条
- * 架构约定。几个纯格式化函数各留一份，代价远小于模块之间的编译期耦合。
- */
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '未知';
-  const units = ['B', 'KB', 'MB'];
-  let value = bytes;
-  let index = 0;
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024;
-    index += 1;
-  }
-  return `${value >= 10 || index === 0 ? Math.round(value) : value.toFixed(1)} ${units[index]}`;
-}
 
 const DetailRow: React.FC<{ label: string; value: string; mono?: boolean }> = ({
   label,
