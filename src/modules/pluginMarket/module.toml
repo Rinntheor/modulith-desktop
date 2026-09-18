@@ -1,0 +1,11 @@
+[module]
+id = "pluginMarket"
+name = "插件市场"
+description = "浏览插件仓库中的插件，查看权限后一键安装"
+icon = "Store"
+path = "/market"
+priority = 91
+category = "system"
+component = "PluginMarket.tsx"
+# 不在侧边栏/仪表盘等导航视图中出现；入口在标题栏「设置 → 市场」
+visible = false

@@ -1,7 +1,8 @@
 // src/components/Settings/SettingsDialog.tsx
 //
-// 应用设置：通用 / 安全 / 插件 / 关于。
-// 「插件」分页直接复用插件管理页，因此插件不再占用侧边栏格子；
+// 应用设置：通用 / 安全 / 插件 / 市场 / 关于。
+// 「插件」分页直接复用插件管理页，「市场」分页复用插件市场页，
+// 因此两者都不占用侧边栏格子；
 // 「安全」分页承载访问授权（访问密钥、设备白名单、登录审计）。
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
@@ -11,6 +12,7 @@ import {
   SlidersHorizontal,
   ShieldCheck,
   Puzzle,
+  Store,
   Info,
   AlertCircle,
   CheckCircle,
@@ -44,7 +46,7 @@ import {
 } from '../../services/appSettings';
 import { resyncTabsFromSettings } from '../../services/tabStore';
 
-export type SettingsSectionId = 'general' | 'security' | 'plugins' | 'about';
+export type SettingsSectionId = 'general' | 'security' | 'plugins' | 'market' | 'about';
 
 interface SectionDef {
   id: SettingsSectionId;
@@ -56,6 +58,7 @@ const SECTIONS: SectionDef[] = [
   { id: 'general', label: '通用', icon: SlidersHorizontal },
   { id: 'security', label: '安全', icon: ShieldCheck },
   { id: 'plugins', label: '插件', icon: Puzzle },
+  { id: 'market', label: '市场', icon: Store },
   { id: 'about', label: '关于', icon: Info },
 ];
 
@@ -568,6 +571,14 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                     {/* 经 ModuleEmbed 动态导入：外壳不静态依赖业务模块，
                         因此删除 src/modules/plugins/ 不会让外壳编译失败。 */}
                     <ModuleEmbed moduleId="plugins" />
+                  </div>
+                )}
+
+                {section === 'market' && (
+                  <div className="pb-4">
+                    {/* 同上：市场页也走动态导入，删掉 src/modules/pluginMarket/
+                        只会让这一格空白，不会让外壳编译失败。 */}
+                    <ModuleEmbed moduleId="pluginMarket" />
                   </div>
                 )}
 
