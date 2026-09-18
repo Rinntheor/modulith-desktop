@@ -47,7 +47,7 @@ impl ModuleConfigState {
 pub fn get_module_preferences(
     state: State<ModuleConfigState>,
 ) -> Result<ModulePreferences, String> {
-    let config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
     Ok(config.clone())
 }
 
@@ -58,7 +58,7 @@ pub fn reset_module_preferences(
     state: State<ModuleConfigState>,
 ) -> Result<ModulePreferences, String> {
     let default = ModulePreferences::default();
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
     *config = default.clone();
     save_config(&app, &config)?;
     Ok(default)
@@ -71,7 +71,7 @@ pub fn record_module_open(
     state: State<ModuleConfigState>,
     module_id: String,
 ) -> Result<(), String> {
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
     // 添加到最近使用
     config.recent_modules.retain(|id| id != &module_id);
@@ -93,7 +93,7 @@ pub fn toggle_favorite_module(
     state: State<ModuleConfigState>,
     module_id: String,
 ) -> Result<(), String> {
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
     let pos = config.favorite_modules.iter().position(|id| id == &module_id);
 
@@ -115,7 +115,7 @@ pub fn toggle_favorite_module(
 pub fn get_favorite_modules(
     state: State<ModuleConfigState>,
 ) -> Result<Vec<String>, String> {
-    let config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
     Ok(config.favorite_modules.clone())
 }
 
@@ -124,7 +124,7 @@ pub fn get_favorite_modules(
 pub fn get_recent_modules(
     state: State<ModuleConfigState>,
 ) -> Result<Vec<String>, String> {
-    let config = state.0.lock().map_err(|e|| format!("Lock error: {}", e))?;
+    let config = state.inner().0.lock().map_err(|e|| format!("Lock error: {}", e))?;
     Ok(config.recent_modules.clone())
 }
 

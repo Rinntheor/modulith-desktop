@@ -21,7 +21,7 @@ fn to_msg<E: std::fmt::Display>(err: E) -> String {
 pub async fn list_plugins(
     state: State<'_, PluginState>,
 ) -> Result<Vec<InstalledPlugin>, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     Ok(manager.list())
 }
 
@@ -30,7 +30,7 @@ pub async fn get_plugin(
     state: State<'_, PluginState>,
     id: String,
 ) -> Result<Option<InstalledPlugin>, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     Ok(manager.get(&id))
 }
 
@@ -39,7 +39,7 @@ pub async fn install_plugin_package(
     state: State<'_, PluginState>,
     path: String,
 ) -> Result<InstalledPlugin, String> {
-    let mut manager = state.0.write().await;
+    let mut manager = state.inner().0.write().await;
     manager
         .install_from_lcp(&PathBuf::from(path))
         .map_err(to_msg)
@@ -50,7 +50,7 @@ pub async fn install_plugin_folder(
     state: State<'_, PluginState>,
     path: String,
 ) -> Result<InstalledPlugin, String> {
-    let mut manager = state.0.write().await;
+    let mut manager = state.inner().0.write().await;
     manager
         .install_from_folder(&PathBuf::from(path))
         .map_err(to_msg)
@@ -61,7 +61,7 @@ pub async fn install_plugin_url(
     state: State<'_, PluginState>,
     url: String,
 ) -> Result<InstalledPlugin, String> {
-    let mut manager = state.0.write().await;
+    let mut manager = state.inner().0.write().await;
     manager.install_from_url(&url).await.map_err(to_msg)
 }
 
@@ -71,13 +71,13 @@ pub async fn set_plugin_enabled(
     id: String,
     enabled: bool,
 ) -> Result<InstalledPlugin, String> {
-    let mut manager = state.0.write().await;
+    let mut manager = state.inner().0.write().await;
     manager.set_enabled(&id, enabled).map_err(to_msg)
 }
 
 #[tauri::command]
 pub async fn uninstall_plugin(state: State<'_, PluginState>, id: String) -> Result<(), String> {
-    let mut manager = state.0.write().await;
+    let mut manager = state.inner().0.write().await;
     manager.uninstall(&id).map_err(to_msg)
 }
 
@@ -87,7 +87,7 @@ pub async fn read_plugin_asset(
     id: String,
     rel: String,
 ) -> Result<String, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.read_asset(&id, &rel).map_err(to_msg)
 }
 
@@ -97,7 +97,7 @@ pub async fn export_plugin(
     id: String,
     dest: Option<String>,
 ) -> Result<ExportOutcome, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager
         .export(&id, dest.map(PathBuf::from))
         .await
@@ -132,7 +132,7 @@ pub async fn plugin_storage_get(
     id: String,
     key: String,
 ) -> Result<Option<String>, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.storage_get(&id, &key).map_err(to_msg)
 }
 
@@ -143,7 +143,7 @@ pub async fn plugin_storage_set(
     key: String,
     value: String,
 ) -> Result<(), String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.storage_set(&id, &key, &value).map_err(to_msg)
 }
 
@@ -153,7 +153,7 @@ pub async fn plugin_storage_delete(
     id: String,
     key: String,
 ) -> Result<(), String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.storage_delete(&id, &key).map_err(to_msg)
 }
 
@@ -162,7 +162,7 @@ pub async fn plugin_storage_keys(
     state: State<'_, PluginState>,
     id: String,
 ) -> Result<Vec<String>, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.storage_keys(&id).map_err(to_msg)
 }
 
@@ -171,7 +171,7 @@ pub async fn plugin_storage_clear(
     state: State<'_, PluginState>,
     id: String,
 ) -> Result<(), String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.storage_clear(&id).map_err(to_msg)
 }
 
@@ -184,7 +184,7 @@ pub async fn plugin_http_request(
     headers: Option<HashMap<String, String>>,
     body: Option<String>,
 ) -> Result<HttpResponse, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager
         .http_request(&id, &method, &url, headers, body)
         .await
@@ -202,7 +202,7 @@ pub async fn plugin_launch_program(
     program: String,
     args: Option<Vec<String>>,
 ) -> Result<(), String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager
         .launch_program(&id, &program, &args.unwrap_or_default())
         .map_err(to_msg)
@@ -215,7 +215,7 @@ pub async fn plugin_extract_icon(
     id: String,
     path: String,
 ) -> Result<String, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.extract_icon(&id, &path).map_err(to_msg)
 }
 
@@ -226,7 +226,7 @@ pub async fn plugin_reveal_in_folder(
     id: String,
     path: String,
 ) -> Result<(), String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.reveal_in_folder(&id, &path).map_err(to_msg)
 }
 
@@ -238,6 +238,6 @@ pub async fn plugin_pick_audio(
     state: State<'_, PluginState>,
     id: String,
 ) -> Result<Option<PickedAudio>, String> {
-    let manager = state.0.read().await;
+    let manager = state.inner().0.read().await;
     manager.pick_audio(&id).await.map_err(to_msg)
 }

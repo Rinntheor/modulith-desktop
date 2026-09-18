@@ -18,7 +18,7 @@ impl SidebarState {
 pub fn get_sidebar_preferences(
     state: State<'_, SidebarState>,
 ) -> Result<SidebarPreferences, String> {
-    let config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
     Ok(config.clone())
 }
 
@@ -29,7 +29,7 @@ pub fn update_module_order(
     state: State<'_, SidebarState>,
     order: Vec<String>,
 ) -> Result<(), String> {
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
     config.module_order = order;
     config.save(&app)?;
     Ok(())
@@ -43,7 +43,7 @@ pub fn toggle_module_visibility(
     module_id: String,
     hidden: bool,
 ) -> Result<(), String> {
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
     if hidden {
         if !config.hidden_modules.contains(&module_id) {
@@ -65,7 +65,7 @@ pub fn toggle_module_pin(
     module_id: String,
     pinned: bool,
 ) -> Result<(), String> {
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
     if pinned {
         if !config.pinned_modules.contains(&module_id) {
@@ -87,7 +87,7 @@ pub fn move_module_position(
     module_id: String,
     new_index: usize,
 ) -> Result<(), String> {
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
     if !config.module_order.contains(&module_id) {
         config.module_order.push(module_id.clone());
@@ -109,7 +109,7 @@ pub fn reset_sidebar_preferences(
     state: State<'_, SidebarState>,
 ) -> Result<SidebarPreferences, String> {
     let default_config = SidebarPreferences::reset(&app)?;
-    let mut config = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+    let mut config = state.inner().0.lock().map_err(|e| format!("Lock error: {}", e))?;
     *config = default_config.clone();
     Ok(default_config)
 }
