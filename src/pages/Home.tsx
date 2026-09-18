@@ -26,7 +26,17 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'framer-motion';
-import { LayoutGrid, TriangleAlert, X } from 'lucide-react';
+import {
+  Bell,
+  ChevronLeft,
+  ChevronRight,
+  Eye,
+  LayoutGrid,
+  RefreshCw,
+  Settings,
+  TriangleAlert,
+  X,
+} from 'lucide-react';
 import { SidebarProvider, useSidebar } from '@/contexts/SidebarContext';
 import { ModuleRuntimeProvider } from '@/contexts/ModuleRuntimeContext';
 import Sidebar from '../components/Sidebar/Sidebar';
@@ -36,9 +46,10 @@ import TabBar from '../components/Tabs/TabBar';
 import ToastLayer from '../components/Notifications/ToastLayer';
 import NotificationCenter from '../components/Notifications/NotificationCenter';
 import SettingsDialog, { type SettingsSectionId } from '../components/Settings/SettingsDialog';
+import GlobalContextMenu, { type GlobalMenuEntry } from '../components/GlobalContextMenu';
 import { moduleManager } from '../services/moduleManager';
 import { reloadPluginRuntime } from '../services/pluginRuntime';
-import { getCachedSettings, saveAppSettings } from '../services/appSettings';
+import { getCachedSettings, saveAppSettings, subscribeSettings } from '../services/appSettings';
 import { getBootResult } from '../services/boot';
 import { useTabs } from '../hooks/useTabs';
 import { useCatalog } from '../hooks/useCatalog';
@@ -46,6 +57,7 @@ import { getFallbackModule, initializeTabs, openFallbackTab } from '../services/
 import { loadNotifications } from '../services/notifications';
 import { useGlobalShortcuts } from '../hooks/useGlobalShortcuts';
 import { registerHostCommands } from '../services/commandRegistry';
+import { registerHostShortcuts } from '../services/hostShortcuts';
 
 interface HomeContentProps {
   /** 初始化期间的非致命告警 */
@@ -89,9 +101,13 @@ const EmptyTabs: React.FC = () => {
 };
 
 const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
-  const { isOpen } = useSidebar();
+  const { isOpen, canGoBack, canGoForward, goBack, goForward } = useSidebar();
   const { openTabs, activeTab, mountedTabs } = useTabs();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // 全局右键菜单的位置；null 表示未打开
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  // 二级标题栏是否显示（持久化在设置里，因此重启后保持）
+  const [showTabBar, setShowTabBar] = useState(() => getCachedSettings().tabBarVisible);
   // 设置对话框固定从「通用」页打开。此前这里是一个丢弃了 setter 的 state
   // （`const [settingsSection] = useState(...)`），即一个恒定值冒充 state ——
   // 没有任何路径能改它，因此不需要 state。
@@ -135,6 +151,10 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
       onOpenNotifications: () => setNotificationsOpen(true),
       onRefreshPlugins: handleRefresh,
     });
+    // 宿主快捷键也必须注册一次。此前只注册了「命令」（供搜索框使用）而漏了
+    // 「快捷键」，于是 Ctrl+K / Ctrl+W / Ctrl+Tab / Ctrl+1..9 全都没有反应
+    // （注册表写好了，却从来没有人往里注册）。
+    registerHostShortcuts();
   }, [handleRefresh]);
 
   useGlobalShortcuts();
@@ -153,8 +173,67 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
   const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
   const handleOpenNotifications = useCallback(() => setNotificationsOpen(true), []);
 
+  // 设置里的 tabBarVisible 是唯一事实来源：别的入口（设置页、快捷键）改了它，
+  // 这里跟着更新，避免「设置里改了但界面没变」。
+  useEffect(
+    () => subscribeSettings(() => setShowTabBar(getCachedSettings().tabBarVisible)),
+    []
+  );
+
+  const toggleTabBar = useCallback(() => {
+    void saveAppSettings({ tabBarVisible: !getCachedSettings().tabBarVisible });
+  }, []);
+
+  /**
+   * 全局右键。
+   *
+   * 两条让位规则，缺一个都会出问题：
+   *   1. **模块自己的右键优先。** 子元素的处理器（例如快捷启动的卡片菜单）先跑并
+   *      调用 `preventDefault()`，冒泡到这里时 `defaultPrevented` 为真 —— 直接返回，
+   *      否则会出现「模块菜单和全局菜单同时弹出」。
+   *   2. **输入框里不接管。** 浏览器原生菜单在文本框里是有用的（复制 / 粘贴 /
+   *      拼写检查），把它们换成一个只有应用动作的菜单是倒退。
+   */
+  const handleGlobalContextMenu = useCallback((event: React.MouseEvent) => {
+    if (event.defaultPrevented) return;
+
+    const target = event.target as HTMLElement | null;
+    if (target && target.closest('input, textarea, [contenteditable="true"]')) return;
+
+    event.preventDefault();
+    setMenuPos({ x: event.clientX, y: event.clientY });
+  }, []);
+
+  const menuEntries: GlobalMenuEntry[] = [
+    {
+      label: '后退',
+      icon: ChevronLeft,
+      shortcut: 'Alt+←',
+      disabled: !canGoBack,
+      action: goBack,
+    },
+    {
+      label: '前进',
+      icon: ChevronRight,
+      shortcut: 'Alt+→',
+      disabled: !canGoForward,
+      action: goForward,
+    },
+    { type: 'divider' },
+    { label: '刷新插件与模块', icon: RefreshCw, action: () => void handleRefresh() },
+    { label: '打开设置', icon: Settings, action: handleOpenSettings },
+    { label: '打开通知中心', icon: Bell, action: handleOpenNotifications },
+    { type: 'divider' },
+    {
+      label: '显示二级标题栏',
+      icon: Eye,
+      checked: showTabBar,
+      action: toggleTabBar,
+    },
+  ];
+
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gray-50" onContextMenu={handleGlobalContextMenu}>
       <Titlebar
         onRefresh={handleRefresh}
         refreshing={refreshing}
@@ -163,20 +242,24 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
         notificationsOpen={notificationsOpen}
       />
       <Sidebar />
-      <TabBar />
+      {/* 二级标题栏可以整体隐藏（全局右键 →「显示二级标题栏」），用于沉浸浏览。
+          注意只隐藏它，不隐藏标题栏：窗口是无边框的，标题栏承载窗口按钮。 */}
+      {showTabBar && <TabBar />}
 
       {/*
         内容区结构说明见文件头。要点：
-          * `top-[76px]` = 标题栏 h-10(40px) + 标签栏 h-9(36px)；
+          * 内容区上沿 = 标题栏 h-10(40px) + 二级标题栏 h-9(36px)；隐藏二级标题栏
+            时只剩 40px，因此这里必须是 `top-19` / `top-10` 二选一，写死会让内容
+            区上沿留出一条空白；
           * 外层是 `overflow-hidden` 的**视口**，本身不滚动；
           * 每个已挂载的标签是一个 `absolute inset-0 overflow-y-auto` 的独立滚动区，
             非激活的用 `invisible + pointer-events-none` 隐藏 —— 保留盒子，
             因此 scrollTop 不会丢。
       */}
       <main
-        className={`fixed inset-x-0 bottom-0 top-19 flex flex-col overflow-hidden transition-[margin] duration-200 ${
-          isOpen ? 'ml-64' : 'ml-0'
-        }`}
+        className={`fixed inset-x-0 bottom-0 flex flex-col overflow-hidden transition-[margin] duration-200 ${
+          showTabBar ? 'top-19' : 'top-10'
+        } ${isOpen ? 'ml-64' : 'ml-0'}`}
       >
         {/* 初始化期间的非致命告警（例如某个插件加载失败）：提示一次，可关闭 */}
         <AnimatePresence>
@@ -296,6 +379,16 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
         initialSection={settingsSection}
         onClose={() => setSettingsOpen(false)}
       />
+
+      {/* 全局右键菜单：位置由最后一次右键决定，条目见上面的 menuEntries */}
+      {menuPos && (
+        <GlobalContextMenu
+          x={menuPos.x}
+          y={menuPos.y}
+          entries={menuEntries}
+          onClose={() => setMenuPos(null)}
+        />
+      )}
     </div>
   );
 };
