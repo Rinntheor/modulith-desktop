@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use tauri::{AppHandle, Manager, State};
 
-use super::types::{ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio};
+use super::permissions::PermissionDescriptor;
+use super::types::{
+    ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio, PluginPermission,
+};
 use super::PluginState;
 
 /// 把管理器方法的结果映射为前端可读的错误字符串
@@ -32,6 +35,19 @@ pub async fn get_plugin(
 ) -> Result<Option<InstalledPlugin>, String> {
     let manager = state.inner().0.read().await;
     Ok(manager.get(&id))
+}
+
+/// 全部插件权限的元数据（标签、描述、效果、作用域、风险等级、强制程度）。
+///
+/// 不接收参数、不读状态，因为它描述的是宿主**自己**的权限注册表，与装了哪些
+/// 插件无关。前端因此只在启动时取一次即可。
+///
+/// 之所以让前端来取而不是自己维护一份表：风险等级必须由宿主推导，且同一权限
+/// 在"已安装插件"与"市场里待安装的插件"两处必须显示一致。详见
+/// `super::permissions` 的模块注释。
+#[tauri::command]
+pub fn list_plugin_permissions() -> Vec<PermissionDescriptor> {
+    PluginPermission::all_descriptors()
 }
 
 #[tauri::command]

@@ -4,6 +4,7 @@
 pub mod commands;
 pub mod icon;
 pub mod manager;
+pub mod permissions;
 pub mod types;
 pub mod validator;
 

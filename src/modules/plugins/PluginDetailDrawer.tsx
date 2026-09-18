@@ -24,8 +24,8 @@ import {
   formatBytes,
   formatDate,
   formatRelativeTime,
-  getPermissionInfo,
 } from './pluginMeta';
+import { getPermissionDescriptor } from '../../services/permissionRegistry';
 import type { InstalledPlugin, PluginLoadState } from '../../services/pluginRuntime';
 
 interface PluginDetailDrawerProps {
@@ -251,7 +251,7 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                   ) : (
                     <div className="space-y-2">
                       {(plugin.manifest.permissions ?? []).map((perm) => {
-                        const info = getPermissionInfo(perm);
+                        const info = getPermissionDescriptor(perm);
                         const tone =
                           info.risk === 'high'
                             ? 'bg-red-50 text-red-700 border-red-200'
