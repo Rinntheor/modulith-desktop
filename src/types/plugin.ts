@@ -11,12 +11,16 @@
 //     * `PluginPermission`（权限名，kebab-case）
 //     * `PluginNotificationAPI`（`ctx.notifications`）
 //     * `PluginEventAPI` / `PluginBusEvent`（`ctx.events`）
+//     * `PluginLauncherAPI`（`ctx.launcher`）
+//     * `PluginIconAPI`（`ctx.icons`）
+//     * `PluginShellAPI`（`ctx.shell`）
+//     * `PluginFileDropAPI`（`ctx.fileDrop`）
 //
 //   【设计草案】—— 尚未实现的长期设想，**照它写会直接失败**：
 //     * `PluginContext`（真实的上下文见 `createContext()`，字段是
 //       `pluginId / pluginVersion / manifest / version / storage / http /
-//       logger / notifications / events`，与这里列的 commands / views /
-//       menus / fs / plugins 完全不同）
+//       logger / notifications / events / launcher / icons / shell / fileDrop`，
+//       与这里列的 commands / views / menus / fs / plugins 完全不同）
 //     * `PluginLifecycle` 的各个钩子（`activate` / `deactivate` / `onInstall` …）
 //       运行时都不会被调用，宿主也没有调用它们的时机
 //     * `PluginCommandAPI` / `PluginViewAPI` / `PluginMenuAPI` /
@@ -46,9 +50,10 @@ export interface SemVer {
 /**
  * 插件权限类型（与 Rust `PluginPermission` 的 kebab-case 序列化保持一致）
  *
- * 注意「声明了」不等于「被强制」：当前只有 `network` / `network-external`
- * （后端 HTTP 代理里检查）、`notification`（前端通知接口里检查）与
- * `plugin-communicate`（前端事件总线上检查）真正生效。
+ * 注意「声明了」不等于「被强制」。当前真正生效的是七项：
+ * `storage` / `network` / `network-external` / `process-spawn` / `filesystem-read`
+ * 在后端检查（`filesystem-read` 另有一处前端检查，见 `ctx.fileDrop`），
+ * `notification` / `plugin-communicate` 在前端检查。
  * 其余取值会被解析并保留，但不改变任何行为 —— 详见
  * docs/02-开发指南/插件开发/插件系统架构.md 第 6 节。
  */
@@ -58,12 +63,13 @@ export type PluginPermission =
   | 'network-external'           // 外部域名请求
   | 'notification'               // 应用内通知（已强制）
   | 'clipboard'                  // 剪贴板访问
-  | 'filesystem-read'            // 文件读取
+  | 'filesystem-read'            // 文件读取（已强制）
   | 'filesystem-write'           // 文件写入
   | 'filesystem-scoped'          // 限定目录访问
   | 'plugin-communicate'         // 插件间通信
   | 'native-module'              // 原生模块调用
-  | 'dev-tools';                 // 开发者工具
+  | 'dev-tools'                  // 开发者工具
+  | 'process-spawn';             // 启动外部程序（已强制）
 
 /**
  * 插件沙箱级别
@@ -531,6 +537,72 @@ export interface PluginHttpAPI {
   put(url: string, data?: any, options?: RequestInit): Promise<Response>;
   delete(url: string, options?: RequestInit): Promise<Response>;
   fetch(url: string, options?: RequestInit): Promise<Response>;
+}
+
+/**
+ * 插件启动外部程序 API（`ctx.launcher` 的**实际**签名）。
+ *
+ * 已实现，需要 `process-spawn` 权限。**这是插件能拿到的最强能力** ——
+ * 它可以运行本机上的任意程序。因此未声明权限时是**拒绝**（抛出错误），
+ * 而不是像通知那样降级为空实现：一次静默失败的启动请求，只会让作者
+ * 以为是自己的路径写错了。
+ *
+ * 与 `notification` / `events` 不同，这一项在后端强制：真正的门是 Rust 侧的
+ * `plugin_launch_program`，前端绕不过去。
+ */
+export interface PluginLauncherAPI {
+  /**
+   * 启动一个程序。
+   *
+   * `program` 必须是**绝对路径**且指向一个已存在的文件；不接受 `cmd` 这类
+   * 依赖 PATH 解析的程序名。`args` 作为独立参数传递，不经过 shell。
+   */
+  launch(program: string, args?: string[]): Promise<void>;
+}
+
+/**
+ * 插件图标提取 API（`ctx.icons` 的**实际**签名）。
+ *
+ * 需要 `filesystem-read` 权限，在 Rust 侧强制。返回可直接放进 `src` 的
+ * PNG data URL；非 Windows 平台或文件没有图标资源时会抛出错误，调用方应当
+ * 准备好回退图标（而不是把失败当成致命错误）。
+ */
+export interface PluginIconAPI {
+  /** 提取指定文件的图标；`path` 必须是绝对路径 */
+  extract(path: string): Promise<string>;
+}
+
+/**
+ * 插件与本机外壳协作的 API（`ctx.shell` 的**实际**签名）。
+ *
+ * 需要 `filesystem-read` 权限。目前只有「在文件管理器中定位」，它**不会打开
+ * 文件本身**，因此没有借插件之手执行文件的风险。
+ */
+export interface PluginShellAPI {
+  /** 在系统文件管理器中定位文件或目录 */
+  revealInFolder(path: string): Promise<void>;
+}
+
+export interface PluginFileDropEvent {
+  type: 'enter' | 'over' | 'drop' | 'leave';
+  /** 拖入的文件或目录的绝对路径；非 `drop` 阶段可能是空数组 */
+  paths: string[];
+}
+
+/**
+ * 插件文件拖放 API（`ctx.fileDrop` 的**实际**签名）。
+ *
+ * 需要 `filesystem-read` 权限，未声明时降级为空实现（订阅返回空函数）。
+ *
+ * **事件是窗口级的**：只要有文件被拖进窗口就会触发，与当前显示哪个模块无关。
+ * 插件必须自己用 `Modulith.useModuleActive()` 判断可见性，否则会在后台抢走
+ * 本该属于其它模块的拖放。
+ */
+export interface PluginFileDropAPI {
+  /** 权限已声明且底层监听建立成功 */
+  isAvailable(): boolean;
+  /** 订阅拖放事件，返回取消订阅函数 */
+  subscribe(handler: (event: PluginFileDropEvent) => void): () => void;
 }
 
 /**

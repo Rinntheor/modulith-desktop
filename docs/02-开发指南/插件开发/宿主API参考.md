@@ -125,6 +125,10 @@ var ctx = Modulith.createContext();
 | `logger` | object | 带插件前缀的日志 |
 | `notifications` | object | 应用内通知（需 `notification` 权限） |
 | `events` | object | 跨模块事件总线（需 `plugin-communicate` 权限） |
+| `launcher` | object | 启动外部程序（需 `process-spawn` 权限） |
+| `icons` | object | 提取本机文件图标（需 `filesystem-read` 权限） |
+| `shell` | object | 在文件管理器中定位（需 `filesystem-read` 权限） |
+| `fileDrop` | object | 接收拖入的文件路径（需 `filesystem-read` 权限） |
 
 **调用时机是严格受限的**：只能在插件 bundle 执行期间调用，例如 IIFE 顶层。在插件代码之外调用会抛出异常，因为服务需要绑定正在加载的插件 ID。
 
@@ -327,7 +331,105 @@ off();
 - 插件的订阅会自动归属到插件 ID，因此插件被禁用或卸载时宿主会一次性摘掉它的全部订阅与命令。你不需要自己记住取消订阅，但仍应在不再需要时主动 `off()`。
 - 总线上**没有权限隔离**：声明了权限的插件可以订阅任意主题。它带来的是「模块之间可以协作」，不是「模块之间互相隔离」。
 
-## 7. 完整示例
+## 7. launcher
+
+启动外部程序。**需要 `process-spawn` 权限**，未声明时调用会被拒绝。
+
+这是插件能拿到的最强能力 —— 它运行的是本机上的任意程序，权限等同于你自己的
+用户账户。插件详情页会把它标为高风险；安装前请确认你信任该插件的来源。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `launch` | `launch(program, args?) => Promise<void>` | 启动一个程序；`program` 必须是绝对路径 |
+
+```js
+// 需要 process-spawn 权限
+await ctx.launcher.launch('C:\\Program Files\\App\\app.exe');
+
+// 带参数：作为独立 argv 项传递，不经过 shell
+await ctx.launcher.launch('C:\\Program Files\\App\\app.exe', ['--profile', 'work']);
+```
+
+约束：
+
+- **`program` 必须是绝对路径**，且指向一个已存在的文件。`cmd`、`powershell`
+  这类依赖 `PATH` 解析的程序名会被拒绝。这条限制不阻止插件启动 `cmd.exe`
+  （那同样是绝对路径）—— 它的目的是让「要执行什么」在代码里显式可见，
+  而不是一道沙箱。
+- **参数不经过 shell**：作为独立 argv 项传入，因此不存在引号、`&&`、`|`
+  这类注入问题。
+- **启动后不等待**：命令在子进程创建后立即返回，宿主不跟踪它的退出状态。
+- 失败原因（路径不存在、非绝对路径、未声明权限）以错误抛出。建议展示给用户 ——
+  静默失败会让人误以为是路径写错了。
+
+完整可运行示例见 `samples/quick-launch`。
+
+## 8. icons
+
+提取本机文件的图标。**需要 `filesystem-read` 权限**，未声明时调用会被拒绝。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `extract` | `extract(path) => Promise<string>` | 返回可直接放进 `src` 的 PNG data URL |
+
+```js
+const url = await ctx.icons.extract('C:\\Program Files\\App\\app.exe');
+img.src = url;
+```
+
+约束：
+
+- `path` 必须是绝对路径，且指向一个**已存在的文件**（目录不行）。
+- **没有图标资源的文件会失败**（例如 `.txt` 就走这条路径），因此调用方应当准备好回退图标，不要把它当致命错误。
+- **目前只在 Windows 上实现**，其他平台返回明确错误，而不是一张占位图。
+- 结果是 64×64 的 PNG。取一次约几十 KB，建议**缓存** —— 示例插件把它写进自己的存储，键为 `icon.<条目ID>`。
+- 注意存储键的字符集限制：只允许字母数字与 `.` `_` `-`，所以是 `icon.` 前缀而不是 `icon:`。
+
+## 9. shell
+
+与系统文件管理器协作。**需要 `filesystem-read` 权限**。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `revealInFolder` | `revealInFolder(path) => Promise<void>` | 在文件管理器中打开该路径并选中它 |
+
+```js
+await ctx.shell.revealInFolder('C:\\Program Files\\App\\app.exe');
+```
+
+约束：
+
+- `path` 必须是绝对路径且已存在；**目录也可以**（与 `icons.extract` 不同）。
+- 它**只定位，不打开文件本身**，因此没有「借插件之手执行文件」的风险。
+
+## 10. fileDrop
+
+接收拖入窗口的文件路径。**需要 `filesystem-read` 权限**；未声明时 `subscribe` 返回空函数并记录一次警告（与 `notifications` 的降级方式一致）。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `isAvailable` | `isAvailable() => boolean` | 权限已声明且底层监听建立成功 |
+| `subscribe` | `subscribe(handler) => () => void` | 订阅拖放事件，返回取消订阅函数 |
+
+```js
+const active = Modulith.useModuleActive();
+React.useEffect(() => {
+  if (!active) return;                       // 见下方「窗口级」说明
+  return ctx.fileDrop.subscribe((event) => {
+    if (event.type === 'drop') addFromPaths(event.paths);
+  });
+}, [active]);
+```
+
+`event` 形如 `{ type, paths }`：`type` 为 `enter` / `over` / `drop` / `leave`，`paths` 是绝对路径数组（非 `drop` 阶段可能为空）。
+
+**这是窗口级事件。** 无论当前显示哪个模块，只要有文件被拖进窗口就会触发。因此**必须**先用 `Modulith.useModuleActive()` 判断可见性再订阅，否则插件会在后台抢走本该属于其它模块的拖放。
+
+**为什么必须由宿主转发。** Tauri 的 `dragDropEnabled` 默认为 `true` 时会拦截系统拖放，此时 WebView 内的 HTML5 拖放整体不可用；而 `withGlobalTauri` 未开启，插件拿不到 `window.__TAURI__`。两者相加使插件无法自行接收拖入路径 —— 这条通道是宿主代为建立的。
+
+> 同一个原因还带来一项限制：**WebView 内的 HTML5 拖放不可用**。因此「把界面元素拖到另一个元素上」这类交互（例如把卡片拖进分组）需要自己用指针事件实现，不能依赖 `dragstart` / `drop`。
+
+## 11. 完整示例
 
 一个最小可用的插件代码包：
 
@@ -383,7 +485,7 @@ off();
 }
 ```
 
-## 8. 约束速查
+## 12. 约束速查
 
 | 约束 | 说明 |
 | --- | --- |
@@ -400,7 +502,7 @@ off();
 | 后台工作要看 `useModuleActive()` | 标签页保活，切走不会卸载，定时器需自行暂停 |
 | 插件数据用 `storage` | 不要用 `localStorage` |
 
-## 9. 相关文档
+## 13. 相关文档
 
 - 加载流程与隔离边界：[插件系统架构](插件系统架构.md)
 - 清单字段：[清单文件参考](清单文件参考.md)

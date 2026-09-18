@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 
+use super::icon;
 use super::types::{
     ExportOutcome, HttpResponse, InstalledPlugin, PluginError, PluginManifest, PluginPermission,
     PluginResult, PluginStatus, RegistryEntry, RegistryFile,
@@ -24,6 +25,10 @@ const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_README_BYTES: u64 = 64 * 1024;
 /// HTTP 代理允许的最大响应体（2 MB）
 const MAX_HTTP_BODY_BYTES: u64 = 2 * 1024 * 1024;
+/// 启动外部程序允许的最大参数个数
+const MAX_LAUNCH_ARGS: usize = 64;
+/// 单个启动参数的最大字符数
+const MAX_LAUNCH_ARG_LEN: usize = 4096;
 
 /// 校验来自前端的插件 ID。
 ///
@@ -61,6 +66,87 @@ fn ensure_permission(
         id,
         permission.as_str()
     )))
+}
+
+/// 校验并解析「宿主代表插件访问的本机路径」。
+///
+/// 三条规则，都是刻意的：
+///
+/// 1. **必须绝对路径。** 这挡掉的是「借助 PATH 解析的程序名」（`cmd`、
+///    `powershell`…）。插件若想执行一段命令，就得先写出一条真实存在的路径 ——
+///    这让行为在插件清单与代码里都看得见，而不是藏在一个短名字后面。
+///    注意它**不能**阻止插件启动 `cmd.exe`：该文件同样是绝对路径。
+///    插件本就被视为本机程序，这里做的是「让意图显式」，不是沙箱。
+/// 2. **必须已存在。** 否则错误会推迟到真正使用路径时才出现，报错更含糊。
+/// 3. 经 `canonicalize` 归一化，避免 `..` 与符号链接造成的歧义。
+///
+/// 这里**不要求是文件**：「在文件管理器中定位」既可以指向文件也可以指向目录。
+/// 需要文件的调用方自行再加一道检查。
+fn resolve_existing_path(raw: &str) -> PluginResult<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(PluginError::SandboxViolation("路径为空".to_string()));
+    }
+    if trimmed.contains('\0') {
+        return Err(PluginError::SandboxViolation(
+            "路径含 NUL 字符".to_string(),
+        ));
+    }
+
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(PluginError::SandboxViolation(format!(
+            "必须使用绝对路径，不接受借助 PATH 解析的程序名: {}",
+            trimmed
+        )));
+    }
+
+    path.canonicalize().map_err(|e| {
+        PluginError::NotFound(format!("路径不存在或无法访问: {}（{}）", trimmed, e))
+    })
+}
+
+/// 在 `resolve_existing_path` 之上再要求目标确实是一个文件。
+///
+/// 要启动的程序、要取图标的文件都属于这一类。
+fn resolve_file_argument(raw: &str) -> PluginResult<PathBuf> {
+    let canonical = resolve_existing_path(raw)?;
+    if !canonical.is_file() {
+        return Err(PluginError::NotFound(format!(
+            "目标不是文件: {}",
+            raw.trim()
+        )));
+    }
+    Ok(canonical)
+}
+
+/// 校验启动参数。
+///
+/// 参数**不经过 shell**：它们作为独立的 argv 项传给 `Command::args`，
+/// 因此不存在引号、`&&`、`|` 这类注入问题。这里限制的只是规模，防止
+/// 一次调用塞进异常多的参数。
+fn validate_launch_args(args: &[String]) -> PluginResult<()> {
+    if args.len() > MAX_LAUNCH_ARGS {
+        return Err(PluginError::SandboxViolation(format!(
+            "参数过多: {}（上限 {}）",
+            args.len(),
+            MAX_LAUNCH_ARGS
+        )));
+    }
+    for arg in args {
+        if arg.contains('\0') {
+            return Err(PluginError::SandboxViolation(
+                "参数含 NUL 字符".to_string(),
+            ));
+        }
+        if arg.chars().count() > MAX_LAUNCH_ARG_LEN {
+            return Err(PluginError::SandboxViolation(format!(
+                "单个参数过长（上限 {} 字符）",
+                MAX_LAUNCH_ARG_LEN
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 运行时插件管理器
@@ -738,6 +824,82 @@ impl PluginManager {
 }
 
 // ============================================================
+// 启动外部程序
+// ============================================================
+
+impl PluginManager {
+    /// 启动一个外部程序（受 `process-spawn` 权限约束）。
+    ///
+    /// **这是整个插件系统里最强的一项能力**：它让插件能运行任意本机程序，
+    /// 因此也是清单里最该被用户看见的一条。权限检查不可省，且必须落在本函数 ——
+    /// 前端 `ctx.launcher` 只是入口，真正的门在这里。
+    ///
+    /// 采用「启动后不等待」：快捷启动的语义就是「把它叫起来」，宿主没有理由
+    /// 陪着子进程一起活着。`Child` 丢弃后子进程继续运行（Windows 上不会产生
+    /// 僵尸进程）。
+    pub fn launch_program(&self, id: &str, program: &str, args: &[String]) -> PluginResult<()> {
+        self.require_permission(id, PluginPermission::ProcessSpawn)?;
+
+        let target = resolve_file_argument(program)?;
+        validate_launch_args(args)?;
+
+        let mut command = std::process::Command::new(&target);
+        command.args(args);
+
+        let child = command.spawn().map_err(|e| {
+            PluginError::IoError(std::io::Error::new(
+                e.kind(),
+                format!("启动失败 {}: {}", target.display(), e),
+            ))
+        })?;
+
+        log::info!(
+            "插件 {} 启动了 {}（PID {}）",
+            id,
+            target.display(),
+            child.id()
+        );
+        Ok(())
+    }
+}
+
+// ============================================================
+// 图标提取 / 在文件管理器中定位
+// ============================================================
+
+impl PluginManager {
+    /// 提取一个文件的图标，返回 `data:image/png;base64,...`。
+    ///
+    /// 需要 `filesystem-read` 权限 —— 它按路径读取本机文件，与「读文件内容」
+    /// 同属一类：插件据此可以判断某个路径上存不存在、是什么类型的文件。
+    ///
+    /// 提取本身在 `icon` 模块里完成（Windows 上走 Shell + GDI）。
+    pub fn extract_icon(&self, id: &str, path: &str) -> PluginResult<String> {
+        self.require_permission(id, PluginPermission::FilesystemRead)?;
+        // 图标只对文件有意义，目录与不存在的路径都在这里被挡掉
+        let target = resolve_file_argument(path)?;
+        icon::extract_icon_data_url(&target)
+    }
+
+    /// 在系统文件管理器中定位一个文件或目录（Windows 上是「在资源管理器中显示」）。
+    ///
+    /// 同样需要 `filesystem-read`。注意它**不打开文件本身**，只是把文件管理器
+    /// 打开到该路径并选中它 —— 因此没有「借插件之手执行文件」的风险。
+    pub fn reveal_in_folder(&self, id: &str, path: &str) -> PluginResult<()> {
+        self.require_permission(id, PluginPermission::FilesystemRead)?;
+        // 与图标不同，这里允许目录
+        let target = resolve_existing_path(path)?;
+
+        tauri_plugin_opener::reveal_item_in_dir(&target).map_err(|e| {
+            PluginError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("无法在文件管理器中定位 {}: {}", target.display(), e),
+            ))
+        })
+    }
+}
+
+// ============================================================
 // HTTP 代理
 // ============================================================
 
@@ -1379,6 +1541,143 @@ mod tests {
                 serialized.trim_matches('"'),
                 "as_str() 与 serde 序列化不一致: {:?}",
                 permission
+            );
+        }
+    }
+
+    // ============================================================
+    // 启动外部程序
+    // ============================================================
+
+    #[test]
+    fn launching_requires_process_spawn_permission() {
+        let manifest = manifest_with(&["network"]);
+        let err = ensure_permission(&manifest, "com.test.plugin", PluginPermission::ProcessSpawn)
+            .expect_err("未声明 process-spawn 必须拒绝");
+        assert!(matches!(err, PluginError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn process_spawn_is_allowed_when_declared() {
+        let manifest = manifest_with(&["process-spawn"]);
+        ensure_permission(&manifest, "com.test.plugin", PluginPermission::ProcessSpawn)
+            .expect("已声明 process-spawn 时应当放行");
+    }
+
+    /// 相对路径与纯程序名必须被拒绝。
+    ///
+    /// 这是本命令最主要的一道限制：它挡掉的是「靠 PATH 解析出 cmd / powershell」
+    /// 这类写法，迫使插件写出一条真实存在的绝对路径，让行为在代码里看得见。
+    /// （它拦不住 `C:\Windows\System32\cmd.exe` —— 插件本就被视为本机程序，
+    /// 这里追求的是显式，而非沙箱。）
+    #[test]
+    fn launch_rejects_relative_program_names() {
+        for name in [
+            "cmd",
+            "cmd.exe",
+            "./local.exe",
+            "sub/dir/app.exe",
+            "sub\\dir\\app.exe",
+        ] {
+            let err = match resolve_file_argument(name) {
+                Ok(path) => {
+                    panic!("裸程序名必须被拒绝: {}（却解析为 {}）", name, path.display())
+                }
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, PluginError::SandboxViolation(_)),
+                "{} 期望 SandboxViolation，实际: {:?}",
+                name,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn launch_rejects_empty_and_nul() {
+        assert!(resolve_file_argument("").is_err());
+        assert!(resolve_file_argument("   ").is_err());
+        assert!(resolve_file_argument("C:\\a\u{0}b.exe").is_err());
+    }
+
+    #[test]
+    fn launch_rejects_nonexistent_path() {
+        let missing = if cfg!(windows) {
+            "C:\\definitely-not-here-modulith\\nope.exe"
+        } else {
+            "/definitely-not-here-modulith/nope"
+        };
+        let err = resolve_file_argument(missing).expect_err("不存在的路径必须被拒绝");
+        assert!(matches!(err, PluginError::NotFound(_)), "实际: {:?}", err);
+    }
+
+    /// 目录不能当程序启动
+    #[test]
+    fn launch_rejects_directory() {
+        let dir = std::env::temp_dir();
+        let err = resolve_file_argument(&dir.to_string_lossy())
+            .expect_err("目录必须被拒绝");
+        assert!(matches!(err, PluginError::NotFound(_)), "实际: {:?}", err);
+    }
+
+    /// 本测试进程自身的可执行文件满足「绝对 + 存在 + 是文件」，应当通过
+    #[test]
+    fn launch_accepts_existing_absolute_file() {
+        let exe = std::env::current_exe().expect("应能取得当前进程路径");
+        let resolved =
+            resolve_file_argument(&exe.to_string_lossy()).expect("真实存在的绝对路径应当通过");
+        assert!(resolved.is_file());
+    }
+
+    #[test]
+    fn launch_args_are_bounded() {
+        let at_limit = vec!["a".to_string(); MAX_LAUNCH_ARGS];
+        validate_launch_args(&at_limit).expect("刚好到上限应当通过");
+
+        let too_many = vec!["a".to_string(); MAX_LAUNCH_ARGS + 1];
+        assert!(validate_launch_args(&too_many).is_err(), "超量参数必须被拒绝");
+
+        let too_long = vec!["x".repeat(MAX_LAUNCH_ARG_LEN + 1)];
+        assert!(validate_launch_args(&too_long).is_err(), "超长参数必须被拒绝");
+
+        assert!(
+            validate_launch_args(&["a\u{0}b".to_string()]).is_err(),
+            "含 NUL 的参数必须被拒绝"
+        );
+    }
+
+    /// 示例插件 quick-launch 的清单必须能通过校验，且声明了它实际用到的两项权限。
+    ///
+    /// 这条测试的意义在于：清单里的 `permissions` 现在真的会被强制，因此
+    /// 「代码用了 ctx.storage / ctx.launcher，清单却忘了声明」会变成一个
+    /// **运行时才暴露**的错误。把它提前到测试里，改示例时不会漏。
+    #[test]
+    fn quick_launch_sample_manifest_is_valid() {
+        let root = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../samples/quick-launch"
+        ));
+        if !root.exists() {
+            eprintln!("跳过：示例插件目录不存在: {}", root.display());
+            return;
+        }
+
+        let text = std::fs::read_to_string(root.join("manifest.json")).expect("应能读取清单");
+        let manifest: PluginManifest = serde_json::from_str(&text).expect("清单应当能解析");
+
+        // 入口与图标都真实存在 —— validate_manifest 会检查 main
+        validator::validate_manifest(&manifest, &root).expect("示例清单应当通过校验");
+
+        for required in [
+            PluginPermission::Storage,
+            PluginPermission::ProcessSpawn,
+            PluginPermission::FilesystemRead,
+        ] {
+            assert!(
+                manifest.permissions.contains(&required),
+                "示例插件用到了 {}，清单必须声明它",
+                required.as_str()
             );
         }
     }

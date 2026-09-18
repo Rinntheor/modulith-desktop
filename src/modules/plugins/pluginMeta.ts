@@ -42,7 +42,7 @@ export const PERMISSION_INFO: Record<string, PermissionInfo> = {
   },
   'filesystem-read': {
     label: '读取文件',
-    description: '读取本机文件',
+    description: '按路径读取本机文件信息（图标、所在位置），并可接收拖入的文件路径',
     risk: 'medium',
   },
   'filesystem-write': {
@@ -68,6 +68,11 @@ export const PERMISSION_INFO: Record<string, PermissionInfo> = {
   'dev-tools': {
     label: '开发者工具',
     description: '访问开发者工具与调试接口',
+    risk: 'high',
+  },
+  'process-spawn': {
+    label: '启动外部程序',
+    description: '运行本机上的任意程序，权限等同于你自己的用户账户',
     risk: 'high',
   },
 };

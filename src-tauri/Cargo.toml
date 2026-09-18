@@ -48,4 +48,13 @@ hmac = "0.12"
 # 采集硬件指纹（MAC / 主机名 / CPU / 核心数）
 sysinfo = "0.29"
 
-
+# ---- Windows 平台专属：提取可执行文件图标（src/modules/plugins/icon.rs）----
+# 用 windows-sys 而不是 windows：这里只需要几个 Win32 函数的裸声明，
+# 不需要 COM 包装与 Result 化，编译时间与体积都小得多。
+# 只启用用到的那三个模块，其余 Win32 绑定不会被编进来。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

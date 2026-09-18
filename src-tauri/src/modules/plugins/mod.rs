@@ -2,6 +2,7 @@
 // 运行时插件系统模块
 
 pub mod commands;
+pub mod icon;
 pub mod manager;
 pub mod types;
 pub mod validator;

@@ -256,6 +256,7 @@ pub enum PluginPermission {
     PluginCommunicate,
     NativeModule,
     DevTools,
+    ProcessSpawn,
 }
 
 impl PluginPermission {
@@ -278,6 +279,7 @@ impl PluginPermission {
             Self::PluginCommunicate => "plugin-communicate",
             Self::NativeModule => "native-module",
             Self::DevTools => "dev-tools",
+            Self::ProcessSpawn => "process-spawn",
         }
     }
 
@@ -285,7 +287,7 @@ impl PluginPermission {
     ///
     /// 新增枚举值时必须一并加入 —— 否则上面那个一致性测试覆盖不到新值，
     /// 而"测试通过"会给人已经覆盖了的错觉。
-    pub const ALL: [PluginPermission; 11] = [
+    pub const ALL: [PluginPermission; 12] = [
         Self::Storage,
         Self::Network,
         Self::NetworkExternal,
@@ -297,6 +299,7 @@ impl PluginPermission {
         Self::PluginCommunicate,
         Self::NativeModule,
         Self::DevTools,
+        Self::ProcessSpawn,
     ];
 }
 
@@ -658,6 +661,9 @@ pub enum PluginError {
 
     #[error("网络错误: {0}")]
     NetworkError(String),
+
+    #[error("图标提取失败: {0}")]
+    IconExtractionFailed(String),
 }
 
 impl From<reqwest::Error> for PluginError {

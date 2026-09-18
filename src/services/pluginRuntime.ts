@@ -30,6 +30,7 @@ import { pushNotification, type NotificationLevel } from './notifications';
 import { publish, subscribe, unsubscribeBySource, type EventHandler } from './eventBus';
 import { registerCommand, unregisterCommandsByPrefix } from './commandRegistry';
 import { useModuleActive } from '../hooks/useModuleActive';
+import { isFileDropAvailable, subscribeFileDrop } from './fileDrop';
 
 /**
  * 宿主版本号的**占位初值**。
@@ -300,8 +301,96 @@ function pluginHttp(pluginId: string) {
   };
 }
 
+/**
+ * 插件启动外部程序（`ctx.launcher`）。
+ *
+ * 权限检查**刻意不放在这一层**：真正的门是 Rust 侧的 `plugin_launch_program`，
+ * 它在 `spawn` 之前检查清单是否声明了 `process-spawn`。前端不重复判断，理由与
+ * storage / http 相同 —— 检查应当落在「动作真正发生」的那一侧，在前端再判一次
+ * 只会多出一套可能与后端分叉的规则。
+ */
+function pluginLauncher(pluginId: string) {
+  return {
+    launch: (program: string, args?: string[]) =>
+      invoke<void>('plugin_launch_program', {
+        id: pluginId,
+        program,
+        args: args ?? [],
+      }),
+  };
+}
+
+/**
+ * 插件提取**本机文件**图标（`ctx.icons`）。
+ *
+ * 名字刻意与上面的 `pluginIcons`（插件自己的 SVG 图标缓存）区分开：
+ * 两者是全然不同的东西 —— 那个是插件清单里的图标，这个是任意本机文件的图标。
+ *
+ * 与 launcher 同理，权限检查在后端（`plugin_extract_icon` → `filesystem-read`）。
+ */
+function pluginFileIcons(pluginId: string) {
+  return {
+    extract: (path: string) =>
+      invoke<string>('plugin_extract_icon', { id: pluginId, path }),
+  };
+}
+
+/**
+ * 在系统文件管理器中定位文件（`ctx.shell`）。
+ *
+ * 权限检查同样在后端（`plugin_reveal_in_folder` → `filesystem-read`）。
+ */
+function pluginShell(pluginId: string) {
+  return {
+    revealInFolder: (path: string) =>
+      invoke<void>('plugin_reveal_in_folder', { id: pluginId, path }),
+  };
+}
+
+/**
+ * 文件拖放（`ctx.fileDrop`）。
+ *
+ * 需要 `filesystem-read` 权限 —— 拖放事件带来的是**本机路径**，与「按路径读取
+ * 文件」属于同一类信息。未声明时降级为空实现并记录警告（与 notifications 的
+ * 处理一致）：拖放通常只是「再加一个条目」的便捷入口，让整个模块因为一个可选
+ * 入口而不可用并不划算。
+ *
+ * **这是窗口级事件**：无论当前显示哪个模块，只要有文件被拖进窗口就会触发。
+ * 插件必须用 `Modulith.useModuleActive()` 自行判断当前是否可见，否则会在后台
+ * 抢走本该属于其它模块的拖放。
+ */
+function pluginFileDrop(pluginId: string, manifest: PluginManifest | undefined) {
+  const allowed = pluginHasPermission(manifest, 'filesystem-read');
+
+  let warned = false;
+  const warnOnce = () => {
+    if (warned) return;
+    warned = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 订阅了文件拖放，但清单里没有声明 "filesystem-read" 权限，订阅被忽略（后续同类调用不再重复提示）`
+    );
+  };
+
+  return {
+    isAvailable: () => allowed && isFileDropAvailable(),
+    subscribe: (
+      handler: (event: {
+        type: 'enter' | 'over' | 'drop' | 'leave';
+        paths: string[];
+      }) => void
+    ): (() => void) => {
+      if (!allowed) {
+        warnOnce();
+        return () => {};
+      }
+      return subscribeFileDrop(handler);
+    },
+  };
+}
+
 function pluginLogger(pluginId: string) {
   const prefix = `[plugin:${pluginId}]`;
+
   return {
     debug: (msg: string, ...args: unknown[]) => console.debug(prefix, msg, ...args),
     info: (msg: string, ...args: unknown[]) => console.info(prefix, msg, ...args),
@@ -444,6 +533,10 @@ function createContext() {
     logger: pluginLogger(pluginId),
     notifications: pluginNotifications(pluginId, manifest),
     events: pluginEvents(pluginId, manifest),
+    launcher: pluginLauncher(pluginId),
+    icons: pluginFileIcons(pluginId),
+    shell: pluginShell(pluginId),
+    fileDrop: pluginFileDrop(pluginId, manifest),
   };
 }
 

@@ -190,3 +190,42 @@ pub async fn plugin_http_request(
         .await
         .map_err(to_msg)
 }
+
+/// 启动外部程序。需要清单声明 `process-spawn` 权限。
+///
+/// `args` 用 `Option` 而非 `Vec`：省略参数是常见调用，没必要强迫前端每次都传
+/// 一个空数组（同 `plugin_http_request` 的 `headers` / `body`）。
+#[tauri::command]
+pub async fn plugin_launch_program(
+    state: State<'_, PluginState>,
+    id: String,
+    program: String,
+    args: Option<Vec<String>>,
+) -> Result<(), String> {
+    let manager = state.0.read().await;
+    manager
+        .launch_program(&id, &program, &args.unwrap_or_default())
+        .map_err(to_msg)
+}
+
+/// 提取一个文件的图标，返回 PNG data URL。需要 `filesystem-read` 权限。
+#[tauri::command]
+pub async fn plugin_extract_icon(
+    state: State<'_, PluginState>,
+    id: String,
+    path: String,
+) -> Result<String, String> {
+    let manager = state.0.read().await;
+    manager.extract_icon(&id, &path).map_err(to_msg)
+}
+
+/// 在系统文件管理器中定位文件或目录。需要 `filesystem-read` 权限。
+#[tauri::command]
+pub async fn plugin_reveal_in_folder(
+    state: State<'_, PluginState>,
+    id: String,
+    path: String,
+) -> Result<(), String> {
+    let manager = state.0.read().await;
+    manager.reveal_in_folder(&id, &path).map_err(to_msg)
+}
