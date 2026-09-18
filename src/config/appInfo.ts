@@ -73,8 +73,8 @@ export const APP_INFO = {
 export const APP_LINKS: SocialLink[] = [
   {
     label: 'GitHub',
-    url: 'https://github.com/Rinntheor',
-    handle: 'Rinntheor',
+    url: 'https://github.com/Rinntheor/modulith-desktop',
+    handle: 'Modulith Desktop',
     icon: 'github',
     accent: {
       iconHover: 'group-hover:text-gray-900',
@@ -85,7 +85,7 @@ export const APP_LINKS: SocialLink[] = [
   {
     label: '哔哩哔哩',
     url: 'https://space.bilibili.com/3546759747865450',
-    handle: 'space.bilibili.com/3546759747865450',
+    handle: '环理论',
     icon: 'bilibili',
     accent: {
       iconHover: 'group-hover:text-[#fb7299]',
