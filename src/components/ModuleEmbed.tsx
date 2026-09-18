@@ -60,6 +60,26 @@ const EmbedMissing: React.FC<{ moduleId: string; error: string }> = ({ moduleId,
 );
 
 /**
+ * 可内嵌的模块：模块 ID → 它的入口组件文件名。
+ *
+ * 必须显式登记，有两个原因：
+ *
+ * - `import.meta.glob` 只能匹配**字面路径**，读不到 `module.toml` 里的 `component`。
+ * - 模块 ID 与文件名之间没有必然关系（`plugins` 的入口叫 `Plugins.tsx`，
+ *   `pluginMarket` 的叫 `PluginMarket.tsx`），推导不出来。
+ *
+ * 文件名因此在上面的 glob 与本表里各出现一次，这是 Vite 的静态分析要求带来的重复，
+ * 无法消除。**新增一个可内嵌模块时两处都要加** —— 漏了其中一处不会编译失败，而是
+ * 运行期显示「模块不可用」，这正是本文件刻意保留的降级路径。
+ */
+const EMBEDDABLE_MODULES = {
+  plugins: 'Plugins.tsx',
+  pluginMarket: 'PluginMarket.tsx',
+} as const;
+
+export type EmbeddableModuleId = keyof typeof EMBEDDABLE_MODULES;
+
+/**
  * 内嵌模块的加载函数表。
  *
  * `import.meta.glob` 返回 `{ 路径: () => Promise<模块> }`，路径以本文件为基准。
@@ -67,24 +87,24 @@ const EmbedMissing: React.FC<{ moduleId: string; error: string }> = ({ moduleId,
  *
  * 用 `eager: false`（默认）保持懒加载：这个分页不打开就不会下载对应 chunk。
  * 模块被删除时，glob 匹配不到，映射里就没有对应键 —— 见 resolveEmbedLoader。
+ *
+ * 模式写成显式列表，而不是「匹配每个模块目录下的全部 tsx」：后者会把
+ * `PluginCard.tsx` 这类内部组件也变成动态入口，凭空多出一堆互相指向的 chunk。
  */
 const embedLoaders = import.meta.glob<{
   default: React.ComponentType<{ embedded?: boolean }>;
-}>('../modules/*/Plugins.tsx');
+}>(['../modules/*/Plugins.tsx', '../modules/*/PluginMarket.tsx']);
 
 /**
  * 把模块 ID 映射到它的加载函数。
  *
- * 模块 ID 与目录同名（见 module.toml 的 `id` 与目录约定），因此
- * `plugins` -> `../modules/plugins/Plugins.tsx`。
- *
  * 找不到时返回 null，由调用方降级为「模块不可用」提示 —— 这与「模块被删除
  * 后框架仍能编译运行」的约定一致：编译期不报错，运行期给可读提示。
  */
-function resolveEmbedLoader(moduleId: string): (() => Promise<{
+function resolveEmbedLoader(moduleId: EmbeddableModuleId): (() => Promise<{
   default: React.ComponentType<{ embedded?: boolean }>;
 }>) | null {
-  const key = `../modules/${moduleId}/Plugins.tsx`;
+  const key = `../modules/${moduleId}/${EMBEDDABLE_MODULES[moduleId]}`;
   return embedLoaders[key] ?? null;
 }
 
@@ -95,7 +115,7 @@ const lazyCache = new Map<
 >();
 
 function getLazyEmbed(
-  moduleId: string
+  moduleId: EmbeddableModuleId
 ): React.LazyExoticComponent<React.ComponentType<{ embedded?: boolean }>> | null {
   const cached = lazyCache.get(moduleId);
   if (cached) return cached;
@@ -124,8 +144,8 @@ export function isPluginModuleAvailable(): boolean | undefined {
 }
 
 interface ModuleEmbedProps {
-  /** 要内嵌的模块 ID，目前仅支持 `'plugins'` */
-  moduleId: 'plugins';
+  /** 要内嵌的模块 ID，取值见 `EMBEDDABLE_MODULES` */
+  moduleId: EmbeddableModuleId;
 }
 
 /**
@@ -171,23 +191,18 @@ class EmbedBoundary extends React.Component<
 
 const ModuleEmbed: React.FC<ModuleEmbedProps> = ({ moduleId }) => {
   const element = useMemo(() => {
-    // 目前只有插件页一个内嵌点；用 switch 保持「新增一个内嵌模块只需加一个分支」
-    switch (moduleId) {
-      case 'plugins': {
-        const LazyPlugins = getLazyEmbed('plugins');
-        if (!LazyPlugins) {
-          return (
-            <EmbedMissing
-              moduleId={moduleId}
-              error="未找到 src/modules/plugins/Plugins.tsx，该模块可能已被移除"
-            />
-          );
-        }
-        return <LazyPlugins embedded />;
-      }
-      default:
-        return <EmbedMissing moduleId={moduleId} error="未注册的内嵌模块" />;
+    // 走统一的查表，不再按模块 ID 分支：新增一个可内嵌模块只需在
+    // EMBEDDABLE_MODULES 里登记，不需要在这里加 case。
+    const Lazy = getLazyEmbed(moduleId);
+    if (!Lazy) {
+      return (
+        <EmbedMissing
+          moduleId={moduleId}
+          error={`未找到 src/modules/${moduleId}/${EMBEDDABLE_MODULES[moduleId]}，该模块可能已被移除`}
+        />
+      );
     }
+    return <Lazy embedded />;
   }, [moduleId]);
 
   return (

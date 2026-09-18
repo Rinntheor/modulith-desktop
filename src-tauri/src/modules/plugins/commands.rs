@@ -81,6 +81,41 @@ pub async fn install_plugin_url(
     manager.install_from_url(&url).await.map_err(to_msg)
 }
 
+/// 从 URL 下载并按预期哈希校验后安装。**插件市场唯一的安装入口。**
+///
+/// `sha256` 是必需参数而不是可选项：一个"忘了传就静默跳过校验"的接口，早晚会在某条
+/// 调用路径上被漏传，而失败方式是安静的 —— 插件装上了，校验没发生。强制传入让漏传
+/// 变成一个必须写出来的显式选择。
+#[tauri::command]
+pub async fn install_plugin_url_verified(
+    state: State<'_, PluginState>,
+    url: String,
+    sha256: String,
+) -> Result<InstalledPlugin, String> {
+    let mut manager = state.inner().0.write().await;
+    manager
+        .install_from_url_verified(&url, Some(&sha256))
+        .await
+        .map_err(to_msg)
+}
+
+/// 从插件仓库拉取一个文本文件（索引或某个插件的 README）。
+///
+/// 只负责"取回一段文本"：解析、缓存、渲染都在前端。后端不该知道索引里有几个字段，
+/// 也不该知道详情页要显示什么。
+///
+/// 地址受白名单约束（见 `manager.rs` 的 `ALLOWED_REGISTRY_HOSTS`）：它**不是**一个
+/// 通用的"取任意网址"能力。插件与宿主同处一个 JS 上下文、能触达 IPC 桥，若这里放开
+/// 宿主限制，一个没有声明 `network-external` 的插件就能借它发出任意外部请求。
+#[tauri::command]
+pub async fn fetch_registry_text(
+    state: State<'_, PluginState>,
+    url: String,
+) -> Result<String, String> {
+    let manager = state.inner().0.read().await;
+    manager.fetch_registry_text(&url).await.map_err(to_msg)
+}
+
 #[tauri::command]
 pub async fn set_plugin_enabled(
     state: State<'_, PluginState>,

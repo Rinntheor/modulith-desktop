@@ -104,6 +104,8 @@ pub fn run() -> Result<(), tauri::Error> {
         install_plugin_package,
         install_plugin_folder,
         install_plugin_url,
+        install_plugin_url_verified,
+        fetch_registry_text,
         set_plugin_enabled,
         uninstall_plugin,
         read_plugin_asset,

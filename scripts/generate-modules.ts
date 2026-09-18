@@ -60,6 +60,9 @@ const LUCIDE_ICONS = new Set([
   'FolderTree', 'Copy', 'Download', 'RefreshCw', 'File', 'Folder',
   'ChevronRight', 'Filter', 'FileText', 'FileJson', 'FileCode',
   'X', 'Plus', 'Wrench', 'Package',
+  // 插件市场：刻意与「插件」的 Package 区分开，两个分页在设置里并排，
+  // 用同一个图标会让人以为点错了地方。
+  'Store',
 ]);
 
 // ==================== 类型定义 ====================
