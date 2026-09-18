@@ -609,6 +609,21 @@ impl ExportOutcome {
     }
 }
 
+/// 插件导入的音频文件（前端 `PickedAudio`）
+///
+/// `data_url` 已经是能直接交给 `new Audio(...)` 的完整 data URL，插件因此
+/// **不需要**接触原始字节或路径 —— 扩展名校验与体积上限都收在宿主这一处。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedAudio {
+    /// 原始文件名，界面上显示「当前提示音：xxx.mp3」用
+    pub name: String,
+    /// 形如 `data:audio/mpeg;base64,...`
+    pub data_url: String,
+    /// 原始字节数，便于界面显示体积
+    pub bytes: u64,
+}
+
 /// 插件请求代理的响应（前端 `HttpResponse`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpResponse {

@@ -8,6 +8,7 @@
     "build": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && tsc && vite build",
     "gen:modules": "node scripts/generate-modules.ts",
     "gen:backend": "node scripts/generate-backend-module.ts",
+    "check:samples": "node scripts/check-samples.ts",
     "ver": "node scripts/version-manager.ts",
     "ver:fix": "node scripts/version-manager.ts sync",
     "preview": "vite preview",

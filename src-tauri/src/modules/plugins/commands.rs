@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use tauri::{AppHandle, Manager, State};
 
-use super::types::{ExportOutcome, HttpResponse, InstalledPlugin};
+use super::types::{ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio};
 use super::PluginState;
 
 /// 把管理器方法的结果映射为前端可读的错误字符串
@@ -228,4 +228,16 @@ pub async fn plugin_reveal_in_folder(
 ) -> Result<(), String> {
     let manager = state.0.read().await;
     manager.reveal_in_folder(&id, &path).map_err(to_msg)
+}
+
+/// 让用户选择音频文件并读入，返回可直接播放的 data URL。需要 `filesystem-read` 权限。
+///
+/// 返回 `null` 表示用户取消了选择。
+#[tauri::command]
+pub async fn plugin_pick_audio(
+    state: State<'_, PluginState>,
+    id: String,
+) -> Result<Option<PickedAudio>, String> {
+    let manager = state.0.read().await;
+    manager.pick_audio(&id).await.map_err(to_msg)
 }

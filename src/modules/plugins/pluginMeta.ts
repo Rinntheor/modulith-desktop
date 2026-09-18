@@ -42,7 +42,7 @@ export const PERMISSION_INFO: Record<string, PermissionInfo> = {
   },
   'filesystem-read': {
     label: '读取文件',
-    description: '按路径读取本机文件信息（图标、所在位置），并可接收拖入的文件路径',
+    description: '读取本机文件信息（图标、所在位置）、导入音频文件，并可接收拖入的文件路径',
     risk: 'medium',
   },
   'filesystem-write': {

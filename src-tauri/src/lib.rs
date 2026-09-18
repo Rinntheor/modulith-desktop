@@ -119,6 +119,7 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_launch_program,
         plugin_extract_icon,
         plugin_reveal_in_folder,
+        plugin_pick_audio,
         get_app_settings,
         get_app_info,
         update_app_settings,

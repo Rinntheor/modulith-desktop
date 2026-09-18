@@ -5,13 +5,14 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 
 use super::icon;
 use super::types::{
-    ExportOutcome, HttpResponse, InstalledPlugin, PluginError, PluginManifest, PluginPermission,
-    PluginResult, PluginStatus, RegistryEntry, RegistryFile,
+    ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio, PluginError, PluginManifest,
+    PluginPermission, PluginResult, PluginStatus, RegistryEntry, RegistryFile,
 };
 use super::validator;
 
@@ -29,6 +30,13 @@ const MAX_HTTP_BODY_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LAUNCH_ARGS: usize = 64;
 /// 单个启动参数的最大字符数
 const MAX_LAUNCH_ARG_LEN: usize = 4096;
+/// 允许插件导入的音频扩展名（对话框过滤器与校验共用同一份，避免两者漂移）
+const AUDIO_EXTENSIONS: [&str; 8] = ["mp3", "wav", "ogg", "m4a", "aac", "flac", "opus", "webm"];
+/// 单个音频文件的大小上限（2 MB）
+///
+/// 提示音通常只有几十 KB，2 MB 留了足够余量；上限的意义在于**不把一个几百 MB
+/// 的文件读进内存再编码成 base64 塞进插件存储** —— 那会一次性吃掉几十 MB。
+const MAX_AUDIO_BYTES: u64 = 2 * 1024 * 1024;
 
 /// 校验来自前端的插件 ID。
 ///
@@ -118,6 +126,25 @@ fn resolve_file_argument(raw: &str) -> PluginResult<PathBuf> {
         )));
     }
     Ok(canonical)
+}
+
+/// 音频扩展名 → data URL 使用的 MIME 类型。
+///
+/// **必须按扩展名白名单校验**，不能只依赖对话框的过滤器：过滤器只是给用户的
+/// 建议，选择框里仍然可以切到「所有文件」。返回 `None` 即拒绝。
+fn audio_mime_for(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "opus" => "audio/opus",
+        "webm" => "audio/webm",
+        _ => return None,
+    })
 }
 
 /// 校验启动参数。
@@ -897,6 +924,64 @@ impl PluginManager {
             ))
         })
     }
+
+    /// 让用户挑一个音频文件，读进来并编码成 data URL。
+    ///
+    /// 需要 `filesystem-read` 权限。
+    ///
+    /// 为什么把「选择 + 读取 + 编码」合成一步，而不是先给插件一个路径让它自己读：
+    /// 这样**扩展名校验与体积上限只有一个执行点**，插件拿不到原始字节，也就不存在
+    /// 绕过限制的路径。与图标提取同一思路 —— 宿主给成品，而不是给原料。
+    ///
+    /// 返回 `Ok(None)` 表示用户取消了选择。这与「选了但格式不对」是两回事：
+    /// 前者是正常操作，不该报错。
+    pub async fn pick_audio(&self, id: &str) -> PluginResult<Option<PickedAudio>> {
+        self.require_permission(id, PluginPermission::FilesystemRead)?;
+
+        let app = self.app.clone();
+        let picked = tauri::async_runtime::spawn_blocking(move || {
+            app.dialog()
+                .file()
+                .add_filter("音频文件", &AUDIO_EXTENSIONS)
+                .blocking_pick_file()
+        })
+        .await
+        .map_err(|e| PluginError::DialogUnavailable(e.to_string()))?;
+
+        let Some(choice) = picked else {
+            return Ok(None);
+        };
+        let path = file_path_to_path(choice)?;
+
+        let mime = audio_mime_for(&path).ok_or_else(|| {
+            PluginError::SandboxViolation(format!(
+                "不支持的音频格式（支持 {}）: {}",
+                AUDIO_EXTENSIONS.join(" / "),
+                path.display()
+            ))
+        })?;
+
+        let size = std::fs::metadata(&path)?.len();
+        if size > MAX_AUDIO_BYTES {
+            return Err(PluginError::SandboxViolation(format!(
+                "音频文件过大: {:.1} MB（上限 {} MB）",
+                size as f64 / 1024.0 / 1024.0,
+                MAX_AUDIO_BYTES / 1024 / 1024
+            )));
+        }
+
+        let bytes = std::fs::read(&path)?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "audio".to_string());
+
+        Ok(Some(PickedAudio {
+            name,
+            data_url: format!("data:{};base64,{}", mime, BASE64.encode(&bytes)),
+            bytes: bytes.len() as u64,
+        }))
+    }
 }
 
 // ============================================================
@@ -1424,39 +1509,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 用仓库里真实的示例插件包做一次完整解压校验。
+    /// 用仓库里真实的示例插件包各做一次完整解压 + 校验。
     ///
-    /// 这是对「导入 .lcp 报条目逃出目标目录」那个 bug 最直接的回归测试：
-    /// 示例包内含有 `dist/index.css` 这样的嵌套条目，修复前必然失败。
+    /// 这是对「导入 .lcp 报条目逃出目标目录」那个 bug 最直接的回归测试 ——
+    /// 覆盖全部示例而不是某一个，样本越多越不容易漏。
+    ///
+    /// 它同时是**对已打包产物**的检查：解压出来的目录要能通过 `validate_manifest`，
+    /// 也就是仓库里那个 `.lcp` 真的可安装，而不只是源码看起来对。
     #[test]
-    fn extracts_real_sample_lcp() {
-        let sample = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../samples/hello-plugin.lcp"
-        ));
-        if !sample.exists() {
-            eprintln!("跳过：示例插件包不存在: {}", sample.display());
-            return;
+    fn extracts_and_validates_real_sample_lcps() {
+        let samples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../samples");
+        let packages = ["notes.lcp", "pomodoro.lcp", "quick-launch.lcp"];
+
+        let mut checked = 0;
+        for name in packages {
+            let package = samples.join(name);
+            if !package.exists() {
+                eprintln!("跳过：示例包不存在: {}", package.display());
+                continue;
+            }
+
+            let dest = temp_dir(name);
+            extract_zip(&package, &dest).expect("示例 .lcp 应当可以正常解压");
+
+            for required in ["manifest.json", "index.js", "index.css", "icon.svg"] {
+                assert!(
+                    dest.join(required).is_file(),
+                    "{} 缺少 {}（打包时应当包含插件目录下的全部文件）",
+                    name,
+                    required
+                );
+            }
+
+            let text = std::fs::read_to_string(dest.join("manifest.json")).unwrap();
+            let manifest: PluginManifest = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{} 的清单无法解析: {}", name, e));
+
+            let stem = name.trim_end_matches(".lcp");
+            assert_eq!(
+                manifest.name,
+                format!("com.modulith.sample.{}", stem),
+                "{} 的插件 ID 与文件名不符",
+                name
+            );
+
+            // 解压后仍要通过完整校验，才算「这个包真的能装」
+            validator::validate_manifest(&manifest, &dest)
+                .unwrap_or_else(|e| panic!("{} 解压后未通过清单校验: {}", name, e));
+
+            // **包必须与源码目录逐字节一致。**
+            // 否则仓库里那个 .lcp 是陈旧的，用户装到的不是当前代码 ——
+            // 这个错误我已经犯过两次（改完插件忘记重新打包），因此用测试钉死：
+            // 只要改动源码后没重新打包，这里就会红。
+            let source = samples.join(stem);
+            if source.is_dir() {
+                for entry in std::fs::read_dir(&source).expect("应能读取示例目录") {
+                    let entry = entry.expect("目录项应可读");
+                    if !entry.path().is_file() {
+                        continue;
+                    }
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    let from_source = std::fs::read(entry.path()).expect("应能读取源文件");
+                    let from_package = std::fs::read(dest.join(&file_name)).unwrap_or_else(|_| {
+                        panic!("{} 里缺少 {}，需要重新打包", name, file_name)
+                    });
+                    assert_eq!(
+                        from_source, from_package,
+                        "{}/{} 与包内内容不一致 —— 改完插件后忘记重新打包了",
+                        stem, file_name
+                    );
+                }
+            }
+
+            let _ = std::fs::remove_dir_all(&dest);
+            checked += 1;
         }
 
-        let dest = temp_dir("sample");
-        extract_zip(&sample, &dest).expect("示例 .lcp 应当可以正常解压");
-
-        assert!(
-            dest.join("manifest.json").exists(),
-            "manifest.json 必须位于压缩包根目录"
-        );
-        assert!(dest.join("dist/index.js").exists(), "缺少入口 bundle");
-        assert!(dest.join("dist/index.css").exists(), "缺少样式文件");
-        assert!(dest.join("icon.svg").exists(), "缺少图标文件");
-
-        let manifest = std::fs::read_to_string(dest.join("manifest.json")).unwrap();
-        assert!(
-            manifest.contains("com.modulith.sample.notes"),
-            "清单内容不符合预期"
-        );
-
-        let _ = std::fs::remove_dir_all(&dest);
+        assert!(checked > 0, "一个示例包都没找到，这条测试实际上什么也没检查");
     }
 
     // ============================================================
@@ -1647,17 +1776,16 @@ mod tests {
         );
     }
 
-    /// 示例插件 quick-launch 的清单必须能通过校验，且声明了它实际用到的两项权限。
+    /// 校验一个示例插件目录：清单能解析、能通过 `validate_manifest`，
+    /// 且声明了它实际用到的那几项权限。
     ///
-    /// 这条测试的意义在于：清单里的 `permissions` 现在真的会被强制，因此
-    /// 「代码用了 ctx.storage / ctx.launcher，清单却忘了声明」会变成一个
-    /// **运行时才暴露**的错误。把它提前到测试里，改示例时不会漏。
-    #[test]
-    fn quick_launch_sample_manifest_is_valid() {
-        let root = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../samples/quick-launch"
-        ));
+    /// 抽成公共函数是因为这类校验对**每个**示例插件都成立 —— 而且它挡住的是一类
+    /// **运行时才暴露**的错误：权限现在真的会被强制，「代码用了某能力、清单忘了
+    /// 声明」原本要等用户点下去才发现，现在构建期就红。
+    fn assert_sample_manifest_valid(folder: &str, required: &[PluginPermission]) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../samples")
+            .join(folder);
         if !root.exists() {
             eprintln!("跳过：示例插件目录不存在: {}", root.display());
             return;
@@ -1667,17 +1795,85 @@ mod tests {
         let manifest: PluginManifest = serde_json::from_str(&text).expect("清单应当能解析");
 
         // 入口与图标都真实存在 —— validate_manifest 会检查 main
-        validator::validate_manifest(&manifest, &root).expect("示例清单应当通过校验");
+        validator::validate_manifest(&manifest, &root)
+            .unwrap_or_else(|e| panic!("示例插件 {} 的清单未通过校验: {}", folder, e));
 
-        for required in [
-            PluginPermission::Storage,
-            PluginPermission::ProcessSpawn,
-            PluginPermission::FilesystemRead,
-        ] {
+        for permission in required {
             assert!(
-                manifest.permissions.contains(&required),
-                "示例插件用到了 {}，清单必须声明它",
-                required.as_str()
+                manifest.permissions.contains(permission),
+                "示例插件 {} 用到了 {}，清单必须声明它",
+                folder,
+                permission.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn quick_launch_sample_manifest_is_valid() {
+        assert_sample_manifest_valid(
+            "quick-launch",
+            &[
+                PluginPermission::Storage,
+                PluginPermission::ProcessSpawn,
+                PluginPermission::FilesystemRead,
+            ],
+        );
+    }
+
+    #[test]
+    fn notes_sample_manifest_is_valid() {
+        assert_sample_manifest_valid("notes", &[PluginPermission::Storage]);
+    }
+
+    #[test]
+    fn pomodoro_sample_manifest_is_valid() {
+        assert_sample_manifest_valid(
+            "pomodoro",
+            &[
+                PluginPermission::Storage,
+                PluginPermission::Notification,
+                // 自定义提示音要导入本机音频文件
+                PluginPermission::FilesystemRead,
+            ],
+        );
+    }
+
+    // ============================================================
+    // 音频导入
+    // ============================================================
+
+    /// 扩展名白名单必须**大小写不敏感**，并且拒绝非音频格式。
+    #[test]
+    fn audio_mime_only_accepts_known_extensions() {
+        assert_eq!(audio_mime_for(Path::new("/x/sound.mp3")), Some("audio/mpeg"));
+        assert_eq!(audio_mime_for(Path::new("/x/SOUND.MP3")), Some("audio/mpeg"));
+        assert_eq!(audio_mime_for(Path::new("C:\\x\\a.WAV")), Some("audio/wav"));
+
+        for bad in ["exe", "dll", "png", "txt", "mp4", "zip", "js"] {
+            assert_eq!(
+                audio_mime_for(Path::new(&format!("/x/file.{}", bad))),
+                None,
+                "{} 不应被当成音频接受",
+                bad
+            );
+        }
+
+        // 没有扩展名
+        assert_eq!(audio_mime_for(Path::new("/x/sound")), None);
+    }
+
+    /// `AUDIO_EXTENSIONS`（对话框过滤器）与实际校验必须一致。
+    ///
+    /// 这是一处真实的漂移风险：过滤器里列了某扩展名、校验却不认，用户就会遇到
+    /// 「在对话框里明明能选中，选完却报格式不支持」。把两者钉在一起，
+    /// 以后只改一边就会红。
+    #[test]
+    fn audio_filter_list_matches_validator() {
+        for ext in AUDIO_EXTENSIONS {
+            assert!(
+                audio_mime_for(Path::new(&format!("/x/file.{}", ext))).is_some(),
+                "对话框过滤器里列了 {}，但校验不认它",
+                ext
             );
         }
     }

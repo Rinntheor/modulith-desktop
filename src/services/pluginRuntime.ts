@@ -26,6 +26,7 @@ import {
   getPluginModuleIds,
 } from './moduleCatalog';
 import type { ModuleDescriptor } from '../types/module';
+import type { PickedAudio } from '../types/plugin';
 import { pushNotification, type NotificationLevel } from './notifications';
 import { publish, subscribe, unsubscribeBySource, type EventHandler } from './eventBus';
 import { registerCommand, unregisterCommandsByPrefix } from './commandRegistry';
@@ -388,6 +389,17 @@ function pluginFileDrop(pluginId: string, manifest: PluginManifest | undefined) 
   };
 }
 
+/**
+ * 插件导入音频文件（`ctx.audio`）。
+ *
+ * 权限检查在后端（`plugin_pick_audio` → `filesystem-read`）。
+ */
+function pluginAudio(pluginId: string) {
+  return {
+    pick: () => invoke<PickedAudio | null>('plugin_pick_audio', { id: pluginId }),
+  };
+}
+
 function pluginLogger(pluginId: string) {
   const prefix = `[plugin:${pluginId}]`;
 
@@ -537,6 +549,7 @@ function createContext() {
     icons: pluginFileIcons(pluginId),
     shell: pluginShell(pluginId),
     fileDrop: pluginFileDrop(pluginId, manifest),
+    audio: pluginAudio(pluginId),
   };
 }
 

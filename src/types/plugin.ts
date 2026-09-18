@@ -15,12 +15,13 @@
 //     * `PluginIconAPI`（`ctx.icons`）
 //     * `PluginShellAPI`（`ctx.shell`）
 //     * `PluginFileDropAPI`（`ctx.fileDrop`）
+//     * `PluginAudioAPI`（`ctx.audio`）
 //
 //   【设计草案】—— 尚未实现的长期设想，**照它写会直接失败**：
 //     * `PluginContext`（真实的上下文见 `createContext()`，字段是
 //       `pluginId / pluginVersion / manifest / version / storage / http /
-//       logger / notifications / events / launcher / icons / shell / fileDrop`，
-//       与这里列的 commands / views / menus / fs / plugins 完全不同）
+//       logger / notifications / events / launcher / icons / shell / fileDrop /
+//       audio`，与这里列的 commands / views / menus / fs / plugins 完全不同）
 //     * `PluginLifecycle` 的各个钩子（`activate` / `deactivate` / `onInstall` …）
 //       运行时都不会被调用，宿主也没有调用它们的时机
 //     * `PluginCommandAPI` / `PluginViewAPI` / `PluginMenuAPI` /
@@ -603,6 +604,31 @@ export interface PluginFileDropAPI {
   isAvailable(): boolean;
   /** 订阅拖放事件，返回取消订阅函数 */
   subscribe(handler: (event: PluginFileDropEvent) => void): () => void;
+}
+
+/**
+ * 插件音频导入 API（`ctx.audio` 的**实际**签名）。
+ *
+ * 需要 `filesystem-read` 权限，在 Rust 侧强制。
+ *
+ * 刻意做成「选择 + 读取 + 编码」一步到位：插件拿到的是可直接播放的 data URL，
+ * **接触不到原始字节或路径**。这样扩展名校验与体积上限只有一个执行点，
+ * 也就没有绕过限制的路径。与 `ctx.icons` 同一思路 —— 宿主给成品，不给原料。
+ *
+ * 拿到之后建议存进插件自己的存储（`ctx.storage`），下次启动就不必再让用户选一次。
+ */
+export interface PluginAudioAPI {
+  /** 弹出原生文件选择框；用户取消时返回 `null`（取消不是错误） */
+  pick(): Promise<PickedAudio | null>;
+}
+
+export interface PickedAudio {
+  /** 原始文件名，界面上显示「当前提示音：xxx.mp3」用 */
+  name: string;
+  /** 形如 `data:audio/mpeg;base64,...`，可直接交给 `new Audio(...)` */
+  dataUrl: string;
+  /** 原始字节数 */
+  bytes: number;
 }
 
 /**
