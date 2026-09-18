@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 
@@ -26,6 +27,26 @@ const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_README_BYTES: u64 = 64 * 1024;
 /// HTTP 代理允许的最大响应体（2 MB）
 const MAX_HTTP_BODY_BYTES: u64 = 2 * 1024 * 1024;
+/// 从插件仓库拉取的单个文本文件允许的最大体积（1 MB）
+///
+/// 索引正常只有几 KB，README 通常几十 KB。上限的意义是**不把一个来路不明的巨大响应
+/// 读进内存**，并让"地址填错指向了一个大文件"这种情况立刻失败而不是先卡住。
+const MAX_REGISTRY_TEXT_BYTES: u64 = 1024 * 1024;
+
+/// 允许从中拉取插件仓库内容的宿主。
+///
+/// **这是一个安全白名单，不是便利性检查。** 它守护的命令能"取回任意文本"，而插件与宿主
+/// 运行在同一个 JavaScript 上下文里，能够触达 IPC 桥 —— 这正是「声明式权限拦不住恶意
+/// 插件」那条已知限制的体现（见 docs/02-开发指南/插件开发/插件系统架构.md 第 6.3 节）。
+/// 若这里不限制宿主，一个**没有声明 `network-external`** 的插件就能借这条命令发出任意
+/// 外部请求，把权限模型整个绕过去。
+///
+/// 限定之后，可触达的范围只剩公开的插件仓库内容。
+///
+/// 与 `src/config/pluginRegistry.ts` 里的 CDN 模板是一对：那边决定"去哪里取"，这边决定
+/// "允许去哪里取"。两者都必须改，因此这里显式记下对方的位置。前端不能把宿主当参数传进来
+/// —— 那等于让被约束的一方自己划定边界。
+const ALLOWED_REGISTRY_HOSTS: [&str; 2] = ["cdn.jsdelivr.net", "raw.githubusercontent.com"];
 /// 启动外部程序允许的最大参数个数
 const MAX_LAUNCH_ARGS: usize = 64;
 /// 单个启动参数的最大字符数
@@ -74,6 +95,87 @@ fn ensure_permission(
         id,
         permission.as_str()
     )))
+}
+
+/// 计算内容的 SHA-256，返回小写十六进制。
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+/// 校验下载内容与索引记录的 SHA-256 是否一致。
+///
+/// 抽成纯函数是为了可测 —— `PluginManager` 持有 `AppHandle`，单测里造不出来。
+///
+/// 三点是刻意的：
+///
+/// 1. **先校验格式，再比对内容。** 索引里写一个残缺的哈希（比如少几位）时，直接比对
+///    只会得到"不符"，而那与"内容被篡改"共用一条错误信息 —— 排查方向会完全跑偏。
+/// 2. **大小写不敏感。** 十六进制有大小写两种写法：`Get-FileHash` 给大写、`shasum`
+///    给小写。为这个拒绝安装是纯粹的折磨。
+/// 3. **失败即拒绝，不提供"仍然安装"。** 哈希不符意味着下载链路或索引有问题，此时
+///    唯一安全的动作是不装。
+fn verify_sha256(bytes: &[u8], expected: &str) -> PluginResult<()> {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PluginError::InvalidPackage(format!(
+            "索引里的 sha256 格式非法（需要 64 位十六进制）：{}",
+            expected
+        )));
+    }
+
+    let actual = hex_sha256(bytes);
+    if actual != expected {
+        return Err(PluginError::DownloadFailed(format!(
+            "下载内容与索引记录的哈希不符（索引 {}，实际 {}）：文件可能下载不完整或已被篡改，已拒绝安装",
+            expected, actual
+        )));
+    }
+    Ok(())
+}
+
+/// 插件仓库内容的地址策略：必须是白名单宿主 + https；本机回环地址可用 http。
+///
+/// 两条规则各自的理由：
+///
+/// - **宿主白名单**见 `ALLOWED_REGISTRY_HOSTS` —— 防止这条命令变成绕过 `network-external`
+///   权限的任意 GET。
+/// - **https** 是因为索引目前没有签名（见 docs/08-规划/插件生态设计.md 第 4.5 节），
+///   传输层加密是它唯一的完整性保护。允许明文 http 等于把"装什么插件"交给网络中间人。
+/// - **回环例外**只为本地调试：在那台服务器就是用户自己机器、插件代码也运行在同一台机器上
+///   的前提下，它不削弱真实威胁模型。
+fn ensure_registry_url_allowed(url: &str) -> PluginResult<()> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|e| PluginError::DownloadFailed(format!("地址非法: {}", e)))?;
+
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let scheme = parsed.scheme();
+
+    if is_loopback_host(&host) && (scheme == "http" || scheme == "https") {
+        return Ok(());
+    }
+
+    if scheme != "https" {
+        return Err(PluginError::SandboxViolation(format!(
+            "插件仓库内容必须通过 https 获取（本机回环地址可用 http 以便调试）: {}",
+            url.trim()
+        )));
+    }
+
+    if !ALLOWED_REGISTRY_HOSTS.contains(&host.as_str()) {
+        return Err(PluginError::SandboxViolation(format!(
+            "只允许从插件仓库的地址获取内容（{}），实际为: {}",
+            ALLOWED_REGISTRY_HOSTS.join(" 或 "),
+            host
+        )));
+    }
+
+    Ok(())
 }
 
 /// 校验并解析「宿主代表插件访问的本机路径」。
@@ -500,8 +602,24 @@ impl PluginManager {
         result
     }
 
-    /// 从 URL 下载 .lcp 后安装
+    /// 从 URL 下载 .lcp 后安装（**不校验哈希**）。
+    ///
+    /// 这是"用户自己粘贴一个地址"的路径：没有可对照的期望值，因此无从校验。
+    /// 插件市场的路径走 [`Self::install_from_url_verified`]。
     pub async fn install_from_url(&mut self, url: &str) -> PluginResult<InstalledPlugin> {
+        self.install_from_url_verified(url, None).await
+    }
+
+    /// 从 URL 下载 .lcp，可校验哈希后安装。
+    ///
+    /// `expected_sha256` 给定时，校验发生在**写盘与解压之前**：下载来源（CDN）与索引
+    /// 本身都可能出问题，而一旦解压安装就晚了 —— 那时错误只能靠"卸载"来纠正。
+    /// 插件市场只用这个入口。
+    pub async fn install_from_url_verified(
+        &mut self,
+        url: &str,
+        expected_sha256: Option<&str>,
+    ) -> PluginResult<InstalledPlugin> {
         if !is_http_url(url) {
             return Err(PluginError::InvalidPackage(format!(
                 "只支持 http/https 协议: {}",
@@ -526,6 +644,10 @@ impl PluginManager {
             )));
         }
 
+        if let Some(expected) = expected_sha256 {
+            verify_sha256(&bytes, expected)?;
+        }
+
         std::fs::create_dir_all(self.staging_dir())?;
         let tmp = self
             .staging_dir()
@@ -535,6 +657,38 @@ impl PluginManager {
         let result = self.install_from_lcp(&tmp);
         let _ = std::fs::remove_file(&tmp);
         result
+    }
+
+    /// 从插件仓库拉取一个文本文件（索引或 README）。
+    ///
+    /// **只在后端做，不经过 WebView 的 `fetch`。** 后端已经有 reqwest 客户端、超时与
+    /// 体积上限，而且不依赖 WebView 的 CORS 与安全上下文行为 —— 那两者在本项目里没有
+    /// 任何自动化覆盖，出问题时的表现是"市场页一片空白"，排查方向会指向插件系统，
+    /// 而真实原因在网络层。
+    ///
+    /// 地址策略见 [`ensure_registry_url_allowed`]：宿主必须在白名单里且走 https。
+    pub async fn fetch_registry_text(&self, url: &str) -> PluginResult<String> {
+        ensure_registry_url_allowed(url)?;
+
+        let response = self.client.get(url.trim()).send().await?;
+        if !response.status().is_success() {
+            return Err(PluginError::DownloadFailed(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+
+        let bytes = response.bytes().await?;
+        if bytes.len() as u64 > MAX_REGISTRY_TEXT_BYTES {
+            return Err(PluginError::InvalidPackage(format!(
+                "内容体积 {} 字节超过上限 {} 字节",
+                bytes.len(),
+                MAX_REGISTRY_TEXT_BYTES
+            )));
+        }
+
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| PluginError::InvalidPackage("内容不是合法的 UTF-8".to_string()))
     }
 
     /// 校验暂存目录中的插件，然后移动到 <plugins_dir>/<id>/<version>/
@@ -2156,6 +2310,158 @@ mod tests {
                 "对话框过滤器里列了 {}，但校验不认它",
                 ext
             );
+        }
+    }
+
+    // ============================================================
+    // 插件市场：哈希校验与索引地址策略
+    // ============================================================
+
+    /// 空内容的 SHA-256。
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// 用**公开的已知向量**校验实现，而不是拿实现去校验实现 ——
+    /// 后者在哈希算错时会一起错，测试照样全绿。
+    #[test]
+    fn sha256_matches_published_vectors() {
+        assert_eq!(hex_sha256(b""), EMPTY_SHA256);
+        assert_eq!(
+            hex_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn verify_sha256_accepts_matching_content() {
+        assert!(verify_sha256(b"", EMPTY_SHA256).is_ok());
+    }
+
+    /// 十六进制有大小写两种写法：`Get-FileHash` 给大写、`shasum` 给小写，
+    /// 发布说明里还可能带首尾空白。这些都不该导致拒绝安装。
+    #[test]
+    fn verify_sha256_tolerates_case_and_whitespace() {
+        assert!(verify_sha256(b"", &EMPTY_SHA256.to_ascii_uppercase()).is_ok());
+        assert!(verify_sha256(b"", &format!("  {}  ", EMPTY_SHA256)).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_rejects_mismatch() {
+        let err = verify_sha256(b"tampered", EMPTY_SHA256).unwrap_err();
+        assert!(
+            matches!(err, PluginError::DownloadFailed(_)),
+            "哈希不符应当报下载失败，实际: {:?}",
+            err
+        );
+    }
+
+    /// 残缺的哈希与「内容不符」必须给出**不同**的错误。
+    ///
+    /// 两者都拒绝安装，但原因完全不同：前者是索引写错了，后者才可能意味着下载链路
+    /// 有问题。共用一条信息会让排查方向跑偏 —— 用户会去怀疑 CDN，而实际只是索引里
+    /// 少复制了几位。
+    #[test]
+    fn verify_sha256_distinguishes_malformed_from_mismatch() {
+        for malformed in [
+            "abc123",                    // 太短
+            &"z".repeat(64),             // 长度对但不是十六进制
+            "",                          // 空
+            &"a".repeat(63),             // 差一位
+        ] {
+            let err = verify_sha256(b"", malformed).unwrap_err();
+            assert!(
+                matches!(err, PluginError::InvalidPackage(_)),
+                "格式非法应当报包非法（{}），实际: {:?}",
+                malformed,
+                err
+            );
+        }
+
+        let err = verify_sha256(b"x", EMPTY_SHA256).unwrap_err();
+        assert!(matches!(err, PluginError::DownloadFailed(_)));
+    }
+
+    // ---- 仓库内容的地址策略 ----
+
+    #[test]
+    fn registry_url_allows_known_hosts_over_https() {
+        for url in [
+            "https://cdn.jsdelivr.net/gh/Rinntheor/modulith-plugins@main/index.json",
+            "https://raw.githubusercontent.com/Rinntheor/modulith-plugins/main/index.json",
+        ] {
+            assert!(ensure_registry_url_allowed(url).is_ok(), "应当允许: {}", url);
+        }
+    }
+
+    /// 这条是**安全边界**，不是便利性检查。
+    ///
+    /// 该命令能取回任意文本，而插件与宿主同处一个 JavaScript 上下文、能够触达 IPC 桥。
+    /// 若宿主不设白名单，一个**没有声明 `network-external`** 的插件就能借它发出任意外部
+    /// 请求，把权限模型整个绕过去。
+    ///
+    /// 注意最后两条是「域名后缀伪装」：`cdn.jsdelivr.net.evil.com` 以白名单域名**开头**，
+    /// 因此必须按完整宿主比较，不能按前缀匹配。
+    #[test]
+    fn registry_url_rejects_other_hosts_even_over_https() {
+        for url in [
+            "https://evil.example.com/index.json",
+            "https://cdn.jsdelivr.net.evil.com/index.json",
+            "https://raw.githubusercontent.com.evil.com/index.json",
+        ] {
+            let err = ensure_registry_url_allowed(url).unwrap_err();
+            assert!(
+                matches!(err, PluginError::SandboxViolation(_)),
+                "不在白名单里的宿主必须被拒绝（{}），实际: {:?}",
+                url,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn registry_url_requires_https_even_for_known_hosts() {
+        let err = ensure_registry_url_allowed("http://cdn.jsdelivr.net/gh/x/y@main/index.json")
+            .unwrap_err();
+        assert!(
+            matches!(err, PluginError::SandboxViolation(_)),
+            "白名单宿主上的明文 http 也必须被拒绝，实际: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn registry_url_allows_loopback_for_local_debugging() {
+        for url in [
+            "http://127.0.0.1:8000/index.json",
+            "http://localhost:8000/index.json",
+            "http://[::1]:8000/index.json",
+        ] {
+            assert!(
+                ensure_registry_url_allowed(url).is_ok(),
+                "回环地址应当允许 http（便于本机调试）: {}",
+                url
+            );
+        }
+    }
+
+    /// 「看起来像回环但不是」的地址必须被拒绝。
+    ///
+    /// 少了这条，`http://127.0.0.1.evil.com/` 这类域名就能绕过 https 与白名单 ——
+    /// 它确实以 `127.0.0.1` 开头。
+    #[test]
+    fn registry_url_rejects_loopback_lookalikes() {
+        for url in [
+            "http://127.0.0.1.evil.com/index.json",
+            "http://localhost.evil.com/index.json",
+            "http://192.168.1.10/index.json",
+        ] {
+            assert!(ensure_registry_url_allowed(url).is_err(), "不该允许: {}", url);
+        }
+    }
+
+    #[test]
+    fn registry_url_rejects_non_http_schemes() {
+        for url in ["file:///etc/passwd", "ftp://example.com/index.json", "not a url"] {
+            assert!(ensure_registry_url_allowed(url).is_err(), "不该允许: {}", url);
         }
     }
 }
