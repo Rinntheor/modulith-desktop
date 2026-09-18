@@ -658,27 +658,55 @@
         // 对话框、右键菜单与备注提示都要被限制在同一范围内，因此任一打开就测量
         if (!dialog && !menu && !tooltip) return undefined;
 
+        var viewport = findScrollAncestor(rootRef.current);
+        if (!viewport) {
+          // 找不到滚动祖先（例如模块被内嵌到别处）：退回 inset:0，
+          // 覆盖整个窗口虽然不理想，但比对话框跑到屏幕外好。
+          setOverlayBox(null);
+          return undefined;
+        }
+
         function measure() {
-          var viewport = findScrollAncestor(rootRef.current);
-          if (!viewport) {
-            // 找不到滚动祖先（例如模块被内嵌到别处）：退回 inset:0，
-            // 覆盖整个窗口虽然不理想，但比对话框跑到屏幕外好。
-            setOverlayBox(null);
-            return;
-          }
           var rect = viewport.getBoundingClientRect();
-          setOverlayBox({
-            top: rect.top,
-            left: rect.left,
-            width: rect.width,
-            height: rect.height,
+          setOverlayBox(function (prev) {
+            // 值没变就返回原对象，让 React 跳过这次更新。
+            // 过渡期间 ResizeObserver 会连续回调，没有这道判断就会白白重渲染。
+            if (
+              prev &&
+              prev.top === rect.top &&
+              prev.left === rect.left &&
+              prev.width === rect.width &&
+              prev.height === rect.height
+            ) {
+              return prev;
+            }
+            return {
+              top: rect.top,
+              left: rect.left,
+              width: rect.width,
+              height: rect.height,
+            };
           });
         }
 
         measure();
+
+        // **必须观察元素本身，不能只监听窗口 resize。**
+        // 折叠侧边栏改的是 main 的 margin-left（256px → 0），窗口尺寸一点没变，
+        // 所以 resize 不会触发，弹窗就会停在折叠前的位置上。
+        // ResizeObserver 观察的是元素的盒子，因此折叠（以及它那 200ms 过渡的
+        // 每一帧）都会回调，弹窗跟着连续移动而不是跳一下。
+        var observer = null;
+        if (typeof ResizeObserver !== 'undefined') {
+          observer = new ResizeObserver(measure);
+          observer.observe(viewport);
+        }
+
+        // 保留 resize 监听：ResizeObserver 不可用时它是唯一的兜底
         window.addEventListener('resize', measure);
         return function () {
           window.removeEventListener('resize', measure);
+          if (observer) observer.disconnect();
         };
       },
       [dialog, menu, tooltip]
@@ -1086,8 +1114,17 @@
             h(
               'div',
               { className: 'ql-card-text' },
-              h('span', { className: 'ql-card-name', title: item.name }, item.name),
-              h('span', { className: 'ql-card-path', title: item.target }, item.target)
+              // 卡片上只显示名称 —— 完整路径很占地方，而且用户认的是软件名。
+              // 路径的两个去处：编辑对话框里可以看全，悬停时用原生提示补充。
+              // 有备注时不加 title，避免原生提示与备注提示同时出现、互相压住。
+              h(
+                'span',
+                {
+                  className: 'ql-card-name',
+                  title: item.note ? undefined : item.target,
+                },
+                item.name
+              )
             ),
             item.note ? h('span', { className: 'ql-card-note-dot', title: '有备注' }) : null
           );

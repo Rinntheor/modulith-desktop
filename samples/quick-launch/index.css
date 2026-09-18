@@ -293,21 +293,6 @@
   font-size: 12px;
 }
 
-/* 路径通常很长，用省略号而不是换行 —— 换行会让每行高度不一致 */
-.ql-card-path {
-  font-size: 11px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: #9ca3af;
-  max-width: 100%;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.ql-view-compact .ql-card-path {
-  display: none;
-}
-
 /* 有备注的条目给一个小圆点，否则用户不知道悬浮会有东西 */
 .ql-card-note-dot {
   position: absolute;
@@ -650,10 +635,6 @@
 
 :root.dark .ql-card-name {
   color: #e5e7eb;
-}
-
-:root.dark .ql-card-path {
-  color: #6b7280;
 }
 
 :root.dark .ql-card-icon-fallback {
