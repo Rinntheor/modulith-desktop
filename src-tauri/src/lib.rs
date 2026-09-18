@@ -100,6 +100,7 @@ pub fn run() -> Result<(), tauri::Error> {
         get_notification_summary,
         list_plugins,
         get_plugin,
+        list_plugin_permissions,
         install_plugin_package,
         install_plugin_folder,
         install_plugin_url,
