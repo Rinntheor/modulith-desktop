@@ -1,0 +1,724 @@
+/* samples/quick-launch/index.css
+ *
+ * 插件自带样式。为什么不用 Tailwind 工具类：
+ * Tailwind 在**构建宿主时**扫描源码生成类名，插件是运行时才注入的，
+ * 它写的 `class="bg-white"` 不在宿主那次扫描里，因此不会生成对应规则 ——
+ * 看起来「有时能用」只是因为那个类名恰好被宿主自己用到了。
+ *
+ * 配色与宿主一致：强调色复用宿主的 `--accent-*` 变量，深浅两套各自声明。
+ * 深色模式由宿主在 `:root` 上加 `.dark` 类切换。
+ */
+
+.ql-root {
+  position: relative;
+  padding: 22px 26px 40px;
+  max-width: 900px;
+  margin: 0 auto;
+  min-height: 100%;
+}
+
+/* ============================================================
+   工具栏
+   ============================================================ */
+
+.ql-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.ql-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #111827;
+  flex: 1 1 auto;
+}
+
+/* 分段控件：视图切换 */
+.ql-segmented {
+  display: inline-flex;
+  padding: 2px;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
+
+.ql-seg {
+  padding: 5px 12px;
+  font-size: 12px;
+  color: #6b7280;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.ql-seg:hover {
+  color: #111827;
+}
+
+.ql-seg-active {
+  color: #111827;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* ============================================================
+   按钮
+   ============================================================ */
+
+.ql-btn {
+  flex: 0 0 auto;
+  padding: 7px 14px;
+  font-size: 13px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.ql-btn-primary {
+  color: #ffffff;
+  background: var(--accent-500);
+}
+
+.ql-btn-primary:hover {
+  background: var(--accent-600);
+}
+
+.ql-btn-ghost {
+  color: #4b5563;
+  background: transparent;
+  border-color: #e5e7eb;
+}
+
+.ql-btn-ghost:hover {
+  background: #f9fafb;
+}
+
+/* ============================================================
+   分组筛选
+   ============================================================ */
+
+.ql-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.ql-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: #4b5563;
+  background: transparent;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.ql-chip:hover {
+  background: #f9fafb;
+}
+
+.ql-chip-active {
+  color: var(--accent-700);
+  background: var(--accent-50);
+  border-color: var(--accent-200);
+}
+
+.ql-chip-count {
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+.ql-chip-add {
+  border-style: dashed;
+  color: #9ca3af;
+}
+
+/* ============================================================
+   卡片列表
+   ============================================================ */
+
+.ql-grid {
+  display: grid;
+  gap: 10px;
+}
+
+/* 网格：图标在上、文字在下 */
+.ql-view-grid {
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+}
+
+/* 列表：图标在左、文字在右，一行一个 */
+.ql-view-list {
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+
+/* 紧凑：小图标 + 只显示名称 */
+.ql-view-compact {
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 6px;
+}
+
+.ql-card {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  cursor: default;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+
+.ql-view-grid .ql-card {
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 10px;
+  text-align: center;
+}
+
+.ql-view-list .ql-card {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+}
+
+.ql-view-compact .ql-card {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 8px;
+}
+
+.ql-card:hover {
+  background: #f9fafb;
+  border-color: #e5e7eb;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.07);
+}
+
+.ql-view-grid .ql-card:hover {
+  transform: translateY(-2px);
+}
+
+.ql-card-icon {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 9px;
+}
+
+.ql-view-grid .ql-card-icon {
+  width: 48px;
+  height: 48px;
+}
+
+.ql-view-list .ql-card-icon {
+  width: 28px;
+  height: 28px;
+}
+
+.ql-view-compact .ql-card-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.ql-card-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* 图标还没提取出来（或提取失败）时的占位：用名称首字母，避免一片空白 */
+.ql-card-icon-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-700);
+  background: var(--accent-50);
+  border-radius: 9px;
+}
+
+.ql-view-compact .ql-card-icon-fallback {
+  font-size: 9px;
+  border-radius: 5px;
+}
+
+.ql-card-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ql-view-grid .ql-card-text {
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+}
+
+.ql-view-list .ql-card-text,
+.ql-view-compact .ql-card-text {
+  flex: 1 1 auto;
+  gap: 1px;
+}
+
+.ql-card-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #111827;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ql-view-compact .ql-card-name {
+  font-size: 12px;
+}
+
+/* 路径通常很长，用省略号而不是换行 —— 换行会让每行高度不一致 */
+.ql-card-path {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #9ca3af;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ql-view-compact .ql-card-path {
+  display: none;
+}
+
+/* 有备注的条目给一个小圆点，否则用户不知道悬浮会有东西 */
+.ql-card-note-dot {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent-400);
+}
+
+.ql-view-list .ql-card-note-dot,
+.ql-view-compact .ql-card-note-dot {
+  position: static;
+  flex: 0 0 auto;
+}
+
+/* ============================================================
+   备注悬浮提示
+   ============================================================ */
+
+.ql-tooltip {
+  position: fixed;
+  z-index: 60;
+  max-width: 280px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #f9fafb;
+  background: rgba(17, 24, 39, 0.95);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  white-space: pre-wrap;
+  word-break: break-word;
+  pointer-events: none;
+  /* 锚在卡片上边中点，向上展开 */
+  transform: translate(-50%, calc(-100% - 8px));
+}
+
+/* ============================================================
+   空状态 / 拖放提示
+   ============================================================ */
+
+.ql-empty {
+  padding: 40px 16px;
+  font-size: 13px;
+  text-align: center;
+  color: #9ca3af;
+  border: 1px dashed #e5e7eb;
+  border-radius: 12px;
+}
+
+/* 用 outline 而不是 border：拖入时出现/消失不会引起布局跳动 */
+.ql-dropping {
+  outline: 2px dashed var(--accent-400);
+  outline-offset: -8px;
+  border-radius: 12px;
+}
+
+.ql-dropHint {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--accent-700);
+  background: var(--accent-50);
+  border: 1px solid var(--accent-200);
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+/* ============================================================
+   右键菜单
+   ============================================================ */
+
+.ql-menu {
+  position: fixed;
+  z-index: 70;
+  min-width: 168px;
+  padding: 4px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.16);
+}
+
+.ql-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 13px;
+  color: #374151;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.ql-menu-item:hover {
+  background: #f3f4f6;
+}
+
+.ql-menu-item-danger {
+  color: #b91c1c;
+}
+
+.ql-menu-item-danger:hover {
+  background: #fef2f2;
+}
+
+.ql-menu-label {
+  flex: 1 1 auto;
+}
+
+.ql-menu-mark {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--accent-600);
+}
+
+.ql-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: #e5e7eb;
+}
+
+.ql-menu-heading {
+  padding: 5px 10px 3px;
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+/* ============================================================
+   编辑对话框
+   ============================================================ */
+
+.ql-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.ql-dialog {
+  width: 100%;
+  max-width: 460px;
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 20px;
+  background: #ffffff;
+  border-radius: 14px;
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.28);
+}
+
+.ql-dialog-title {
+  margin: 0 0 14px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.ql-field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.ql-field-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #4b5563;
+}
+
+.ql-field-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9ca3af;
+}
+
+.ql-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #111827;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 9px;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.ql-input:focus {
+  background: #ffffff;
+  border-color: var(--accent-400);
+}
+
+.ql-input-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.ql-textarea {
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.ql-dialog-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.ql-dialog-spacer {
+  flex: 1 1 auto;
+}
+
+/* ============================================================
+   错误提示
+   ============================================================ */
+
+.ql-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+}
+
+.ql-error-text {
+  flex: 1 1 auto;
+  word-break: break-word;
+}
+
+.ql-error-close {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  font-size: 16px;
+  line-height: 1;
+  color: inherit;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.ql-error-close:hover {
+  opacity: 1;
+}
+
+/* ============================================================
+   深色模式
+   ============================================================ */
+
+:root.dark .ql-title,
+:root.dark .ql-dialog-title {
+  color: #e5e7eb;
+}
+
+:root.dark .ql-segmented {
+  background: #0e111a;
+  border-color: #2c3242;
+}
+
+:root.dark .ql-seg {
+  color: #9ca3af;
+}
+
+:root.dark .ql-seg:hover {
+  color: #e5e7eb;
+}
+
+:root.dark .ql-seg-active {
+  color: #f3f4f6;
+  background: #1c2130;
+  box-shadow: none;
+}
+
+:root.dark .ql-btn-ghost {
+  color: #cbd5e1;
+  border-color: #2c3242;
+}
+
+:root.dark .ql-btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+:root.dark .ql-chip {
+  color: #9ca3af;
+  border-color: #2c3242;
+}
+
+:root.dark .ql-chip:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+:root.dark .ql-chip-active {
+  color: var(--accent-300);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #3a4257;
+}
+
+:root.dark .ql-card:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: #2c3242;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+:root.dark .ql-card-name {
+  color: #e5e7eb;
+}
+
+:root.dark .ql-card-path {
+  color: #6b7280;
+}
+
+:root.dark .ql-card-icon-fallback {
+  color: var(--accent-300);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+:root.dark .ql-empty {
+  color: #6b7280;
+  border-color: #2c3242;
+}
+
+:root.dark .ql-menu {
+  background: #1a1f2b;
+  border-color: #2c3242;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+:root.dark .ql-menu-item {
+  color: #cbd5e1;
+}
+
+:root.dark .ql-menu-item:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+:root.dark .ql-menu-item-danger {
+  color: #fca5a5;
+}
+
+:root.dark .ql-menu-item-danger:hover {
+  background: rgba(127, 29, 29, 0.25);
+}
+
+:root.dark .ql-menu-sep {
+  background: #2c3242;
+}
+
+:root.dark .ql-menu-heading {
+  color: #6b7280;
+}
+
+:root.dark .ql-dialog {
+  background: #151823;
+}
+
+:root.dark .ql-field-label {
+  color: #9ca3af;
+}
+
+:root.dark .ql-field-hint {
+  color: #6b7280;
+}
+
+:root.dark .ql-input {
+  color: #e5e7eb;
+  background: #0e111a;
+  border-color: #2c3242;
+}
+
+:root.dark .ql-input::placeholder {
+  color: #6b7280;
+}
+
+:root.dark .ql-input:focus {
+  border-color: var(--accent-400);
+}
+
+:root.dark .ql-error {
+  color: #fca5a5;
+  background: rgba(127, 29, 29, 0.18);
+  border-color: #7f1d1d;
+}
+
+:root.dark .ql-dropHint {
+  color: var(--accent-300);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #2c3242;
+}
