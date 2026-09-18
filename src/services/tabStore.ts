@@ -72,8 +72,27 @@ function notify(): void {
   });
 }
 
+/**
+ * 写入新状态。
+ *
+ * **这里强制维护一条不变量：激活的标签必须同时在 `mountedTabs` 里。**
+ *
+ * 为什么必须在这一层做：`Home` 只渲染 `mountedTabs` 里的面板（惰性挂载），
+ * 因此「activeTab 指向一个没挂载的标签」在界面上表现为 —— 标签栏高亮着某个
+ * 标签，内容区却完全是空的（白屏）。这不是假设出来的情况：
+ * `reconcile()` 在插件目录变化后会把 `activeTab` 改指到 `openTabs[0]`，却只对
+ * `mountedTabs` 做过滤、从不追加，于是那个新激活的标签根本没有面板可渲染。
+ * 实测表现正是「去设置里管理插件，回来后发现来到了白屏的仪表盘」，
+ * 而手动点一下该标签就能恢复 —— 因为 `activate()` 会补上挂载。
+ *
+ * 与其在每个转移函数里各写一遍（`reconcile` / `closeTab` /
+ * `closeTabsToTheRight` 三处都漏了，以后新增的入口还会继续漏），不如在唯一的
+ * 写入点兜住：任何调用方都不可能再写出违反不变量的状态。
+ */
 function setState(next: TabState): void {
-  state = next;
+  const needsMount = next.activeTab !== null && !next.mountedTabs.includes(next.activeTab);
+
+  state = needsMount ? { ...next, mountedTabs: [...next.mountedTabs, next.activeTab!] } : next;
   notify();
 }
 
