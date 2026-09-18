@@ -1,0 +1,22 @@
+{
+  "name": "com.modulith.sample.pomodoro",
+  "displayName": "番茄工作钟",
+  "version": "1.0.0",
+  "description": "专注 / 短休息 / 长休息循环计时，时长、轮次、提示音与自动开始全部可调。结束时通过应用内通知提醒。",
+  "author": {
+    "name": "Modulith Samples",
+    "url": "https://github.com/Rinntheor/modulith-desktop"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/Rinntheor/modulith-desktop",
+  "categories": ["示例", "效率"],
+  "keywords": ["sample", "pomodoro", "timer", "notification", "demo"],
+  "engines": {
+    "loopcore": ">=1.0.0"
+  },
+  "main": "index.js",
+  "style": "index.css",
+  "icon": "icon.svg",
+  "permissions": ["storage", "notification", "filesystem-read"],
+  "sandboxLevel": 2
+}
