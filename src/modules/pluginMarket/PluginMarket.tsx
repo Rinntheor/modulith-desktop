@@ -34,12 +34,15 @@ import { jsdelivrUrl, PLUGIN_INDEX_REF, PLUGIN_REPO_URL } from '../../config/plu
 import { getPermissionDescriptor, type PermissionRisk } from '../../services/permissionRegistry';
 import {
   installMarketVersion,
-  installedVersionOf,
   latestVersionOf,
   loadIndex,
   loadReadme,
+  planUpdate,
+  updateStateFor,
   type MarketIndex,
   type MarketPlugin,
+  type UpdatePlan,
+  type UpdateState,
 } from '../../services/pluginMarket';
 import { reloadPluginRuntime, subscribePlugins } from '../../services/pluginRuntime';
 
@@ -112,15 +115,21 @@ const MarketIcon: React.FC<{ plugin: MarketPlugin }> = ({ plugin }) => {
   );
 };
 
-/** 安装确认：把权限摊开，中高风险置顶提示 */
+/** 安装 / 更新确认：把权限摊开，新增项与中高风险置顶 */
 const InstallConfirm: React.FC<{
   plugin: MarketPlugin;
+  /** 更新时提供；首次安装为 null */
+  plan: UpdatePlan | null;
   busy: boolean;
   onCancel: () => void;
   onConfirm: () => void;
-}> = ({ plugin, busy, onCancel, onConfirm }) => {
-  const version = latestVersionOf(plugin);
-  const highest = version.permissions.reduce<PermissionRisk>((worst, perm) => {
+}> = ({ plugin, plan, busy, onCancel, onConfirm }) => {
+  const version = plan?.version ?? latestVersionOf(plugin);
+
+  // 更新时只关心**新增**的权限：既有的那些用户已经同意过了，把它们一并算进"需要注意"
+  // 只会稀释真正新增的那几项 —— 而那个判断正是这次确认要用户做的。
+  const noteworthy = plan ? plan.added : version.permissions;
+  const highest = noteworthy.reduce<PermissionRisk>((worst, perm) => {
     const { risk } = getPermissionDescriptor(perm);
     if (risk === 'high' || worst === 'high') return 'high';
     if (risk === 'medium' || worst === 'medium') return 'medium';
@@ -132,15 +141,48 @@ const InstallConfirm: React.FC<{
       <div className="w-full max-w-lg rounded-xl border border-gray-200 bg-white shadow-xl">
         <div className="px-5 py-4 border-b border-gray-100">
           <h3 className="text-sm font-semibold text-gray-900">
-            安装 {plugin.displayName} {version.version}
+            {plan
+              ? `${plan.downgrade ? '回退' : '更新'} ${plugin.displayName} ${plan.from} → ${version.version}`
+              : `安装 ${plugin.displayName} ${version.version}`}
           </h3>
           <p className="mt-1 text-xs text-gray-500">
-            插件代码会以本应用的权限运行，能访问这台机器上的东西。
+            {plan?.downgrade
+              ? '这是退回到更旧的版本 —— 本机当前版本比仓库里的更新。'
+              : '插件代码会以本应用的权限运行，能访问这台机器上的东西。'}
           </p>
         </div>
 
         <div className="px-5 py-4 max-h-80 overflow-y-auto">
-          <div className="text-xs font-medium text-gray-700 mb-2">该插件申请的权限</div>
+          {plan && plan.added.length > 0 && (
+            <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+              <div className="text-xs font-medium text-amber-900">
+                本次新增 {plan.added.length} 项权限
+              </div>
+              <ul className="mt-1.5 space-y-1">
+                {plan.added.map((perm) => {
+                  const info = getPermissionDescriptor(perm);
+                  return (
+                    <li key={perm} className="text-[11px] leading-relaxed text-amber-800">
+                      <span className="font-medium">{info.label}</span>
+                      <span className="mx-1 text-amber-600">（{RISK_LABEL[info.risk]}风险）</span>
+                      {info.description}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+
+          {plan && plan.removed.length > 0 && (
+            <p className="mb-3 text-[11px] leading-relaxed text-gray-500">
+              新版本不再申请：
+              {plan.removed.map((perm) => getPermissionDescriptor(perm).label).join('、')}
+            </p>
+          )}
+
+          <div className="text-xs font-medium text-gray-700 mb-2">
+            {plan ? '该版本的完整权限列表' : '该插件申请的权限'}
+          </div>
           {version.permissions.length === 0 ? (
             <p className="text-xs text-gray-500">
               未申请任何权限 —— 它无法访问网络、文件或存储。
@@ -245,6 +287,58 @@ const DetailRow: React.FC<{ label: string; value: string; mono?: boolean }> = ({
 );
 
 /**
+ * 状态徽章的文案与配色。
+ *
+ * 卡片与详情抽屉共用同一份定义 —— 同一个状态在两处出现不同说法，用户会以为是两件事。
+ */
+function stateBadge(state: UpdateState): { text: string; className: string } | null {
+  switch (state.kind) {
+    case 'not-installed':
+      return null;
+    case 'up-to-date':
+      return {
+        text: `已安装 ${state.version}`,
+        className: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+      };
+    case 'update-available':
+      return {
+        text: `可更新 ${state.from} → ${state.to}`,
+        className: 'border-amber-200 bg-amber-50 text-amber-700',
+      };
+    case 'local-newer':
+      // 用户可能从 .lcp 装了比索引更新的版本。这时必须说清楚，
+      // 否则"重新安装"会被误当成升级，实际是降级。
+      return {
+        text: `已安装 ${state.version}（比仓库里的新）`,
+        className: 'border-gray-200 bg-gray-50 text-gray-600',
+      };
+    case 'dev-linked':
+      return {
+        text: `开发链接 ${state.version}`,
+        className: 'border-indigo-200 bg-indigo-50 text-indigo-700',
+      };
+  }
+}
+
+const StateBadge: React.FC<{ state: UpdateState }> = ({ state }) => {
+  const badge = stateBadge(state);
+  if (!badge) return null;
+  return (
+    <span
+      className={`px-1.5 py-0.5 text-[10px] font-medium rounded border ${badge.className}`}
+    >
+      {badge.text}
+    </span>
+  );
+};
+
+function actionLabel(state: UpdateState): string {
+  if (state.kind === 'update-available') return '更新';
+  if (state.kind === 'not-installed') return '安装';
+  return '重新安装';
+}
+
+/**
  * 详情抽屉：完整权限说明、版本与来源、以及**发布者写的 README**。
  *
  * 说明内容取自仓库里的 `README.md`（按该版本的不可变 tag），不是索引里的字段 ——
@@ -256,10 +350,10 @@ const DetailRow: React.FC<{ label: string; value: string; mono?: boolean }> = ({
  */
 const MarketDetailDrawer: React.FC<{
   plugin: MarketPlugin;
-  installedVersion: string | null;
+  state: UpdateState;
   onClose: () => void;
-  onInstall: () => void;
-}> = ({ plugin, installedVersion, onClose, onInstall }) => {
+  onAction: () => void;
+}> = ({ plugin, state, onClose, onAction }) => {
   const version = useMemo(() => latestVersionOf(plugin), [plugin]);
   const [readme, setReadme] = useState<'loading' | string | null>('loading');
 
@@ -302,11 +396,7 @@ const MarketDetailDrawer: React.FC<{
                 <span className="px-1.5 py-0.5 text-[11px] font-mono rounded bg-gray-100 text-gray-600">
                   v{version.version}
                 </span>
-                {installedVersion && (
-                  <span className="px-1.5 py-0.5 text-[11px] rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700">
-                    已安装 {installedVersion}
-                  </span>
-                )}
+                <StateBadge state={state} />
               </div>
               <p className="text-xs text-gray-500 mt-0.5 font-mono truncate">{plugin.id}</p>
             </div>
@@ -322,14 +412,21 @@ const MarketDetailDrawer: React.FC<{
           </div>
 
           <div className="flex items-center gap-2 mt-4">
-            <button
-              type="button"
-              onClick={onInstall}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-900 text-white hover:bg-gray-800"
-            >
-              <Download className="w-3.5 h-3.5" />
-              {installedVersion ? '重新安装' : '安装'}
-            </button>
+            {state.kind === 'dev-linked' ? (
+              <p className="text-[11px] leading-relaxed text-indigo-700">
+                该插件从源码目录实时读取，改完代码点标题栏的刷新即生效，因此不需要从市场
+                更新。这里也不提供更新：那会把它换成安装目录里的副本，丢掉开发链接。
+              </p>
+            ) : (
+              <button
+                type="button"
+                onClick={onAction}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-900 text-white hover:bg-gray-800"
+              >
+                <Download className="w-3.5 h-3.5" />
+                {actionLabel(state)}
+              </button>
+            )}
             {plugin.source && (
               <button
                 type="button"
@@ -439,7 +536,9 @@ const PluginMarket: React.FC = () => {
   const [error, setError] = useState('');
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<string | null>(null);
-  const [pending, setPending] = useState<MarketPlugin | null>(null);
+  const [pending, setPending] = useState<{ plugin: MarketPlugin; plan: UpdatePlan | null } | null>(
+    null
+  );
   const [detail, setDetail] = useState<MarketPlugin | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
@@ -484,31 +583,73 @@ const PluginMarket: React.FC = () => {
     });
   }, [index, query, category]);
 
-  const installed = useMemo(() => {
-    const map = new Map<string, string | null>();
-    for (const plugin of visible) map.set(plugin.id, installedVersionOf(plugin.id));
+  const states = useMemo(() => {
+    const map = new Map<string, UpdateState>();
+    for (const plugin of visible) map.set(plugin.id, updateStateFor(plugin));
     return map;
     // installedTick 只是重算的触发器：已安装列表活在 pluginRuntime 的模块级状态里
   }, [visible, installedTick]);
 
-  const doInstall = useCallback(async (plugin: MarketPlugin) => {
+  /**
+   * 真正的安装 / 更新动作。
+   *
+   * 更新完成后的提示会**列出新增的低风险权限**：设计文档 3.8 要求这类权限静默通过，
+   * 但"静默"指的是不打断用户，不是不告诉他 —— 权限集合变了而用户完全不知情，
+   * 下次他看到权限列表时会以为一直是那样。
+   */
+  const performInstall = useCallback(async (plugin: MarketPlugin, plan: UpdatePlan | null) => {
     setBusyId(plugin.id);
     setNotice(null);
     try {
-      const version = latestVersionOf(plugin);
+      const version = plan?.version ?? latestVersionOf(plugin);
       await installMarketVersion(plugin, version);
       await reloadPluginRuntime();
       setPending(null);
-      setNotice({
-        kind: 'ok',
-        text: `${plugin.displayName} ${version.version} 已安装。可在「设置 → 插件」里启用、禁用或卸载。`,
-      });
+
+      if (plan) {
+        const addedNote =
+          plan.added.length > 0
+            ? `新增 ${plan.added.length} 项低风险权限：${plan.added
+                .map((p) => getPermissionDescriptor(p).label)
+                .join('、')}。`
+            : plan.removed.length > 0
+              ? `不再申请 ${plan.removed.length} 项权限。`
+              : '';
+        setNotice({
+          kind: 'ok',
+          text: `${plugin.displayName} 已从 ${plan.from} 更新到 ${version.version}。${addedNote}`,
+        });
+      } else {
+        setNotice({
+          kind: 'ok',
+          text: `${plugin.displayName} ${version.version} 已安装。可在「设置 → 插件」里启用、禁用或卸载。`,
+        });
+      }
     } catch (err) {
       setNotice({ kind: 'err', text: err instanceof Error ? err.message : String(err) });
     } finally {
       setBusyId(null);
     }
   }, []);
+
+  /**
+   * 统一的入口：需要确认时打开对话框，否则直接执行。
+   *
+   * 只有**首次安装**和**新增了中/高风险权限的更新**需要确认。权限变少、不变、或只新增
+   * 低风险权限时直接装，结果写进提示里（见 performInstall）。
+   */
+  const requestAction = useCallback(
+    (plugin: MarketPlugin) => {
+      const plan = planUpdate(plugin);
+      if (plan && !plan.needsConfirmation) {
+        void performInstall(plugin, plan);
+        return;
+      }
+      setNotice(null);
+      setPending({ plugin, plan });
+    },
+    [performInstall]
+  );
 
   return (
     <div className="px-6 py-5">
@@ -648,7 +789,7 @@ const PluginMarket: React.FC = () => {
             <div className="mt-4 space-y-2">
               {visible.map((plugin) => {
                 const version = latestVersionOf(plugin);
-                const local = installed.get(plugin.id) ?? null;
+                const state = states.get(plugin.id) ?? { kind: 'not-installed' as const };
                 const busy = busyId === plugin.id;
 
                 return (
@@ -668,11 +809,7 @@ const PluginMarket: React.FC = () => {
                           {plugin.displayName}
                         </button>
                         <span className="text-[11px] text-gray-400">{version.version}</span>
-                        {local && (
-                          <span className="px-1.5 py-0.5 text-[10px] font-medium rounded border border-emerald-200 bg-emerald-50 text-emerald-700">
-                            已安装 {local}
-                          </span>
-                        )}
+                        <StateBadge state={state} />
                         {plugin.source && (
                           <span
                             className="px-1.5 py-0.5 text-[10px] rounded border border-gray-200 text-gray-500"
@@ -721,12 +858,17 @@ const PluginMarket: React.FC = () => {
                       )}
                       <button
                         type="button"
-                        disabled={busy || busyId !== null}
-                        onClick={() => setPending(plugin)}
+                        disabled={busy || busyId !== null || state.kind === 'dev-linked'}
+                        onClick={() => requestAction(plugin)}
+                        title={
+                          state.kind === 'dev-linked'
+                            ? '该插件是开发链接，改完源码点刷新即生效，不需要从市场更新'
+                            : undefined
+                        }
                         className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
                       >
                         <Download className="w-3.5 h-3.5" />
-                        {busy ? '安装中…' : local ? '重新安装' : '安装'}
+                        {busy ? '处理中…' : actionLabel(state)}
                       </button>
                     </div>
                   </div>
@@ -741,19 +883,22 @@ const PluginMarket: React.FC = () => {
         {detail && (
           <MarketDetailDrawer
             plugin={detail}
-            installedVersion={installedVersionOf(detail.id)}
+            // 直接算而不是查 states：详情打开期间用户可能改了筛选，那时 states 里
+            // 就没有这个插件了，回退值会把状态显示错。
+            state={updateStateFor(detail)}
             onClose={() => setDetail(null)}
-            onInstall={() => setPending(detail)}
+            onAction={() => requestAction(detail)}
           />
         )}
       </AnimatePresence>
 
       {pending && (
         <InstallConfirm
-          plugin={pending}
-          busy={busyId === pending.id}
+          plugin={pending.plugin}
+          plan={pending.plan}
+          busy={busyId === pending.plugin.id}
           onCancel={() => setPending(null)}
-          onConfirm={() => void doInstall(pending)}
+          onConfirm={() => void performInstall(pending.plugin, pending.plan)}
         />
       )}
     </div>

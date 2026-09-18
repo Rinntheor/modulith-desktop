@@ -15,6 +15,8 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import { pluginIndexSources, registrySources } from '../config/pluginRegistry';
+import { isNewer } from '../utils/semver';
+import { getPermissionDescriptor } from './permissionRegistry';
 import { getInstalledPlugins } from './pluginRuntime';
 
 /** 本应用能理解的索引格式版本。索引里的值高于它时，提示更新应用而不是硬解析。 */
@@ -251,16 +253,96 @@ export async function loadIndex(options: { force?: boolean } = {}): Promise<Mark
 // 与本机状态对照
 // ============================================================
 
-/** 本机已安装的版本号；未安装返回 `null`。 */
-export function installedVersionOf(pluginId: string): string | null {
-  return getInstalledPlugins().find((p) => p.id === pluginId)?.version ?? null;
-}
-
 /** 取某个插件在索引里的最新版本条目 */
 export function latestVersionOf(plugin: MarketPlugin): MarketVersion {
   const found = plugin.versions.find((v) => v.version === plugin.latest);
   if (!found) fail(`索引里 ${plugin.id} 的 latest（${plugin.latest}）没有对应条目`);
   return found;
+}
+
+/** 本机某个插件相对索引最新版本的状态 */
+export type UpdateState =
+  | { kind: 'not-installed' }
+  | { kind: 'up-to-date'; version: string }
+  | { kind: 'update-available'; from: string; to: string }
+  | { kind: 'local-newer'; version: string }
+  | { kind: 'dev-linked'; version: string };
+
+/**
+ * 判断本机已安装版本与索引里的最新版本之间的关系。
+ *
+ * `dev-linked` 单独成一类，因为**市场不该更新开发链接的插件**：那会把它从"实时读取源
+ * 目录"换成"安装目录里的副本"，静默丢掉用户刻意选择的工作方式。它本来也不需要更新 ——
+ * 改了源码点刷新就生效。
+ *
+ * `local-newer` 也是一类：用户可能从 `.lcp` 装了比索引里更新的版本（比如索引还没更新）。
+ * 这时不该显示"可更新" —— 那会诱导用户降级。
+ */
+export function updateStateFor(plugin: MarketPlugin): UpdateState {
+  const installed = getInstalledPlugins().find((p) => p.id === plugin.id);
+  if (!installed) return { kind: 'not-installed' };
+  if (installed.devSource) return { kind: 'dev-linked', version: installed.version };
+
+  if (isNewer(plugin.latest, installed.version)) {
+    return { kind: 'update-available', from: installed.version, to: plugin.latest };
+  }
+  if (isNewer(installed.version, plugin.latest)) {
+    return { kind: 'local-newer', version: installed.version };
+  }
+  return { kind: 'up-to-date', version: installed.version };
+}
+
+/** 一次更新涉及的权限变化 */
+export interface UpdatePlan {
+  /** 本机当前版本 */
+  from: string;
+  version: MarketVersion;
+  /** 新版本新增的权限 */
+  added: string[];
+  /** 新版本不再申请的权限 */
+  removed: string[];
+  /** 这次「更新」实际是退回到更旧的版本 */
+  downgrade: boolean;
+  /**
+   * 是否需要用户明确确认。
+   *
+   * 规则见设计文档 3.8：权限变少、或只新增低风险权限时静默；**只要新增了中/高风险权限
+   * 就必须确认**，且用户拒绝时保留旧版本（不卸载、不回滚、不部分应用）。
+   *
+   * 判断依据是**等级而非数量** —— 新增十个低风险权限不该比新增一个高风险权限更受阻拦。
+   *
+   * 降级也一律确认：权限没变不代表用户想退回旧版本。本机版本比仓库新是可能发生的
+   * （从 `.lcp` 装了索引里还没有的版本），此时"重新安装"会被误当成升级。
+   */
+  needsConfirmation: boolean;
+}
+
+/**
+ * 规划一次更新。未安装时返回 `null`（那是首次安装，不是更新）。
+ *
+ * 权限基线取自**本机已安装插件自己的清单**，而不是索引里的历史条目：清单是权威的，
+ * 而且它反映的是用户实际同意过的那份权限集合。
+ */
+export function planUpdate(plugin: MarketPlugin): UpdatePlan | null {
+  const installed = getInstalledPlugins().find((p) => p.id === plugin.id);
+  if (!installed) return null;
+
+  const version = latestVersionOf(plugin);
+  const before = new Set(installed.manifest.permissions ?? []);
+  const after = new Set(version.permissions);
+
+  const added = version.permissions.filter((p) => !before.has(p));
+  const removed = (installed.manifest.permissions ?? []).filter((p) => !after.has(p));
+  const downgrade = isNewer(installed.version, version.version);
+
+  return {
+    from: installed.version,
+    version,
+    added,
+    removed,
+    downgrade,
+    needsConfirmation: downgrade || added.some((p) => getPermissionDescriptor(p).risk !== 'low'),
+  };
 }
 
 // ============================================================
