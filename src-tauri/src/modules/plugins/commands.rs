@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
 use super::permissions::PermissionDescriptor;
+use super::signature::{pubkey_from_plugin_config, verify_index_signature};
 use super::types::{
     ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio, PluginPermission,
 };
@@ -114,6 +115,26 @@ pub async fn fetch_registry_text(
 ) -> Result<String, String> {
     let manager = state.inner().0.read().await;
     manager.fetch_registry_text(&url).await.map_err(to_msg)
+}
+
+/// 校验插件索引的签名。
+///
+/// **调用方必须在解析索引之前调用它。** 索引是插件分发的信任根 —— 它同时给出「装什么」
+/// 与「校验哪个哈希」，因此一个被替换的索引可以连同包和哈希一起换掉。先解析再看结果等于
+/// 让不可信的内容先进入解析器。
+///
+/// 公钥取自 `tauri.conf.json` 的 `plugins.updater.pubkey`：与应用更新共用同一对密钥，
+/// 因此不在代码里再保存一份。缺公钥会**报错而不是放行**（见 `signature.rs`）。
+#[tauri::command]
+pub fn verify_plugin_index(
+    app: AppHandle,
+    index: String,
+    signature: String,
+) -> Result<(), String> {
+    let config = app.config();
+    let updater = config.plugins.0.get("updater");
+    let pubkey = pubkey_from_plugin_config(updater).map_err(to_msg)?;
+    verify_index_signature(&index, &signature, &pubkey).map_err(to_msg)
 }
 
 #[tauri::command]

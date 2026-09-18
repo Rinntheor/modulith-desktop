@@ -1,6 +1,6 @@
 [package]
 name = "modulith-desktop"
-version = "1.0.3"
+version = "1.1.0"
 description = "A modular desktop framework built with Tauri"
 authors = ["环理论 (Rinntheor)"]
 edition = "2021"
@@ -48,6 +48,12 @@ hmac = "0.12"
 # 采集硬件指纹（MAC / 主机名 / CPU / 核心数）
 sysinfo = "0.29"
 tauri-plugin-updater = "2.11.0"
+# 校验插件索引的 minisign 签名。
+#
+# 版本与 tauri-plugin-updater 的传递依赖保持一致（见 Cargo.lock）—— 两者必须能接受
+# 同一个 tauri signer 产出的签名，版本不一致会让「应用更新能装、插件市场打不开」
+# 这种组合出现，而那种现象极难归因。
+minisign-verify = "0.2.5"
 
 # ---- Windows 平台专属：提取可执行文件图标（src/modules/plugins/icon.rs）----
 # 用 windows-sys 而不是 windows：这里只需要几个 Win32 函数的裸声明，
