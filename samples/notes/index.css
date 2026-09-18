@@ -1,0 +1,460 @@
+/* samples/notes/index.css
+ *
+ * 为什么根元素用 `position: absolute; inset: 0`：
+ * 宿主的模块滚动容器（`.lc-tab-panel`）本身是 `position: absolute` 的，因此它就是
+ * 最近的定位祖先。absolute + inset:0 让这个插件正好铺满**模块可见区域**，
+ * 于是「左列表右编辑器」的两栏布局可以各占一半高度、各自内部滚动，
+ * 而不是让整个页面跟着正文一起变长。
+ *
+ * 好处是不必写死 `calc(100vh - 76px)` 这类算式 —— 那种算式把标题栏与二级标题栏
+ * 的高度抄了一份，宿主一改就错位。
+ *
+ * 配色沿用宿主的 `--accent-*` 变量，深色模式由宿主在 `:root` 上加 `.dark` 切换。
+ */
+
+.nt-root {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 24px 16px;
+  box-sizing: border-box;
+}
+
+/* ============================================================
+   工具栏
+   ============================================================ */
+
+.nt-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.nt-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #111827;
+  flex: 0 0 auto;
+}
+
+.nt-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 320px;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #111827;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 9px;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.nt-search:focus {
+  background: #ffffff;
+  border-color: var(--accent-400);
+}
+
+.nt-select {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #4b5563;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 9px;
+  outline: none;
+  cursor: pointer;
+}
+
+/* ============================================================
+   按钮
+   ============================================================ */
+
+.nt-btn {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-family: inherit;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.nt-btn-primary {
+  color: #ffffff;
+  background: var(--accent-500);
+}
+
+.nt-btn-primary:hover {
+  background: var(--accent-600);
+}
+
+.nt-btn-ghost {
+  color: #4b5563;
+  background: transparent;
+  border-color: #e5e7eb;
+}
+
+.nt-btn-ghost:hover {
+  background: #f9fafb;
+}
+
+/* ============================================================
+   两栏主体
+   ============================================================ */
+
+.nt-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(200px, 288px) 1fr;
+  gap: 12px;
+}
+
+/* ---- 左侧列表 ---- */
+
+.nt-list {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nt-item {
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.nt-item:hover {
+  background: #f9fafb;
+}
+
+.nt-item-active {
+  background: var(--accent-50);
+  border-color: var(--accent-200);
+}
+
+.nt-item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nt-item-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: #111827;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nt-item-pin {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--accent-500);
+}
+
+.nt-item-preview {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9ca3af;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nt-item-foot {
+  display: flex;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.nt-item-time {
+  flex: 1 1 auto;
+  font-size: 10px;
+  color: #9ca3af;
+}
+
+/* 行内小按钮平时隐形，悬停或选中时才出现 —— 列表因此保持干净 */
+.nt-item-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.nt-item:hover .nt-item-actions,
+.nt-item-active .nt-item-actions {
+  opacity: 1;
+}
+
+.nt-icon-btn {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1;
+  color: #9ca3af;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.nt-icon-btn:hover {
+  color: #4b5563;
+  background: #f3f4f6;
+}
+
+.nt-icon-btn-danger:hover {
+  color: #b91c1c;
+  background: #fef2f2;
+}
+
+/* ---- 右侧编辑器 ---- */
+
+.nt-editor {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.nt-editor-empty {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 13px;
+  color: #9ca3af;
+  border-style: dashed;
+  background: transparent;
+}
+
+.nt-editor-hint {
+  margin: 0;
+  font-size: 11px;
+  color: #cbd5e1;
+}
+
+.nt-editor-title {
+  flex: 0 0 auto;
+  padding: 4px 2px 8px;
+  font-size: 15px;
+  font-weight: 600;
+  font-family: inherit;
+  color: #111827;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid #f3f4f6;
+  outline: none;
+}
+
+.nt-editor-body {
+  flex: 1 1 auto;
+  min-height: 120px;
+  padding: 2px;
+  font-size: 13px;
+  line-height: 1.75;
+  font-family: inherit;
+  color: #374151;
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+}
+
+.nt-editor-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #f3f4f6;
+}
+
+.nt-editor-stat {
+  font-size: 11px;
+  color: #9ca3af;
+  white-space: nowrap;
+}
+
+.nt-editor-spacer {
+  flex: 1 1 auto;
+}
+
+/* ============================================================
+   其他
+   ============================================================ */
+
+.nt-empty {
+  padding: 24px 12px;
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: center;
+  color: #9ca3af;
+}
+
+.nt-footnote {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.nt-error {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+}
+
+.nt-error-text {
+  flex: 1 1 auto;
+  word-break: break-word;
+}
+
+.nt-error-close {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  font-size: 16px;
+  line-height: 1;
+  color: inherit;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.nt-error-close:hover {
+  opacity: 1;
+}
+
+/* 窄窗口：改成上下两段，列表压缩到三分之一高度 */
+@media (max-width: 820px) {
+  .nt-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(120px, 34%) 1fr;
+  }
+}
+
+/* ============================================================
+   深色模式
+   ============================================================ */
+
+:root.dark .nt-title,
+:root.dark .nt-item-title,
+:root.dark .nt-editor-title {
+  color: #e5e7eb;
+}
+
+:root.dark .nt-search,
+:root.dark .nt-select {
+  color: #e5e7eb;
+  background: #0e111a;
+  border-color: #2c3242;
+}
+
+:root.dark .nt-search:focus {
+  border-color: var(--accent-400);
+}
+
+:root.dark .nt-btn-ghost {
+  color: #cbd5e1;
+  border-color: #2c3242;
+}
+
+:root.dark .nt-btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+:root.dark .nt-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+:root.dark .nt-item-active {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: #3a4257;
+}
+
+:root.dark .nt-item-preview,
+:root.dark .nt-item-time,
+:root.dark .nt-editor-stat,
+:root.dark .nt-footnote,
+:root.dark .nt-empty {
+  color: #6b7280;
+}
+
+:root.dark .nt-icon-btn {
+  color: #6b7280;
+}
+
+:root.dark .nt-icon-btn:hover {
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+:root.dark .nt-icon-btn-danger:hover {
+  color: #fca5a5;
+  background: rgba(127, 29, 29, 0.25);
+}
+
+:root.dark .nt-editor {
+  background: #151823;
+  border-color: #2c3242;
+}
+
+:root.dark .nt-editor-empty {
+  color: #6b7280;
+  background: transparent;
+}
+
+:root.dark .nt-editor-hint {
+  color: #4b5563;
+}
+
+:root.dark .nt-editor-title {
+  border-bottom-color: #232838;
+}
+
+:root.dark .nt-editor-body {
+  color: #cbd5e1;
+}
+
+:root.dark .nt-editor-foot {
+  border-top-color: #232838;
+}
+
+:root.dark .nt-error {
+  color: #fca5a5;
+  background: rgba(127, 29, 29, 0.18);
+  border-color: #7f1d1d;
+}

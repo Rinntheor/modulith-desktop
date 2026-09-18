@@ -1,0 +1,22 @@
+{
+  "name": "com.modulith.sample.notes",
+  "displayName": "文本速记",
+  "version": "1.0.0",
+  "description": "随手记下想法、待办与片段。支持全文搜索、置顶、自动保存、多种排序与快捷键。",
+  "author": {
+    "name": "Modulith Samples",
+    "url": "https://github.com/Rinntheor/modulith-desktop"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/Rinntheor/modulith-desktop",
+  "categories": ["示例", "效率"],
+  "keywords": ["sample", "notes", "memo", "demo"],
+  "engines": {
+    "loopcore": ">=1.0.0"
+  },
+  "main": "index.js",
+  "style": "index.css",
+  "icon": "icon.svg",
+  "permissions": ["storage"],
+  "sandboxLevel": 1
+}
