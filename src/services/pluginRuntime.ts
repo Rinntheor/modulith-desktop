@@ -32,6 +32,7 @@ import { publish, subscribe, unsubscribeBySource, type EventHandler } from './ev
 import { registerCommand, unregisterCommandsByPrefix } from './commandRegistry';
 import { useModuleActive } from '../hooks/useModuleActive';
 import { isFileDropAvailable, subscribeFileDrop } from './fileDrop';
+import { clearModuleComponentCache } from './moduleComponentCache';
 
 /**
  * 宿主版本号的**占位初值**。
@@ -144,6 +145,14 @@ export interface InstalledPlugin {
   hasStyle: boolean;
   readme: string | null;
   /**
+   * 开发链接：该插件当前正从哪个源目录实时读取（只有「从目录安装」且该目录
+   * 仍然有效时才有值）。
+   *
+   * 后端会把清单与资源都从该目录读，因此改完代码点刷新即生效；`path` 此时
+   * 也等于这个目录。源目录被删掉后后端不再报告它（退回安装目录的副本）。
+   */
+  devSource?: string;
+  /**
    * 引擎范围不匹配时的提示。
    *
    * 注意它**不表示插件不可用**：`engines.loopcore` 在 0.x 阶段很脆弱
@@ -178,6 +187,17 @@ export interface PluginLoadState {
 let installed: InstalledPlugin[] = [];
 const loadStates = new Map<string, PluginLoadState>();
 const listeners = new Set<() => void>();
+
+/**
+ * 是否已经完整地拉取过一次插件列表。
+ *
+ * 用途：插件是**后台加载**的，`installed` 在加载完成前一直是空数组。
+ * 界面不能把「还没加载」当成「一个插件都没装」—— 那会让用户在打开插件页的
+ * 瞬间看到「还没有安装任何插件」的空状态，然后插件突然冒出来。
+ * 单靠 `isPluginCatalogLoading()` 不够：它只在加载**进行中**为真，而用户完全
+ * 可能在后台加载开始之前就打开了插件页。
+ */
+let runtimeLoadedOnce = false;
 
 /** 正在被加载的插件 ID（脚本同步执行期间有效） */
 let loadingPluginId: string | null = null;
@@ -219,6 +239,11 @@ export function getInstalledPlugins(): InstalledPlugin[] {
 /** 加载状态表 */
 export function getLoadStates(): Map<string, PluginLoadState> {
   return loadStates;
+}
+
+/** 是否已经完整地拉取过一次插件列表（见 `runtimeLoadedOnce` 的说明） */
+export function hasPluginRuntimeLoaded(): boolean {
+  return runtimeLoadedOnce;
 }
 
 /** 某个插件的加载状态 */
@@ -964,9 +989,17 @@ export async function reloadPluginRuntime(
   installHostGlobals();
 
   installed = await invoke<InstalledPlugin[]>('list_plugins');
+  runtimeLoadedOnce = true;
 
   // 清空全部动态模块，避免残留已卸载插件注册的模块
   clearDynamicModules();
+
+  // 作废已缓存的模块组件。**必须在这里做，而不是让调用方各自记得**：
+  // 下面每个插件的 registerModule() 都会为同一模块 ID 造一个全新的懒加载
+  // 组件（闭包指向新 bundle 里的函数），而 ModuleRenderer 命中缓存后就不会再
+  // 看描述符里的新组件。漏掉这一步的表现是「插件改了、刷新了、界面没变」——
+  // 也就是必须删掉插件重装才生效。统一放在重载入口，所有路径都被覆盖。
+  clearModuleComponentCache();
 
   // 移除列表中已不存在或已禁用的插件资源
   const activeIds = new Set(

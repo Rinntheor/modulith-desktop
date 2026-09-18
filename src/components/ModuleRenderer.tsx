@@ -7,6 +7,18 @@ import {
   isPluginCatalogLoading,
   subscribeCatalog,
 } from '../services/moduleCatalog';
+import {
+  clearModuleComponentCache,
+  getCachedModuleComponent,
+  setCachedModuleComponent,
+} from '../services/moduleComponentCache';
+
+/**
+ * 兼容再导出：模块组件缓存已移入 `services/moduleComponentCache`，
+ * 由 `pluginRuntime` 在重载运行时统一作废。这里保留导出名，避免调用方
+ * （`Home` 的手动刷新路径）被这次重构波及。
+ */
+export { clearModuleComponentCache };
 
 interface ModuleRendererProps {
   moduleId: string;
@@ -175,60 +187,6 @@ class ModuleErrorBoundary extends React.Component<
   }
 }
 
-/**
- * 组件缓存管理器
- * 使用模块级缓存替代全局缓存，防止内存泄漏
- */
-const ComponentCacheManager = {
-  cache: new Map<string, React.LazyExoticComponent<React.ComponentType<any>>>(),
-
-  /**
-   * 获取缓存的组件
-   */
-  get(moduleId: string): React.LazyExoticComponent<React.ComponentType<any>> | null {
-    return this.cache.get(moduleId) || null;
-  },
-
-  /**
-   * 设置缓存的组件
-   */
-  set(moduleId: string, component: React.LazyExoticComponent<React.ComponentType<any>>): void {
-    this.cache.set(moduleId, component);
-  },
-
-  /**
-   * 清理指定模块的缓存
-   */
-  clear(moduleId: string): void {
-    this.cache.delete(moduleId);
-  },
-
-  /**
-   * 清理所有缓存
-   */
-  clearAll(): void {
-    this.cache.clear();
-  },
-
-  /**
-   * 清理过期缓存
-   *
-   * 说明：缓存条目目前不记录时间戳，无法按时间淘汰，因此直接清空。
-   * 如果之后需要按时间淘汰，需要在 set() 时记录 Date.now()。
-   */
-  clearExpired(): void {
-    this.cache.clear();
-  },
-};
-
-/**
- * 清空模块组件缓存。
- * 插件重载/刷新后必须调用，否则会继续复用旧插件注册的组件实例。
- */
-export function clearModuleComponentCache(): void {
-  ComponentCacheManager.clearAll();
-}
-
 const ModuleRenderer: React.FC<ModuleRendererProps> = memo(({ moduleId, initial = true }) => {
   // 订阅模块目录：插件在后台注册模块时必须让这里重新求值。
   // 用目录版本号（而不是动态模块数量）做信号 —— 插件替换同名模块时
@@ -241,11 +199,11 @@ const ModuleRenderer: React.FC<ModuleRendererProps> = memo(({ moduleId, initial 
   const moduleDescriptor = useMemo(() => {
     const descriptor = getCatalogFlatMap().get(moduleId);
     if (descriptor) {
-      // 检查是否已缓存
-      const cachedComponent = ComponentCacheManager.get(moduleId);
-      if (!cachedComponent) {
-        // 如果没有缓存，则添加到缓存
-        ComponentCacheManager.set(moduleId, descriptor.component);
+      // 首次见到该模块时记下它的组件。注意这里**只在缓存为空时写入**：
+      // 缓存由 pluginRuntime 在重载运行时统一作废（见 moduleComponentCache.ts），
+      // 因此「描述符换了新组件、缓存还留着旧的」这种状态不会出现。
+      if (!getCachedModuleComponent(moduleId)) {
+        setCachedModuleComponent(moduleId, descriptor.component);
       }
     }
     return descriptor;
@@ -261,7 +219,7 @@ const ModuleRenderer: React.FC<ModuleRendererProps> = memo(({ moduleId, initial 
   }
 
   // 使用缓存的组件
-  const CachedComponent = ComponentCacheManager.get(moduleId) || moduleDescriptor.component;
+  const CachedComponent = getCachedModuleComponent(moduleId) || moduleDescriptor.component;
 
   return (
     <ModuleErrorBoundary moduleId={moduleId}>
