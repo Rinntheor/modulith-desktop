@@ -32,9 +32,11 @@
     "noFallthroughCasesInSwitch": true
   },
   /*
-   * `src/types/**` 只保留脚本真正引用的类型文件：
+   * `src/types/**` 与 `src/utils/semver.ts` 只保留脚本真正引用的类型/实现文件：
    * generate-modules.ts 会 `import type { ModuleToml } from '../src/types/module.ts'`，
-   * 该文件必须属于本 project，否则报 TS6307。
+   * check-semver.ts 会 `import { ... } from '../src/utils/semver.ts'`，
+   * 这两个文件必须属于本 project，否则整次检查以 TS6307 直接失败 ——
+   * 而失败会盖住后面所有的真实错误，等于脚本从来没有被检查过。
    */
-  "include": ["vite.config.ts", "scripts/**/*.ts", "src/types/module.ts"]
+  "include": ["vite.config.ts", "scripts/**/*.ts", "src/types/module.ts", "src/utils/semver.ts"]
 }
