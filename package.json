@@ -10,6 +10,7 @@
     "gen:backend": "node scripts/generate-backend-module.ts",
     "check:samples": "node scripts/check-samples.ts",
     "check:semver": "node scripts/check-semver.ts",
+    "release": "node scripts/release.ts",
     "release:manifest": "node scripts/generate-latest-json.ts",
     "ver": "node scripts/version-manager.ts",
     "ver:fix": "node scripts/version-manager.ts sync",
