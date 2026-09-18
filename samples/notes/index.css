@@ -18,11 +18,18 @@
   box-sizing: border-box;
 }
 
-/* 内容限宽并居中：一行太长会难读 */
-.nt-root > * {
+/*
+ * 内容限宽并居中。
+ *
+ * 限宽必须落在一个**显式容器**上，而不是写成 `.nt-root > *`：
+ * 那种选择器（一个类 + 通配）与子元素自己的 `.nt-list-head { margin: 20px 0 8px }`
+ * 特异度相同，而后者在样式表里更靠后 —— 简写 `margin` 会把 auto 左右边距覆盖成
+ * 0，于是「已记下」那一行在宽窗口（全屏）下贴到最左边，其余内容却仍然居中。
+ * 用一个专用容器来居中，子元素怎么写 margin 都不会再破坏它。
+ */
+.nt-inner {
   max-width: 720px;
-  margin-left: auto;
-  margin-right: auto;
+  margin: 0 auto;
 }
 
 .nt-head {
@@ -155,7 +162,10 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 20px 0 8px;
+  /* 用长写而不是简写 `margin`：简写会连带把左右边距写死，
+     一旦这个元素将来又回到「靠 auto 边距居中」的布局里就会静默错位。 */
+  margin-top: 20px;
+  margin-bottom: 8px;
 }
 
 .nt-list-title {

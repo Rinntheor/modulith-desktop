@@ -1,7 +1,7 @@
 {
   "name": "com.modulith.sample.pomodoro",
   "displayName": "番茄工作钟",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "专注 / 短休息 / 长休息循环计时，时长、轮次、提示音与自动开始全部可调。结束时通过应用内通知提醒。",
   "author": {
     "name": "Modulith Samples",

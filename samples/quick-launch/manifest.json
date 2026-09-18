@@ -1,7 +1,7 @@
 {
   "name": "com.modulith.sample.quick-launch",
   "displayName": "快捷启动",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "把常用程序收在一处，点一下就打开。支持分组、多种视图、拖入添加、图标提取、备注与右键菜单；演示 process-spawn / filesystem-read 两项原生能力的用法。",
   "author": {
     "name": "Modulith Samples",

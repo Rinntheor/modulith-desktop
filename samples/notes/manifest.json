@@ -1,8 +1,8 @@
 {
   "name": "com.modulith.sample.notes",
   "displayName": "文本速记",
-  "version": "1.0.0",
-  "description": "随手记下想法、待办与片段。支持全文搜索、置顶、自动保存、多种排序与快捷键。",
+  "version": "1.0.1",
+  "description": "把想到的事写进上面那个框，点保存就收进下面的列表。可复制、修改、删除，不必先想标题。",
   "author": {
     "name": "Modulith Samples",
     "url": "https://github.com/Rinntheor/modulith-desktop"

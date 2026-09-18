@@ -524,22 +524,34 @@
     return h(
       'div',
       { className: 'nt-root' },
+      // 单列内容整体包一层 .nt-inner：限宽与居中都由它负责。
+      //
+      // 为什么必须有这一层（而不是让 .nt-root 直接对子元素下 max-width + auto
+      // margin）：那种写法与子元素自己的 `.nt-list-head { margin: 20px 0 8px }`
+      // 特异度相同，而后者在样式表里更靠后 —— 简写的 margin 会把 auto 覆盖成 0。
+      // 结果是那一行标题在宽窗口下甩到最左边，其余内容仍居中。
+      // 一个显式的居中容器不参与这种竞争：任何子元素的 margin 都改不动它。
       h(
         'div',
-        { className: 'nt-head' },
-        h('h1', { className: 'nt-title' }, '文本速记'),
-        h('span', { className: 'nt-subtitle' }, '想到什么就写下来，不必先想标题')
+        { className: 'nt-inner' },
+        h(
+          'div',
+          { className: 'nt-head' },
+          h('h1', { className: 'nt-title' }, '文本速记'),
+          h('span', { className: 'nt-subtitle' }, '想到什么就写下来，不必先想标题')
+        ),
+        composer,
+        errorNode,
+        h(
+          'div',
+          { className: 'nt-list-head' },
+          h('span', { className: 'nt-list-title' }, '已记下'),
+          h('span', { className: 'nt-count' }, String(items.length))
+        ),
+        list,
+        h('div', { className: 'nt-footnote' }, '数据保存在插件自己的存储中，卸载插件会一并清除')
       ),
-      composer,
-      errorNode,
-      h(
-        'div',
-        { className: 'nt-list-head' },
-        h('span', { className: 'nt-list-title' }, '已记下'),
-        h('span', { className: 'nt-count' }, String(items.length))
-      ),
-      list,
-      h('div', { className: 'nt-footnote' }, '数据保存在插件自己的存储中，卸载插件会一并清除'),
+      // 轻提示固定在窗口右下角，不参与上面的限宽列，因此留在 .nt-inner 之外
       toast ? h('div', { className: 'nt-toast' }, toast) : null
     );
   }
