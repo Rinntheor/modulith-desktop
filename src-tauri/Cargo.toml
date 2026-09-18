@@ -1,6 +1,6 @@
 [package]
 name = "modulith-desktop"
-version = "1.0.3"
+version = "1.1.0"
 description = "A modular desktop framework built with Tauri"
 authors = ["环理论 (Rinntheor)"]
 edition = "2021"

@@ -1,7 +1,7 @@
 {
   "name": "modulith-desktop",
   "private": true,
-  "version": "1.0.3",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && vite",
