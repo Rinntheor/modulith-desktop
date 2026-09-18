@@ -1,0 +1,213 @@
+/* samples/reference/index.css
+ *
+ * 参考插件的样式。除了把界面写得能看，它同时示范三件与「插件」身份有关的事：
+ *
+ *   1. **类名带插件专属前缀**（`rf-`），避免与宿主或其它插件冲突；
+ *   2. **颜色复用宿主的 `--accent-*` 变量**，于是它跟随用户选的主题配色；
+ *   3. **为 `:root.dark` 补一份深色样式** —— 少了它，深色模式下会得到一片刺眼的
+ *      浅色方块。宿主是在 `:root` 上切换 `.dark` 的，插件只需要按这个选择器再写一份。
+ *
+ * 不用 Tailwind 工具类：Tailwind 是在**构建宿主时**扫描源码生成类名的，而插件是运行时
+ * 才注入的 —— 插件里写的 `bg-white` 不在那次扫描范围内，不会生成对应规则。它「有时能用」
+ * 只是因为那个类名恰好被宿主自己用到了。
+ *
+ * 根元素用 `position: absolute; inset: 0` 铺满**模块可见区域**（宿主每个标签的滚动容器
+ * 就是最近的定位祖先），这样不必写死 `calc(100vh - 76px)` 这类算式 —— 那种算式把标题栏
+ * 与二级标题栏的高度抄了一份，宿主一改就错位。
+ */
+
+/*
+ * 内容限宽居中，用 **flex 的 align-items** 而不是给子元素设左右 margin。
+ *
+ * 理由是踩过的坑：`.rf-root > *`（一个类 + 通配）与子元素自己的 `.rf-card { margin: … }`
+ * 特异度相同，而后者在样式表里更靠后 —— 子元素的简写 `margin` 会把 auto 左右边距覆盖成
+ * 0，于是「居中」在某个子元素上静默失效。改用 flex 居中之后，子元素怎么写 margin 都破坏
+ * 不了它。另一个做法是专门套一个容器（`notes` 就是这么做的），两者都行，这里选了少一层
+ * DOM 的那个。
+ */
+.rf-root {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 20px 24px 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.rf-root > * {
+  width: 100%;
+  max-width: 760px;
+}
+
+.rf-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--accent-700, #3730a3);
+}
+
+.rf-lead {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #4b5563;
+}
+
+.rf-card {
+  margin-bottom: 12px;
+  padding: 14px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.rf-card__title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #111827;
+}
+
+.rf-muted {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #6b7280;
+}
+
+.rf-value {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: #111827;
+}
+
+.rf-value strong {
+  font-size: 15px;
+  color: var(--accent-600, #4f46e5);
+}
+
+.rf-warn {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--accent-200, #c7d2fe);
+  border-radius: 8px;
+  background: var(--accent-50, #eef2ff);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--accent-700, #3730a3);
+}
+
+.rf-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rf-btn {
+  padding: 6px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 12px;
+  color: #374151;
+  cursor: pointer;
+}
+
+.rf-btn:hover {
+  background: #f9fafb;
+}
+
+.rf-btn--primary {
+  border-color: transparent;
+  background: var(--accent-600, #4f46e5);
+  color: #fff;
+}
+
+.rf-btn--primary:hover {
+  background: var(--accent-700, #4338ca);
+}
+
+.rf-log {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.rf-log__row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #f3f4f6;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.rf-log__row:last-child {
+  border-bottom: 0;
+}
+
+.rf-log__time {
+  flex-shrink: 0;
+  color: #9ca3af;
+  font-variant-numeric: tabular-nums;
+}
+
+.rf-log__text {
+  min-width: 0;
+  color: #374151;
+  word-break: break-word;
+}
+
+/* ---- 深色模式：宿主在 :root 上加 .dark ---- */
+
+:root.dark .rf-title {
+  color: var(--accent-300, #a5b4fc);
+}
+
+:root.dark .rf-lead,
+:root.dark .rf-muted {
+  color: #9ca3af;
+}
+
+:root.dark .rf-card {
+  border-color: #374151;
+  background: #1f2937;
+}
+
+:root.dark .rf-card__title,
+:root.dark .rf-value {
+  color: #f3f4f6;
+}
+
+:root.dark .rf-value strong {
+  color: var(--accent-400, #818cf8);
+}
+
+:root.dark .rf-warn {
+  border-color: rgb(from var(--accent-500) r g b / 0.4);
+  background: rgb(from var(--accent-500) r g b / 0.16);
+  color: var(--accent-300, #a5b4fc);
+}
+
+:root.dark .rf-btn {
+  border-color: #374151;
+  background: #111827;
+  color: #d1d5db;
+}
+
+:root.dark .rf-btn:hover {
+  background: #1f2937;
+}
+
+:root.dark .rf-log__row {
+  border-bottom-color: #374151;
+}
+
+:root.dark .rf-log__text {
+  color: #d1d5db;
+}

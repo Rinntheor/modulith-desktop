@@ -114,7 +114,7 @@ modulith-desktop/
     src/core/              模块抽象与注册表
     src/modules/           内建后端模块
   scripts/                 构建与维护脚本
-  samples/                 示例插件
+  samples/reference/       参考插件：只示范不需要危险权限的核心接口，可直接复制
   docs/                    文档
   version.toml             版本号唯一事实来源
 ```
@@ -144,7 +144,7 @@ cd src-tauri && cargo test --offline --lib
 pnpm check:samples                    # 改了 samples/ 才需要
 ```
 
-`cargo test` 里有一条检查**示例包是否与源码一致**：它解压每个 `.lcp` 并逐个文件比对，
+`cargo test` 里有一条检查**示例包是否与源码一致**：它解压那个 `.lcp` 并逐个文件比对，
 因此改完插件忘记重新打包会直接失败（这个错我犯过两次，所以现在有测试兜着）。
 `pnpm check:samples` 则检查示例插件的清单与代码对不对得上 —— 用了却没声明、
 声明了却没用，两种都报。

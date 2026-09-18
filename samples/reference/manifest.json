@@ -1,0 +1,26 @@
+{
+  "name": "com.modulith.sample.reference",
+  "displayName": "宿主接口参考",
+  "version": "1.0.0",
+  "description": "不提供功能，只把不需要危险权限的核心宿主接口逐个示范一遍：模块注册、存储、通知、事件、窗口级监听与日志。",
+  "author": {
+    "name": "环理论",
+    "url": "https://github.com/Rinntheor"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/Rinntheor/modulith-desktop/tree/main/samples/reference",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rinntheor/modulith-desktop.git"
+  },
+  "categories": ["示例"],
+  "keywords": ["sample", "reference", "api", "demo"],
+  "engines": {
+    "loopcore": ">=1.0.0"
+  },
+  "main": "index.js",
+  "style": "index.css",
+  "icon": "icon.svg",
+  "permissions": ["storage", "notification", "plugin-communicate"],
+  "sandboxLevel": 1
+}

@@ -1944,17 +1944,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 用仓库里真实的示例插件包各做一次完整解压 + 校验。
+    /// 用仓库里真实的示例插件包做一次完整解压 + 校验。
     ///
-    /// 这是对「导入 .lcp 报条目逃出目标目录」那个 bug 最直接的回归测试 ——
-    /// 覆盖全部示例而不是某一个，样本越多越不容易漏。
+    /// 这是对「导入 .lcp 报条目逃出目标目录」那个 bug 最直接的回归测试。
     ///
     /// 它同时是**对已打包产物**的检查：解压出来的目录要能通过 `validate_manifest`，
     /// 也就是仓库里那个 `.lcp` 真的可安装，而不只是源码看起来对。
+    ///
+    /// 仓库里只有一个示例插件（`samples/reference`）。另外三个完整示例
+    /// （`com.modulith.sample.notes` / `pomodoro` / `quick-launch`）已经迁到插件仓库
+    /// `modulith-plugins`，那边由 `scripts/build.ts` 负责打包，同样会在构建时复核
+    /// 每个包与索引记录一致。
     #[test]
     fn extracts_and_validates_real_sample_lcps() {
         let samples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../samples");
-        let packages = ["notes.lcp", "pomodoro.lcp", "quick-launch.lcp"];
+        let packages = ["reference.lcp"];
 
         let mut checked = 0;
         for name in packages {
@@ -2244,31 +2248,14 @@ mod tests {
     }
 
     #[test]
-    fn quick_launch_sample_manifest_is_valid() {
+    fn reference_sample_manifest_is_valid() {
         assert_sample_manifest_valid(
-            "quick-launch",
-            &[
-                PluginPermission::Storage,
-                PluginPermission::ProcessSpawn,
-                PluginPermission::FilesystemRead,
-            ],
-        );
-    }
-
-    #[test]
-    fn notes_sample_manifest_is_valid() {
-        assert_sample_manifest_valid("notes", &[PluginPermission::Storage]);
-    }
-
-    #[test]
-    fn pomodoro_sample_manifest_is_valid() {
-        assert_sample_manifest_valid(
-            "pomodoro",
+            "reference",
             &[
                 PluginPermission::Storage,
                 PluginPermission::Notification,
-                // 自定义提示音要导入本机音频文件
-                PluginPermission::FilesystemRead,
+                // 插件之间通信（事件总线）
+                PluginPermission::PluginCommunicate,
             ],
         );
     }
