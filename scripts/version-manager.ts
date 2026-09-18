@@ -42,6 +42,7 @@ const VERSION_FILE = join(PROJECT_ROOT, 'version.toml');
 
 const CONFIG_FILES = {
   cargo: join(PROJECT_ROOT, 'src-tauri', 'Cargo.toml'),
+  cargoLock: join(PROJECT_ROOT, 'src-tauri', 'Cargo.lock'),
   package: join(PROJECT_ROOT, 'package.json'),
   tauri: join(PROJECT_ROOT, 'src-tauri', 'tauri.conf.json'),
 } as const;
@@ -351,6 +352,63 @@ function updateCargoToml(config: VersionConfig): boolean {
   return true;
 }
 
+/** 读取 Cargo.toml 里 [package] 段的 name —— Cargo.lock 要靠它定位本包条目 */
+function readCrateName(): string | null {
+  if (!existsSync(CONFIG_FILES.cargo)) return null;
+
+  const content = readFileSync(CONFIG_FILES.cargo, 'utf-8');
+  const packageEnd = content.indexOf('\n[', content.indexOf('[package]') + 1);
+  const head = packageEnd === -1 ? content : content.slice(0, packageEnd);
+  const match = /^name\s*=\s*"(.*)"$/m.exec(head);
+  return match ? match[1] : null;
+}
+
+/**
+ * 匹配 Cargo.lock 里本包自己的那个 `[[package]]` 条目。
+ *
+ * 捕获组：[1] 前缀、[2] 旧版本号、[3] 收尾引号 —— 以便用 `$1…$3` 只换中间那段。
+ */
+function cargoLockEntryRe(crateName: string): RegExp {
+  const escaped = crateName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(\\[\\[package\\]\\]\\r?\\nname = "${escaped}"\\r?\\nversion = ")([^"]*)(")`);
+}
+
+/**
+ * 同步 Cargo.lock 里本包自己的 version。
+ *
+ * 这个文件由 cargo 生成，但**本包自身的版本号**只是 Cargo.toml 的镜像：不同步它，
+ * `pnpm ver bump` 之后工作区就是脏的 —— 下一次 cargo 构建会顺手把它改回来，
+ * 于是「提交完再发布」这一步会撞上工作区不干净，而问题看起来跟版本号毫无关系。
+ *
+ * 只动 `name = "<本包>"` 那个条目：依赖项也带 version 字段，全局替换会改坏别人的版本。
+ */
+function updateCargoLock(config: VersionConfig): boolean {
+  if (!existsSync(CONFIG_FILES.cargoLock)) {
+    printWarning('Cargo.lock not found', 'skipped');
+    return false;
+  }
+
+  const crateName = readCrateName();
+  if (!crateName) {
+    printWarning('No package name in Cargo.toml', 'Cargo.lock skipped');
+    return false;
+  }
+
+  const content = readFileSync(CONFIG_FILES.cargoLock, 'utf-8');
+  const re = cargoLockEntryRe(crateName);
+  const match = re.exec(content);
+
+  if (!match) {
+    printWarning(`No "${crateName}" entry in Cargo.lock`, 'skipped');
+    return false;
+  }
+  if (match[2] === config.app.version) return false;
+
+  writeFileSync(CONFIG_FILES.cargoLock, content.replace(re, `$1${config.app.version}$3`), 'utf-8');
+  printSuccess('Cargo.lock', `version ${symbols.arrow} ${config.app.version}`);
+  return true;
+}
+
 function updatePackageJson(config: VersionConfig): boolean {
   if (!existsSync(CONFIG_FILES.package)) {
     printWarning('package.json not found', 'skipped');
@@ -395,7 +453,12 @@ function updateTauriConfig(config: VersionConfig): boolean {
 
 function updateConfigFiles(config: VersionConfig): number {
   printStep('Syncing config files');
-  const results = [updateCargoToml(config), updatePackageJson(config), updateTauriConfig(config)];
+  const results = [
+    updateCargoToml(config),
+    updateCargoLock(config),
+    updatePackageJson(config),
+    updateTauriConfig(config),
+  ];
   const changed = results.filter(Boolean).length;
   if (changed === 0) printInfo('All config files already in sync');
   return changed;
@@ -621,14 +684,14 @@ function bumpVersion(type: BumpType): void {
     printStep('Updating CHANGELOG');
     generateChangelog(config, previousTag);
     console.log();
-
-    printStep('Creating git tag');
-    if (createVersionTag(config.build.full_version)) {
-      printSuccess('Tagged', `v${config.build.full_version}`);
-      printDim('Push with: git push --follow-tags');
-    }
-    console.log();
   }
+
+  // tag **不在这里打**。bump 只改文件，改完还没提交 —— 此刻 HEAD 仍是升级前的提交，
+  // 在这里打 tag 会指向旧代码，而这一点很难被发现（tag 存在、名字也对）。
+  // 提交之后用 `pnpm ver tag` 打，tag 才真正指向这次发布。
+  printStep('Next step');
+  printDim('提交后执行 pnpm ver tag，把 tag 打在这次提交上。');
+  console.log();
 }
 
 // ==================== git 访问层 ====================
@@ -646,7 +709,9 @@ export interface GitAdapter {
   log(from: string | null): string[];
   latestTag(): string | null;
   listTags(): string[];
-  createTag(tag: string, message: string): void;
+  createTag(tag: string, message: string, force?: boolean): void;
+  /** 某个引用指向的提交哈希；引用不存在时返回空串 */
+  commitOf(ref: string): string;
 }
 
 /** 基于子进程的默认实现 */
@@ -669,11 +734,15 @@ const childProcessGit: GitAdapter = {
     const out = gitOut(['tag', '--list']);
     return out ? out.split('\n').filter(Boolean) : [];
   },
-  createTag(tag, message) {
-    execFileSync('git', ['tag', '-a', tag, '-m', message], {
+  createTag(tag, message, force = false) {
+    const flags = force ? ['-f'] : [];
+    execFileSync('git', ['tag', ...flags, '-a', tag, '-m', message], {
       cwd: PROJECT_ROOT,
       stdio: 'pipe',
     });
+  },
+  commitOf(ref) {
+    return gitOut(['rev-list', '-n', '1', ref]);
   },
 };
 
@@ -720,22 +789,66 @@ function warnIfDirty(): void {
   }
 }
 
-/** 为当前版本打 tag；已存在同名 tag 时返回 false 而不是报错 */
-function createVersionTag(fullVersion: string): boolean {
-  const tag = `v${fullVersion}`;
+/**
+ * 在当前 HEAD 上创建（或移动）本版本的附注 tag。
+ *
+ * 为什么不让 `bump` 顺手打 tag：tag 必须落在**包含版本变更的那个提交**上，而 bump
+ * 只改文件、不提交 —— 那时 HEAD 仍指向升级前的提交。在那里打 tag 会得到一个
+ * 「名字正确、内容错一代」的 tag，而且从 tag 列表上完全看不出来。
+ *
+ * 因此这里坚持工作区必须干净：脏工作区打出的 tag，指向的提交里没有这些改动，
+ * 正是同一个问题的另一种形式。
+ */
+function tagCurrentVersion(force: boolean): number {
+  if (!isGitRepo()) {
+    printError('Not a git repository', 'cannot create tag');
+    return 1;
+  }
+
+  const config = readVersionFile();
+  const tag = `v${config.build.full_version}`;
+
+  printTitle('Tag current version', tag);
+  console.log();
+
+  const dirty = git.status();
+  if (dirty) {
+    printError('Working tree is not clean', `${dirty.split('\n').length} file(s) changed`);
+    printDim('先提交，再打 tag —— 否则 tag 指向的提交里没有这些改动。');
+    console.log();
+    return 1;
+  }
+
+  const head = git.commitOf('HEAD');
+  const existing = git.listTags().includes(tag) ? git.commitOf(tag) : '';
+
+  if (head && existing === head) {
+    printSuccess('Tag already points at HEAD', tag);
+    console.log();
+    return 0;
+  }
+
+  if (existing && !force) {
+    printError('Tag already exists elsewhere', `${tag} ${symbols.arrow} ${existing.slice(0, 7)}`);
+    printDim(`当前 HEAD 是 ${head.slice(0, 7)}。`);
+    printDim('要把它移到 HEAD：pnpm ver tag --force');
+    printDim('但若这个 tag 已经推到远端，移动它会让远端与本地不一致 —— 那种情况应当换个新版本号。');
+    console.log();
+    return 1;
+  }
 
   try {
-    if (git.listTags().includes(tag)) {
-      printWarning('Tag already exists', tag);
-      return false;
-    }
-
-    git.createTag(tag, `Release ${tag}`);
-    return true;
+    git.createTag(tag, `Release ${tag}`, force);
   } catch (err) {
-    printWarning('Failed to create tag', String(err));
-    return false;
+    printError('Failed to create tag', String(err));
+    console.log();
+    return 1;
   }
+
+  printSuccess(existing ? 'Tag moved to HEAD' : 'Tagged', tag);
+  printDim('Push with: git push --follow-tags');
+  console.log();
+  return 0;
 }
 
 // ==================== CHANGELOG ====================
@@ -898,6 +1011,17 @@ function checkVersion(): void {
     printWarning('Cargo.toml not found', 'skipped');
   }
 
+  // Cargo.lock 里本包的版本号只是 Cargo.toml 的镜像，但不同步它工作区就是脏的 ——
+  // 而发布前要求「提交完、工作区干净」，那次失败看起来与版本号毫无关系。
+  const crateName = readCrateName();
+  if (existsSync(CONFIG_FILES.cargoLock) && crateName) {
+    const content = readFileSync(CONFIG_FILES.cargoLock, 'utf-8');
+    const m = cargoLockEntryRe(crateName).exec(content);
+    check('Cargo.lock', m?.[2], config.app.version);
+  } else {
+    printWarning('Cargo.lock not found', 'skipped');
+  }
+
   if (existsSync(CONFIG_FILES.package)) {
     const pkg = JSON.parse(readFileSync(CONFIG_FILES.package, 'utf-8'));
     check('package.json', pkg.version, config.app.version);
@@ -1003,9 +1127,12 @@ function printUsage(): void {
   console.log(`  ${c.info('pnpm ver sync --dry-run')}           ${c.dim('Preview changes without writing')}`);
   console.log(`  ${c.info('pnpm ver check')}                    ${c.dim('Verify all files match version.toml')}`);
   console.log(`  ${c.info('pnpm ver changelog')}                ${c.dim('Regenerate CHANGELOG.md from git history')}`);
+  console.log(`  ${c.info('pnpm ver tag')}                      ${c.dim('Tag HEAD with the current version (run after committing)')}`);
+  console.log(`  ${c.info('pnpm ver tag --force')}              ${c.dim('Move an existing tag to HEAD')}`);
   console.log();
   console.log(c.bold('Config files (automatically updated):'));
   console.log(`  ${c.dim(symbols.bullet)} src-tauri/Cargo.toml       ${c.dim(`${symbols.arrow} [package].version`)}`);
+  console.log(`  ${c.dim(symbols.bullet)} src-tauri/Cargo.lock       ${c.dim(`${symbols.arrow} this crate's [[package]] version`)}`);
   console.log(`  ${c.dim(symbols.bullet)} package.json               ${c.dim(`${symbols.arrow} version`)}`);
   console.log(`  ${c.dim(symbols.bullet)} src-tauri/tauri.conf.json  ${c.dim(`${symbols.arrow} version, productName, app.windows[0].title`)}`);
   console.log();
@@ -1065,6 +1192,10 @@ function main(): void {
       changelogOnly();
       break;
 
+    case 'tag':
+      if (tagCurrentVersion(args.includes('--force')) !== 0) process.exit(1);
+      break;
+
     default:
       printError('Unknown command', String(command));
       printUsage();
@@ -1084,6 +1215,7 @@ export {
   updateMarkedFiles,
   buildMarkers,
   checkVersion,
+  tagCurrentVersion,
   classifyCommit,
   cleanSubject,
   generateChangelog,
