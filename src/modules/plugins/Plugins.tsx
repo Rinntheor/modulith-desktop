@@ -28,10 +28,11 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { moduleManager } from '../../services/moduleManager';
 import { getCachedSettings } from '../../services/appSettings';
-import { getPluginModuleIds } from '../../services/moduleCatalog';
+import { getPluginModuleIds, isPluginCatalogLoading, subscribeCatalog } from '../../services/moduleCatalog';
 import {
   getInstalledPlugins,
   getLoadStates,
+  hasPluginRuntimeLoaded,
   reloadPluginRuntime,
   installPluginFromPackage,
   installPluginFromFolder,
@@ -46,6 +47,8 @@ import PluginCard from './PluginCard';
 import PluginDetailDrawer from './PluginDetailDrawer';
 import DevGuide from './DevGuide';
 import IconPlate from '../../components/icons/IconPlate';
+import { subscribeFileDrop, isFileDropAvailable } from '../../services/fileDrop';
+import { useModuleActive } from '../../hooks/useModuleActive';
 
 type FilterTab = 'all' | 'enabled' | 'disabled' | 'error';
 type SortMode = 'name' | 'version' | 'installed' | 'status';
@@ -285,13 +288,44 @@ const UrlDialog: React.FC<{
 };
 
 // ============================================================
+// 拖放安装
+// ============================================================
+
+/**
+ * 判定拖入的路径应当按「插件包」还是「本地目录」安装。
+ *
+ * 前端拿到的只有字符串路径，无法 stat，因此只能按扩展名判断：
+ * `.lcp` / `.zip` 视作包，其余一律交给「从目录安装」（后端会明确报错
+ * 「插件目录不存在」，比猜错方向的错误信息更准确）。
+ */
+function looksLikePackage(path: string): boolean {
+  return /\.(lcp|zip)$/i.test(path);
+}
+
+/**
+ * 同一次拖放事件的去重标记。
+ *
+ * 为什么需要：`Plugins` 可能**同时挂载两份** —— 一份是插件标签页里的模块，
+ * 一份是设置对话框「插件」分页里内嵌的那个。两者都认为自己是可见的，
+ * 于是同一次拖放会被两个订阅者各处理一遍：装两遍、重载两次运行时。
+ *
+ * `subscribeFileDrop` 把**同一个**事件对象扇出给所有订阅者，因此用引用相等
+ * 去重是可靠的（见 fileDrop.ts 的 normalize + 循环分发）。
+ */
+let lastHandledDrop: object | null = null;
+
+// ============================================================
 // 主页面
 // ============================================================
 
 const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
+  /** 该模块所在的标签页当前是否真的对用户可见（供拖放等窗口级事件判断） */
+  const moduleActive = useModuleActive();
   const [plugins, setPlugins] = useState<InstalledPlugin[]>(getInstalledPlugins());
   const [loadStates, setLoadStates] = useState<Map<string, PluginLoadState>>(getLoadStates());
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  /** 插件目录是否正在后台加载（`runtimeLoadedOnce` 为假时也算「还没就绪」） */
+  const [catalogLoading, setCatalogLoading] = useState(() => isPluginCatalogLoading());
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [search, setSearch] = useState('');
   const [tab, setTab] = useState<FilterTab>('all');
@@ -305,6 +339,8 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const [urlDialogOpen, setUrlDialogOpen] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [installBusy, setInstallBusy] = useState(false);
+  /** 有文件正被拖到窗口上方（控制拖放提示层的显隐） */
+  const [dropActive, setDropActive] = useState(false);
 
   const flash = useCallback((kind: Feedback['kind'], message: string, ms = 5000) => {
     setFeedback({ kind, message });
@@ -322,6 +358,17 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     return unsubscribe;
   }, [sync]);
 
+  // 订阅模块目录：插件后台加载开始/结束都要让「是否还在加载」重新求值
+  useEffect(
+    () => subscribeCatalog(() => setCatalogLoading(isPluginCatalogLoading())),
+    []
+  );
+
+  /**
+   * 重新加载插件运行时（重新读列表 + 重新执行每个启用的插件）。
+   *
+   * 只应由**显式动作**触发：用户点刷新按钮、或安装/启用/禁用/卸载之后。
+   */
   const refresh = useCallback(
     async (silent = false) => {
       if (!silent) setLoading(true);
@@ -339,10 +386,21 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     [sync]
   );
 
+  /**
+   * 挂载时**只同步已有状态，绝不重载插件运行时**。
+   *
+   * 这里曾经是 `useEffect(() => { refresh(); }, [])`。那意味着每次打开
+   * 「设置 → 插件」都会把整个插件运行时拆掉重建：`reloadPluginRuntime()`
+   * 第一步就 `clearDynamicModules()`，于是侧边栏里的插件模块全部消失、随后
+   * 又被逐个重新注册并重新排序 —— 用户看到的是「一进插件设置，侧边栏就刷新
+   * 重排」。顺带还会触发 tabStore 的目录对账，把插件的标签页判为失效。
+   *
+   * 插件运行时在启动阶段就已经加载好了（见 boot 的 plugins 步骤），
+   * 这个页面只需要读它当前的状态；`subscribePlugins` 会把后续变化推过来。
+   */
   useEffect(() => {
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    sync();
+  }, [sync]);
 
   const afterMutation = useCallback(() => {
     sync();
@@ -397,6 +455,103 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     },
     [afterMutation, flash]
   );
+
+  /**
+   * 拖放安装：一次拖入的每一个路径都尝试安装，逐个汇报结果。
+   *
+   * 为什么不「有一个失败就整体放弃」：多选拖入时，其中一个是无关文件（例如
+   * 顺手把 README 拖了进来）很常见，因为一个无关文件把已经成功的安装回滚掉
+   * 既做不到（后端已经落盘）也没有意义。逐个安装并如实列出失败原因更诚实。
+   */
+  const installDroppedPaths = useCallback(
+    async (paths: string[]) => {
+      if (paths.length === 0) return;
+
+      setInstallBusy(true);
+      // `installBusy` 控制着「安装插件」按钮的禁用状态，也决定后续拖放要不要受理。
+      // **必须放在 finally 里复位**：漏掉它的话，拖放安装一次之后这个标志就永远
+      // 停在 true —— 安装按钮再也点不动、再拖也没反应，只有重开设置（组件重新
+      // 挂载、state 归零）才能恢复。（这里原先就是漏了，正是用户遇到的现象。）
+      try {
+        const installed: string[] = [];
+        const failed: string[] = [];
+
+        for (const path of paths) {
+          try {
+            const plugin = looksLikePackage(path)
+              ? await installPluginFromPackage(path)
+              : await installPluginFromFolder(path);
+            installed.push(`「${plugin.manifest.displayName || plugin.id}」`);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            // 只报文件名：完整路径通常很长，而反馈条本身空间有限
+            const label = path.split(/[\\/]/).pop() || path;
+            failed.push(`${label}（${message}）`);
+          }
+        }
+
+        afterMutation();
+
+        if (failed.length === 0) {
+          flash(
+            'success',
+            installed.length === 1
+              ? `已安装插件${installed[0]}`
+              : `已安装 ${installed.length} 个插件：${installed.join('、')}`
+          );
+        } else if (installed.length === 0) {
+          flash('error', `安装失败：${failed.join('；')}`, 9000);
+        } else {
+          flash(
+            'error',
+            `已安装 ${installed.length} 个（${installed.join('、')}），但有 ${failed.length} 个失败：${failed.join('；')}`,
+            9000
+          );
+        }
+      } finally {
+        setInstallBusy(false);
+      }
+    },
+    [afterMutation, flash]
+  );
+
+  /**
+   * 本页面是否应当接受拖放。
+   *
+   * 两种「可见」的情形必须区分开：
+   *   · 作为插件标签页显示时，用 `useModuleActive()` —— 它同时考虑「标签是否
+   *     激活」与「窗口是否可见」。后台标签不能抢走本该属于别人的拖放。
+   *   · 作为设置对话框的分页内嵌时（`embedded`），标签页的激活状态与它无关：
+   *     对话框是模态的、开着就说明它就在用户眼前，因此直接放行。
+   */
+  const acceptDrop = embedded || moduleActive;
+
+  useEffect(() => {
+    if (!acceptDrop || !isFileDropAvailable()) return;
+
+    const unsubscribe = subscribeFileDrop((event) => {
+      if (event.type === 'enter' || event.type === 'over') {
+        setDropActive(true);
+        return;
+      }
+      if (event.type === 'leave') {
+        setDropActive(false);
+        return;
+      }
+
+      // drop
+      setDropActive(false);
+
+      // 同一次拖放只处理一遍（可能同时挂载了标签页与设置页两份实例）
+      if (lastHandledDrop === event) return;
+      lastHandledDrop = event;
+
+      if (installBusy) return;
+      void installDroppedPaths(event.paths);
+    });
+
+    return unsubscribe;
+  }, [acceptDrop, installBusy, installDroppedPaths]);
 
   const handleToggleEnabled = useCallback(
     async (plugin: InstalledPlugin, enabled: boolean) => {
@@ -528,6 +683,16 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     { id: 'error', label: '异常', count: counts.error },
   ];
 
+  /**
+   * 是否应当显示「加载中」而不是「还没有安装任何插件」。
+   *
+   * 两种情况都算未就绪：目录正在后台加载，或者一次都还没加载完
+   * （用户可能在后台加载开始之前就打开了这个页面）。
+   * 没装任何插件时的空状态是**结论性**的提示，不能在还没读完列表时显示。
+   */
+  const notReady = catalogLoading || !hasPluginRuntimeLoaded();
+  const showSpinner = plugins.length === 0 && (loading || notReady);
+
   return (
     <div className={embedded ? 'px-6 py-4' : 'max-w-7xl mx-auto px-4 py-6'}>
       {/* 响应式区域：改用容器查询，按「插件区实际可用宽度」排版而不是按窗口宽度。
@@ -617,7 +782,7 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
         <StatCard label="加载异常" value={counts.error} icon={AlertTriangle} tone="bg-red-50 text-red-600" index={3} />
       </div>
 
-      {loading && plugins.length === 0 ? (
+      {showSpinner ? (
         <div className="flex items-center justify-center py-20">
           <div className="w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
         </div>
@@ -807,6 +972,38 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
         </div>
       )}
       </div>
+
+      {/*
+        拖放提示层。
+        **必须留在这个 `@container` 之外**：container-type 会让该元素成为
+        fixed 后代的包含块，放在里面就会以插件区（而不是窗口）为定位基准 ——
+        与上面那条「抽屉 / 确认框必须留在这个 div 之外」是同一个原因。
+      */}
+      <AnimatePresence>
+        {dropActive && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.12 }}
+            data-testid="plugin-drop-overlay"
+            className="pointer-events-none fixed inset-0 z-70 flex items-center justify-center bg-indigo-600/10 backdrop-blur-[1px]"
+          >
+            <div className="flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed border-indigo-400 bg-white/95 px-10 py-8 shadow-2xl">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-50">
+                <Upload className="h-5 w-5 text-indigo-600" />
+              </div>
+              <p className="text-sm font-medium text-gray-900">松开即可安装插件</p>
+              <p className="text-xs text-gray-500 leading-relaxed text-center max-w-xs">
+                支持 <code className="font-mono text-indigo-600">.lcp</code> /{' '}
+                <code className="font-mono text-indigo-600">.zip</code> 插件包；
+                <br />
+                拖入一个插件目录会按「从目录安装」处理，并自动启用开发链接。
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* 详情抽屉 */}
       <PluginDetailDrawer
