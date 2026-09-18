@@ -49,14 +49,19 @@ export interface SemVer {
 }
 
 /**
- * 插件权限类型（与 Rust `PluginPermission` 的 kebab-case 序列化保持一致）
+ * 插件权限标识符（与 Rust `PluginPermission` 的 kebab-case 序列化保持一致）
  *
- * 注意「声明了」不等于「被强制」。当前真正生效的是七项：
- * `storage` / `network` / `network-external` / `process-spawn` / `filesystem-read`
- * 在后端检查（`filesystem-read` 另有一处前端检查，见 `ctx.fileDrop`），
- * `notification` / `plugin-communicate` 在前端检查。
- * 其余取值会被解析并保留，但不改变任何行为 —— 详见
- * docs/02-开发指南/插件开发/插件系统架构.md 第 6 节。
+ * 这个联合类型只用于**编写清单时的类型提示**。权限的标签、描述、风险等级与强制
+ * 程度都不在这里 —— 它们由宿主推导，运行时通过 `list_plugin_permissions` 取回，
+ * 见 `src/services/permissionRegistry.ts`。
+ *
+ * 因此本类型与 Rust 枚举之间仍是一份手写副本（漏写一项不会报错，只会让清单里多出
+ * 一个看起来莫名其妙的类型错误），但**风险等级不再是**：它已经没有前端副本了。
+ * 风险是安全信息，不能由被审查的一方提供，也不能由前端逐条手写 —— 详见
+ * docs/08-规划/插件生态设计.md 第 3 节。
+ *
+ * 注意「声明了」不等于「被强制」。强制程度是宿主元数据的一部分，取值为
+ * `host` / `frontend` / `none`，界面必须如实标注 `none`。
  */
 export type PluginPermission =
   | 'storage'                    // 本地存储

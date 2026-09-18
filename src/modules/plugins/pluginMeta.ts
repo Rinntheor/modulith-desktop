@@ -3,89 +3,14 @@
 
 import type { PluginStatus } from '../../services/pluginRuntime';
 
-export type PermissionRisk = 'low' | 'medium' | 'high';
-
-export interface PermissionInfo {
-  label: string;
-  description: string;
-  risk: PermissionRisk;
-}
-
-/**
- * 权限说明表。键名与 Rust `PluginPermission` 的 kebab-case 序列化一致。
- */
-export const PERMISSION_INFO: Record<string, PermissionInfo> = {
-  storage: {
-    label: '本地存储',
-    description: '在应用数据目录中读写本插件自己的键值数据',
-    risk: 'low',
-  },
-  network: {
-    label: '本机网络',
-    description: '请求本机地址（127.0.0.1 / localhost）上的服务',
-    risk: 'low',
-  },
-  'network-external': {
-    label: '外部网络',
-    description: '请求任意外部域名，数据会离开本机',
-    risk: 'medium',
-  },
-  notification: {
-    label: '系统通知',
-    description: '弹出系统级通知',
-    risk: 'low',
-  },
-  clipboard: {
-    label: '剪贴板',
-    description: '读取与写入系统剪贴板',
-    risk: 'medium',
-  },
-  'filesystem-read': {
-    label: '读取文件',
-    description: '读取本机文件信息（图标、所在位置）、导入音频文件，并可接收拖入的文件路径',
-    risk: 'medium',
-  },
-  'filesystem-write': {
-    label: '写入文件',
-    description: '修改或删除本机文件',
-    risk: 'high',
-  },
-  'filesystem-scoped': {
-    label: '限定目录访问',
-    description: '仅在用户授权的目录内读写文件',
-    risk: 'medium',
-  },
-  'plugin-communicate': {
-    label: '插件间通信',
-    description: '与其他插件交换数据、调用其命令',
-    risk: 'medium',
-  },
-  'native-module': {
-    label: '原生模块',
-    description: '调用原生代码，可绕过沙箱限制',
-    risk: 'high',
-  },
-  'dev-tools': {
-    label: '开发者工具',
-    description: '访问开发者工具与调试接口',
-    risk: 'high',
-  },
-  'process-spawn': {
-    label: '启动外部程序',
-    description: '运行本机上的任意程序，权限等同于你自己的用户账户',
-    risk: 'high',
-  },
-};
-
-export function getPermissionInfo(permission: string): PermissionInfo {
-  return (
-    PERMISSION_INFO[permission] ?? {
-      label: permission,
-      description: '未声明的权限',
-      risk: 'medium',
-    }
-  );
-}
+// 权限的标签、描述与风险等级**不在这里**。
+//
+// 它们曾经在这里，是一张手写的 `PERMISSION_INFO` 表 —— 与 Rust 的
+// `PluginPermission` 枚举构成两份独立维护的清单：新增权限要改两处，漏掉任何一处
+// 都不会报错，界面只会安静地展示一个没有依据的风险等级。
+//
+// 现在它们由宿主推导，通过 `list_plugin_permissions` 提供，见
+// `src/services/permissionRegistry.ts`。
 
 export interface StatusInfo {
   label: string;

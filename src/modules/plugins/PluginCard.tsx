@@ -19,8 +19,8 @@ import {
   formatAuthor,
   formatBytes,
   formatRelativeTime,
-  getPermissionInfo,
 } from './pluginMeta';
+import { getPermissionDescriptor } from '../../services/permissionRegistry';
 import type { InstalledPlugin, PluginLoadState } from '../../services/pluginRuntime';
 
 export interface PluginCardProps {
@@ -194,7 +194,7 @@ const PermissionChips: React.FC<{ permissions: string[]; max?: number }> = ({
   return (
     <div className="flex items-center flex-wrap gap-1">
       {shown.map((perm) => {
-        const info = getPermissionInfo(perm);
+        const info = getPermissionDescriptor(perm);
         const tone =
           info.risk === 'high'
             ? 'bg-red-50 text-red-700 border-red-200'

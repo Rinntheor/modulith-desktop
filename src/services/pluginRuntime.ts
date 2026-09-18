@@ -33,6 +33,7 @@ import { registerCommand, unregisterCommandsByPrefix } from './commandRegistry';
 import { useModuleActive } from '../hooks/useModuleActive';
 import { isFileDropAvailable, subscribeFileDrop } from './fileDrop';
 import { clearModuleComponentCache } from './moduleComponentCache';
+import { loadPermissionRegistry } from './permissionRegistry';
 
 /**
  * 宿主版本号的**占位初值**。
@@ -987,6 +988,15 @@ export async function reloadPluginRuntime(
   // 保证插件在 IIFE 顶层读到的 window.Modulith.version 就是后端真实版本。
   await refreshHostVersion();
   installHostGlobals();
+
+  // 权限元数据与插件列表一起取回。
+  //
+  // 放在这个唯一入口，而不是让插件页自己去拉：启动阶段就会走到这里（见
+  // boot.ts 的 'plugins' 步骤），因此插件页渲染时数据已经在手，不会先按
+  // "未知权限"（最高等级）画一遍，再跳变成正确等级。
+  //
+  // 失败不抛出，也不阻断下面的插件加载 —— 权限标签缺失不该升级成插件全不可用。
+  await loadPermissionRegistry();
 
   installed = await invoke<InstalledPlugin[]>('list_plugins');
   runtimeLoadedOnce = true;
