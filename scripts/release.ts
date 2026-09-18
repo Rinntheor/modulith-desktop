@@ -21,7 +21,8 @@
 // 在最后一步才发现忘了设环境变量是最亏的失败方式。
 
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
 import {
@@ -58,6 +59,7 @@ const MANIFEST_ENDPOINT =
 interface Args {
   dryRun: boolean;
   skipBuild: boolean;
+  skipSignCheck: boolean;
   allowDirty: boolean;
   noPassword: boolean;
   help: boolean;
@@ -77,6 +79,7 @@ function parseArgs(argv: string[]): Args {
   return {
     dryRun: argv.includes('--dry-run'),
     skipBuild: argv.includes('--skip-build'),
+    skipSignCheck: argv.includes('--skip-sign-check'),
     allowDirty: argv.includes('--allow-dirty'),
     noPassword: argv.includes('--no-password'),
     help: argv.includes('--help') || argv.includes('-h'),
@@ -93,6 +96,7 @@ function printUsage(): void {
   console.log();
   console.log('  --dry-run            只做预检，不构建、不写文件');
   console.log('  --skip-build         复用已有安装包，只重新生成清单');
+  console.log('  --skip-sign-check    跳过「试签一个临时文件」的口令自检');
   console.log('  --allow-dirty        工作区不干净时也继续');
   console.log('  --no-password        私钥没有口令');
   console.log('  --notes <文字>       更新说明正文');
@@ -180,6 +184,62 @@ function printIndented(text: string): void {
   for (const line of text.split('\n')) console.error(`    ${c.dim(line.trim())}`);
 }
 
+/**
+ * 试签一个临时文件，确认「私钥 + 口令」这一对真的能用。
+ *
+ * 为什么值得单独做：口令错、或私钥与口令不是一对时，`tauri build` 要跑几分钟才走到签名那一步，
+ * 而"能不能解密"这件事一秒就能问出来。
+ *
+ * 实测结论（决定了这里不做原因区分）：
+ *
+ *   口令正确                    → 签名成功
+ *   口令多一个**尾随空格**      → incorrect updater private key password: Wrong password for that key
+ *   口令完全错误                → 同一句话，一字不差
+ *
+ * 也就是说 CLI 无法区分"记错了"和"多了个看不见的字符"，所以这里也只报告"这一对用不了"，
+ * 并把 CLI 的原始报错透传出去（stderr 直连终端）让人自己看。
+ *
+ * 参数走环境变量而不是命令行开关：`signer sign` 的 `-f` 与 `TAURI_SIGNING_PRIVATE_KEY`
+ * 同时存在会直接报参数互斥（clap），而后者在构建时是必须设置的。这里显式删掉再用对的那个，
+ * 正是为了绕开那处不对称 —— 顺带也说明两个变量各管一段。
+ *
+ * 返回 null 表示这一对可用；返回字符串表示不可用（字符串是给人看的说明）。
+ * 不确定时（例如 CLI 都没装）返回 null，把判断留给后面的构建 —— 预热检查不该成为新的拦路石。
+ */
+function verifySigningKey(key: string): string | null {
+  const tauriJs = join(ROOT, 'node_modules', '@tauri-apps', 'cli', 'tauri.js');
+  if (!existsSync(tauriJs)) return null;
+
+  const dir = mkdtempSync(join(tmpdir(), 'modulith-release-probe-'));
+  const probe = join(dir, 'probe.txt');
+  writeFileSync(probe, 'modulith release signing probe\n');
+
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env.TAURI_SIGNING_PRIVATE_KEY;
+  delete env.TAURI_SIGNING_PRIVATE_KEY_PATH;
+  if (existsSync(key)) {
+    env.TAURI_SIGNING_PRIVATE_KEY_PATH = key;
+  } else {
+    env.TAURI_SIGNING_PRIVATE_KEY = key;
+  }
+
+  let ok = true;
+  try {
+    // stdout 丢弃、stderr 直连终端：不用管道（Node 在受限环境里打不开管道），
+    // 同时让 CLI 自己的报错原样显示出来 —— 那比转述有用。
+    execFileSync(process.execPath, [tauriJs, 'signer', 'sign', probe], {
+      cwd: ROOT,
+      env,
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+  } catch {
+    ok = false;
+  }
+
+  rmSync(dir, { recursive: true, force: true });
+  return ok ? null : '这一对私钥与口令签不出名来（tauri 的原始报错见上一行）。';
+}
+
 // ==================== 主流程 ====================
 
 function main(): number {
@@ -222,7 +282,22 @@ function main(): number {
     return 1;
   }
   const key = (process.env.TAURI_SIGNING_PRIVATE_KEY ?? '').trim();
-  printSuccess('私钥与口令就绪', existsSync(key) ? `文件 ${key}` : '内联内容');
+  if (args.skipSignCheck) {
+    printSuccess('私钥与口令就绪', existsSync(key) ? `文件 ${key}` : '内联内容');
+    printDim('（--skip-sign-check：未验证口令能否解开私钥）');
+  } else {
+    // 环境变量只说明"设了"，说明不了"对不对"。这里真的签一次，把失败挡在构建之前。
+    const signProblem = verifySigningKey(key);
+    if (signProblem) {
+      printError('签名自检失败', signProblem);
+      printDim('常见原因是口令末尾多了空格，或口令里的符号被 PowerShell 展开了。');
+      printDim("用单引号赋值可以避开后者：$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '口令'");
+      printDim('确认要跳过这项检查：pnpm release --skip-sign-check');
+      return 1;
+    }
+    printSuccess('私钥与口令就绪', existsSync(key) ? `文件 ${key}` : '内联内容');
+    printDim('已试签一个临时文件验证口令可用。');
+  }
 
   // ---- 3. 工作区状态 ----
   const gitAvailable = gitWorks();
