@@ -56,7 +56,22 @@ export const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
  * release：`releases/latest/download/latest.json` 永远指向最新一次发布，而安装包在
  * 那一次发布的 `releases/download/<tag>/` 下。
  */
-export const DEFAULT_BASE_URL = 'https://github.com/Rinntheor/modulith-desktop/releases/download';
+/**
+ * 应用仓库的 Release 根地址。清单地址与安装包地址都由它推出 —— 仓库位置只写一次。
+ */
+export const RELEASES_BASE = 'https://github.com/Rinntheor/modulith-desktop/releases';
+
+/** 发布资源的基地址：`<RELEASES_BASE>/download/<tag>/<资产名>` */
+export const DEFAULT_BASE_URL = `${RELEASES_BASE}/download`;
+
+/**
+ * 客户端实际读取的清单地址。
+ *
+ * **必须与 `src-tauri/tauri.conf.json` 的 `plugins.updater.endpoints` 逐字一致。**
+ * 不一致时「开发者核对用的地址」与「客户端请求的地址」就成了两个地方，而那种不一致
+ * 没有任何东西会发现 —— `pnpm check:release` 用的就是它。
+ */
+export const LATEST_MANIFEST_URL = `${RELEASES_BASE}/latest/download/latest.json`;
 
 /** 安装包类型 → bundle 子目录、扩展名、以及 latest.json 里的 target 键 */
 export const INSTALLERS = [
@@ -281,6 +296,33 @@ export interface BuiltManifest {
   manifest: Manifest;
 }
 
+/**
+ * 把本机的安装包文件名转成 **GitHub Release 上实际的资产名**。
+ *
+ * GitHub 在上传资源时会把文件名里的**空格换成点**：
+ *
+ * ```
+ * 本机：Modulith Desktop_1.1.2_x64-setup.exe
+ * 线上：Modulith.Desktop_1.1.2_x64-setup.exe
+ * ```
+ *
+ * 而下载地址是 `releases/download/<tag>/<资产名>` —— 名字对不上就是 404，且这个失败
+ * 出现在很远的地方：`check()` 只读 latest.json，能正常发现新版本、版本号也对，只有
+ * 用户真的点下「下载并安装」才 404。
+ *
+ * 这里原先写的是 `encodeURIComponent(file)`，注释还写着「GitHub 的资源地址必须把空格
+ * 写成 %20」。那个说法只对「URL 里出现的空格如何编码」成立，而线上**根本没有空格这个
+ * 字符** —— 编码一个不存在的字符永远不会匹配。1.0.0 起的每个 Release 都受影响，只是
+ * 直到 1.1.0 的客户端第一次真的去下载才暴露出来。
+ *
+ * 为什么是「点」：这是 GitHub 的实际行为（1.0.0 / 1.0.1 / 1.1.0 / 1.1.2 四个 Release 的
+ * 资产名一致如此），只能跟随。规则只覆盖我们已知的字符（`productName` 带一个空格）；
+ * 真正的兜底是发布后的 `pnpm check:release` —— 它按客户端的方式去请求清单里的每个
+ * 地址，任何名字不匹配都会当场变成一条 404。
+ */
+export function githubAssetName(file: string): string {
+  return file.replace(/ /g, '.');
+}
 /** 组装更新清单。找不到安装包或缺签名时抛错，不会返回半成品。 */
 export function buildManifest(options: ManifestOptions): BuiltManifest {
   const { bundleDir, version } = options;
@@ -293,8 +335,8 @@ export function buildManifest(options: ManifestOptions): BuiltManifest {
   const platforms: Record<string, ManifestPlatform> = {};
   for (const installer of installers) {
     platforms[installer.target] = {
-      // encodeURIComponent 把文件名里的空格写成 %20 —— GitHub 的资源地址必须这样写
-      url: `${baseUrl}/${tag}/${encodeURIComponent(installer.file)}`,
+      // 文件名先换成 GitHub 上实际的资产名，再按 URL 规则编码
+      url: `${baseUrl}/${tag}/${encodeURIComponent(githubAssetName(installer.file))}`,
       signature: installer.signature,
     };
   }
