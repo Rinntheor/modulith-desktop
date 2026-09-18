@@ -174,7 +174,7 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                     className="flex items-center gap-1.5 px-3.5 py-2 text-sm rounded-lg bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 transition-colors"
                   >
                     <FolderOpen className="w-3.5 h-3.5" />
-                    安装目录
+                    {plugin.devSource ? '源目录' : '安装目录'}
                   </button>
 
                   <button
@@ -363,16 +363,34 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                       {plugin.source === 'file'
                         ? '插件包文件'
                         : plugin.source === 'folder'
-                          ? '本地目录'
+                          ? plugin.devSource
+                            ? '本地目录（开发链接）'
+                            : '本地目录'
                           : '网络下载'}
                     </Row>
                     <Row label="安装时间">
                       {formatDate(plugin.installedAt)}（{formatRelativeTime(plugin.installedAt)}）
                     </Row>
                     <Row label="磁盘占用">{formatBytes(plugin.sizeBytes)}</Row>
-                    <Row label="安装路径">
-                      <code className="font-mono">{plugin.path}</code>
-                    </Row>
+                    {/*
+                      开发链接下 `plugin.path` 就是源目录，与「安装路径」是同一个值。
+                      与其并排列出两行相同的内容，不如把语义说清楚：这一行是
+                      **当前实际被读取的目录**，并说明为什么改完就生效。
+                    */}
+                    {plugin.devSource ? (
+                      <Row label="源目录（开发链接）">
+                        <code className="font-mono">{plugin.devSource}</code>
+                        <p className="mt-1 text-[11px] text-gray-500 leading-relaxed">
+                          该插件按「从目录安装」安装，清单与代码都直接读取此目录：
+                          改完代码点插件页右上角的刷新即生效，无需卸载重装；
+                          卸载插件也不会删除此目录。
+                        </p>
+                      </Row>
+                    ) : (
+                      <Row label="安装路径">
+                        <code className="font-mono">{plugin.path}</code>
+                      </Row>
+                    )}
                   </div>
                 </section>
 

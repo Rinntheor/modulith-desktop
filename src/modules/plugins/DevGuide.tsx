@@ -214,6 +214,41 @@ const DevGuide: React.FC<DevGuideProps> = memo(({ open, onClose }) => (
               <CodeBlock title="vite.config.ts（打包插件时）" code={VITE_SNIPPET} icon={FileCode} />
             </section>
 
+            <section className="space-y-3">
+              <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-800">
+                <FolderTree className="w-4 h-4 text-gray-400" />
+                开发与调试
+              </h3>
+              <p className="text-xs text-gray-500 leading-relaxed">
+                用「从目录安装…」把插件的源目录装进来，就会建立一条
+                <strong className="text-gray-700">开发链接</strong>
+                ：宿主直接读取该目录下的清单与代码，而不是安装时复制的副本。
+                改完代码点插件页右上角的刷新即生效，不必卸载重装。
+                插件卡片上的「开发链接」标记表示该插件正处于这种状态。
+              </p>
+              <ul className="text-xs text-gray-500 leading-relaxed space-y-1.5 list-disc pl-4">
+                <li>
+                  刷新会<strong className="text-gray-700">重新执行一次 bundle 顶层代码</strong>。
+                  因此不要在顶层做「只应发生一次」的副作用（注册全局监听、启动定时器、
+                  改写 window 上的东西）—— 那会在每次刷新后重复叠加。把这类工作放进组件，
+                  或用 <code className="font-mono">ctx.events.subscribe</code>，
+                  宿主会在插件卸载 / 重载时自动清理它的订阅。
+                </li>
+                <li>
+                  清单里的 <code className="font-mono">main</code>、
+                  <code className="font-mono">style</code>、
+                  <code className="font-mono">permissions</code> 等改动同样即时生效
+                  （权限判定读的就是这份清单）。
+                </li>
+                <li>
+                  卸载插件只删除安装副本与插件自己的存储，<strong className="text-gray-700">不会删除你的源目录</strong>。
+                </li>
+                <li>
+                  源目录被删除或改名后，宿主会自动退回安装时的副本，并在卡片上取消该标记。
+                </li>
+              </ul>
+            </section>
+
             <section>
               <h3 className="text-sm font-semibold text-gray-800 mb-2">运行时 API</h3>
               <div className="rounded-xl border border-gray-100 overflow-hidden">

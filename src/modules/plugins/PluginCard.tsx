@@ -250,6 +250,25 @@ const EngineAdvisoryBanner: React.FC<{ required: string; host: string }> = ({
   </div>
 );
 
+/**
+ * 「开发链接」标记。
+ *
+ * 从本地目录安装的插件会保留指向源目录的链接：读取清单与资源都走源目录，
+ * 因此在源目录里改完代码、点一下刷新就生效，不必卸载重装。
+ *
+ * 这件事必须在界面上**说出来**。否则用户会遇到两个无法解释的现象：
+ *   · 改完源码点刷新居然生效了（不知道是设计如此，还是缓存出了问题）；
+ *   · 卸载插件后源目录还在（以为卸载不干净，或者反过来担心源码被删）。
+ */
+const DevLinkBadge: React.FC<{ source: string }> = ({ source }) => (
+  <span
+    title={`正在从源目录实时读取：\n${source}\n\n修改后点右上角刷新即生效；卸载插件不会删除该目录。`}
+    className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-emerald-100 text-emerald-700 shrink-0"
+  >
+    开发链接
+  </span>
+);
+
 const PluginCard: React.FC<PluginCardProps> = memo(
   ({
     plugin,
@@ -281,6 +300,7 @@ const PluginCard: React.FC<PluginCardProps> = memo(
                 <span className="px-1.5 py-0.5 text-[11px] font-mono rounded bg-gray-100 text-gray-600 shrink-0">
                   v{plugin.version}
                 </span>
+                {plugin.devSource && <DevLinkBadge source={plugin.devSource} />}
                 <span
                   className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] rounded-full border shrink-0 ${status.className}`}
                 >
@@ -364,6 +384,7 @@ const PluginCard: React.FC<PluginCardProps> = memo(
                   已废弃
                 </span>
               )}
+              {plugin.devSource && <DevLinkBadge source={plugin.devSource} />}
             </div>
             <div className="flex items-center gap-2 mt-1">
               <span className="text-[11px] font-mono text-gray-500">v{plugin.version}</span>
