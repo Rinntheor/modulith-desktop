@@ -1,0 +1,15 @@
+# ============================================================
+# Modulith Desktop 统一版本管理 —— 唯一事实来源
+# 由 scripts/version-manager.ts 读写，请勿手工改乱格式
+# ============================================================
+[app]
+name = "Modulith Desktop"
+version = "1.0.0"
+author = "环理论 (Rinntheor)"
+description = "A modular desktop framework built with Tauri"
+
+[build]
+# stable 表示正式发布：full_version 直接等于 version，不带预发布后缀
+release_type = "stable"
+build_number = 1
+full_version = "1.0.0"

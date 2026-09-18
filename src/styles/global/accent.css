@@ -1,0 +1,356 @@
+/* src/styles/global/accent.css */
+/*
+ * 主题配色的变量消费层。
+ *
+ * 作用：把界面里用到的**品牌色工具类**重定向到 `--accent-*` CSS 变量。
+ * 变量由 `src/services/accent.ts` 在运行期写入根元素，因此换配色
+ * **不需要修改任何组件** —— 加一套新配色只需在 config/accentTheme.ts
+ * 注册一行。
+ *
+ * ---------------------------------------------------------------------------
+ * 为什么用「覆盖工具类」而不是改组件里的类名
+ *
+ * 全项目有 50 种品牌色工具类、约 178 处使用。逐个改成 `bg-accent-600`
+ * 之类的自定义类，改动面大、review 困难，且以后再换方案还要再改一遍。
+ * 这里保持组件原样，只在这一层做重定向：
+ *
+ *     [class~='bg-indigo-600'] { background-color: var(--accent-600); }
+ *
+ * `[class~='x']` 与 `.x` 等价（都是单类选择器），本文件未分层，
+ * 因此优先于 Tailwind 的 `@layer utilities` —— 覆盖必定生效。
+ *
+ * 只覆盖**实际用到的**工具类。这份清单是从源码扫出来的（50 种），
+ * 没有凭空多写：多余规则只会增加维护面，不会带来收益。
+ *
+ * ---------------------------------------------------------------------------
+ * 语义色刻意不动
+ *
+ * 红（错误）/ 琥珀（警告）/ 绿（成功）不参与主题。这意味着选红色主题时，
+ * 红色既表示品牌又表示危险，会削弱语义色的警示作用 —— 这一点在
+ * 设置页已向用户说明，属于配色功能的固有取舍。
+ * ============================================================ */
+
+/* ============================================================
+ * 1. 背景
+ * ============================================================ */
+
+/* 主色底：按钮、选中态 */
+[class~='bg-indigo-600'],
+[class~='bg-purple-600'],
+[class~='bg-violet-600'] {
+  background-color: var(--accent-600);
+}
+
+[class~='bg-indigo-500'],
+[class~='bg-purple-500'],
+[class~='bg-violet-500'] {
+  background-color: var(--accent-500);
+}
+
+/* 浅底：标签、徽标、选中行的底色 */
+[class~='bg-indigo-50'],
+[class~='bg-purple-50'],
+[class~='bg-violet-50'] {
+  background-color: var(--accent-50);
+}
+
+[class~='bg-indigo-100'],
+[class~='bg-purple-100'],
+[class~='bg-violet-100'] {
+  background-color: var(--accent-100);
+}
+
+/* 带透明度的主色底：深色界面上的选中态、装饰层 */
+[class~='bg-indigo-500/10'],
+[class~='bg-purple-500/10'],
+[class~='bg-violet-500/10'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.1);
+}
+
+[class~='bg-indigo-500/20'],
+[class~='bg-purple-500/20'],
+[class~='bg-violet-500/20'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.2);
+}
+
+[class~='bg-indigo-500/50'],
+[class~='bg-purple-500/50'],
+[class~='bg-violet-500/50'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.5);
+}
+
+/* ============================================================
+ * 2. 文字
+ * ============================================================ */
+
+/* 浅色背景上的主色文字：需足够深 */
+[class~='text-indigo-600'],
+[class~='text-purple-600'],
+[class~='text-violet-600'] {
+  color: var(--accent-600);
+}
+
+[class~='text-indigo-700'],
+[class~='text-purple-700'],
+[class~='text-violet-700'] {
+  color: var(--accent-700);
+}
+
+[class~='text-indigo-500'],
+[class~='text-purple-500'],
+[class~='text-violet-500'] {
+  color: var(--accent-500);
+}
+
+/* 深色背景上的主色文字：需足够亮（深色模式下由 dark 段再提亮） */
+[class~='text-indigo-400'],
+[class~='text-purple-400'],
+[class~='text-violet-400'] {
+  color: var(--accent-600);
+}
+
+/* 深色授权界面上本来就是亮色文字，保持 —— 那里底色固定是深色，
+   与本主题无关，因此显式指向深色模式的一组变量 */
+[class~='text-indigo-300'],
+[class~='text-purple-300'],
+[class~='text-violet-300'] {
+  color: var(--accent-500);
+}
+
+[class~='text-indigo-200'],
+[class~='text-purple-200'],
+[class~='text-violet-200'] {
+  color: var(--accent-500);
+}
+
+/* ============================================================
+ * 3. 边框
+ * ============================================================ */
+
+[class~='border-indigo-200'],
+[class~='border-purple-200'],
+[class~='border-violet-200'] {
+  border-color: var(--accent-200);
+}
+
+[class~='border-indigo-300'],
+[class~='border-purple-300'],
+[class~='border-violet-300'] {
+  border-color: var(--accent-300);
+}
+
+[class~='border-indigo-500'],
+[class~='border-purple-500'],
+[class~='border-violet-500'] {
+  border-color: var(--accent-500);
+}
+
+[class~='border-indigo-600'],
+[class~='border-purple-600'],
+[class~='border-violet-600'] {
+  border-color: var(--accent-600);
+}
+
+[class~='border-indigo-400/50'],
+[class~='border-purple-400/50'],
+[class~='border-violet-400/50'] {
+  border-color: rgb(from var(--accent-400) r g b / 0.5);
+}
+
+[class~='border-indigo-500/20'],
+[class~='border-purple-500/20'],
+[class~='border-violet-500/20'] {
+  border-color: rgb(from var(--accent-500) r g b / 0.2);
+}
+
+/* ============================================================
+ * 4. 渐变（from / to / via）
+ *
+ * 品牌渐变原先多为 indigo → violet。重定向后两端都指向同一套变量，
+ * 因此渐变自然变成单色 —— 这正是想要的效果：主色只有一个。
+ * ============================================================ */
+
+[class~='from-indigo-500'],
+[class~='from-purple-500'],
+[class~='from-violet-500'] {
+  --tw-gradient-from: var(--accent-500) var(--tw-gradient-from-position);
+  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+}
+
+[class~='from-indigo-600'],
+[class~='from-purple-600'],
+[class~='from-violet-600'] {
+  --tw-gradient-from: var(--accent-600) var(--tw-gradient-from-position);
+  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+}
+
+[class~='to-indigo-500'],
+[class~='to-purple-500'],
+[class~='to-violet-500'],
+[class~='to-fuchsia-500'] {
+  --tw-gradient-to: var(--accent-500) var(--tw-gradient-to-position);
+}
+
+[class~='to-indigo-600'],
+[class~='to-purple-600'],
+[class~='to-violet-600'],
+[class~='to-fuchsia-600'] {
+  --tw-gradient-to: var(--accent-600) var(--tw-gradient-to-position);
+}
+
+[class~='from-indigo-500/10'],
+[class~='from-purple-500/10'],
+[class~='from-violet-500/10'] {
+  --tw-gradient-from: rgb(from var(--accent-500) r g b / 0.1) var(--tw-gradient-from-position);
+  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+}
+
+[class~='from-indigo-500/20'],
+[class~='from-purple-500/20'],
+[class~='from-violet-500/20'] {
+  --tw-gradient-from: rgb(from var(--accent-500) r g b / 0.2) var(--tw-gradient-from-position);
+  --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+}
+
+[class~='to-indigo-500/10'],
+[class~='to-purple-500/10'],
+[class~='to-violet-500/10'] {
+  --tw-gradient-to: rgb(from var(--accent-500) r g b / 0.1) var(--tw-gradient-to-position);
+}
+
+[class~='to-indigo-500/20'],
+[class~='to-purple-500/20'],
+[class~='to-violet-500/20'] {
+  --tw-gradient-to: rgb(from var(--accent-500) r g b / 0.2) var(--tw-gradient-to-position);
+}
+
+/* ============================================================
+ * 5. 阴影与 ring / 表单
+ * ============================================================ */
+
+[class~='shadow-indigo-500/10'],
+[class~='shadow-violet-500/10'] {
+  --tw-shadow-color: rgb(from var(--accent-500) r g b / 0.1);
+}
+
+[class~='shadow-indigo-500/20'],
+[class~='shadow-violet-500/20'] {
+  --tw-shadow-color: rgb(from var(--accent-500) r g b / 0.2);
+}
+
+[class~='shadow-indigo-500/25'],
+[class~='shadow-violet-500/25'] {
+  --tw-shadow-color: rgb(from var(--accent-500) r g b / 0.25);
+}
+
+[class~='shadow-indigo-100/40'],
+[class~='shadow-violet-100/40'] {
+  --tw-shadow-color: rgb(from var(--accent-100) r g b / 0.4);
+}
+
+[class~='shadow-indigo-100/50'],
+[class~='shadow-violet-100/50'] {
+  --tw-shadow-color: rgb(from var(--accent-100) r g b / 0.5);
+}
+
+/* hover:shadow-* 是独立的类名 token，必须单独列出（同 hover:bg-* 的道理） */
+[class~='hover:shadow-indigo-100/40']:hover,
+[class~='hover:shadow-violet-100/40']:hover {
+  --tw-shadow-color: rgb(from var(--accent-100) r g b / 0.4);
+}
+
+[class~='hover:shadow-indigo-100/50']:hover,
+[class~='hover:shadow-violet-100/50']:hover {
+  --tw-shadow-color: rgb(from var(--accent-100) r g b / 0.5);
+}
+
+[class~='ring-indigo-100'],
+[class~='ring-violet-100'] {
+  --tw-ring-color: var(--accent-100);
+}
+
+/* 复选框/开关的 accent-color */
+[class~='accent-indigo-600'] {
+  accent-color: var(--accent-600);
+}
+
+/* ============================================================
+ * 6. 变体：hover / focus / group-hover
+ *
+ * 与 dark-theme.css 同样的注意点：`hover:bg-x` 是**独立的类名 token**，
+ * 不会被裸类名的规则命中，必须单独列出。
+ * ============================================================ */
+
+[class~='hover:bg-indigo-50/30']:hover,
+[class~='hover:bg-violet-50/30']:hover,
+[class~='hover:bg-indigo-100']:hover,
+[class~='hover:bg-violet-100']:hover {
+  background-color: var(--accent-100);
+}
+
+/* group-hover 由父元素的 .group:hover 驱动，因此选择器要挂在父级上 */
+.group:hover [class~='group-hover:bg-indigo-100'],
+.group:hover [class~='group-hover:bg-violet-100'] {
+  background-color: var(--accent-100);
+}
+
+[class~='hover:bg-indigo-700']:hover,
+[class~='hover:bg-violet-700']:hover {
+  background-color: var(--accent-700);
+}
+
+[class~='hover:text-indigo-400']:hover,
+[class~='hover:text-violet-400']:hover,
+[class~='hover:text-indigo-600']:hover,
+[class~='hover:text-violet-600']:hover {
+  color: var(--accent-600);
+}
+
+[class~='group-hover:text-indigo-400'],
+[class~='group-hover:text-violet-400'] {
+  color: var(--accent-600);
+}
+
+[class~='group-hover:text-indigo-600'],
+[class~='group-hover:text-violet-600'] {
+  color: var(--accent-600);
+}
+
+[class~='hover:border-indigo-200']:hover,
+[class~='hover:border-violet-200']:hover {
+  border-color: var(--accent-200);
+}
+
+[class~='focus:border-indigo-300']:focus,
+[class~='focus:border-violet-300']:focus {
+  border-color: var(--accent-300);
+}
+
+[class~='focus:ring-indigo-100']:focus,
+[class~='focus:ring-violet-100']:focus {
+  --tw-ring-color: var(--accent-100);
+}
+
+/* ============================================================
+ * 7. 默认变量
+ *
+ * 必须在 `:root` 上给出**默认值**，否则在 accent.ts 尚未执行时
+ * （例如纯前端预览、单元测试）`rgb(from var(--accent-500) …)` 会因为
+ * 变量为空而整条声明失效，颜色会退回 Tailwind 的 indigo —— 那倒也不算坏，
+ * 但显式给出默认值可以避免"部分元素是主题色、部分还是靛蓝"的混合状态。
+ *
+ * 这组值是 `indigo` 主题的推导结果，与 accent.ts 的算法一致。
+ * ============================================================ */
+
+:root {
+  --accent-50: hsl(243 80% 97%);
+  --accent-100: hsl(243 80% 93%);
+  --accent-200: hsl(243 80% 86%);
+  --accent-300: hsl(243 80% 76%);
+  --accent-400: hsl(243 80% 64%);
+  --accent-500: hsl(243 80% 55%);
+  --accent-600: hsl(243 80% 45%);
+  --accent-700: hsl(243 80% 37%);
+  --accent-800: hsl(243 82% 27%);
+  --accent-900: hsl(243 82% 20%);
+}

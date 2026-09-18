@@ -1,0 +1,51 @@
+[package]
+name = "modulith-desktop"
+version = "1.0.0"
+description = "A modular desktop framework built with Tauri"
+authors = ["环理论 (Rinntheor)"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "modulith_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2.7.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+urlencoding = "2.1"
+zip = "0.6"
+tokio = { version = "1", features = ["full"] }
+
+# ---- 授权系统（src/modules/auth）----
+# 访问密钥使用 Argon2id 哈希存储，绝不保存明文，也不内置默认密钥。
+argon2 = "0.5"
+# 「记住我」令牌使用 AES-256-GCM 加密，密钥由硬件指纹派生（换机即失效）。
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
+# 擦除内存中的密钥副本（尽力而为：IPC 层与 JS 侧的字符串无法触及）
+zeroize = "1"
+# HKDF-SHA256：用 hmac + sha2 手动实现（RFC 5869），避免引入额外的 hkdf 依赖。
+hmac = "0.12"
+# 采集硬件指纹（MAC / 主机名 / CPU / 核心数）
+sysinfo = "0.29"
+
+

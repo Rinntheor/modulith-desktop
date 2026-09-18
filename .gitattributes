@@ -1,0 +1,55 @@
+# 统一换行符与二进制文件处理。
+#
+# 为什么需要这个文件：
+#   仓库当前所有文本文件都是 LF。但 Git for Windows 默认 `core.autocrlf=true`，
+#   会在检出时把 LF 转成 CRLF、提交时再转回来。这在单人开发时看不出问题，
+#   一旦有 Linux/macOS 的贡献者或 CI 参与，就会出现「同一文件在不同机器上
+#   换行符不同」——表现为 PR 里整文件 diff、或 CI 与本地结果不一致。
+#
+#   显式声明 `eol=lf` 后，无论谁在什么平台上检出，工作区拿到的都是 LF，
+#   与仓库中已有文件一致，也不会产生无意义的整文件差异。
+
+# 默认：所有文本文件以 LF 存储与检出
+* text=auto eol=lf
+
+# ---- 显式声明为文本（避免被误判为二进制）----
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.rs    text eol=lf
+*.svg   text eol=lf
+
+# ---- 必须保持 CRLF 的文件 ----
+# Windows 批处理对 LF 极其敏感，换行符错误会导致脚本无法执行。
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# ---- 二进制文件：不做任何换行符转换 ----
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.icns  binary
+*.lcp   binary
+
+# ---- 生成产物与锁文件 ----
+# 锁文件由工具生成，标记为 linguist-generated 可让 GitHub 在 PR 中默认折叠其差异。
+pnpm-lock.yaml  -diff linguist-generated
+Cargo.lock      -diff linguist-generated
+
+# 生成文件不参与 GitHub 的语言统计，避免把生成代码算成「项目主体」
+src/generated/*  linguist-generated
+src-tauri/src/lib.rs            linguist-generated
+src-tauri/src/modules/mod.rs    linguist-generated

@@ -1,0 +1,298 @@
+/* .src/styles/global/index.css */
+@import 'tailwindcss';
+
+/*
+ * 深色模式必须在这个位置导入：它靠「与 Tailwind 工具类同优先级 + 后加载」
+ * 取胜，因此不能放进 @layer（分层样式优先级低于未分层样式，放进去会失效）。
+ * 详见 dark-theme.css 顶部说明。
+ */
+@import './dark-theme.css';
+
+/*
+ * 主题配色的变量定义与消费层。
+ *
+ * 顺序要求：**必须在 dark-theme.css 之后**。
+ * dark-theme.css 里原本有若干硬编码的靛蓝值；它们现在已改为引用
+ * `--accent-*` 变量（见该文件内的注释），因此两者不再冲突。
+ * 但 accent.css 定义了变量的默认值，放在最后可保证：
+ * 若运行期脚本尚未执行，界面仍有一套完整的默认配色，不会出现
+ * 「部分元素是主题色、部分还是靛蓝」的混合状态。
+ */
+@import './accent.css';
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-gray-200);
+  }
+  body {
+    @apply bg-gray-50 text-gray-900 antialiased;
+  }
+
+  /* 深色下的默认边框色：与浅色规则同样的作用范围 */
+  :root.dark *,
+  :root.dark ::before,
+  :root.dark ::after {
+    border-color: #2c3242;
+  }
+
+  /* ---------- 动画总开关（由 services/theme.ts 切换） ----------
+   *
+   * 覆盖的是 CSS 动画与过渡。JS 驱动的动画（framer-motion）由
+   * MotionConfig reducedMotion="always" 单独关闭，两者合起来才是完整的
+   * 「关闭动画」。
+   *
+   * 0.001ms 而不是 0s：部分浏览器对 `transition: none` 的处理会让
+   * transitionend 永不触发，进而卡住依赖它的逻辑；保留一个极短时长更安全。
+   */
+  :root.lc-reduce-motion *,
+  :root.lc-reduce-motion *::before,
+  :root.lc-reduce-motion *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@layer components {
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(156, 163, 175, 0.3) transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 4px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background-color: rgba(156, 163, 175, 0.3);
+    border-radius: 20px;
+  }
+
+  /*
+   * 标签栏专用：横向可滚动，但不显示滚动条。
+   *
+   * 标签栏高度只有 36px，一条滚动条会吃掉近三分之一并让整排标签上下错位。
+   * 隐藏它不会让人「找不到」被挤出去的内容：TabBar 把纵向滚轮转成了横向滚动，
+   * 标签本身也可以拖动排序，溢出时用户仍有明确的操作途径。
+   */
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* ============================================================
+ * 非激活标签：切走即静止
+ *
+ * 问题（用户报告）：从仪表盘切到别的模块时，有几个卡片会在新页面上停留
+ * 一小会儿才消失；理想情况下切换应当是瞬时的。
+ *
+ * 根因不是「隐藏没生效」，而是**隐藏之后动画还在跑**：
+ *   · 标签保活意味着切走的模块仍在 DOM 里（这是刻意的，见 Home.tsx）；
+ *   · 仪表盘的统计卡片带入场延迟（`delay: 0.15s + i*0.06s`），
+ *     index 2/3/4 的延迟是 0.27/0.33/0.39s —— 用户切走时它们刚播到前几帧，
+ *     这正是「有几个卡片停留一下」里那个「几个」的来源；
+ *   · `visibility: hidden` 只让元素不参与最终绘制，**并不暂停动画**，
+ *     合成器仍会把中间帧画出来。
+ *
+ * 隐藏方式保持 `visibility: hidden`（**不要改成 display:none**）：元素一旦
+ * 失去盒子，多数浏览器会丢掉 scrollTop，而「切回来还在原处」正是保活的
+ * 核心目标。这里只叠加「暂停动画」这一件事，不碰布局。
+ *
+ * 关于 `content-visibility: hidden`：它更彻底，但 MDN 的语义说明是
+ * "similar to giving the contents display: none"，与 scrollTop 的保留存在
+ * 冲突风险（CSSWG 亦讨论过 skipped 子树恢复滚动位置的问题）。在一个以
+ * 「滚动位置保留」为卖点的功能上，不拿这个不变量去换一个性能属性。
+ * ============================================================ */
+
+.lc-tab-panel[data-active='false'],
+.lc-tab-panel[data-active='false'] * {
+  visibility: hidden;
+  pointer-events: none;
+  /* CSS 动画与过渡：停在当前帧，而不是跳到终态（后者会让切回来时看到跳变） */
+  animation-play-state: paused !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+}
+
+/*
+ * framer-motion 的动画是 JS 驱动、**直接写行内 style** 的
+ * （`element.style.opacity = ...`，见 motion-dom 的 effects/style/index.mjs），
+ * CSS 动不了它；但行内样式可以被带 `!important` 的样式表规则压过。
+ *
+ * 因此下面两条用 `!important` 把非激活标签的**可见性与位移钉死在终态**：
+ *   · opacity: 1  —— 消除「淡入播到一半」的中间帧（这正是卡片残留的可见表现）；
+ *   · transform: none —— 消除位移/缩放类动画的中间帧。
+ *
+ * 为什么这是必要的、而不是多余的一层：
+ *   1. `animation-play-state` 只管 CSS 动画，管不到 JS 驱动的行内样式；
+ *   2. `MotionConfig reducedMotion="always"` 在 framer-motion 12 里**只对位置类
+ *      属性生效**，opacity 不在其列（见 motion-dom 的
+ *      visual-element-target.mjs：`shouldReduceMotion && positionalKeys.has(key)`）；
+ *   3. `initial={false}`（见 ModuleRenderer）只作用于包裹层与「挂载那一刻」，
+ *      模块内部自己写的 motion 组件不受其影响 —— 仪表盘的 StatCard 就是内部组件。
+ *   三条加起来仍可能留下中间帧，所以这里做最后一道确定性收口：
+ *   非激活标签里的每一个元素，无论谁在给它写行内样式，都必须是完全可见、
+ *   不带位移的终态。
+ *
+ * 对激活标签没有任何影响（选择器要求 data-active="false"）。
+ */
+.lc-tab-panel[data-active='false'] *,
+.lc-tab-panel[data-active='false'] {
+  opacity: 1 !important;
+  transform: none !important;
+}
+
+/* ============================================================
+ * 打印 / 另存为 PDF
+ *
+ * 用途：把恢复码印到纸上，或经系统的「另存为 PDF」得到文件。
+ * 之所以用打印而不是引 PDF 库：项目没有 PDF 依赖，装一个属于新增第三方
+ * 依赖；而系统打印对话框本来就能产出 PDF，且零新增代码路径。
+ *
+ * 机制：屏上**整体隐藏**，只显示 `.lc-print-sheet`（由 RecoveryPrintSheet
+ * 渲染）。因此打印容器平时对用户完全不可见，不需要维护显隐状态。
+ *
+ * 三个必须注意的点：
+ *  1. **不能放进 @layer**。分层的样式优先级低于未分层样式，而这些规则要
+ *     覆盖 dark-theme.css 里未分层的深色映射；一旦被包进 @layer，打印件会
+ *     带着深色底色输出。
+ *  2. 必须在 dark-theme.css **之后**（即文件末尾）：两者优先级相同，
+ *     靠后加载取胜。
+ *  3. 强制浅色并去掉动画：打印是静态输出，深色底既费墨又难读。
+ * ============================================================ */
+
+/* 屏上隐藏打印件（直接不参与渲染，而不是用 z-index 之类的小把戏） */
+.lc-print-sheet {
+  display: none;
+}
+
+@media print {
+  /* 让渲染器按浅色输出 */
+  :root {
+    color-scheme: light !important;
+  }
+
+  html,
+  body {
+    height: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+  }
+
+  /* 隐藏屏幕上的一切（应用本体、启动界面、对话框…） */
+  body * {
+    visibility: hidden !important;
+  }
+
+  /* 只显示打印件自身 */
+  .lc-print-sheet,
+  .lc-print-sheet * {
+    visibility: visible !important;
+  }
+
+  .lc-print-sheet {
+    display: block !important;
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    padding: 14mm 16mm !important;
+    margin: 0 !important;
+    background: #ffffff !important;
+    color: #111827 !important;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', system-ui,
+      sans-serif !important;
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .lc-print-sheet h1 {
+    margin: 0 0 2mm !important;
+    font-size: 17pt !important;
+    font-weight: 700 !important;
+    color: #111827 !important;
+  }
+
+  .lc-print-sheet h2 {
+    margin: 6mm 0 1.5mm !important;
+    font-size: 10.5pt !important;
+    font-weight: 600 !important;
+    color: #374151 !important;
+  }
+
+  .lc-print-sheet p,
+  .lc-print-sheet li {
+    margin: 0 0 1.2mm !important;
+    font-size: 9.5pt !important;
+    line-height: 1.6 !important;
+    color: #1f2937 !important;
+  }
+
+  .lc-print-sheet ol,
+  .lc-print-sheet ul {
+    margin: 0 0 2mm !important;
+    padding-left: 6mm !important;
+  }
+
+  .lc-print-sheet__meta {
+    font-size: 8.5pt !important;
+    color: #6b7280 !important;
+  }
+
+  .lc-print-sheet__lead {
+    margin: 0 0 4mm !important;
+    font-size: 9.5pt !important;
+    line-height: 1.6 !important;
+    color: #1f2937 !important;
+  }
+
+  /* 恢复码清单：每行一枚，等宽，序号在左侧 */
+  .lc-print-sheet__codes {
+    margin: 0 0 4mm !important;
+    padding: 4mm !important;
+    list-style: none !important;
+    border: 1.5pt dashed #9ca3af !important;
+    border-radius: 3mm !important;
+  }
+
+  .lc-print-sheet__codes li {
+    display: flex !important;
+    align-items: baseline !important;
+    gap: 4mm !important;
+    margin: 0 0 2mm !important;
+    padding: 0 !important;
+  }
+
+  .lc-print-sheet__codes li:last-child {
+    margin-bottom: 0 !important;
+  }
+
+  .lc-print-sheet__index {
+    flex: 0 0 6mm !important;
+    font-size: 9pt !important;
+    color: #9ca3af !important;
+    text-align: right !important;
+  }
+
+  .lc-print-sheet__value {
+    font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace !important;
+    font-size: 13pt !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.12em !important;
+    color: #111827 !important;
+    /* 长码在窄纸上折行，而不是被裁掉 */
+    word-break: break-all !important;
+  }
+
+  .lc-print-sheet__footer {
+    margin-top: 8mm !important;
+    padding-top: 3mm !important;
+    border-top: 0.5pt solid #d1d5db !important;
+    font-size: 8pt !important;
+    color: #6b7280 !important;
+  }
+}

@@ -1,0 +1,11 @@
+[module]
+id = "plugins"
+name = "插件"
+description = "安装、启用、禁用与卸载插件，打包导出与开发指南"
+icon = "Package"
+path = "/plugins"
+priority = 90
+category = "system"
+component = "Plugins.tsx"
+# 不在侧边栏/仪表盘等导航视图中出现；入口在标题栏「设置 → 插件」
+visible = false

@@ -1,0 +1,41 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window. The opener plugin needs an explicit path scope: 'allow-open-path' grants the open_path COMMAND but no path, so without scope entries every openPath() call fails with 'Not allowed to open path'. The scoped entries below cover the two call sites (Settings > About > open data dir, and the plugin detail drawer's open plugin folder).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        {
+          "path": "$APPDATA"
+        },
+        {
+          "path": "$APPDATA/**"
+        },
+        {
+          "path": "$APPLOCALDATA"
+        },
+        {
+          "path": "$APPLOCALDATA/**"
+        }
+      ]
+    },
+    "core:window:allow-close",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-maximize",
+    "core:window:allow-minimize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-title",
+    "core:window:allow-is-maximized",
+    "core:window:allow-is-focused",
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-start-resize-dragging"
+  ]
+}

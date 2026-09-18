@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "types": ["node"],
+
+    /*
+     * 以下三项目的是让这个 project 能真正检查 scripts/ 下的构建脚本。
+     *
+     * 原先缺少 target（默认 ES5）与 allowImportingTsExtensions，导致
+     * `tsc -p tsconfig.node.json` 对脚本报出大量与本意无关的错误
+     * （Set/Map 迭代、`.ts` 后缀导入），这个 project 实际上从未被当作
+     * 检查入口使用过 —— 脚本因此处于无类型检查的状态。
+     *
+     * - target ES2022：脚本运行在 Node 24 上，Set/Map 迭代是语言内置能力；
+     * - allowImportingTsExtensions：脚本之间用 `./colors.ts` 显式导入，
+     *   因为 Node 的原生类型擦除模式不支持无后缀/`.js` 后缀（见各脚本头部说明）；
+     * - noEmit + emitDeclarationOnly 的组合：composite 要求产出声明文件，
+     *   但这里只做检查；用 noEmit 保留 composite 的增量能力同时不落盘。
+     */
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  /*
+   * `src/types/**` 只保留脚本真正引用的类型文件：
+   * generate-modules.ts 会 `import type { ModuleToml } from '../src/types/module.ts'`，
+   * 该文件必须属于本 project，否则报 TS6307。
+   */
+  "include": ["vite.config.ts", "scripts/**/*.ts", "src/types/module.ts"]
+}

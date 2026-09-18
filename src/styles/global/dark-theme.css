@@ -1,0 +1,607 @@
+/* .src/styles/global/dark-theme.css */
+/*
+ * 深色模式。
+ *
+ * 设计取向：这是一层「按工具类精确映射」的全局覆盖，而不是在每个组件里
+ * 逐个补 `dark:` 变体。原因有两条：
+ *
+ *   1. 现有界面有 30 多个组件、数千个颜色工具类。逐文件补 `dark:` 需要改
+ *      动的面积很大，与「不引入灾难性变更」的前提冲突；
+ *   2. **插件**由第三方编写，它们不知道宿主是否处于深色模式，也不可能
+ *      配合补 `dark:` 变体。如果深色只靠组件内的 `dark:` 实现，那么任何
+ *      插件界面在深色模式下都会是白底黑字，与宿主割裂。
+ *
+ * 因此这里直接匹配工具类名（`[class~="bg-white"]` 等价于 `.bg-white`，
+ * 但**不会**被 `bg-white/90` 这类带透明度修饰符的类命中，正好避免了
+ * 「误伤半透明层」），把浅色工具类映射到对应的深色值。插件只要用常规的
+ * Tailwind 工具类，就能自动跟随主题。
+ *
+ * 关键约束：所有规则都在 `:root.dark` 下，且与 Tailwind 生成的工具类
+ * **同优先级**（都是单类选择器），依靠「后加载」取胜 —— 见 index.css 中的
+ * @import 顺序。因此这个文件必须在 tailwindcss 之后导入。
+ *
+ * 另需注意：这里不做 `transition: none` 之外的动画干预，
+ * 动效开关由 framer-motion 的 MotionConfig 与 .lc-reduce-motion 负责。
+ *
+ * ---------------------------------------------------------------------------
+ * 关于 `hover:` 等变体（第 9 节）：
+ *
+ * `[class~="bg-gray-100"]` 只匹配**整个**类名 token，而 `hover:bg-gray-100`
+ * 是另一个 token，因此默认不会被覆盖。结果是深色模式下悬停时闪出**浅灰色
+ * 方块**（全项目有 124 处 hover 颜色工具类会受影响）。
+ *
+ * 这些变体在主选择器之后单独补一节，用 `[class~="hover:bg-gray-100"]:hover`
+ * 精确命中。属性值里的 `:` 不需要转义（它在引号内是普通字符）；而生成这些
+ * 规则的 Tailwind 用的是 `@media (hover: hover)` 包裹 + 伪类，两者特异性
+ * 都是「一个类 + 一个伪类」，靠后加载取胜，因此必须放在文件末尾。
+ */
+
+:root.dark {
+  color-scheme: dark;
+}
+
+/* ============================================================
+ * 1. 页面底色
+ * ============================================================ */
+
+:root.dark body {
+  background-color: #0f1117;
+  color: #e5e7eb;
+}
+
+/* 滚动条在深色下换成浅色滑块 */
+:root.dark .custom-scrollbar {
+  scrollbar-color: rgba(148, 163, 184, 0.28) transparent;
+}
+
+/* ============================================================
+ * 2. 纯色背景
+ *
+ * 层次（由深到浅）：app 底 #0f1117 → 面板 #151823 → 卡片 #1a1e2b
+ * → 下沉区 #11141d → 悬浮 #222736
+ *
+ * ---------------------------------------------------------------------------
+ * 关于「白色 + 透明度」这类工具类（重要，改这里之前先读完）
+ *
+ * `bg-white/90` 与 `bg-white` 是**两个不同的类名 token**，属性选择器
+ * `[class~='bg-white']` 不会命中前者。因此每一个用到的不透明度档位都必须在
+ * 下面显式列出，**漏掉任何一档，那个元素在深色模式下就会退回原始的浅色** ——
+ * 表现为「深色界面里出现一块灰白」，而不是报错。
+ *
+ * 这个坑真实发生过：标题栏（`bg-white/90`）映射了，但二级标题栏 —— 标签栏 ——
+ * 用的是 `bg-white/85`，当时不在列表里，于是整条标签栏在深色下渲染成灰白色；
+ * 全局搜索框的输入区是 `bg-gray-50/80`，同样漏掉，渲染成浅灰。
+ *
+ * 两处修法不同，都是刻意的：
+ *   · 标签栏、标题栏这类**窗口亚层（chrome）**改为**不透明**的深色面板色。
+ *     它们背后就是应用底色，半透明只会把底色透上来、让同一层的两块亚层
+ *     深浅不一；而不透明之后，标题栏与标签栏成为同一块连续的面板，文字对比度
+ *     也不再依赖背后的内容。这是「好看且不突兀」的关键：亚层要看起来是**一整块**。
+ *   · 搜索框是**下沉的输入区**，用比面板更深一档的实色（见 §2.5），
+ *     靠明度差表达「这里是凹进去的输入位」，而不是靠灰。
+ *
+ * 同时把 `bg-white/85`、`bg-white/95`、`bg-gray-50/80`、`bg-gray-50/60`
+ * 这些档位补进映射表，作为兜底 —— 即使将来某个组件再写半透明白，
+ * 也不会退回浅色。
+ * ============================================================ */
+
+:root.dark [class~='bg-white'],
+:root.dark [class~='bg-white/90'],
+:root.dark [class~='bg-white/85'],
+:root.dark [class~='bg-white/80'],
+:root.dark [class~='bg-white/70'],
+:root.dark [class~='bg-white/60'],
+:root.dark [class~='bg-white/50'],
+:root.dark [class~='bg-white/95'] {
+  background-color: #1a1e2b;
+}
+
+/* 标题栏与标签栏：窗口亚层，一律用不透明面板色，且**同一取值** ——
+   两块亚层在视觉上必须连成一片，否则窗口顶部会出现一条色带分界。 */
+:root.dark [class~='bg-white/90'][class~='backdrop-blur-xl'],
+:root.dark [class~='bg-white/85'][class~='backdrop-blur-xl'],
+:root.dark [class~='bg-white/95'][class~='backdrop-blur-xl'] {
+  background-color: #151823;
+}
+
+/* ============================================================
+ * 2.5 下沉 / 悬浮表面
+ *
+ * 输入框、代码块这类「凹进去」的区域，比所在面板更深一档；
+ * 下拉菜单、浮层这类「凸出来」的区域更亮一档。靠明度差表达层级，
+ * 而不是靠降低饱和度（那正是「灰」的来源，在深色下读起来像禁用态）。
+ * ============================================================ */
+
+/* 下沉区：搜索框输入区、非激活标签、内嵌代码块 */
+:root.dark [class~='bg-gray-50'],
+:root.dark [class~='bg-gray-50/50'],
+:root.dark [class~='bg-gray-50/30'],
+:root.dark [class~='bg-gray-50/60'],
+:root.dark [class~='bg-gray-50/80'] {
+  background-color: #11141d;
+}
+
+/* 输入类控件单独再深一点，并配一道可见的描边（见 §6 的 border 映射），
+   让「可以打字的地方」与「只是深色底」区分开。 */
+:root.dark [class~='bg-gray-50/80'][class~='rounded-lg'] {
+  background-color: #0e111a;
+}
+
+:root.dark [class~='bg-gray-100'],
+:root.dark [class~='bg-gray-100/80'] {
+  background-color: #222736;
+}
+
+:root.dark [class~='bg-gray-200'],
+:root.dark [class~='bg-gray-200/80'] {
+  background-color: #2a3040;
+}
+
+:root.dark [class~='bg-gray-300'] {
+  background-color: #374151;
+}
+
+:root.dark [class~='bg-gray-800'],
+:root.dark [class~='bg-gray-800/40'],
+:root.dark [class~='bg-gray-800/50'] {
+  background-color: #151823;
+}
+
+:root.dark [class~='bg-gray-900'],
+:root.dark [class~='bg-gray-900/40'] {
+  background-color: #0b0d14;
+}
+
+/* 深色下「更深的灰」当浮层底用：下拉菜单、右键菜单、抽屉。
+   比卡片亮一档，才有「浮在内容之上」的观感。 */
+:root.dark [class~='bg-gray-700'],
+:root.dark [class~='bg-gray-700/70'] {
+  background-color: #262c3b;
+}
+
+/* ============================================================
+ * 3. 半透明状态色（hover / 选中 / 徽标）
+ *
+ * 浅色下这些是 -50/-100 的淡色块，深色下换成低透明度的同色，
+ * 保持色相可辨识但不过亮。
+ *
+ * 注意这里以及下文所有 indigo 相关规则都指向 `--accent-*` 变量，
+ * 而不是硬编码的靛蓝 —— 否则主题配色功能会在深色模式下失效
+ * （硬编码值会盖掉 accent.css 的重定向）。变量的定义见 accent.css。
+ * ============================================================ */
+
+:root.dark [class~='bg-indigo-50'],
+:root.dark [class~='bg-indigo-50/30'],
+:root.dark [class~='bg-indigo-50/50'],
+:root.dark [class~='bg-purple-50'],
+:root.dark [class~='bg-violet-50'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.16);
+}
+:root.dark [class~='bg-indigo-100'],
+:root.dark [class~='bg-purple-100'],
+:root.dark [class~='bg-violet-100'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.24);
+}
+:root.dark [class~='bg-indigo-100/80'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.22);
+}
+
+:root.dark [class~='bg-amber-50'],
+:root.dark [class~='bg-amber-50/20'],
+:root.dark [class~='bg-amber-50/30'] {
+  background-color: rgba(245, 158, 11, 0.14);
+}
+:root.dark [class~='bg-amber-100'] {
+  background-color: rgba(245, 158, 11, 0.22);
+}
+
+:root.dark [class~='bg-emerald-50'] {
+  background-color: rgba(16, 185, 129, 0.14);
+}
+:root.dark [class~='bg-emerald-100'] {
+  background-color: rgba(16, 185, 129, 0.22);
+}
+
+:root.dark [class~='bg-red-50'] {
+  background-color: rgba(239, 68, 68, 0.14);
+}
+:root.dark [class~='bg-red-100'] {
+  background-color: rgba(239, 68, 68, 0.22);
+}
+:root.dark [class~='bg-red-500/10'] {
+  background-color: rgba(239, 68, 68, 0.12);
+}
+:root.dark [class~='bg-red-500/20'] {
+  background-color: rgba(239, 68, 68, 0.2);
+}
+
+:root.dark [class~='bg-blue-50'] {
+  background-color: rgba(59, 130, 246, 0.14);
+}
+
+:root.dark [class~='bg-violet-50'] {
+  background-color: rgba(139, 92, 246, 0.16);
+}
+
+:root.dark [class~='bg-purple-100'] {
+  background-color: rgba(168, 85, 247, 0.22);
+}
+
+:root.dark [class~='bg-amber-500/10'] {
+  background-color: rgba(245, 158, 11, 0.12);
+}
+
+/* ============================================================
+ * 4. 文字
+ *
+ * 亮度按语义分层：900/800 是主文本（最亮），700/600 次之，
+ * 500 是次要说明，400 是弱化文本。深色下整体反转。
+ * ============================================================ */
+
+:root.dark [class~='text-gray-900'],
+:root.dark [class~='text-gray-800'] {
+  color: #f3f4f6;
+}
+
+:root.dark [class~='text-gray-700'] {
+  color: #d1d5db;
+}
+
+:root.dark [class~='text-gray-600'] {
+  color: #9ca3af;
+}
+
+:root.dark [class~='text-gray-500'] {
+  color: #8b93a7;
+}
+
+:root.dark [class~='text-gray-400'] {
+  color: #6b7280;
+}
+
+:root.dark [class~='text-gray-300'] {
+  color: #4b5563;
+}
+
+/* 强调色在深色底上需要提亮，否则对比度不足。
+   指向变量而非硬编码靛蓝，保证主题配色在深色模式下同样生效。 */
+:root.dark [class~='text-indigo-600'],
+:root.dark [class~='text-purple-600'],
+:root.dark [class~='text-violet-600'] {
+  color: var(--accent-400);
+}
+:root.dark [class~='text-indigo-700'],
+:root.dark [class~='text-purple-700'],
+:root.dark [class~='text-violet-700'] {
+  color: var(--accent-300);
+}
+:root.dark [class~='text-indigo-500'],
+:root.dark [class~='text-purple-500'],
+:root.dark [class~='text-violet-500'] {
+  color: var(--accent-400);
+}
+
+:root.dark [class~='text-amber-600'] {
+  color: #fcd34d;
+}
+:root.dark [class~='text-amber-700'] {
+  color: #fde68a;
+}
+:root.dark [class~='text-amber-500'] {
+  color: #fbbf24;
+}
+
+:root.dark [class~='text-emerald-600'],
+:root.dark [class~='text-emerald-700'] {
+  color: #6ee7b7;
+}
+
+:root.dark [class~='text-red-600'],
+:root.dark [class~='text-red-700'] {
+  color: #fca5a5;
+}
+
+:root.dark [class~='text-blue-900'],
+:root.dark [class~='text-blue-700'] {
+  color: #bfdbfe;
+}
+
+:root.dark [class~='text-violet-600'] {
+  color: #c4b5fd;
+}
+
+:root.dark [class~='text-purple-600'] {
+  color: #d8b4fe;
+}
+
+/* ============================================================
+ * 5. 边框
+ * ============================================================ */
+
+:root.dark [class~='border-gray-50'],
+:root.dark [class~='border-gray-100'],
+:root.dark [class~='border-gray-100/80'] {
+  border-color: #252a38;
+}
+
+:root.dark [class~='border-gray-200'],
+:root.dark [class~='border-gray-200/50'],
+:root.dark [class~='border-gray-200/60'],
+:root.dark [class~='border-gray-200/70'] {
+  border-color: #2c3242;
+}
+
+/*
+ * 亚层分隔线单独处理（标题栏底边、标签栏底边）。
+ *
+ * 问题：深色模式下标签栏底部有一条**浅色**边线，在深色面板上像一道白边。
+ * 根因有两层：
+ *   1. `border-gray-200/70` 不在映射表里（只列了 /50、/60），原样保留浅色；
+ *   2. 即便映射到常规边框色 `#2c3242`，对「窗口亚层」来说仍偏亮 ——
+ *      它会让标题栏与标签栏各自像被描了一圈框。
+ *
+ * 取向：亚层的分界应当**压下去**，而不是**提起来**。
+ * 深色界面里用亮线勾边会让每个亚层像被描了一圈白框，既突兀，也与本项目
+ * 「层次靠明度差表达」的既定取向冲突（见设计规范第 2.4 节）。
+ *
+ * 取值 `#0a0c12`：比亚层（#151823）与应用底（#0f1117）都更暗，
+ * 与亚层的对比约 1.10:1。这个量级是**刻意选的**，参照的是本项目既有的
+ * 层次基准 —— 应用底与亚层之间本来就只有 1.066:1（同属"安静"的层次表达）。
+ * 因此分隔线要读作「一道浅浅的接缝」，而不是一条明显的线：
+ * 比这个更暗会显得脏，更亮就又回到"勾白边"的问题。
+ *
+ * 之前的中间稿用过 #0b0d14（约 1.097:1），与现在基本等价；
+ * 这里统一取 #0a0c12，与 accent.css / 设计规范里的深色底值保持同一族。
+ *
+ * **只对窗口亚层生效**，不波及浮层：右键菜单、插件卡片、下拉面板也用
+ * `/50`、`/70`，但它们需要的是常规边框色 —— 深色下给浮层描一道近黑边，
+ * 会让它看起来像一块硬邦邦的补丁，而不是浮在内容之上。
+ * 判据用 `backdrop-blur-xl`：本项目里只有窗口亚层（标题栏、标签栏）用它。
+ */
+:root.dark [class~='border-gray-200/50'][class~='backdrop-blur-xl'],
+:root.dark [class~='border-gray-200/70'][class~='backdrop-blur-xl'] {
+  border-color: #0a0c12;
+}
+
+:root.dark [class~='border-gray-300'] {
+  border-color: #3b4252;
+}
+
+:root.dark [class~='border-gray-700'],
+:root.dark [class~='border-gray-700/50'] {
+  border-color: #2c3242;
+}
+
+:root.dark [class~='border-indigo-200'] {
+  border-color: rgb(from var(--accent-500) r g b / 0.38);
+}
+:root.dark [class~='border-amber-200'],
+:root.dark [class~='border-amber-200/60'] {
+  border-color: rgba(245, 158, 11, 0.38);
+}
+:root.dark [class~='border-red-200'] {
+  border-color: rgba(239, 68, 68, 0.38);
+}
+:root.dark [class~='border-emerald-200'] {
+  border-color: rgba(16, 185, 129, 0.38);
+}
+:root.dark [class~='border-red-500/30'] {
+  border-color: rgba(239, 68, 68, 0.3);
+}
+:root.dark [class~='border-amber-500/25'] {
+  border-color: rgba(245, 158, 11, 0.25);
+}
+
+/* ============================================================
+ * 6. 阴影
+ *
+ * 深色底上彩色阴影（shadow-indigo-100 之类）几乎不可见，
+ * 换成更深的黑阴影才有层次。
+ * ============================================================ */
+
+:root.dark [class~='shadow-sm'],
+:root.dark [class~='shadow'],
+:root.dark [class~='shadow-md'],
+:root.dark [class~='shadow-lg'],
+:root.dark [class~='shadow-xl'],
+:root.dark [class~='shadow-2xl'] {
+  --tw-shadow-color: rgba(0, 0, 0, 0.5);
+}
+
+:root.dark [class~='shadow-indigo-100/50'],
+:root.dark [class~='shadow-amber-100/50'],
+:root.dark [class~='shadow-indigo-500/25'],
+:root.dark [class~='shadow-indigo-500/20'] {
+  --tw-shadow-color: rgba(0, 0, 0, 0.45);
+}
+
+/* ============================================================
+ * 7. 表单控件
+ *
+ * 原生控件（select 的弹出列表、textarea 的滚动条、input 的自动填充）
+ * 不认 Tailwind 类，必须显式声明 color-scheme 才能跟随深色。
+ * ============================================================ */
+
+:root.dark select,
+:root.dark input,
+:root.dark textarea {
+  color-scheme: dark;
+}
+
+:root.dark select option {
+  background-color: #1a1e2b;
+  color: #e5e7eb;
+}
+
+:root.dark input::placeholder,
+:root.dark textarea::placeholder {
+  color: #6b7280;
+}
+
+/* ============================================================
+ * 8. 启动 / 授权界面
+ *
+ * 这两个界面本来就是深色设计（见 BootScreen / AuthScreen），
+ * 上面的映射会把它们的 from-gray-900 渐变与 text-gray-* 一起改写，
+ * 因此这里显式还原，避免「深色主题把深色界面改坏」。
+ * ============================================================ */
+
+:root.dark [class~='bg-linear-to-br'][class~='from-gray-900'] {
+  background-image: linear-gradient(to bottom right, #101322, #16182b, #101322);
+}
+
+:root.dark .lc-boot-surface {
+  color: #f3f4f6;
+}
+
+/* ============================================================
+ * 9. hover / 其它变体的背景与文字
+ *
+ * 上面的映射只匹配**裸类名**（`bg-gray-100`）。`hover:bg-gray-100` 是
+ * 另一个类名 token，因此不会被命中 —— 深色模式下鼠标悬停时会闪出一块
+ * 浅灰底，在深色界面上非常刺眼。全项目有 124 处 hover 颜色工具类。
+ *
+ * 这一节为常用的 hover 变体补上对应值。选择器
+ * `[class~='hover:bg-gray-100']:hover` 的特异性是「一个类 + 一个伪类」，
+ * 与 Tailwind 生成的一致，靠**文件位置在最后**取胜。
+ *
+ * 只覆盖实际用到的组合（从源码扫出来），不追求穷举 —— 没列到的组合
+ * 会退回浅色值，是可见但无害的降级。
+ * ============================================================ */
+
+/* --- hover 背景 --- */
+
+:root.dark [class~='hover:bg-gray-50']:hover,
+:root.dark [class~='hover:bg-gray-50/50']:hover {
+  background-color: #222736;
+}
+
+:root.dark [class~='hover:bg-gray-100']:hover {
+  background-color: #222736;
+}
+
+:root.dark [class~='hover:bg-gray-200']:hover,
+:root.dark [class~='hover:bg-gray-200/80']:hover {
+  background-color: #2a3040;
+}
+
+/* 深色界面里"更亮"的方向：hover 用比底色更浅的灰 */
+:root.dark [class~='hover:bg-gray-700']:hover {
+  background-color: #333a4d;
+}
+
+:root.dark [class~='hover:bg-gray-800']:hover {
+  background-color: #2a3040;
+}
+
+:root.dark [class~='hover:bg-white']:hover {
+  background-color: #222736;
+}
+
+/* 深色底上"更暗"的方向没有对比度，反转为提亮 */
+:root.dark [class~='hover:bg-gray-900/10']:hover {
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+:root.dark [class~='hover:bg-white/10']:hover {
+  background-color: rgba(255, 255, 255, 0.14);
+}
+
+:root.dark [class~='hover:bg-indigo-50/30']:hover,
+:root.dark [class~='hover:bg-indigo-100']:hover {
+  background-color: rgb(from var(--accent-500) r g b / 0.22);
+}
+
+:root.dark [class~='hover:bg-indigo-700']:hover {
+  background-color: #4338ca;
+}
+
+:root.dark [class~='hover:bg-amber-50']:hover,
+:root.dark [class~='hover:bg-amber-100']:hover,
+:root.dark [class~='hover:bg-amber-200']:hover {
+  background-color: rgba(245, 158, 11, 0.22);
+}
+
+:root.dark [class~='hover:bg-red-50']:hover,
+:root.dark [class~='hover:bg-red-500/30']:hover {
+  background-color: rgba(239, 68, 68, 0.22);
+}
+
+:root.dark [class~='hover:bg-red-500']:hover,
+:root.dark [class~='hover:bg-red-700']:hover {
+  background-color: #dc2626;
+}
+
+/* --- hover 文字 --- */
+
+:root.dark [class~='hover:text-gray-600']:hover {
+  color: #d1d5db;
+}
+
+:root.dark [class~='hover:text-gray-700']:hover,
+:root.dark [class~='hover:text-gray-800']:hover {
+  color: #e5e7eb;
+}
+
+:root.dark [class~='hover:text-gray-900']:hover,
+:root.dark [class~='hover:text-gray-200']:hover {
+  color: #f3f4f6;
+}
+
+/* 深色底上的次要文字：hover 要变亮而不是变暗 */
+:root.dark [class~='hover:text-gray-300']:hover {
+  color: #d1d5db;
+}
+
+:root.dark [class~='hover:text-indigo-400']:hover {
+  color: var(--accent-400);
+}
+
+:root.dark [class~='hover:text-indigo-600']:hover {
+  color: var(--accent-400);
+}
+
+:root.dark [class~='hover:text-red-600']:hover {
+  color: #fca5a5;
+}
+
+:root.dark [class~='hover:text-amber-500']:hover {
+  color: #fbbf24;
+}
+
+:root.dark [class~='hover:text-amber-800']:hover {
+  color: #fcd34d;
+}
+
+:root.dark [class~='hover:text-white']:hover {
+  color: #ffffff;
+}
+
+/* --- group-hover 文字（父元素 hover 时改变子元素） --- */
+
+:root.dark [class~='group-hover:text-gray-900'] {
+  color: #f3f4f6;
+}
+
+:root.dark [class~='group-hover:text-indigo-600'] {
+  color: var(--accent-400);
+}
+
+/* --- hover 边框 --- */
+
+:root.dark [class~='hover:border-gray-200']:hover,
+:root.dark [class~='hover:border-gray-400']:hover {
+  border-color: #3b4252;
+}
+
+:root.dark [class~='hover:border-gray-600']:hover {
+  border-color: #4b5563;
+}
+
+:root.dark [class~='hover:border-indigo-200']:hover {
+  border-color: rgb(from var(--accent-500) r g b / 0.5);
+}
+
+:root.dark [class~='hover:border-amber-300']:hover {
+  border-color: rgba(245, 158, 11, 0.5);
+}

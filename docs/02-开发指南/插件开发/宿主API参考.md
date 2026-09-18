@@ -1,0 +1,399 @@
+# 宿主 API 参考
+
+宿主在页面加载时向 `window` 注入 `Modulith` 对象，这是插件与框架交互的唯一入口。本文列出全部可用接口与使用约束。
+
+## 1. window.Modulith
+
+接口**没有被 `Object.freeze`**，宿主也没有用 `defineProperty` 把它设为只读。插件在技术上可以覆写或增删 `window.Modulith` 上的成员，宿主不会检测、也不会因此拒绝加载。约定是「不要修改」，而不是「不能修改」。
+
+之所以不加冻结，是因为 `version` 本身需要在后端版本号取回后被宿主就地更新：`reloadPluginRuntime()` 会先 `await refreshHostVersion()`，再在已注入的情况下写入 `Modulith.version`。冻结会把这条唯一的写路径也一并封死。若要改为冻结，需要先把 `version` 改成 getter，属于接口形态变更，当前未做。
+
+需要强调的后果：**覆写 `Modulith` 只会破坏你自己的插件**。宿主内部并不通过 `window.Modulith` 调用这些函数——它持有模块作用域内的原始引用（`React`、`jsx`、`registerModule` 等直接 import 进来），插件写入 `window.Modulith.registerModule = ...` 只影响后续加载的其他插件读到的值。宿主不提供接口防护，因此不要在生产插件里依赖这种写法的任何「隔离」效果。
+
+| 成员 | 类型 | 说明 |
+| --- | --- | --- |
+| `version` | string | 宿主版本号，来自后端 `get_app_info` |
+| `platform` | string | 固定为 `"tauri"` |
+| `React` | object | 宿主使用的 React 实例 |
+| `jsx` | function | 宿主的 JSX 运行时（自动运行时） |
+| `jsxs` | function | 同 `jsx`，用于多子元素场景 |
+| `Fragment` | symbol | React Fragment |
+| `registerModule` | function | 注册一个模块 |
+| `createContext` | function | 取得当前插件的服务集合 |
+| `registerCommand` | function | 把一个动作注册进全局搜索框 |
+| `useModuleActive` | function | 判断当前模块是否真的对用户可见（Hook） |
+
+`registerCommand` 与 `createContext` 一样**只能在插件加载期间调用**（即 IIFE 顶层），因为命令需要归属到具体插件，而「当前正在加载哪个插件」只有加载期才有确定值。宿主会给 ID 加上 `plugin:<插件ID>:` 前缀，插件卸载时据此一次性摘除它注册的全部命令。
+
+```js
+window.Modulith.registerCommand({
+  id: 'clear-done',                       // 插件内的局部 ID，宿主自动加前缀
+  title: '清除已完成的待办',
+  keywords: ['clear', 'qingchu'],
+  run: function () { ctx.storage.set('todos', []); },
+});
+```
+
+`useModuleActive` 是标签页保活的配套接口：模块被切走后**不会卸载**，定时器与轮询会照常运行。插件应当用它决定要不要暂停后台工作：
+
+```js
+var React = window.Modulith.React;
+var active = window.Modulith.useModuleActive();
+
+React.useEffect(function () {
+  if (!active) return;                    // 在后台就不起轮询
+  var timer = setInterval(refresh, 30000);
+  return function () { clearInterval(timer); };
+}, [active]);
+```
+
+它同时考虑了两件事：所在标签页是否是当前激活的那个，以及窗口是否被最小化/隐藏。宿主提供的是**感知能力**而不是强制暂停 —— JS 里拿不到模块创建的定时器句柄，宿主无法可靠地代为清理。
+
+### 1.1 使用 React
+
+插件必须使用 `Modulith.React`，不得自行导入 React：
+
+```js
+var React = window.Modulith.React;
+var h = React.createElement;
+```
+
+原因在于 Hooks 依赖模块实例的身份。如果插件打包进自己的 React 副本，那么插件组件调用 `useState` 时读取的是另一个实例的内部状态，导致「Invalid hook call」或状态不同步。共用同一实例是硬性要求。
+
+打包时应把以下模块设为外部依赖，映射到 `Modulith` 的对应成员：
+
+| 模块 | 映射到 |
+| --- | --- |
+| `react` | `Modulith.React` |
+| `react/jsx-runtime` | `Modulith.jsx` 与 `Modulith.jsxs` |
+| `react-dom` | 无需映射，宿主不提供 ReactDOM |
+
+宿主**不提供** `ReactDOM`。插件不应调用 `createRoot` 或 `render`，而应通过 `registerModule` 交出组件，由宿主负责挂载与卸载。
+
+### 1.2 JSX 自动运行时
+
+若构建工具配置为自动运行时，编译产物会引用 `react/jsx-runtime` 的 `jsx`、`jsxs` 与 `Fragment`。这三者都可在 `Modulith` 上找到，按上表映射即可。
+
+### 1.3 registerModule
+
+```js
+Modulith.registerModule({
+  id: 'sampleNotes',
+  name: '速记本',
+  displayName: '速记本',
+  description: '本地速记',
+  icon: 'icon.svg',
+  priority: 30,
+  category: '示例',
+  component: Notes,
+});
+```
+
+| 字段 | 类型 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 模块唯一标识，不得与内建模块或其他插件模块冲突 |
+| `name` | string | 是 | 模块名 |
+| `component` | React 组件 | 是 | 模块的根组件，接收空 props |
+| `displayName` | string | 否 | 显示名，缺省时使用 `name` |
+| `description` | string | 否 | 描述 |
+| `icon` | string | 否 | lucide-react 图标名 |
+| `path` | string | 否 | 逻辑路径 |
+| `priority` | number | 否 | 排序权重，升序 |
+| `category` | string | 否 | 分组名 |
+| `badge` | string | 否 | 角标文本 |
+
+调用时机：必须在 `registerModule` 可用的窗口内调用，即插件代码执行期间。注册成功后模块进入动态编目，与内建模块一起出现在侧边栏。
+
+如果插件执行完毕却没有注册任何模块，宿主会判定加载失败。
+
+### 1.4 createContext
+
+```js
+var ctx = Modulith.createContext();
+```
+
+返回绑定到当前插件的服务集合：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `pluginId` | string | 当前插件 ID |
+| `pluginVersion` | string | 当前插件版本 |
+| `manifest` | object | 解析后的清单 |
+| `version` | string | 宿主版本号 |
+| `storage` | object | 插件私有存储 |
+| `http` | object | 网络请求 |
+| `logger` | object | 带插件前缀的日志 |
+| `notifications` | object | 应用内通知（需 `notification` 权限） |
+| `events` | object | 跨模块事件总线（需 `plugin-communicate` 权限） |
+
+**调用时机是严格受限的**：只能在插件 bundle 执行期间调用，例如 IIFE 顶层。在插件代码之外调用会抛出异常，因为服务需要绑定正在加载的插件 ID。
+
+推荐在 bundle 顶层获取一次并复用：
+
+```js
+(function () {
+  var Modulith = window.Modulith;
+  if (!Modulith) return;
+
+  var ctx = Modulith.createContext();   // 顶层获取一次
+
+  function MyView() {
+    // 在组件内部闭包引用 ctx 即可，不要再次调用 createContext
+    React.useEffect(function () {
+      ctx.storage.get('key').then(function (value) { /* ... */ });
+    }, []);
+    return null;
+  }
+
+  Modulith.registerModule({ id: 'myView', name: '我的视图', component: MyView });
+})();
+```
+
+## 2. storage
+
+插件私有存储，按插件 ID 隔离。数据以 JSON 序列化后保存在应用数据目录中，卸载插件时一并清除。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `get` | `get<T>(key, defaultValue?) => Promise<T \| undefined>` | 读取并反序列化；键不存在或解析失败时返回 `defaultValue` |
+| `set` | `set<T>(key, value) => Promise<void>` | 序列化后写入 |
+| `delete` | `delete(key) => Promise<void>` | 删除单个键 |
+| `clear` | `clear() => Promise<void>` | 清空该插件的全部数据 |
+| `keys` | `keys() => Promise<string[]>` | 列出全部键 |
+| `all` | `all() => Promise<Record<string, unknown>>` | 读取全部键值 |
+
+用法：
+
+```js
+// 读取，带默认值
+var notes = await ctx.storage.get('notes', []);
+
+// 写入任意可 JSON 序列化的值
+await ctx.storage.set('notes', [{ id: '1', text: '第一条' }]);
+
+// 删除
+await ctx.storage.delete('notes');
+
+// 遍历全部
+var keys = await ctx.storage.keys();
+```
+
+注意 `get` 在内部捕获 JSON 解析错误并返回默认值，因此数据损坏不会导致调用方抛出异常。
+
+**不要用 localStorage 保存插件数据**。`storage` 会随插件卸载而清理，且按插件隔离；`localStorage` 既不隔离也不清理。
+
+## 3. http
+
+网络请求服务。返回标准 `Response` 对象，因此可以像 `fetch` 一样使用。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `fetch` | `fetch(url, init?) => Promise<Response>` | 通用请求，方法取自 `init.method`，默认 GET |
+| `get` | `get(url, init?) => Promise<Response>` | GET |
+| `post` | `post(url, data?, init?) => Promise<Response>` | POST，`data` 会被 JSON 序列化 |
+| `put` | `put(url, data?, init?) => Promise<Response>` | PUT，`data` 会被 JSON 序列化 |
+| `delete` | `delete(url, init?) => Promise<Response>` | DELETE |
+
+用法：
+
+```js
+// GET 并解析 JSON
+var res = await ctx.http.get('https://api.example.com/items');
+var items = await res.json();
+
+// POST JSON
+var created = await ctx.http.post('https://api.example.com/items', { name: '新条目' });
+
+// 自定义请求头
+await ctx.http.get('https://api.example.com/data', {
+  headers: { Authorization: 'Bearer token' },
+});
+```
+
+### 3.1 权限要求
+
+网络访问受清单权限约束，未声明时请求会被拒绝：
+
+| 目标 | 需要的权限 |
+| --- | --- |
+| 本机回环地址（`127.0.0.1`、`localhost`、`::1`） | `network` |
+| 其他地址 | `network` 与 `network-external` |
+
+因此访问外部接口的插件需要同时声明两项：
+
+```json
+"permissions": ["network", "network-external"]
+```
+
+请求由后端发出，因此不受浏览器同源策略限制。
+
+## 4. logger
+
+带 `[plugin:<id>]` 前缀的日志输出，便于在开发者工具中按插件过滤。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `debug` | `debug(msg, ...args)` | 调试信息 |
+| `info` | `info(msg, ...args)` | 一般信息 |
+| `warn` | `warn(msg, ...args)` | 警告 |
+| `error` | `error(msg, ...args)` | 错误 |
+| `trace` | `trace(label) => () => void` | 计时，调用返回值输出耗时 |
+
+用法：
+
+```js
+ctx.logger.info('插件已加载', { version: ctx.pluginVersion });
+
+// 计时
+var done = ctx.logger.trace('加载数据');
+await loadData();
+done();   // 输出 "加载数据: 12.3ms"
+```
+
+## 5. notifications
+
+应用内通知。**需要清单声明 `notification` 权限**；未声明时这些方法都是空实现，并会在控制台留下一条警告，但不会导致插件加载失败。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `isAvailable` | `isAvailable() => boolean` | 权限是否已声明 |
+| `show` / `info` | `(title, body?, dedupeKey?) => Promise<void>` | 一般信息 |
+| `success` | 同上 | 成功 |
+| `warn` | 同上 | 警告（浮层停留更久） |
+| `error` | 同上 | 错误（浮层不自动消失） |
+
+```json
+"permissions": ["storage", "notification"]
+```
+
+```js
+// 普通通知：右下角浮层 + 通知中心，重启后仍在
+await ctx.notifications.info('同步完成', '共 42 条记录');
+
+// dedupeKey：同一条信息重复发生时合并为一条（计数递增），不会反复弹浮层
+await ctx.notifications.warn('网络不可用', '正在重试', 'network-down');
+
+// 主动查询权限，自行降级
+if (!ctx.notifications.isAvailable()) {
+  console.warn('本插件未声明 notification 权限，将改用模块内提示');
+}
+```
+
+几个必须知道的行为：
+
+- `source` 自动设为**插件 ID**，而不是你注册的模块 ID。这两者通常不同（插件 ID 是 `com.example.my-plugin`，模块 ID 是你自己起的 `myView`）。
+- 未读徽标与「打开模块」入口会自动处理这个差异：`moduleCatalog` 的 `getNotificationSourcesFor()` 把模块展开为「模块 ID + 其所属插件 ID」，`resolveNotificationTarget()` 把插件 ID 解析回该插件注册的第一个模块。因此一个插件注册多个模块时，通知会显示在**所有**这些模块的徽标上，而点击跳转到 priority 最小的那一个 —— 通知本身不携带「属于哪个模块」的信息。
+- **浮层的展示规则**：`dedupeKey` 命中一条**已读**记录时不会合并（那是新的一件事），因此会重新弹一次；命中未读记录时只增加计数、不弹浮层。
+- **只有应用内通知，没有系统级通知。** 应用关闭时无法提醒。这需要在宿主里引入 `tauri-plugin-notification` 依赖，当前版本刻意不新增依赖，因此不提供该能力。
+- 通知总量上限 200 条，超出后优先丢弃已读的旧通知。
+
+## 6. events
+
+跨模块事件总线。**需要清单声明 `plugin-communicate` 权限**；未声明时 `publish` 被忽略、`subscribe` 返回空的取消函数（同样只记警告）。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `isAvailable` | `isAvailable() => boolean` | 权限是否已声明 |
+| `publish` | `publish(topic, payload?) => void` | 发布，同步投递 |
+| `subscribe` | `subscribe<T>(topic, handler) => () => void` | 订阅，返回取消函数 |
+
+```js
+// 发布
+ctx.events.publish('todo.changed', { pending: 3 });
+
+// 订阅（handler 收到 { topic, payload, source, at }）
+var off = ctx.events.subscribe('timer.finished', function (event) {
+  ctx.notifications.info('计时结束', event.payload.label);
+});
+
+// 不再需要时主动取消（插件被禁用/卸载时宿主会自动清理，这里只是提前收回）
+off();
+```
+
+约束与取舍：
+
+- **主题名只能是**小写字母、数字、`.`、`-`、`_`，且必须以字母或数字开头，最长 64 字符。非法主题会被丢弃并记录警告，而不是抛错 —— 发布通常发生在异步回调里，在那里抛错没人接得住。
+- **投递是同步的**，按订阅顺序依次调用。异步投递会让「发布」与「处理」之间插入任意其它代码，排查问题时很难把因果对上。
+- 某个处理函数抛错会被捕获并记录，**不会中断其余处理函数**，也不会让发布方失败。
+- 默认**收不到自己发布的事件**。这是为了打断「发布 → 自己处理 → 再发布同一主题」的回环。确实需要时用宿主内部的 `subscribe` 选项，插件接口不暴露它。
+- 插件的订阅会自动归属到插件 ID，因此插件被禁用或卸载时宿主会一次性摘掉它的全部订阅与命令。你不需要自己记住取消订阅，但仍应在不再需要时主动 `off()`。
+- 总线上**没有权限隔离**：声明了权限的插件可以订阅任意主题。它带来的是「模块之间可以协作」，不是「模块之间互相隔离」。
+
+## 7. 完整示例
+
+一个最小可用的插件代码包：
+
+```js
+(function () {
+  'use strict';
+
+  var Modulith = window.Modulith;
+  if (!Modulith) {
+    console.error('[my-plugin] window.Modulith 不存在，宿主未就绪');
+    return;
+  }
+
+  var React = Modulith.React;
+  var h = React.createElement;
+  var ctx = Modulith.createContext();
+
+  function MyView() {
+    var state = React.useState(0);
+    var count = state[0];
+    var setCount = state[1];
+
+    return h(
+      'div',
+      { className: 'my-plugin' },
+      h('h1', null, '我的插件'),
+      h('p', null, '当前计数：' + count),
+      h('button', { onClick: function () { setCount(count + 1); } }, '加一')
+    );
+  }
+
+  Modulith.registerModule({
+    id: 'myPluginView',
+    name: '我的插件',
+    description: '示例视图',
+    component: MyView,
+  });
+
+  ctx.logger.info('插件加载完成');
+})();
+```
+
+对应的清单：
+
+```json
+{
+  "name": "com.example.my-plugin",
+  "displayName": "我的插件",
+  "version": "1.0.0",
+  "description": "示例插件",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "dist/index.js"
+}
+```
+
+## 8. 约束速查
+
+| 约束 | 说明 |
+| --- | --- |
+| 不使用 `import` | 代码以 `<script>` 注入执行，必须是自执行脚本 |
+| 不导入 React | 使用 `Modulith.React`，共用宿主实例 |
+| 不修改 `window.Modulith` | 接口未冻结，但覆写只会破坏插件自身 |
+| 不调用 ReactDOM | 通过 `registerModule` 交组件，宿主负责挂载 |
+| `createContext()` 只在加载期调用 | 在 bundle 顶层获取一次并复用 |
+| `registerCommand()` 只在加载期调用 | 命令需要归属到插件，卸载时据此批量摘除 |
+| 必须注册至少一个模块 | 否则判定为加载失败 |
+| 网络需声明权限 | 外部地址需 `network` 与 `network-external` |
+| 通知需声明权限 | `notification`，否则接口是空实现 |
+| 跨模块通信需声明权限 | `plugin-communicate` |
+| 后台工作要看 `useModuleActive()` | 标签页保活，切走不会卸载，定时器需自行暂停 |
+| 插件数据用 `storage` | 不要用 `localStorage` |
+
+## 9. 相关文档
+
+- 加载流程与隔离边界：[插件系统架构](插件系统架构.md)
+- 清单字段：[清单文件参考](清单文件参考.md)
+- 可运行的完整示例：[示例插件](示例插件.md)

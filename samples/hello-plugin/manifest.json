@@ -1,0 +1,22 @@
+{
+  "name": "com.modulith.sample.notes",
+  "displayName": "速记本",
+  "version": "1.0.0",
+  "description": "示例插件：演示如何注册模块、使用插件独立存储、注入样式与自定义 SVG 图标。安装后会在侧边栏与仪表盘出现「速记本」。",
+  "author": {
+    "name": "Modulith Samples",
+    "url": "https://example.com"
+  },
+  "license": "MIT",
+  "homepage": "https://example.com/modulith/samples/notes",
+  "categories": ["示例", "效率"],
+  "keywords": ["sample", "notes", "demo"],
+  "engines": {
+    "loopcore": ">=1.0.0"
+  },
+  "main": "dist/index.js",
+  "style": "dist/index.css",
+  "icon": "icon.svg",
+  "permissions": ["storage"],
+  "sandboxLevel": 1
+}

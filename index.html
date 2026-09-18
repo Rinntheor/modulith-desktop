@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/modulith.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Modulith Desktop</title>
+
+    <!--
+      首帧防白屏（只做底色，不做界面）。
+
+      问题：WebView 在解析 <head> 时就开始绘制，而 React 挂载要等 JS bundle
+      求值完成，中间存在一段空窗。Tauri 窗口本身是白的（WebView 默认底色），
+      这段空窗就表现为「先白屏一段时间」。
+
+      修法只有一件事：在这一刻就把底色刷成正确的颜色。这里**不渲染任何
+      界面元素** —— 启动界面只由 React 的 BootScreen 提供，一次启动只出现
+      一套加载动画。
+
+      历史教训：先前这里还放了一份纯 HTML 的启动骨架（标记 + 文字 + 进度条），
+      本意是让白屏变成"像样的占位"。结果是同一次启动会先后出现静态骨架和
+      BootScreen 两套加载界面；标题栏上的「刷新」触发页面重载时更明显 ——
+      静态骨架闪一下、再接动态启动界面，最后才回到应用，观感比白屏更糟。
+      屏幕只有一块，加载指示器只应该有一个。
+
+      主题：下方脚本在首帧前读取 localStorage 缓存的深/浅色偏好，
+      避免「先渲染成深色再跳成浅色」。后端 settings.json 才是权威来源，
+      services/theme.ts 会在设置加载后用权威值覆盖这里的早期猜测。
+    -->
+    <script>
+      (function () {
+        var root = document.documentElement;
+        try {
+          var stored = localStorage.getItem('modulith.theme');
+          var theme = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
+          var prefersDark =
+            theme === 'dark' ||
+            (theme === 'system' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          root.dataset.theme = theme;
+          root.dataset.resolvedTheme = prefersDark ? 'dark' : 'light';
+          if (prefersDark) root.classList.add('dark');
+          root.style.backgroundColor = prefersDark ? '#0f1117' : '#f7f8fa';
+        } catch (error) {
+          // localStorage 不可用时按深色处理：启动界面本身是深色的，
+          // 猜错方向时浅色底一闪而过比深色底更刺眼。
+          root.classList.add('dark');
+          root.style.backgroundColor = '#0f1117';
+        }
+
+        /*
+         * 主题配色的首帧预置。
+         *
+         * 与深/浅色同理：若等到 React 挂载后再写 --accent-* 变量，会先按
+         * CSS 里的默认靛蓝渲染一帧，再跳到用户选的配色 —— 表现为"启动时
+         * 闪一下紫色"。因此这里用同一份缓存提前写入变量。
+         *
+         * 这段颜色推导必须与 src/services/accent.ts 的算法一致，否则首帧
+         * 与后续渲染会出现色差。两处都只依赖「主色 + HSL 明度表」，
+         * 保持同步不难，但**改一处必须改两处** —— 已在两侧都注明。
+         *
+         * 无彩色主题（灰白）需要把饱和度压到 0，否则浅底会偏色，
+         * 与界面自身的灰阶不协调。
+         */
+        var ACCENT_BASES = {
+          indigo: ['#4f46e5', 0], violet: ['#7c3aed', 0], blue: ['#2563eb', 0],
+          cyan: ['#0891b2', 0], teal: ['#0d9488', 0], emerald: ['#059669', 0],
+          amber: ['#d97706', 0], orange: ['#ea580c', 0], rose: ['#e11d48', 0],
+          gray: ['#4b5563', 1]
+        };
+        var LIGHT_LEVELS = { '50': 0.97, '100': 0.93, '200': 0.86, '300': 0.76, '400': 0.64, '500': 0.55, '600': 0.45, '700': 0.37 };
+        var DARK_LEVELS = { '200': 0.9, '300': 0.82, '400': 0.72, '500': 0.62, '600': 0.52, '700': 0.44, '800': 0.27, '900': 0.2 };
+
+        try {
+          var accentId = localStorage.getItem('modulith.accent') || 'indigo';
+          var entry = ACCENT_BASES[accentId];
+          if (!entry) { return; }          // 未知配色：交给 CSS 的默认值
+          var hex = entry[0], neutral = entry[1] === 1;
+          var r = parseInt(hex.slice(1, 3), 16) / 255;
+          var g = parseInt(hex.slice(3, 5), 16) / 255;
+          var b = parseInt(hex.slice(5, 7), 16) / 255;
+          var max = Math.max(r, g, b), min = Math.min(r, g, b);
+          var l = (max + min) / 2, d = max - min, h = 0, s = 0;
+          if (d !== 0) {
+            s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+            if (max === r) { h = ((g - b) / d + (g < b ? 6 : 0)) / 6; }
+            else if (max === g) { h = ((b - r) / d + 2) / 6; }
+            else { h = ((r - g) / d + 4) / 6; }
+            h *= 360;
+          }
+          if (neutral) { s = 0; }
+          var hsl = function (hh, ss, ll) {
+            return 'hsl(' + Math.round(hh * 100) / 100 + ' ' + Math.round(ss * 10000) / 100 + '% ' + Math.round(ll * 10000) / 100 + '%)';
+          };
+          var lv, dk;
+          for (lv in LIGHT_LEVELS) {
+            root.style.setProperty('--accent-' + lv,
+              neutral && (lv === '50' || lv === '100')
+                ? hsl(h, 0, lv === '50' ? 0.975 : 0.94)
+                : hsl(h, s, LIGHT_LEVELS[lv]));
+          }
+          for (dk in DARK_LEVELS) {
+            root.style.setProperty('--accent-' + dk,
+              neutral && (dk === '800' || dk === '900')
+                ? hsl(h, 0, DARK_LEVELS[dk])
+                : hsl(h, Math.min(1, s * 1.02), DARK_LEVELS[dk]));
+          }
+          root.dataset.accent = accentId;
+        } catch (error) {
+          // 配色预置失败不影响启动：CSS 里的 :root 默认值会兜住
+        }
+      })();
+    </script>
+
+    <style>
+      /*
+       * 只设置底色与尺寸约束，不产生任何可见内容。
+       * 颜色与 index.css 中 body 的深浅色取值一致，避免 React 接管时跳色。
+       */
+      :root {
+        background-color: #f7f8fa;
+      }
+
+      :root.dark {
+        background-color: #0f1117;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background-color: inherit;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

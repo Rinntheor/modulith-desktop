@@ -1,0 +1,9 @@
+[module]
+id = "dashboard"
+name = "仪表盘"
+description = "项目概览和统计"
+icon = "LayoutDashboard"
+path = "/dashboard"
+priority = 1
+category = "main"
+component = "Dashboard.tsx"

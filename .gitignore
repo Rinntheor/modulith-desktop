@@ -1,0 +1,37 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Generated files
+#
+# src/generated/ 完全由构建期生成，不入库。
+# 它由 `pnpm gen:modules` 产出，而 `pnpm dev` / `pnpm build` 都会先跑这一步
+# （见 package.json 的 scripts）。因此全新 clone 无需该目录存在。
+#
+# 注意：不要为它留 .gitkeep 之类的占位例外 —— 目录不需要入库，
+# 生成器会自行创建它（scripts/generate-modules.ts 里有 mkdirSync）。
+src/generated/
+
+# TypeScript 增量编译缓存，属构建产物
+*.tsbuildinfo
