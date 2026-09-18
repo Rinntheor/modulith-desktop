@@ -117,7 +117,7 @@ pub fn summarize(list: &[Notification]) -> NotificationSummary {
 /// 列出全部通知（新的在前）
 #[tauri::command]
 pub fn list_notifications(state: State<'_, NotificationsState>) -> Result<Vec<Notification>, String> {
-    let list = state.0.lock().map_err(|e| e.to_string())?;
+    let list = state.inner().0.lock().map_err(|e| e.to_string())?;
     Ok(list.clone())
 }
 
@@ -138,7 +138,7 @@ pub fn push_notification(
         input.dedupe_key.as_deref(),
     )?;
 
-    let mut list = state.0.lock().map_err(|e| e.to_string())?;
+    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
     store::insert(&mut list, incoming);
     store::save(&app, &list)?;
     Ok(list.clone())
@@ -151,7 +151,7 @@ pub fn mark_notification_read(
     state: State<'_, NotificationsState>,
     id: String,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.0.lock().map_err(|e| e.to_string())?;
+    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
     mark_read(&mut list, &id);
     // 未命中不报错：通知可能刚被「清空全部」删掉，这属于正常的竞态，
     // 界面拿到最新列表即可。
@@ -165,7 +165,7 @@ pub fn mark_all_notifications_read(
     app: AppHandle,
     state: State<'_, NotificationsState>,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.0.lock().map_err(|e| e.to_string())?;
+    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
     mark_all_read(&mut list);
     store::save(&app, &list)?;
     Ok(list.clone())
@@ -178,7 +178,7 @@ pub fn dismiss_notification(
     state: State<'_, NotificationsState>,
     id: String,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.0.lock().map_err(|e| e.to_string())?;
+    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
     dismiss(&mut list, &id);
     store::save(&app, &list)?;
     Ok(list.clone())
@@ -190,7 +190,7 @@ pub fn clear_notifications(
     app: AppHandle,
     state: State<'_, NotificationsState>,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.0.lock().map_err(|e| e.to_string())?;
+    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
     list.clear();
     store::save(&app, &list)?;
     Ok(Vec::new())
@@ -201,7 +201,7 @@ pub fn clear_notifications(
 pub fn get_notification_summary(
     state: State<'_, NotificationsState>,
 ) -> Result<NotificationSummary, String> {
-    let list = state.0.lock().map_err(|e| e.to_string())?;
+    let list = state.inner().0.lock().map_err(|e| e.to_string())?;
     Ok(summarize(&list))
 }
 

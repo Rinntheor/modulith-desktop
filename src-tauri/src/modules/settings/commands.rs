@@ -16,7 +16,7 @@ impl SettingsState {
 /// 读取当前应用设置
 #[tauri::command]
 pub async fn get_app_settings(state: State<'_, SettingsState>) -> Result<AppSettings, String> {
-    let settings = state.0.read().await;
+    let settings = state.inner().0.read().await;
     Ok(settings.clone())
 }
 
@@ -55,7 +55,7 @@ pub async fn update_app_settings(
     settings.validate()?;
     store::save(&app, &settings)?;
 
-    let mut current = state.0.write().await;
+    let mut current = state.inner().0.write().await;
     *current = settings.clone();
 
     Ok(settings)
@@ -69,7 +69,7 @@ pub async fn reset_app_settings(
 ) -> Result<AppSettings, String> {
     let defaults = store::reset(&app)?;
 
-    let mut current = state.0.write().await;
+    let mut current = state.inner().0.write().await;
     *current = defaults.clone();
 
     Ok(defaults)
