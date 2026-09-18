@@ -128,6 +128,7 @@ modulith-desktop/
 | `pnpm tauri dev` | 启动完整开发环境 |
 | `pnpm tauri build` | 打包应用 |
 | `pnpm gen:modules` | 重新生成前端模块注册表 |
+| `pnpm check:samples` | 检查示例插件的清单与代码是否一致 |
 | `pnpm gen:backend update` | 重新生成后端声明与命令注册 |
 | `pnpm gen:backend list` | 查看后端模块与命令 |
 | `pnpm ver check` | 校验版本一致性 |
@@ -140,7 +141,13 @@ pnpm ver check
 pnpm gen:modules                      # 必须：src/generated 不入库，tsc 依赖它
 npx tsc -p tsconfig.json --noEmit
 cd src-tauri && cargo test --offline --lib
+pnpm check:samples                    # 改了 samples/ 才需要
 ```
+
+`cargo test` 里有一条检查**示例包是否与源码一致**：它解压每个 `.lcp` 并逐个文件比对，
+因此改完插件忘记重新打包会直接失败（这个错我犯过两次，所以现在有测试兜着）。
+`pnpm check:samples` 则检查示例插件的清单与代码对不对得上 —— 用了却没声明、
+声明了却没用，两种都报。
 
 `src/generated/` 是构建期产物，**不纳入版本控制**（`.gitignore` 已排除）。因此**全新 clone 之后必须先运行一次 `pnpm gen:modules`**，否则 `tsc` 会报 `Cannot find module '../generated/moduleRegistry'` 这类错误。
 

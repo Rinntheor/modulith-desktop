@@ -78,13 +78,13 @@ var h = React.createElement;
 
 ```js
 Modulith.registerModule({
-  id: 'sampleNotes',
-  name: '速记本',
-  displayName: '速记本',
-  description: '本地速记',
-  icon: 'icon.svg',
-  priority: 30,
-  category: '示例',
+  id: 'notes',
+  name: '文本速记',
+  description: '随手记下想法、待办与片段',
+  // lucide-react 的图标名。留空则回退到清单里的 icon（那个才是文件路径）
+  icon: 'NotebookPen',
+  priority: 70,
+  category: 'plugin',
   component: Notes,
 });
 ```
@@ -129,6 +129,7 @@ var ctx = Modulith.createContext();
 | `icons` | object | 提取本机文件图标（需 `filesystem-read` 权限） |
 | `shell` | object | 在文件管理器中定位（需 `filesystem-read` 权限） |
 | `fileDrop` | object | 接收拖入的文件路径（需 `filesystem-read` 权限） |
+| `audio` | object | 导入音频文件（需 `filesystem-read` 权限） |
 
 **调用时机是严格受限的**：只能在插件 bundle 执行期间调用，例如 IIFE 顶层。在插件代码之外调用会抛出异常，因为服务需要绑定正在加载的插件 ID。
 
@@ -429,7 +430,44 @@ React.useEffect(() => {
 
 > 同一个原因还带来一项限制：**WebView 内的 HTML5 拖放不可用**。因此「把界面元素拖到另一个元素上」这类交互（例如把卡片拖进分组）需要自己用指针事件实现，不能依赖 `dragstart` / `drop`。
 
-## 11. 完整示例
+## 11. audio
+
+导入一个音频文件，用于播放自定义提示音之类的场景。**需要 `filesystem-read` 权限**。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `pick` | `pick() => Promise<PickedAudio \| null>` | 弹出原生选择框；用户取消时返回 `null` |
+
+```js
+const picked = await ctx.audio.pick();
+if (picked) {
+  // 直接就能播
+  new Audio(picked.dataUrl).play();
+  console.log(picked.name, picked.bytes);   // "ding.mp3" 42137
+}
+```
+
+`PickedAudio` 形如 `{ name, dataUrl, bytes }`。
+
+约束：
+
+- **返回的是成品，不是原料。** 「选择 + 读取 + 编码」在宿主里一步完成，插件拿到的是
+  可直接交给 `new Audio(...)` 的 data URL，**接触不到原始字节或路径**。扩展名白名单
+  与体积上限因此只有一个执行点，没有绕过的路径 —— 与 `ctx.icons` 同一思路。
+- 支持的扩展名：`mp3` / `wav` / `ogg` / `m4a` / `aac` / `flac` / `opus` / `webm`。
+  对话框过滤器只是给用户的建议（选择框里仍可切到「所有文件」），**真正的校验按扩展名做**。
+- 单个文件上限 **2 MB**。提示音通常只有几十 KB，这个上限是为了不把一个几百 MB 的
+  文件读进内存再编码成 base64。
+- 用户取消返回 `null`，这与「选了但格式不支持」是两回事：后者会抛错。
+- 拿到之后建议存进插件自己的存储，下次启动就不必再让用户选一次。注意 data URL 是
+  字符串，**别放进会被频繁重写的状态里** —— 单独存一个键更划算。
+
+> **浏览器自动播放策略。** 音频播放通常需要一次用户手势才能「解锁」。如果提示音是在
+> 计时结束时触发、而用户当时并没有点击任何东西，第一次播放可能被拒绝。稳妥做法是在
+> 用户点「开始」这类按钮时先建好并 `resume()` 一个 `AudioContext`，
+> 之后到点播放就不会被拦（`samples/pomodoro` 就是这么做的）。
+
+## 12. 完整示例
 
 一个最小可用的插件代码包：
 
@@ -485,7 +523,7 @@ React.useEffect(() => {
 }
 ```
 
-## 12. 约束速查
+## 13. 约束速查
 
 | 约束 | 说明 |
 | --- | --- |
@@ -502,7 +540,7 @@ React.useEffect(() => {
 | 后台工作要看 `useModuleActive()` | 标签页保活，切走不会卸载，定时器需自行暂停 |
 | 插件数据用 `storage` | 不要用 `localStorage` |
 
-## 13. 相关文档
+## 14. 相关文档
 
 - 加载流程与隔离边界：[插件系统架构](插件系统架构.md)
 - 清单字段：[清单文件参考](清单文件参考.md)
