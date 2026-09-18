@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "modulith-desktop"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
