@@ -153,6 +153,14 @@ var ctx = Modulith.createContext();
 
 插件私有存储，按插件 ID 隔离。数据以 JSON 序列化后保存在应用数据目录中，卸载插件时一并清除。
 
+**需要 `storage` 权限。** 清单里必须声明：
+
+```json
+"permissions": ["storage"]
+```
+
+未声明时所有方法都会被**拒绝**（返回错误），而不是静默失效。存储不属于「可选附加能力」：拿不到数据却继续运行，只会让作者对着「界面是空的」反复排查，不如直接报明原因。
+
 | 方法 | 签名 | 说明 |
 | --- | --- | --- |
 | `get` | `get<T>(key, defaultValue?) => Promise<T \| undefined>` | 读取并反序列化；键不存在或解析失败时返回 `defaultValue` |

@@ -39,6 +39,30 @@ pub fn validate_plugin_id(id: &str, what: &str) -> PluginResult<()> {
     Ok(())
 }
 
+/// 权限判定的**纯函数**部分：只看清单内容，不做任何 IO。
+///
+/// 单独抽出来是为了可测 —— `PluginManager` 持有 `AppHandle`，单测里造不出来。
+/// 判定规则（"必须在清单里显式声明"）因此能被测试锁定，管理器一侧只负责
+/// 把清单读出来再交给这里。
+///
+/// 规则本身值得写清楚：**没声明就是拒绝**，不做"默认放行"或"按沙箱级别推断"。
+/// 默认放行会让清单的权限列表失去意义，而沙箱级别目前没有任何逻辑读取它
+/// （见文档「声明但未强制的部分」）。
+fn ensure_permission(
+    manifest: &PluginManifest,
+    id: &str,
+    permission: PluginPermission,
+) -> PluginResult<()> {
+    if manifest.permissions.contains(&permission) {
+        return Ok(());
+    }
+    Err(PluginError::PermissionDenied(format!(
+        "插件 {} 未声明 {} 权限",
+        id,
+        permission.as_str()
+    )))
+}
+
 /// 运行时插件管理器
 pub struct PluginManager {
     app: AppHandle,
@@ -239,13 +263,30 @@ impl PluginManager {
         })
     }
 
-    /// 读取已安装插件的清单（http 权限检查等使用）
+    /// 读取已安装插件的清单（权限检查用）
     fn manifest_of(&self, id: &str) -> PluginResult<PluginManifest> {
         let entry = self
             .registry
             .get(id)
             .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
         read_manifest(&self.version_dir(entry))
+    }
+
+    /// 强制插件已声明某权限，未声明则拒绝。
+    ///
+    /// **这是权限检查的唯一入口。** 与 `plugin_data_dir` 的 ID 校验同理：
+    /// 检查若散落在各个命令里，漏掉任何一处就等于没有防护 —— 而且漏掉的那处
+    /// 不会有任何症状，直到有人真的去用它。
+    ///
+    /// `manifest_of` 对未安装的 ID 返回 `NotFound`，因此"未安装"与"未声明权限"
+    /// 是两种可区分的错误，插件作者能据此判断到底缺了什么。
+    pub fn require_permission(
+        &self,
+        id: &str,
+        permission: PluginPermission,
+    ) -> PluginResult<()> {
+        let manifest = self.manifest_of(id)?;
+        ensure_permission(&manifest, id, permission)
     }
 }
 
@@ -601,6 +642,20 @@ impl PluginManager {
 // ============================================================
 
 impl PluginManager {
+    /// 取该插件的存储目录，并强制 `storage` 权限。
+    ///
+    /// 五个存储方法（`storage_get` / `set` / `delete` / `keys` / `clear`）全都
+    /// 经由这里取目录 —— 前三个走 `storage_path`，后两个直接调用本方法 ——
+    /// 因此 `storage` 权限检查只有这一个执行点。
+    ///
+    /// 与 `plugin_data_dir` 的分工：那个只保证「ID 合法」，这个额外要求
+    /// 「清单已声明 storage」。卸载等内部流程仍直接使用 `plugin_data_dir`，
+    /// 它们不该受插件的权限声明约束。
+    fn checked_storage_dir(&self, id: &str) -> PluginResult<PathBuf> {
+        self.require_permission(id, PluginPermission::Storage)?;
+        self.plugin_data_dir(id)
+    }
+
     /// 校验存储 key
     fn storage_path(&self, id: &str, key: &str) -> PluginResult<PathBuf> {
         if !is_valid_storage_key(key) {
@@ -609,7 +664,7 @@ impl PluginManager {
                 key
             )));
         }
-        Ok(self.plugin_data_dir(id)?.join(format!("{}.json", key)))
+        Ok(self.checked_storage_dir(id)?.join(format!("{}.json", key)))
     }
 
     pub fn storage_get(&self, id: &str, key: &str) -> PluginResult<Option<String>> {
@@ -640,7 +695,7 @@ impl PluginManager {
     }
 
     pub fn storage_keys(&self, id: &str) -> PluginResult<Vec<String>> {
-        let dir = self.plugin_data_dir(id)?;
+        let dir = self.checked_storage_dir(id)?;
         if !dir.is_dir() {
             return Ok(Vec::new());
         }
@@ -666,7 +721,7 @@ impl PluginManager {
     /// settings.json / auth.json / notifications.json 一起消失。现在 ID 校验
     /// 收在 `plugin_data_dir` 里，本方法只需保证「只删该插件自己的数据目录」。
     pub fn storage_clear(&self, id: &str) -> PluginResult<()> {
-        let dir = self.plugin_data_dir(id)?;
+        let dir = self.checked_storage_dir(id)?;
         if !dir.is_dir() {
             return Ok(());
         }
@@ -1240,5 +1295,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    // ============================================================
+    // 权限强制
+    // ============================================================
+
+    /// 构造最小合法清单，绕过文件 IO。
+    ///
+    /// 之所以能用这种方式测：权限判定被抽成了纯函数 `ensure_permission`，
+    /// 而 `PluginManager` 持有 `AppHandle`，单测里根本造不出来。
+    fn manifest_with(permissions: &[&str]) -> PluginManifest {
+        let perms = serde_json::to_string(permissions).unwrap();
+        serde_json::from_str(&format!(
+            r#"{{"name":"com.test.plugin","version":"1.0.0","permissions":{}}}"#,
+            perms
+        ))
+        .expect("最小清单应当能解析")
+    }
+
+    /// 未声明 `storage` 时必须拒绝。
+    ///
+    /// 这是本次修复的核心行为：修复前 `plugin_storage_*` 五个命令没有任何
+    /// 权限检查，无论插件声明什么都照常读写。
+    #[test]
+    fn storage_is_denied_without_declaration() {
+        let manifest = manifest_with(&[]);
+        let err = ensure_permission(&manifest, "com.test.plugin", PluginPermission::Storage)
+            .expect_err("未声明 storage 时必须拒绝");
+
+        assert!(
+            matches!(err, PluginError::PermissionDenied(_)),
+            "期望 PermissionDenied，实际: {:?}",
+            err
+        );
+    }
+
+    /// 声明了就放行 —— 否则等于把所有插件一起堵死
+    #[test]
+    fn storage_is_allowed_when_declared() {
+        let manifest = manifest_with(&["storage"]);
+        ensure_permission(&manifest, "com.test.plugin", PluginPermission::Storage)
+            .expect("已声明 storage 时应当放行");
+    }
+
+    /// 权限必须逐项判定，而不是「有任意一条就全放行」。
+    ///
+    /// 专门用来防止把检查写成 `!permissions.is_empty()` 这类写法 ——
+    /// 那种写法在单权限插件的测试里会全部通过，却让权限列表形同虚设。
+    #[test]
+    fn declaring_one_permission_does_not_grant_another() {
+        let manifest = manifest_with(&["network"]);
+        let err = ensure_permission(&manifest, "com.test.plugin", PluginPermission::Storage)
+            .expect_err("只声明 network 不应放行 storage");
+        assert!(matches!(err, PluginError::PermissionDenied(_)));
+    }
+
+    /// 错误信息必须写出权限的 kebab-case 名，作者才知道清单里该补什么。
+    #[test]
+    fn permission_error_names_the_exact_permission() {
+        let manifest = manifest_with(&[]);
+        let err = ensure_permission(&manifest, "com.test.plugin", PluginPermission::Storage)
+            .expect_err("应当拒绝");
+        assert!(
+            err.to_string().contains("storage"),
+            "错误信息里应出现 storage，实际: {}",
+            err
+        );
+    }
+
+    /// `as_str()` 与 serde 的 kebab-case 序列化必须逐字一致。
+    ///
+    /// 两者一旦分叉，错误信息就会指向一个清单里根本写不出来的名字。
+    /// 注意 `as_str` 的 `match` 由编译器强制穷尽（新增枚举值必然要改它），
+    /// 但 `ALL` 不会 —— 所以新增取值时要记得同时加进 `ALL`，否则本测试
+    /// 覆盖不到新值。
+    #[test]
+    fn permission_name_matches_serde() {
+        for permission in PluginPermission::ALL {
+            let serialized = serde_json::to_string(&permission).unwrap();
+            assert_eq!(
+                permission.as_str(),
+                serialized.trim_matches('"'),
+                "as_str() 与 serde 序列化不一致: {:?}",
+                permission
+            );
+        }
     }
 }

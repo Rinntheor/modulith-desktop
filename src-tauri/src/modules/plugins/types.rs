@@ -258,6 +258,48 @@ pub enum PluginPermission {
     DevTools,
 }
 
+impl PluginPermission {
+    /// 权限的 kebab-case 名称，用于错误信息与日志。
+    ///
+    /// 必须与上面的 `#[serde(rename_all = "kebab-case")]` 逐字一致：清单里写的
+    /// 就是这个字面量，用户看到的错误信息若与之对不上就无法排查。
+    /// `permission_name_matches_serde` 测试遍历 `ALL` 锁定两者一致，因此新增
+    /// 枚举值后忘记同步会让测试失败，而不是悄悄产生一条拼错的错误信息。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::Network => "network",
+            Self::NetworkExternal => "network-external",
+            Self::Notification => "notification",
+            Self::Clipboard => "clipboard",
+            Self::FilesystemRead => "filesystem-read",
+            Self::FilesystemWrite => "filesystem-write",
+            Self::FilesystemScoped => "filesystem-scoped",
+            Self::PluginCommunicate => "plugin-communicate",
+            Self::NativeModule => "native-module",
+            Self::DevTools => "dev-tools",
+        }
+    }
+
+    /// 全部取值，供测试遍历。
+    ///
+    /// 新增枚举值时必须一并加入 —— 否则上面那个一致性测试覆盖不到新值，
+    /// 而"测试通过"会给人已经覆盖了的错觉。
+    pub const ALL: [PluginPermission; 11] = [
+        Self::Storage,
+        Self::Network,
+        Self::NetworkExternal,
+        Self::Notification,
+        Self::Clipboard,
+        Self::FilesystemRead,
+        Self::FilesystemWrite,
+        Self::FilesystemScoped,
+        Self::PluginCommunicate,
+        Self::NativeModule,
+        Self::DevTools,
+    ];
+}
+
 /// 沙箱级别（序列化为数字 0-3）
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(from = "u8", into = "u8")]
