@@ -14,7 +14,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
-import { pluginIndexSources, registrySources } from '../config/pluginRegistry';
+import { PLUGIN_INDEX_REF, pluginIndexSources, registrySources } from '../config/pluginRegistry';
 import { isNewer } from '../utils/semver';
 import { getPermissionDescriptor } from './permissionRegistry';
 import { getInstalledPlugins } from './pluginRuntime';
@@ -433,4 +433,102 @@ export async function loadReadme(
   }
 
   return null;
+}
+
+// ============================================================
+// 市场图标
+// ============================================================
+
+/**
+ * 图标取回结果。
+ *
+ * 失败是一条**带原因**的结果，而不是 `null`：作者没写图标与图标取不到是两件不同的事，
+ * 而两者在界面上都表现为"一个灰方块"。先前这里只有一个布尔量，那个灰方块于是成了唯一
+ * 的线索 —— 无法判断该去查插件仓库还是查网络。
+ */
+export type MarketIconResult =
+  | { ok: true; dataUrl: string }
+  | { ok: false; reason: string };
+
+/** 图标缓存（`icon` 路径 → 结果）。与 `readmeCache` 同理，只缓存成功。 */
+const iconCache = new Map<string, Promise<MarketIconResult>>();
+
+/** 这段文本是不是 SVG 标记 */
+function isSvgMarkup(value: string): boolean {
+  return value.trimStart().toLowerCase().startsWith('<svg');
+}
+
+/**
+ * SVG 文本 → `data:` URL。
+ *
+ * 用 base64 而不是百分号编码：插件的 SVG 里出现 `#`、`&`、`"`、中文都是正常的，
+ * 逐个转义容易漏掉一个，而 base64 的字符集是确定的。
+ *
+ * 先 UTF-8 编码成字节再逐字节交给 `btoa`：`btoa` 只接受码位小于 256 的字符，
+ * 含中文的字符串直接传进去会抛 `InvalidCharacterError`。
+ */
+function svgToDataUrl(svg: string): string {
+  const bytes = new TextEncoder().encode(svg);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `data:image/svg+xml;base64,${btoa(binary)}`;
+}
+
+/**
+ * 取回市场图标，转成 `data:` URL。
+ *
+ * **为什么不把 CDN 地址直接写进 `<img src>`。** 图标是市场里唯一取远程内容的地方，
+ * 而它此前也是唯一绕过后端通道的那一个。后端通道（索引、签名、安装包、README 都走它）
+ * 已经证明可用 —— 市场能列出插件，就说明它把索引取回来了 —— 而 WebView 自己的网络栈
+ * 在本项目里没有任何覆盖，失败时只表现为一个灰方块，症状会被归因到插件系统。
+ * 统一到同一条通道后，图标同时获得地址白名单（`ALLOWED_REGISTRY_HOSTS`）与
+ * CDN → GitHub 的候选切换。
+ *
+ * **为什么交给 `<img>` 而不是 `dangerouslySetInnerHTML`。** 市场里的插件尚未安装，
+ * 它的 SVG 仍是不可信输入，而 innerHTML 会执行 `<svg onload=...>`；作为图片加载时
+ * 脚本与事件处理器都不会运行。已安装插件的图标之所以可以内联，是因为那份代码本来
+ * 就能执行任意 JS，内联不增加任何能力。
+ *
+ * 与索引取同一个 `ref`（`main`）：索引里的 `icon` 是仓库内的**路径**，不是某个版本的
+ * 产物 —— 一个插件一个图标是有意的，作者改了图标就该立刻生效。
+ *
+ * 只支持 SVG：后端返回文本，PNG 图标会在 UTF-8 解码处失败并落到通用图标。生成索引的
+ * 脚本目前只收录 `.svg`（`modulith-plugins/scripts/build.ts`），所以这不是缺口。
+ *
+ * **永不 reject**：失败也以 `{ ok: false, reason }` 返回，调用方不必再包一层 try。
+ */
+export function loadMarketIcon(iconPath: string): Promise<MarketIconResult> {
+  const cached = iconCache.get(iconPath);
+  if (cached) return cached;
+
+  const pending = fetchMarketIcon(iconPath).then((result) => {
+    // 失败不缓存：一次网络抖动不该让这个图标在本次会话里永久变成灰方块
+    if (!result.ok) iconCache.delete(iconPath);
+    return result;
+  });
+
+  iconCache.set(iconPath, pending);
+  return pending;
+}
+
+async function fetchMarketIcon(iconPath: string): Promise<MarketIconResult> {
+  const failures: string[] = [];
+
+  for (const url of registrySources(PLUGIN_INDEX_REF, iconPath)) {
+    try {
+      const text = await invoke<string>('fetch_registry_text', { url });
+      if (!isSvgMarkup(text)) {
+        failures.push(`${describeSource(url)}：返回的内容不是 SVG`);
+        continue;
+      }
+      return { ok: true, dataUrl: svgToDataUrl(text.trim()) };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      failures.push(`${describeSource(url)}：${reason}`);
+    }
+  }
+
+  const reason = failures.join('；') || '没有可用的来源';
+  console.warn(`[pluginMarket] 图标 "${iconPath}" 取不到，将使用通用图标：${reason}`);
+  return { ok: false, reason };
 }

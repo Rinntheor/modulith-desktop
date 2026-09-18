@@ -30,15 +30,17 @@ import {
 } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
-import { jsdelivrUrl, PLUGIN_INDEX_REF, PLUGIN_REPO_URL } from '../../config/pluginRegistry';
+import { PLUGIN_INDEX_REF, PLUGIN_REPO_URL } from '../../config/pluginRegistry';
 import { getPermissionDescriptor, type PermissionRisk } from '../../services/permissionRegistry';
 import {
   installMarketVersion,
   latestVersionOf,
   loadIndex,
+  loadMarketIcon,
   loadReadme,
   planUpdate,
   updateStateFor,
+  type MarketIconResult,
   type MarketIndex,
   type MarketPlugin,
   type UpdatePlan,
@@ -92,13 +94,34 @@ const PermissionChips: React.FC<{ permissions: string[]; max?: number }> = ({
 /**
  * 市场里的插件图标。
  *
- * 通过 CDN 直接引用（插件尚未安装，读不到本地资源）。加载失败时退回一个通用图标 ——
- * 图标缺失不该让整张卡片看起来像坏的。
+ * 三个阶段：取回中（空框）→ 取到（图标）→ 取不到（通用图标，并把原因挂在 title 上）。
+ *
+ * 图标文本由 `loadMarketIcon` 从后端通道取回（与索引、README、安装包同一条），
+ * 再以 `data:` URL 交给 `<img>` —— 为什么不用 `<img src="https://cdn...">`、
+ * 为什么不用 `dangerouslySetInnerHTML`，见 `services/pluginMarket.ts` 里那段说明。
+ *
+ * 失败的兜底仍然存在（图标缺失不该让整张卡片看起来像坏的），但它不再吞掉原因：
+ * 先前这里是一个 `onError` 直接置位，唯一的现象是一个灰方块，无法区分
+ * "作者没写图标"和"图标取不到"。
  */
 const MarketIcon: React.FC<{ plugin: MarketPlugin }> = ({ plugin }) => {
-  const [failed, setFailed] = useState(false);
+  const icon = plugin.icon;
+  const [state, setState] = useState<MarketIconResult | null>(null);
 
-  if (!plugin.icon || failed) {
+  useEffect(() => {
+    if (!icon) return;
+    let alive = true;
+    setState(null);
+    void loadMarketIcon(icon).then((result) => {
+      // 组件可能已经在请求返回前卸载（列表重排、切换到详情页）
+      if (alive) setState(result);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [icon]);
+
+  if (!icon) {
     return (
       <div className="w-10 h-10 rounded-lg bg-gray-100 flex items-center justify-center shrink-0">
         <Package className="w-5 h-5 text-gray-400" />
@@ -106,14 +129,23 @@ const MarketIcon: React.FC<{ plugin: MarketPlugin }> = ({ plugin }) => {
     );
   }
 
-  return (
-    <img
-      src={jsdelivrUrl(PLUGIN_INDEX_REF, plugin.icon)}
-      alt=""
-      onError={() => setFailed(true)}
-      className="w-10 h-10 rounded-lg shrink-0 object-contain"
-    />
-  );
+  // 取回中：留出同样大小的空框，图标到达时不会让整行跳动
+  if (!state) {
+    return <div className="w-10 h-10 rounded-lg bg-gray-100 shrink-0" />;
+  }
+
+  if (!state.ok) {
+    return (
+      <div
+        title={`图标取不到：${state.reason}`}
+        className="w-10 h-10 rounded-lg bg-gray-100 flex items-center justify-center shrink-0"
+      >
+        <Package className="w-5 h-5 text-gray-400" />
+      </div>
+    );
+  }
+
+  return <img src={state.dataUrl} alt="" className="w-10 h-10 rounded-lg shrink-0 object-contain" />;
 };
 
 /** 安装 / 更新确认：把权限摊开，新增项与中高风险置顶 */
