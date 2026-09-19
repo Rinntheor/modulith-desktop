@@ -4,11 +4,11 @@
 # ============================================================
 [app]
 name = "Modulith Desktop"
-version = "1.1.4"
+version = "1.1.5"
 author = "环理论 (Rinntheor)"
 description = "A modular desktop framework built with Tauri"
 
 [build]
 release_type = "stable"
 build_number = 0
-full_version = "1.1.4"
+full_version = "1.1.5"
