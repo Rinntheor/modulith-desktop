@@ -8,10 +8,12 @@
 // 需要追溯时间时查 git 历史即可。
 
 pub mod auth;
+pub mod logging;
 pub mod notifications;
 pub mod plugins;
 pub mod settings;
 pub mod sidebar;
+pub mod updater;
 
 use crate::core::registry::ModuleRegistry;
 use crate::core::module::Module;
@@ -19,10 +21,12 @@ use crate::core::module::Module;
 /// 注册所有后端模块
 pub fn register_all(registry: &mut ModuleRegistry) -> Result<(), crate::core::registry::RegistryError> {
     registry.register(Box::new(auth::AuthModule))?;
+    registry.register(Box::new(logging::LoggingModule))?;
     registry.register(Box::new(notifications::NotificationsModule))?;
     registry.register(Box::new(plugins::PluginsModule))?;
     registry.register(Box::new(settings::SettingsModule))?;
     registry.register(Box::new(sidebar::SidebarModule))?;
+    registry.register(Box::new(updater::UpdaterModule))?;
     Ok(())
 }
 
@@ -30,9 +34,11 @@ pub fn register_all(registry: &mut ModuleRegistry) -> Result<(), crate::core::re
 pub fn list_all_module_ids() -> Vec<String> {
     vec![
         auth::AuthModule.id().to_string(),
+        logging::LoggingModule.id().to_string(),
         notifications::NotificationsModule.id().to_string(),
         plugins::PluginsModule.id().to_string(),
         settings::SettingsModule.id().to_string(),
         sidebar::SidebarModule.id().to_string(),
+        updater::UpdaterModule.id().to_string(),
     ]
 }

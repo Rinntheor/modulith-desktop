@@ -12,6 +12,7 @@ import {
   getCachedModuleComponent,
   setCachedModuleComponent,
 } from '../services/moduleComponentCache';
+import { reportCrash } from '../services/logger';
 
 /**
  * 兼容再导出：模块组件缓存已移入 `services/moduleComponentCache`，
@@ -135,6 +136,14 @@ class ModuleErrorBoundary extends React.Component<
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
     console.error(`Module ${this.props.moduleId} failed to load:`, error, errorInfo);
+    // 模块崩溃（插件界面是最常见的来源）必须落到崩溃日志：
+    // 用户看到的是"某个页面坏了"，而坏的是哪个模块、为什么，只在这条记录里。
+    reportCrash(
+      `模块 ${this.props.moduleId} 渲染失败: ${error.name}: ${error.message}`,
+      [error.stack, errorInfo.componentStack ? `组件栈：${errorInfo.componentStack}` : '']
+        .filter(Boolean)
+        .join('\n')
+    );
   }
 
   handleRetry = () => {

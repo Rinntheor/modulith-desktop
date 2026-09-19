@@ -40,6 +40,15 @@ export function rawGithubUrl(ref: string, path: string): string {
 }
 
 /**
+ * 候选来源的先后顺序
+ *
+ * `github-first` 用在「用户选了下载源」时：他选它就是因为 GitHub 直连不通，
+ * 而 CDN 那一步在受限网络里可能要先等一个连接超时（30 秒）才轮到加速源 ——
+ * 那会让「我明明配了下载源，市场还是打不开」变成一个必然的抱怨。
+ */
+export type SourcePreference = 'cdn-first' | 'github-first';
+
+/**
  * 仓库内某个文件（在给定 ref 下）的候选地址。
  *
  * 同时服务于两类内容：
@@ -50,9 +59,23 @@ export function rawGithubUrl(ref: string, path: string): string {
  *
  * 两条路都保留：CDN 优先，直连兜底。切换来源不会拿到不同内容 —— 包由索引里的 sha256
  * 保证（见 pluginMarket.ts），README 则由不可变 tag 保证。
+ *
+ * **这里给出的是原始地址，不含用户配置的下载源。** 下载源（前缀式代理）由后端
+ * 在发请求前拼上（`src-tauri/src/modules/settings/network.rs`）。这样做的两个理由：
+ * 后端校验的宿主白名单始终作用在下面这些我们自己写死的宿主上，用户填的地址不会
+ * 成为新的可访问目标；以及改写只在一个地方发生，不会有人漏掉一条通路。
+ *
+ * 顺序不能改变**内容**：两条候选指向同一个不可变 tag，包还有 sha256 兜底，
+ * 因此谁先谁后只影响速度，不影响装到什么。
  */
-export function registrySources(ref: string, path: string): string[] {
-  return [jsdelivrUrl(ref, path), rawGithubUrl(ref, path)];
+export function registrySources(
+  ref: string,
+  path: string,
+  preference: SourcePreference = 'cdn-first'
+): string[] {
+  const cdn = jsdelivrUrl(ref, path);
+  const github = rawGithubUrl(ref, path);
+  return preference === 'github-first' ? [github, cdn] : [cdn, github];
 }
 
 /**
@@ -73,6 +96,9 @@ export function registrySources(ref: string, path: string): string[] {
  *
  * 索引是唯一**可变**的取用对象（它取 `main`），因此只有它需要绕缓存；包与 README 都按
  * 不可变 tag 取，走 registrySources 即可。
+ *
+ * `preference` 的作用与 `registrySources` 相同：选了下载源时把 GitHub 那条排到前面，
+ * 因为直连那条在受限网络里要先等一个超时。
  */
 export interface PluginIndexSource {
   /** 索引地址 */
@@ -81,15 +107,17 @@ export interface PluginIndexSource {
   signature: string;
 }
 
-export function pluginIndexSources(now: number = Date.now()): PluginIndexSource[] {
-  return [
-    {
-      index: `${jsdelivrUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH)}?t=${now}`,
-      signature: `${jsdelivrUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_SIGNATURE_PATH)}?t=${now}`,
-    },
-    {
-      index: rawGithubUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH),
-      signature: rawGithubUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_SIGNATURE_PATH),
-    },
-  ];
+export function pluginIndexSources(
+  now: number = Date.now(),
+  preference: SourcePreference = 'cdn-first'
+): PluginIndexSource[] {
+  const cdn: PluginIndexSource = {
+    index: `${jsdelivrUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH)}?t=${now}`,
+    signature: `${jsdelivrUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_SIGNATURE_PATH)}?t=${now}`,
+  };
+  const github: PluginIndexSource = {
+    index: rawGithubUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_PATH),
+    signature: rawGithubUrl(PLUGIN_INDEX_REF, PLUGIN_INDEX_SIGNATURE_PATH),
+  };
+  return preference === 'github-first' ? [github, cdn] : [cdn, github];
 }

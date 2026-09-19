@@ -11,6 +11,7 @@
     "check:samples": "node scripts/check-samples.ts",
     "check:semver": "node scripts/check-semver.ts",
     "check:update": "node scripts/check-update-throttle.ts",
+    "check:network": "node scripts/check-network.ts",
     "release": "node scripts/release.ts",
     "release:manifest": "node scripts/generate-latest-json.ts",
     "ver": "node scripts/version-manager.ts",

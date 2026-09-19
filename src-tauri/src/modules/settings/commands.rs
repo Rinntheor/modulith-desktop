@@ -1,4 +1,6 @@
 // src-tauri/src/modules/settings/commands.rs
+use crate::modules::logging;
+use crate::modules::settings::probe;
 use crate::modules::settings::settings::{self as store, AppSettings};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
@@ -55,8 +57,27 @@ pub async fn update_app_settings(
     settings.validate()?;
     store::save(&app, &settings)?;
 
-    let mut current = state.inner().0.write().await;
-    *current = settings.clone();
+    {
+        let mut current = state.inner().0.write().await;
+        *current = settings.clone();
+    }
+
+    // 日志开关是**运行期**生效的，所以必须在保存之后立刻套用 ——
+    // 让用户「关掉实时记录」却要重启才生效，等于这个开关是假的。
+    // 放在锁外调用：`apply` 自己会发一条日志，没必要握着设置锁去写盘。
+    logging::apply(
+        settings.file_logging_enabled,
+        settings.crash_logging_enabled,
+    );
+
+    // debug 级：标签切换、主题变更都会走到这里，info 级会把日志刷满。
+    log::debug!(
+        "应用设置已更新：网络 {}，实时记录 {}，崩溃记录 {}，标签 {} 个",
+        crate::modules::settings::network::describe_mode(&settings),
+        settings.file_logging_enabled,
+        settings.crash_logging_enabled,
+        settings.open_tabs.len()
+    );
 
     Ok(settings)
 }
@@ -69,10 +90,29 @@ pub async fn reset_app_settings(
 ) -> Result<AppSettings, String> {
     let defaults = store::reset(&app)?;
 
-    let mut current = state.inner().0.write().await;
-    *current = defaults.clone();
+    {
+        let mut current = state.inner().0.write().await;
+        *current = defaults.clone();
+    }
+
+    logging::apply(
+        defaults.file_logging_enabled,
+        defaults.crash_logging_enabled,
+    );
 
     Ok(defaults)
+}
+
+/// 网络诊断：把「直连」与「下载源」两条路各实测一遍
+///
+/// 目标是**原始地址**（插件索引的 CDN / GitHub、更新清单），代理那一版由后端
+/// 现场改写 —— 安全边界写在 `probe.rs` 的文件头。
+#[tauri::command]
+pub async fn probe_network(
+    app: AppHandle,
+    targets: Vec<probe::ProbeTarget>,
+) -> Result<probe::ProbeReport, String> {
+    probe::run(&app, targets).await
 }
 
 /// 获取应用数据目录（`settings.json` 所在目录），必要时创建

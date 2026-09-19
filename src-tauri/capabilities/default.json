@@ -1,12 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. The opener plugin needs an explicit path scope: 'allow-open-path' grants the open_path COMMAND but no path, so without scope entries every openPath() call fails with 'Not allowed to open path'. The scoped entries below cover the two call sites (Settings > About > open data dir, and the plugin detail drawer's open plugin folder). The updater permission set enables the full check > download > install workflow, which is what Settings > About > software update needs.",
+  "description": "Capability for the main window. The opener plugin needs an explicit path scope: 'allow-open-path' grants the open_path COMMAND but no path, so without scope entries every openPath() call fails with 'Not allowed to open path'. The scoped entries below cover the call sites (Settings > About > open data dir, Settings > Logs > open log dir, and the plugin detail drawer's open plugin folder). NOTE: 'updater:default' is deliberately NO LONGER granted -- app updates go through our own Rust command (src-tauri/src/modules/updater/commands.rs) so that the download-source setting can rewrite both the manifest URL and the installer URL. If the plugin's own commands stayed reachable from the frontend, plugin code (which shares the JS realm) could bypass that setting entirely.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "opener:default",
-    "updater:default",
     {
       "identifier": "opener:allow-open-path",
       "allow": [

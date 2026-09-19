@@ -14,7 +14,7 @@
 //    放在别处会让"为什么会弹更新提示"变成一个要翻设置才能回答的问题。
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { AlertCircle, CheckCircle, Download, RefreshCw } from 'lucide-react';
+import { AlertCircle, CheckCircle, Download, FileText, Globe, RefreshCw } from 'lucide-react';
 
 import {
   checkForAppUpdate,
@@ -41,13 +41,23 @@ const STATUS_TONE: Record<'ok' | 'warn' | 'err', string> = {
   err: 'border-red-200 bg-red-50 text-red-800',
 };
 
-const UpdateChecker: React.FC = () => {
+interface Props {
+  /** 跳到「网络」分页（检查失败时最可能要去的地方） */
+  onOpenNetwork?: () => void;
+  /** 跳到「日志」分页（失败原因记在那里） */
+  onOpenLogs?: () => void;
+}
+
+const UpdateChecker: React.FC<Props> = ({ onOpenNetwork, onOpenLogs }) => {
   const [status, setStatus] = useState<Status>('idle');
   const [currentVersion, setCurrentVersion] = useState('');
   const [available, setAvailable] = useState<AvailableUpdate | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState('');
   const [autoCheck, setAutoCheck] = useState(() => getCachedSettings().autoCheckUpdates);
+  /** 本次请求实际用到的清单地址与联网方式（让「走的是哪条路」可见） */
+  const [endpoints, setEndpoints] = useState<string[]>([]);
+  const [source, setSource] = useState('');
 
   // 设置是唯一事实来源：别处改了它（或保存失败被回滚），这个开关跟着变
   useEffect(
@@ -63,6 +73,8 @@ const UpdateChecker: React.FC = () => {
     try {
       const result = await checkForAppUpdate();
       setCurrentVersion(result.currentVersion);
+      setEndpoints(result.endpoints);
+      setSource(result.source);
       // 手动查过就等于查过了：不该在下次启动时立刻又自动查一次。
       // 写时间戳失败不会抛错（只影响节流），因此不会污染这里的成功路径。
       await noteUpdateCheckCompleted();
@@ -131,6 +143,11 @@ const UpdateChecker: React.FC = () => {
             {status === 'installing' && '正在下载更新…'}
             {status === 'error' && '检查或安装未能完成，详见下方说明。'}
           </p>
+          {status === 'idle' && (
+            <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+              走直连还是下载源由「网络」设置决定。
+            </p>
+          )}
         </div>
 
         <div className="shrink-0">
@@ -157,6 +174,23 @@ const UpdateChecker: React.FC = () => {
           )}
         </div>
       </div>
+
+      {/* 走的是哪条路：改了「网络」设置之后，这里能立刻看出有没有生效 */}
+      {(status === 'latest' || status === 'available') && source && (
+        <div className="mt-3 rounded-lg bg-gray-50 border border-gray-100 px-3 py-2">
+          <p className="text-[11px] text-gray-600">联网方式：{source}</p>
+          {endpoints.length > 0 && (
+            <p className="mt-1 text-[10px] text-gray-400 font-mono break-all leading-relaxed">
+              清单：{endpoints.join('  →  ')}
+            </p>
+          )}
+          {available?.downloadUrl && (
+            <p className="mt-0.5 text-[10px] text-gray-400 font-mono break-all leading-relaxed">
+              安装包：{available.downloadUrl}
+            </p>
+          )}
+        </div>
+      )}
 
       {/* 发布说明 */}
       {status === 'available' && available?.notes && (
@@ -203,7 +237,32 @@ const UpdateChecker: React.FC = () => {
       {status === 'error' && (
         <div className={`mt-3 flex items-start gap-2 rounded-lg border px-3 py-2 ${STATUS_TONE.err}`}>
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-          <p className="text-[11px] leading-relaxed whitespace-pre-wrap">{error}</p>
+          <div className="min-w-0">
+            <p className="text-[11px] leading-relaxed whitespace-pre-wrap">{error}</p>
+            {/* 失败之后最该被看见的两件事：去「网络」测连通性、去「日志」看原因 */}
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {onOpenNetwork && (
+                <button
+                  type="button"
+                  onClick={onOpenNetwork}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded-lg border border-red-200 bg-white/70 text-red-700 hover:bg-white transition-colors"
+                >
+                  <Globe className="w-3 h-3" />
+                  测试网络连通性
+                </button>
+              )}
+              {onOpenLogs && (
+                <button
+                  type="button"
+                  onClick={onOpenLogs}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded-lg border border-red-200 bg-white/70 text-red-700 hover:bg-white transition-colors"
+                >
+                  <FileText className="w-3 h-3" />
+                  查看日志
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
 

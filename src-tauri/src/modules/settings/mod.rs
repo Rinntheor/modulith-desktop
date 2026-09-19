@@ -2,6 +2,8 @@
 // 应用全局设置模块
 
 pub mod commands;
+pub mod network;
+pub mod probe;
 pub mod settings;
 
 use crate::prelude::*;

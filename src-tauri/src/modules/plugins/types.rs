@@ -699,8 +699,14 @@ pub enum PluginError {
 }
 
 impl From<reqwest::Error> for PluginError {
+    /// 保留完整的**因果链**，而不是只取顶层那句话。
+    ///
+    /// `reqwest` 的顶层 Display 是 `error sending request for url (...)`，真正的原因
+    /// （DNS 解析失败 / 证书不受信 / 连接被重置）在它的 `source()` 里。只取顶层会让
+    /// 「被墙」「证书过期」「域名写错」在界面上长得一模一样 —— 而它们要采取的动作
+    /// 完全不同。展开见 `settings/network.rs` 的 `describe_error_chain`。
     fn from(err: reqwest::Error) -> Self {
-        PluginError::NetworkError(err.to_string())
+        PluginError::NetworkError(crate::modules::settings::network::describe_error_chain(&err))
     }
 }
 

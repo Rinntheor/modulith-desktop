@@ -16,6 +16,7 @@ use super::types::{
     PluginPermission, PluginResult, PluginStatus, RegistryEntry, RegistryFile,
 };
 use super::validator;
+use crate::modules::settings::{network, settings as settings_store};
 
 /// 单个插件包解压后的最大体积（64 MB）
 const MAX_PLUGIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -46,7 +47,12 @@ const MAX_REGISTRY_TEXT_BYTES: u64 = 1024 * 1024;
 /// 与 `src/config/pluginRegistry.ts` 里的 CDN 模板是一对：那边决定"去哪里取"，这边决定
 /// "允许去哪里取"。两者都必须改，因此这里显式记下对方的位置。前端不能把宿主当参数传进来
 /// —— 那等于让被约束的一方自己划定边界。
-const ALLOWED_REGISTRY_HOSTS: [&str; 2] = ["cdn.jsdelivr.net", "raw.githubusercontent.com"];
+///
+/// **用户配置的下载源不出现在这张表里，而且不需要出现。** 代理是在校验**之后**
+/// 由 `network::rewrite_url` 拼到原始地址前面的（见 [`PluginManager::fetch_via_sources`]），
+/// 因此这里校验的始终是我们自己写死的原始宿主。反过来说：一个被改坏的代理字段
+/// 也不能让这条命令去访问一个原本不被允许的宿主。
+pub(crate) const ALLOWED_REGISTRY_HOSTS: [&str; 2] = ["cdn.jsdelivr.net", "raw.githubusercontent.com"];
 /// 启动外部程序允许的最大参数个数
 const MAX_LAUNCH_ARGS: usize = 64;
 /// 单个启动参数的最大字符数
@@ -627,15 +633,8 @@ impl PluginManager {
             )));
         }
 
-        let response = self.client.get(url).send().await?;
-        if !response.status().is_success() {
-            return Err(PluginError::DownloadFailed(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
+        let (bytes, used) = self.fetch_via_sources(url.trim()).await?;
 
-        let bytes = response.bytes().await?;
         if bytes.len() as u64 > MAX_PLUGIN_BYTES {
             return Err(PluginError::InvalidPackage(format!(
                 "插件包体积 {} 字节超过上限 {} 字节",
@@ -644,9 +643,13 @@ impl PluginManager {
             )));
         }
 
+        // 校验发生在**写盘与解压之前**：下载来源（CDN / 下载源）与索引本身都可能出问题，
+        // 而一旦解压安装就晚了 —— 那时错误只能靠"卸载"来纠正。
         if let Some(expected) = expected_sha256 {
             verify_sha256(&bytes, expected)?;
         }
+
+        log::info!("插件包已取回（{} 字节，来源 {}）", bytes.len(), used);
 
         std::fs::create_dir_all(self.staging_dir())?;
         let tmp = self
@@ -659,6 +662,81 @@ impl PluginManager {
         result
     }
 
+    /// 当前设置下生效的下载源根地址（`None` = 直连）
+    ///
+    /// **每次调用都重新读设置**，不缓存：网络请求本身就是低频动作（一次市场加载
+    /// 只发几次），而缓存会引入「改了设置要重启才生效」这种最难解释的现象。
+    /// `settings.json` 只有几 KB，读一次的代价远小于一次 HTTP 请求。
+    fn proxy_base(&self) -> Option<String> {
+        let settings = settings_store::load(&self.app);
+        network::proxy_base(&settings).map(|base| base.to_string())
+    }
+
+    /// 按当前网络设置取回一个地址的正文，返回（正文，实际使用的地址）
+    ///
+    /// 开了下载源时**先走下载源，失败再直连**。顺序与回退都是刻意的：
+    ///
+    /// * 先走下载源：用户配它就是为了优先用它，把直连放前面等于这个设置不起作用。
+    /// * 回退到直连：一个填错或临时挂掉的加速源不该把插件市场永久变成不可用 ——
+    ///   那会让一个「加速」选项变成破坏性的。反过来的顺序（直连优先）在受限网络里
+    ///   每次都要先等一个超时，体验更差。
+    ///
+    /// 两条路都失败时，返回**最后一次**的错误：用户看到的应当是「两个地址都不行」，
+    /// 而 `PluginError` 是单个错误类型，因此把两次尝试都写进日志（那才是排查入口）。
+    async fn fetch_via_sources(&self, url: &str) -> PluginResult<(Vec<u8>, String)> {
+        let proxy = self.proxy_base();
+        let candidate = network::rewrite_url(url, proxy.as_deref());
+
+        if candidate != url {
+            log::info!("经下载源取回插件仓库内容：{}", candidate);
+            match self.fetch_once(&candidate).await {
+                Ok(bytes) => return Ok((bytes, candidate)),
+                Err(e) => {
+                    log::warn!(
+                        "经下载源取回失败（{}）：{}；回退直连 {}",
+                        candidate,
+                        e,
+                        url
+                    );
+                }
+            }
+        }
+
+        match self.fetch_once(url).await {
+            Ok(bytes) => Ok((bytes, url.to_string())),
+            Err(e) => {
+                log::warn!("直连取回失败（{}）：{}", url, e);
+                Err(e)
+            }
+        }
+    }
+
+    /// 发一次 GET 并读回全部正文
+    ///
+    /// 体积上限由调用方检查：这里不知道调用方要的是几 KB 的索引还是几十 MB 的包。
+    async fn fetch_once(&self, url: &str) -> PluginResult<Vec<u8>> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| PluginError::NetworkError(network::describe_error_chain(&e)))?;
+
+        if !response.status().is_success() {
+            return Err(PluginError::DownloadFailed(format!(
+                "HTTP {}（{}）",
+                response.status(),
+                url
+            )));
+        }
+
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| PluginError::NetworkError(network::describe_error_chain(&e)))
+    }
+
     /// 从插件仓库拉取一个文本文件（索引或 README）。
     ///
     /// **只在后端做，不经过 WebView 的 `fetch`。** 后端已经有 reqwest 客户端、超时与
@@ -667,27 +745,25 @@ impl PluginManager {
     /// 而真实原因在网络层。
     ///
     /// 地址策略见 [`ensure_registry_url_allowed`]：宿主必须在白名单里且走 https。
+    ///
+    /// **下载源（代理）在校验之后才拼上。** 校验的是原始地址，代理只是把它整条
+    /// 接到另一个域名后面（见 [`PluginManager::fetch_via_sources`]）。这样白名单
+    /// 始终约束我们自己写死的宿主，用户填的代理地址不可能成为新的可访问目标。
     pub async fn fetch_registry_text(&self, url: &str) -> PluginResult<String> {
         ensure_registry_url_allowed(url)?;
 
-        let response = self.client.get(url.trim()).send().await?;
-        if !response.status().is_success() {
-            return Err(PluginError::DownloadFailed(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
+        let (bytes, used) = self.fetch_via_sources(url.trim()).await?;
 
-        let bytes = response.bytes().await?;
         if bytes.len() as u64 > MAX_REGISTRY_TEXT_BYTES {
             return Err(PluginError::InvalidPackage(format!(
-                "内容体积 {} 字节超过上限 {} 字节",
+                "内容体积 {} 字节超过上限 {} 字节（{}）",
                 bytes.len(),
-                MAX_REGISTRY_TEXT_BYTES
+                MAX_REGISTRY_TEXT_BYTES,
+                used
             )));
         }
 
-        String::from_utf8(bytes.to_vec())
+        String::from_utf8(bytes)
             .map_err(|_| PluginError::InvalidPackage("内容不是合法的 UTF-8".to_string()))
     }
 
