@@ -428,6 +428,30 @@ export async function installMarketVersion(
 const readmeCache = new Map<string, string>();
 
 /**
+ * 缓存条目上限（README 与图标各自计）
+ *
+ * 这两个缓存此前**没有任何上限**：每浏览一个新插件/新版本就多一条，而一条
+ * README 是几十 KB、一个图标是几十 KB 的 base64 `data:` URL。
+ *
+ * 取 32 的理由：一次会话里真正会来回看的插件远少于这个数，因此上限不会造成
+ * 可感知的重复下载；而它把「浏览一百个插件就留一百份正文」这类增长截断掉。
+ * 淘汰策略是**先进先出**（`Map` 的插入顺序）而不是 LRU：这两个缓存的读取
+ * 都集中在用户当时停留的那几页，最近插入的恰好就是最可能被读的。
+ */
+const MAX_CACHED_ENTRIES = 32;
+
+/** 写入一个 Map 缓存，超出上限时丢掉最早插入的那一条 */
+function cacheSet<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  cache.set(key, value);
+
+  while (cache.size > MAX_CACHED_ENTRIES) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
+
+/**
  * 取回某个版本的 README 文本。
  *
  * **详情页的说明内容来自发布者写的 `README.md`，而不是索引里的某个描述字段。**
@@ -453,7 +477,7 @@ export async function loadReadme(
   for (const url of registrySources(version.tag, `${plugin.source}/README.md`, sourcePreference())) {
     try {
       const text = await invoke<string>('fetch_registry_text', { url });
-      readmeCache.set(key, text);
+      cacheSet(readmeCache, key, text);
       return text;
     } catch {
       // 换下一个来源。两个都失败说明该 tag 下确实没有 README，
@@ -479,7 +503,10 @@ export type MarketIconResult =
   | { ok: true; dataUrl: string }
   | { ok: false; reason: string };
 
-/** 图标缓存（`icon` 路径 → 结果）。与 `readmeCache` 同理，只缓存成功。 */
+/**
+ * 图标缓存（`icon` 路径 → 结果）。与 `readmeCache` 同理：只缓存成功，
+ * 且同样受 `MAX_CACHED_ENTRIES` 约束（一个条目就是一份几十 KB 的 base64 文本）。
+ */
 const iconCache = new Map<string, Promise<MarketIconResult>>();
 
 /** 这段文本是不是 SVG 标记 */
@@ -536,7 +563,7 @@ export function loadMarketIcon(iconPath: string): Promise<MarketIconResult> {
     return result;
   });
 
-  iconCache.set(iconPath, pending);
+  cacheSet(iconCache, iconPath, pending);
   return pending;
 }
 

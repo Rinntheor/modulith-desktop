@@ -30,6 +30,7 @@ import {
   getCachedSettings,
   saveAppSettings,
 } from './appSettings';
+import { releaseCachedModuleComponent } from './moduleComponentCache';
 import { showToast } from './toast';
 
 export interface TabState {
@@ -92,7 +93,27 @@ function notify(): void {
 function setState(next: TabState): void {
   const needsMount = next.activeTab !== null && !next.mountedTabs.includes(next.activeTab);
 
-  state = needsMount ? { ...next, mountedTabs: [...next.mountedTabs, next.activeTab!] } : next;
+  const resolved = needsMount
+    ? { ...next, mountedTabs: [...next.mountedTabs, next.activeTab!] }
+    : next;
+
+  // 不再挂载的模块，把它的组件缓存条目一并释放。
+  //
+  // 放在这个唯一写入点，理由与上面那条不变量完全相同：`closeTab` /
+  // `closeOtherTabs` / `closeTabsToTheRight` / `closeAllTabs` / `reconcile` /
+  // `resyncTabsFromSettings` 六条路径都会走到这里，逐条去调必然漏。
+  //
+  // 缓存的意义是「目录刷新时保持正在显示的组件实例稳定」，不再挂载就没有对象了；
+  // 不释放则缓存会随「曾经打开过的模块」一直长大（虽然上限是目录里的模块数）。
+  // 这里同步释放是安全的：释放之后 `resolved.mountedTabs` 已经不含它，
+  // React 随后那次渲染不会再渲染它的面板。
+  for (const moduleId of state.mountedTabs) {
+    if (!resolved.mountedTabs.includes(moduleId)) {
+      releaseCachedModuleComponent(moduleId);
+    }
+  }
+
+  state = resolved;
   notify();
 }
 
