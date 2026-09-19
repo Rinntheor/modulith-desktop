@@ -14,15 +14,28 @@
 //
 // 内容区不再是「一个滚动容器」，而是「一层视口 + 每个标签一个滚动容器」。
 // 这是保活的必要条件：只有每个标签自己持有滚动位置，切走再切回才能回到原处。
-// 隐藏方式见 index.css 的 `.lc-tab-panel`：用 `content-visibility: hidden`
-// 把非激活标签移出渲染与合成，而**不是** `display:none`（那会丢掉 scrollTop，
-// 让「滚动位置保留」落空）。
+// 隐藏方式见 index.css 的 `.lc-tab-panel[data-active='false']`：用
+// `visibility: hidden` 加上「暂停 CSS 动画 / 取消合成层提升」，而**不是**
+// `display:none`（那会让元素失去盒子、丢掉 scrollTop，让「滚动位置保留」落空）。
+//
+// 这里**没有**用 `content-visibility: hidden` —— 本注释曾经这样写过，但代码
+// 从来没用过它。它的收益是让非激活子树彻底不参与布局与绘制，看着更彻底；
+// 不用的原因是它同样会让子树内部的滚动容器失去布局，从而威胁「切回原处」这个
+// 保活的核心目标 —— 那个目标比省下几个非激活标签的布局开销重要得多。
+//
+// `visibility: hidden` 只停 CSS 动画，**不停 JS**：非激活模块里的定时器、订阅
+// 与渲染都照旧。因此模块必须自己判断可见性 —— 用 `useModuleActive()`。宿主
+// 拿不到模块创建的定时器句柄，代替不了它（见 ModuleRuntimeContext 的说明）。
 //
 // 为什么还要给每个标签单独套一层 MotionConfig（见下方渲染处）：
 // 保活意味着切走的模块仍在运行。framer-motion 的入场动画带延迟时，那几帧会
-// 落在「用户已经切到别的模块之后」——`content-visibility` 让它不再可见，
-// 但动画本身仍会空转。把非激活标签的 framer-motion 一并停住，既省掉这份空转，
-// 也让模块在后台保持「入场已完成」的稳定状态，切回来不必重播。
+// 落在「用户已经切到别的模块之后」——把非激活标签的 framer-motion 一并停住，
+// 既省掉这份空转，也让模块在后台保持「入场已完成」的稳定状态，切回来不必重播。
+//
+// **那一层的 reducedMotion 必须与全局设置取并集**：MotionConfig 是子层覆盖
+// 父层（framer-motion 的合并规则），因此原先写死的 `isActive ? 'never' : 'always'`
+// 会把 ThemeProvider 上的全局开关在激活标签上重新打开 —— 一个「关了动画却只对
+// 没在看的标签生效」的开关，而这正是「关了动画还是卡」的直接来源。
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'framer-motion';
@@ -50,6 +63,7 @@ import GlobalContextMenu, { type GlobalMenuEntry } from '../components/GlobalCon
 import { moduleManager } from '../services/moduleManager';
 import { reloadPluginRuntime } from '../services/pluginRuntime';
 import { getCachedSettings, saveAppSettings, subscribeSettings } from '../services/appSettings';
+import { getReduceMotion, subscribeTheme } from '../services/theme';
 import { getBootResult } from '../services/boot';
 import { useTabs } from '../hooks/useTabs';
 import { useCatalog } from '../hooks/useCatalog';
@@ -120,6 +134,18 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
   const [refreshing, setRefreshing] = useState(false);
   const [refreshToken, setRefreshToken] = useState(0);
   const [showWarnings, setShowWarnings] = useState(warnings.length > 0);
+  /**
+   * **有效**的动效开关（「关闭动画」或「性能模式」任一开启即为 true）
+   *
+   * 必须在这里读一次：下面给每个标签套的 MotionConfig 会**覆盖**外层的全局
+   * 设置（framer-motion 的合并规则是子层取胜），因此这一层不读，全局的
+   * reducedMotion="always" 在激活标签上就失效了 —— 而那恰好是用户唯一在看的
+   * 那个标签，表现就是「关了动画还是卡」。
+   */
+  const [reduceMotion, setReduceMotionState] = useState(() => getReduceMotion());
+
+  // 设置变化 → 重新求值（「关闭动画」与「性能模式」都会改变这个有效值）
+  useEffect(() => subscribeTheme(() => setReduceMotionState(getReduceMotion())), []);
   const bootstrappedRef = useRef(false);
 
   // 标题栏刷新：重新加载插件运行时与模块目录，并重挂载全部标签
@@ -390,11 +416,13 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
                       而卡片残留的可见表现恰恰是 opacity 淡入，所以
                       reducedMotion 单用不足以解决这个问题。
 
-                      激活标签保持原有动画，切换体验不变。
+                      激活标签保持原有动画，切换体验不变 —— 除非用户开了「关闭动画」
+                      或「性能模式」，那时这一层也必须跟着停（见上面关于子层覆盖父层
+                      的说明）。
                     */}
                     <MotionConfig
-                      reducedMotion={isActive ? 'never' : 'always'}
-                      transition={isActive ? undefined : { duration: 0 }}
+                      reducedMotion={isActive && !reduceMotion ? 'never' : 'always'}
+                      transition={isActive && !reduceMotion ? undefined : { duration: 0 }}
                     >
                       <ModuleRenderer moduleId={moduleId} initial={isActive} />
                     </MotionConfig>

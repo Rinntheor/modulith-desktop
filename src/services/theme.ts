@@ -12,6 +12,8 @@
 // localStorage 只当缓存用，不作为真相来源 —— 后端文件才是用户真正设置的
 // 地方，缓存丢失（清空 WebView 数据）只会让首帧闪一下，不会丢设置。
 
+import { isMotionReduced } from '../utils/motionPreference';
+
 export type ThemeMode = 'light' | 'dark' | 'system';
 
 /** 解析后的实际主题（system 会被解析成 light 或 dark） */
@@ -80,7 +82,18 @@ function applyTheme(mode: ThemeMode): ResolvedTheme {
 
 let currentMode: ThemeMode = 'system';
 let currentResolved: ResolvedTheme = 'dark';
+/**
+ * **有效**的动效开关 —— 不是用户在设置里存的那个值。
+ *
+ * 它等于「用户关了动画」或「开了性能模式」的并集（见 `applyMotionPreference`）。
+ * 对外只暴露这一个有效值，`MotionConfig` 与 CSS 都读它，因此不可能出现
+ * 「两个开关各关一半」的状态。
+ */
 let reduceMotion = false;
+/** 用户在设置里存的那个值 */
+let reduceMotionSetting = false;
+/** 性能模式（用户在设置里存的那个值） */
+let performanceMode = false;
 
 const listeners = new Set<() => void>();
 
@@ -111,6 +124,11 @@ export function getResolvedTheme(): ResolvedTheme {
 
 export function getReduceMotion(): boolean {
   return reduceMotion;
+}
+
+/** 性能模式是否开启（用户在设置里选的那个值） */
+export function getPerformanceMode(): boolean {
+  return performanceMode;
 }
 
 // ============================================================
@@ -146,13 +164,52 @@ export function setThemeMode(mode: ThemeMode): void {
  *   * 让 MotionConfig 使用 reducedMotion="always" —— 关掉 framer-motion
  *     的动画（含 spring、layout 动画）。
  * 只做其中一件都会留下明显还在动的部分。
+ *
+ * 这里存的是**用户设置值**；真正生效的是它与性能模式的并集，见
+ * `applyMotionPreference`。
  */
 export function setReduceMotion(enabled: boolean): void {
-  if (enabled === reduceMotion) return;
+  if (enabled === reduceMotionSetting) return;
 
-  reduceMotion = enabled;
+  reduceMotionSetting = enabled;
+  applyMotionPreference();
+}
+
+/**
+ * 性能模式开关。
+ *
+ * 与 `setReduceMotion` 的关系是**包含**：打开性能模式会连带把有效动效开关
+ * 置为「已关闭」。理由：性能模式要解决的问题正是「关了动画还是卡」，而它的
+ * 代价（界面变朴素）已经由用户付过一次了 —— 此时再要求他把两个开关都拨到位，
+ * 只会让一半用户得到一半效果，然后断定这个功能没用。
+ *
+ * 反过来不成立：关闭动画不会打开性能模式（去毛玻璃是有明显视觉代价的取舍，
+ * 不该被一个作用域更窄的开关顺手做掉）。
+ */
+export function setPerformanceMode(enabled: boolean): void {
+  if (enabled === performanceMode) return;
+
+  performanceMode = enabled;
   if (typeof document !== 'undefined') {
-    document.documentElement.classList.toggle('lc-reduce-motion', enabled);
+    document.documentElement.classList.toggle('lc-performance', enabled);
+  }
+  applyMotionPreference();
+}
+
+/**
+ * 把两个开关合并成**有效**的动效状态，并同步到 document 与订阅者
+ *
+ * 收敛到一处是为了让「有效状态」只有一个定义。此前 CSS 类与 MotionConfig
+ * 各自从设置读同一个布尔量，看起来等价；一旦引入第二个开关，两处各写一遍的
+ * 判断就会漂移。
+ */
+function applyMotionPreference(): void {
+  const effective = isMotionReduced(reduceMotionSetting, performanceMode);
+  if (effective === reduceMotion) return;
+
+  reduceMotion = effective;
+  if (typeof document !== 'undefined') {
+    document.documentElement.classList.toggle('lc-reduce-motion', effective);
   }
   notify();
 }

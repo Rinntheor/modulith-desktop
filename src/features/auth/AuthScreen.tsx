@@ -40,6 +40,7 @@ import {
 import { getCachedAuth, refreshAuth } from '../../services/authStore';
 import { bootManager } from '../../services/boot';
 import { getHostVersion } from '../../services/pluginRuntime';
+import { useReduceMotion } from '../../hooks/usePerformanceMode';
 import KeyInput from './KeyInput';
 import ParticleBackground from './ParticleBackground';
 import RecoveryCodePanel from './RecoveryCodePanel';
@@ -83,6 +84,9 @@ const AuthScreen: React.FC = () => {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [rememberMe, setRememberMe] = useState(cached?.autoLogin ?? false);
+
+  /** 有效动效开关：「关闭动画」或「性能模式」任一开启时，装饰性循环不再挂载 */
+  const reduceMotion = useReduceMotion();
 
   // 初始化期间产生的告警（例如「记住我」凭据已失效）在这里给用户一句解释
   const [notice] = useState(() => {
@@ -327,7 +331,18 @@ const AuthScreen: React.FC = () => {
       animate="visible"
       className="fixed inset-0 z-40 flex items-center justify-center bg-linear-to-br from-gray-900 via-gray-800 to-gray-900 p-6 overflow-y-auto"
     >
-      <ParticleBackground />
+      {/*
+        粒子背景：18 个粒子各自带一条 `repeat: Infinity` 的循环（y / opacity / scale）。
+
+        它必须被显式关掉，而不能指望 framer-motion 的 reducedMotion —— 实测
+        framer-motion 12 只对**位置类**属性（transform / width / height / inset）
+        短路，`opacity` 不在其中，因此那条透明度循环会永远跑下去（18 条 rAF 动画
+        + 18 个合成层）。这是「关了动画还在卡」里最实在的一条：授权界面默认每次
+        启动都会出现。
+
+        关掉它没有任何功能损失：这些粒子不承载任何信息。
+      */}
+      {!reduceMotion && <ParticleBackground />}
       <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl" />
       <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-violet-500/10 rounded-full blur-3xl" />
 

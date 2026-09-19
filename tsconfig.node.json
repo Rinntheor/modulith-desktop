@@ -32,21 +32,25 @@
     "noFallthroughCasesInSwitch": true
   },
   /*
-   * `src/types/**`、`src/utils/*.ts` 与 `src/config/pluginRegistry.ts` 只保留脚本
-   * 真正引用的类型/实现文件：generate-modules.ts 会引入 `src/types/module.ts`，
-   * check-semver.ts / check-update-throttle.ts / check-network.ts 会分别引入
-   * `src/utils/semver.ts`、`src/utils/updateCheck.ts`、`src/utils/networkSettings.ts`
-   * 与 `src/config/pluginRegistry.ts`（后者自身没有任何 import，因此可以安全地
-   * 单独纳入本 project）。
+   * `src/types/**` 与 `src/utils/*.ts` 只保留脚本真正引用的类型/实现文件：
+   * generate-modules.ts 会引入 `src/types/module.ts`；check-semver.ts /
+   * check-update-throttle.ts / check-network.ts / check-memory.ts /
+   * check-performance.ts 会分别引入 `src/utils/semver.ts`、`src/utils/updateCheck.ts`、
+   * `src/utils/networkSettings.ts`、`src/utils/motionPreference.ts`、
+   * `src/services/moduleComponentCache.ts` 与 `src/config/pluginRegistry.ts`。
    *
-   * 这些文件必须属于本 project，否则整次检查以 TS6307 直接失败 ——
-   * 而失败会盖住后面所有的真实错误，等于脚本从来没有被检查过。
+   * **这些文件必须自身不依赖 DOM**（`theme.ts` 这类要操作 `document` 的模块
+   * 因此进不来，它的纯逻辑被抽到 `src/utils/motionPreference.ts`）：本 project
+   * 的 lib 只有 ES2022，引入带 DOM 用法的模块会让整次检查失败 —— 而失败会盖住
+   * 后面所有的真实错误，等于脚本从来没有被检查过。
    */
   "include": [
     "vite.config.ts",
     "scripts/**/*.ts",
     "src/types/module.ts",
     "src/config/pluginRegistry.ts",
+    "src/services/moduleComponentCache.ts",
+    "src/utils/motionPreference.ts",
     "src/utils/semver.ts",
     "src/utils/updateCheck.ts",
     "src/utils/networkSettings.ts"

@@ -157,6 +157,20 @@ pub struct AppSettings {
     /// 而崩溃记录是低频的；这也让「关了日志但仍然能拿到崩溃现场」成为可能。
     #[serde(default = "default_crash_logging_enabled")]
     pub crash_logging_enabled: bool,
+    /// 是否启用性能模式
+    ///
+    /// 默认 `false`。它比 `reduce_motion` 更彻底：除了停用动画，还会去掉毛玻璃
+    /// （`backdrop-filter`）、装饰性渐变与持续动画的背景效果 —— 这些是「关了动画
+    /// 仍然卡」的常见来源，因为它们不表现为"动画"，而是让每一帧都要重新合成
+    /// 整个图层。
+    ///
+    /// **性能模式包含 `reduce_motion` 的效果**（见前端 `services/theme.ts`）：
+    /// 让用户必须同时打开两个开关才能得到完整效果，等于把这个功能藏起来。
+    ///
+    /// 后端只存这个布尔量，具体停用什么由前端 CSS 决定（`index.css` 的
+    /// `.lc-performance`）—— 与 `accent` 同理，视觉细节不该在后端复制一份。
+    #[serde(default = "default_performance_mode")]
+    pub performance_mode: bool,
 }
 
 /// 同时打开的标签页数量上限
@@ -187,6 +201,14 @@ fn default_tab_bar_visible() -> bool {
 /// 自动检查更新默认开启。理由见 `auto_check_updates` 字段上的说明。
 fn default_auto_check_updates() -> bool {
     true
+}
+
+/// 性能模式默认关闭。
+///
+/// 它是有代价的取舍（去掉毛玻璃与装饰效果会让界面变朴素），因此只能是用户
+/// 主动选择的结果 —— 默认打开等于替所有用户做了这个取舍。
+fn default_performance_mode() -> bool {
+    false
 }
 
 /// 默认直连。理由见 `network_mode` 字段上的说明。
@@ -269,6 +291,7 @@ impl Default for AppSettings {
             github_proxy: default_github_proxy(),
             file_logging_enabled: default_file_logging_enabled(),
             crash_logging_enabled: default_crash_logging_enabled(),
+            performance_mode: default_performance_mode(),
         }
     }
 }
@@ -550,6 +573,31 @@ mod tests {
         // 自动检查更新默认开启；还没有检查过
         assert!(defaults.auto_check_updates);
         assert_eq!(defaults.last_update_check_at, None);
+        // 网络默认直连、地址为空：一个默认打开的第三方加速源会把「装什么插件」
+        // 交给一个我们无法控制的中间人
+        assert_eq!(defaults.network_mode, network::NETWORK_MODE_DIRECT);
+        assert_eq!(defaults.github_proxy, "");
+        // 日志默认都开：用户不会为了排查问题提前打开它，默认关闭等于默认没有证据
+        assert!(defaults.file_logging_enabled);
+        assert!(defaults.crash_logging_enabled);
+        // 性能模式默认关闭：它是有代价的取舍，只能是用户主动选择的结果
+        assert!(!defaults.performance_mode);
+    }
+
+    /// 引入网络与日志设置之前写下的 settings.json 没有这五个字段，
+    /// 必须回落到各自的默认值（尤其是两个 `true`，不能因为缺失变成关闭）。
+    #[test]
+    fn network_and_logging_fields_default_on_old_settings_files() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("empty object should load");
+
+        assert_eq!(settings.network_mode, network::NETWORK_MODE_DIRECT);
+        assert_eq!(settings.github_proxy, "");
+        assert!(settings.file_logging_enabled, "缺失时应当按开启处理");
+        assert!(settings.crash_logging_enabled, "缺失时应当按开启处理");
+        assert!(!settings.performance_mode, "缺失时应当按关闭处理");
+
+        // 回落到默认值的一份设置本身必须是合法的，否则老用户的第一次保存就会失败
+        assert!(settings.validate().is_ok());
     }
 
     /// 引入更新检查之前写下的 settings.json 没有这两个字段：
@@ -562,6 +610,32 @@ mod tests {
             "缺失 autoCheckUpdates 时应当按默认开启处理"
         );
         assert_eq!(settings.last_update_check_at, None);
+    }
+
+    /// 网络字段的两条校验规则。
+    ///
+    /// 这里不重复 `network.rs` 里那套格式用例，只锁定两件**在设置层**才成立的事：
+    /// 未知模式被拒绝，以及代理地址在直连模式下也照样校验。
+    #[test]
+    fn validate_covers_network_fields() {
+        let mut settings = AppSettings::default();
+        settings.network_mode = network::NETWORK_MODE_PROXY.to_string();
+        settings.github_proxy = "https://gh-proxy.org".to_string();
+        assert!(settings.validate().is_ok(), "合法的代理配置应当通过");
+
+        settings.network_mode = "off".to_string();
+        let err = settings.validate().expect_err("未知的网络模式必须被拒绝");
+        assert!(err.contains("networkMode"), "错误信息应当点明字段: {err}");
+
+        // 切回直连之后，那个坏地址仍然要拦下来：否则用户可以「先存坏地址、切到
+        // 直连（保存成功）、再切回代理时才发现存不进去」，而报错指向的是一个
+        // 他刚刚没碰过的输入框。
+        settings.network_mode = network::NETWORK_MODE_DIRECT.to_string();
+        settings.github_proxy = "gh-proxy.org".to_string();
+        let err = settings
+            .validate()
+            .expect_err("直连模式下也必须校验代理地址的格式");
+        assert!(err.contains("githubProxy"), "错误信息应当点明字段: {err}");
     }
 
     /// 只接受 RFC3339，拒绝随便一个字符串 —— 它会被拿去算时间差。
@@ -695,6 +769,12 @@ mod tests {
         assert!(json.contains("\"reduceMotion\""));
         assert!(json.contains("\"deferPluginLoading\""));
         assert!(json.contains("\"pluginLoadTimeoutMs\""));
+        // 网络与日志的字段名同样必须是 camelCase —— 前端按这些键读
+        assert!(json.contains("\"networkMode\""));
+        assert!(json.contains("\"githubProxy\""));
+        assert!(json.contains("\"fileLoggingEnabled\""));
+        assert!(json.contains("\"crashLoggingEnabled\""));
+        assert!(json.contains("\"performanceMode\""));
     }
 
     #[test]

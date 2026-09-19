@@ -97,6 +97,17 @@ export interface AppSettings {
    * 而崩溃是低频事件，两者的取舍不同。
    */
   crashLoggingEnabled: boolean;
+  /**
+   * 是否启用性能模式。
+   *
+   * 比 `reduceMotion` 更彻底：在停用动画的基础上，还去掉毛玻璃
+   * （`backdrop-filter`，三个常驻全屏表面各 24px 模糊）、大半径装饰性模糊、
+   * 合成层提升提示（`will-change`）与持续循环的装饰背景。
+   *
+   * **它包含 `reduceMotion` 的效果**（见 `services/theme.ts` 的有效值计算）：
+   * 让用户必须同时打开两个开关才能得到完整效果，等于把这个功能藏起来。
+   */
+  performanceMode: boolean;
 }
 
 /**
@@ -151,6 +162,9 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   fileLoggingEnabled: true,
   // 与后端 default_crash_logging_enabled() 一致
   crashLoggingEnabled: true,
+  // 与后端 default_performance_mode() 一致：默认关闭。
+  // 它是有代价的取舍（去掉毛玻璃与装饰效果会让界面变朴素），只能是用户主动选择。
+  performanceMode: false,
 };
 
 let cache: AppSettings = { ...DEFAULT_APP_SETTINGS };
@@ -219,6 +233,13 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     // 只有显式写成 false 才关闭，与 tabBarVisible / autoCheckUpdates 同一约定
     fileLoggingEnabled: raw?.fileLoggingEnabled !== false,
     crashLoggingEnabled: raw?.crashLoggingEnabled !== false,
+    // 与上面两个相反：这里只有**显式写成 true** 才开启。
+    //
+    // 方向不同是因为默认值不同，而两者的目标是同一个：**老设置文件缺字段时，
+    // 落到默认行为上**。日志的默认是「开」，所以缺字段要按开；性能模式的默认是
+    // 「关」，所以缺字段必须按关 —— 用 `!== false` 的写法会让一份缺字段的
+    // settings.json 把性能模式打开，那是一个用户从未选择过的界面。
+    performanceMode: raw?.performanceMode === true,
   };
 }
 

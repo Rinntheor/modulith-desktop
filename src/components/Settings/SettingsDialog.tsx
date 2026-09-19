@@ -461,6 +461,23 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                           onChange={(next) => update({ reduceMotion: next })}
                         />
                       </SettingRow>
+
+                      <SettingRow
+                        title="性能模式"
+                        description="在关闭动画的基础上，再停用毛玻璃（标题栏、标签栏、侧边栏各有一层常驻模糊）、装饰性大半径模糊与持续循环的粒子背景。它们不表现为动画，而是让每一帧都要重新合成，因此「关了动画还是卡」通常出在这里"
+                      >
+                        <Toggle
+                          checked={settings.performanceMode}
+                          onChange={(next) => update({ performanceMode: next })}
+                        />
+                      </SettingRow>
+
+                      {settings.performanceMode && (
+                        <p className="pb-4 -mt-1 text-[11px] text-gray-500 leading-relaxed">
+                          性能模式已包含「关闭界面动画」的效果，两者不需要同时打开。
+                          代价是界面不再有毛玻璃层次与粒子背景 —— 看起来会更朴素。
+                        </p>
+                      )}
                     </Card>
 
                     <Card title="启动行为">
