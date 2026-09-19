@@ -36,6 +36,20 @@ Modulith Desktop 的核心主张是：**需要什么功能，就加什么模块*
 
 访问密钥使用 Argon2id 派生后存储，不保存明文，不内置默认密钥。「记住我」凭据由硬件指纹派生的 AES-256-GCM 密钥加密，换机即失效。配置损坏时回落为「需要授权」，而非放行。附失败次数限制、请求限流、已知设备与登录记录。
 
+**可配置的联网方式**
+
+应用有两件事必须联网：插件市场（索引、说明、图标、包）与软件更新。两者都走 GitHub 地址，而 GitHub 在部分网络下不可直连 —— 因此「设置 → 网络」允许选择**直连**或**经由下载源**（前缀式加速源，例如 `https://gh-proxy.org`），也可以自己填地址。同页的「网络诊断」把两条路各实测一遍，逐条给出状态码、耗时与失败原因。
+
+改写只发生在一处，而且发生在宿主白名单校验**之后**：代理只是把已经通过校验的原始地址整条接在加速源域名后面，因此用户填任意域名都不会扩大应用能访问的范围。内容完整性也不由加速源保证 —— 插件包有索引里的哈希，索引与更新包有发布签名。
+
+**日志与崩溃记录**
+
+运行日志实时写入文件（1 MB × 3 轮转），崩溃单独记一份；两个开关独立，路径与最近内容都能在「设置 → 日志」里直接看到。插件的 `ctx.logger`、界面未捕获错误与渲染崩溃都进同一个文件。这不只是便利：**在此之前后端几十处 `log::warn!` / `log::error!` 一次也没有输出过**（`log` 只是门面，从来没有装过后端），出问题时没有任何可查的记录。
+
+**性能模式**
+
+「关闭界面动画」之外还有一档性能模式，它额外去掉那些不表现为动画、但让每一帧都要重新合成的开销：三个常驻全屏表面的毛玻璃、装饰性大半径模糊、成片的合成层提升提示与粒子背景。它包含关闭动画，不需要两个开关都打开。
+
 **诚实的启动进度**
 
 启动流程分为五个有真实依赖顺序的阶段，进度由各阶段上报的实际完成量按权重折算，不使用定时器模拟推进。未就绪前上限为 99。插件加载失败不阻塞进入应用，而是作为可关闭的告警呈现。
@@ -77,7 +91,9 @@ pnpm tauri build
 
 **插件**是一个 zip 容器，含清单 `manifest.json` 与一个自执行代码包。代码包在运行时由宿主注入执行，通过 `window.Modulith.registerModule()` 注册界面，通过 `Modulith.createContext()` 取得绑定的存储、网络、日志、通知与事件服务。
 
-插件与宿主运行在同一个 WebView 中，因此**安装插件视同运行本机程序**。权限声明里真正生效的只有 `network`、`network-external`（网络）与 `notification`、`plugin-communicate`（应用内通知与跨模块通信）四项，其余仅作意图声明。详情见[插件系统架构](docs/02-开发指南/插件开发/插件系统架构.md)第 6 节。
+插件与宿主运行在同一个 WebView 中，因此**安装插件视同运行本机程序**。权限声明里**真正被检查的目前有七项**：`storage`、`network`、`network-external`、`process-spawn`、`filesystem-read`、`notification`、`plugin-communicate`；其余取值不影响任何行为，仅作意图声明。
+
+而且这七项买到的是**「权限列表诚实」而不是隔离** —— 插件直接 `invoke('plugin_storage_get', { id: '别的插件', key: 'x' })` 仍能读取他人数据，因为后端在「插件与宿主共享同一个 JS 上下文」的模型下无法知道调用者是谁。逐项边界与剩余缺口见[已知问题与技术债](docs/06-项目/已知问题与技术债.md)第 4.1 节，模型本身的说明见[插件系统架构](docs/02-开发指南/插件开发/插件系统架构.md)第 6 节。
 
 ## 文档
 
@@ -128,11 +144,16 @@ modulith-desktop/
 | `pnpm tauri dev` | 启动完整开发环境 |
 | `pnpm tauri build` | 打包应用 |
 | `pnpm gen:modules` | 重新生成前端模块注册表 |
-| `pnpm check:samples` | 检查示例插件的清单与代码是否一致 |
 | `pnpm gen:backend update` | 重新生成后端声明与命令注册 |
-| `pnpm gen:backend list` | 查看后端模块与命令 |
+| `pnpm gen:backend list` | 查看后端模块与命令（当前 7 个模块、76 条命令） |
 | `pnpm ver check` | 校验版本一致性 |
 | `pnpm ver bump <类型>` | 升级版本并生成变更日志 |
+| `pnpm check:samples` | 示例插件的清单与代码是否一致 |
+| `pnpm check:semver` | 版本比较实现（semver 官方用例） |
+| `pnpm check:update` | 自动检查更新的节流判断 |
+| `pnpm check:network` | 联网方式与下载源（含前后端常量镜像是否漂移） |
+| `pnpm check:memory` | 缓存语义与上限、组件缓存的释放挂钩 |
+| `pnpm check:performance` | 两个动效开关的真值表与接线 |
 
 ## 提交前检查
 
@@ -140,14 +161,22 @@ modulith-desktop/
 pnpm ver check
 pnpm gen:modules                      # 必须：src/generated 不入库，tsc 依赖它
 npx tsc -p tsconfig.json --noEmit
+npx tsc -p tsconfig.node.json          # scripts/ 下的断言脚本
 cd src-tauri && cargo test --offline --lib
 pnpm check:samples                    # 改了 samples/ 才需要
+pnpm check:semver && pnpm check:update && pnpm check:network
+pnpm check:memory && pnpm check:performance
 ```
 
 `cargo test` 里有一条检查**示例包是否与源码一致**：它解压那个 `.lcp` 并逐个文件比对，
 因此改完插件忘记重新打包会直接失败（这个错我犯过两次，所以现在有测试兜着）。
 `pnpm check:samples` 则检查示例插件的清单与代码对不对得上 —— 用了却没声明、
 声明了却没用，两种都报。
+
+`pnpm check:network` 与另外几个不同：它会**直接读 Rust 源文件**核对前后端的常量有没有
+漂移（网络方式取值、地址长度上限、GitHub 宿主表、字段默认值）。`pnpm check:performance`
+会直接跑两个开关的真值表，并把两个「看起来对、实际不生效」的缺陷修复点钉成断言。
+完整清单与各自的覆盖范围见[构建与代码生成](docs/02-开发指南/构建与代码生成.md)。
 
 `src/generated/` 是构建期产物，**不纳入版本控制**（`.gitignore` 已排除）。因此**全新 clone 之后必须先运行一次 `pnpm gen:modules`**，否则 `tsc` 会报 `Cannot find module '../generated/moduleRegistry'` 这类错误。
 

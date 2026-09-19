@@ -65,8 +65,10 @@ var h = React.createElement;
 | 模块 | 映射到 |
 | --- | --- |
 | `react` | `Modulith.React` |
-| `react/jsx-runtime` | `Modulith.jsx` 与 `Modulith.jsxs` |
-| `react-dom` | 无需映射，宿主不提供 ReactDOM |
+| `react/jsx-runtime` | `Modulith`（宿主在该对象上同时提供 `jsx` / `jsxs` / `Fragment`） |
+| `react-dom` | 不映射 —— 宿主不提供 ReactDOM，也不该外部化（见下） |
+
+映射目标是**打包器里那个全局标识符本身**，不是它的子成员：`globals` 只接受一个标识符，打包器会在它后面继续取属性。因此 `react` 映射到 `Modulith.React`（产物里会写 `Modulith.React.createElement`），而 `react/jsx-runtime` 必须映射到 `Modulith`（产物里会写 `Modulith.jsx` / `Modulith.jsxs` / `Modulith.Fragment`）。把后者写成 `Modulith.jsx` 会得到 `Modulith.jsx.jsx`。
 
 宿主**不提供** `ReactDOM`。插件不应调用 `createRoot` 或 `render`，而应通过 `registerModule` 交出组件，由宿主负责挂载与卸载。
 

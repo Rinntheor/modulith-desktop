@@ -11,8 +11,10 @@
 // 宿主在加载插件前会注入 window.Modulith：
 //   { version, React, jsx, jsxs, Fragment, registerModule, createContext }
 //
-// 插件 bundle 必须把 react / react-dom / react/jsx-runtime 标记为 external，
-// 并映射到 window.Modulith.*，这样插件与宿主共用同一份 React（hooks/context 才能工作）。
+// 插件 bundle 必须把 react 与 react/jsx-runtime 标记为 external，并映射到
+// window.Modulith 的对应成员（react → Modulith.React，react/jsx-runtime → Modulith），
+// 这样插件与宿主共用同一份 React（hooks/context 才能工作）。
+// **react-dom 不在其列**：宿主不提供 ReactDOM，插件通过 registerModule 交出组件即可。
 
 import React from 'react';
 import { jsx, jsxs, Fragment } from 'react/jsx-runtime';
