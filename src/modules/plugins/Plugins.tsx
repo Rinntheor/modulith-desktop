@@ -252,7 +252,9 @@ const UrlDialog: React.FC<{
           >
             <h3 className="font-semibold text-gray-900">从 URL 安装插件</h3>
             <p className="text-xs text-gray-500 mt-1">
-              输入插件包（.lcp / .zip）的直链地址，应用会下载并校验后再安装。
+              输入插件包（.lcp / .zip）的直链地址。应用会校验包本身（清单、路径与体积），
+              但<strong className="font-semibold text-gray-600">不会校验来源</strong>
+              —— 请只从你信任的地址安装。
             </p>
             <input
               autoFocus

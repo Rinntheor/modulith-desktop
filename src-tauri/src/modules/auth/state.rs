@@ -37,9 +37,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct RecoveryGrant {
     /// 命中的恢复码在 `AuthConfig::recovery_hash` 中的下标。
     ///
-    /// 多枚恢复码各自独立，第二步需要知道用掉的是哪一枚才能正确记账
-    /// （当前实现会整套换发并以审计形式记录下标，便于排查
-    /// "同一枚纸被反复使用"这类情况）。
+    /// 多枚恢复码各自独立，第二步需要知道用掉的是哪一枚才能正确记账。
+    ///
+    /// 只作废命中的那一枚，其余保留（见 `config.rs` 的 `consume_recovery_code` 与
+    /// `docs/06-项目/已知问题与技术债.md` 第 4.7 节）。这里此前写着"当前实现会整套
+    /// 换发"——那是更早的设计，早已被推翻，为避免读者据此推出错误结论一并改正。
     matched_index: usize,
     /// 过期时间（Unix 秒）
     expires_at: i64,
@@ -178,6 +180,21 @@ impl AuthState {
             .clear();
     }
 
+    /// 结束除 `keep` 之外的全部会话，返回被结束的数量。
+    ///
+    /// 用于「修改访问密钥」：密钥一换，其他会话就不该继续有效 —— 但那**不包括**
+    /// 发起这次操作的那个会话，否则用户刚改完密钥就被自己登出。
+    ///
+    /// （`reset_access_key_with_recovery_code` 走的是另一条路：它先
+    /// `drop_all_sessions()` 再重新签发一个令牌返回给前端，因为那条路径上用户手上
+    /// 本来就没有有效会话。两条路径的差别是「有没有会话需要保住」，不是松紧不同。）
+    pub fn drop_other_sessions(&self, keep: &str) -> usize {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let before = sessions.len();
+        sessions.retain(|token, _| token == keep);
+        before - sessions.len()
+    }
+
     /// 结束某台设备的所有会话，返回被结束的数量。
     ///
     /// 「移除已知设备」依赖它才真正生效（hive_atelier 只删了列表项，
@@ -306,6 +323,26 @@ mod tests {
         assert!(!state.validate_session(&a));
         assert!(!state.validate_session(&b));
         assert_eq!(state.session_remaining_hours(), 0.0);
+    }
+
+    /// **改密钥时只保留发起操作的那个会话。**
+    ///
+    /// 这条测试锁的是 `change_access_key` 的安全性质：密钥一换，其他会话必须失效；
+    /// 但发起操作的那个会话要保住，否则用户刚改完密钥就被自己登出。
+    #[test]
+    fn drop_other_sessions_keeps_only_the_given_one() {
+        let state = state();
+        let keep = state.create_session("dev-1");
+        let other_same_device = state.create_session("dev-1");
+        let other_device = state.create_session("dev-2");
+
+        assert_eq!(state.drop_other_sessions(&keep), 2);
+
+        assert!(state.validate_session(&keep));
+        assert!(!state.validate_session(&other_same_device));
+        assert!(!state.validate_session(&other_device));
+        // 幂等：再调一次没有可撤销的会话
+        assert_eq!(state.drop_other_sessions(&keep), 0);
     }
 
     #[test]

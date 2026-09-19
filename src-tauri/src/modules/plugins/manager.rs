@@ -159,21 +159,12 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> PluginResult<()> {
 /// - **回环例外**只为本地调试：在那台服务器就是用户自己机器、插件代码也运行在同一台机器上
 ///   的前提下，它不削弱真实威胁模型。
 fn ensure_registry_url_allowed(url: &str) -> PluginResult<()> {
-    let parsed = reqwest::Url::parse(url.trim())
-        .map_err(|e| PluginError::DownloadFailed(format!("地址非法: {}", e)))?;
+    let host = ensure_https_or_loopback(url)?;
 
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    let scheme = parsed.scheme();
-
-    if is_loopback_host(&host) && (scheme == "http" || scheme == "https") {
+    // 回环地址只服务于本地调试：那台服务器就是用户自己的机器，插件代码也运行在同一台
+    // 机器上，因此不施加宿主白名单。
+    if is_loopback_host(&host) {
         return Ok(());
-    }
-
-    if scheme != "https" {
-        return Err(PluginError::SandboxViolation(format!(
-            "插件仓库内容必须通过 https 获取（本机回环地址可用 http 以便调试）: {}",
-            url.trim()
-        )));
     }
 
     if !ALLOWED_REGISTRY_HOSTS.contains(&host.as_str()) {
@@ -185,6 +176,36 @@ fn ensure_registry_url_allowed(url: &str) -> PluginResult<()> {
     }
 
     Ok(())
+}
+
+/// 传输层约束：必须 https，本机回环可用 http。返回小写化的宿主名。
+///
+/// 这是**比白名单弱、比"任意 URL"强**的一档，服务于「用户自己粘贴一个地址安装插件」
+/// 那条路径（`install_from_url`）。它**不做宿主白名单**，因为用户可能从自建服务器或
+/// 内网地址安装；但明文 http 一律拒绝 —— 下载的是将要执行的代码，不加密的传输通道
+/// 等于把"装什么"交给链路上的任何人。
+///
+/// 与 `ensure_registry_url_allowed` 的关系是"同一条规则的前半段"：白名单版本在此之上
+/// 再加宿主限制。两者共用这一段，避免两处对"什么算合法地址"给出不同答案。
+fn ensure_https_or_loopback(url: &str) -> PluginResult<String> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|e| PluginError::DownloadFailed(format!("地址非法: {}", e)))?;
+
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let scheme = parsed.scheme();
+
+    if is_loopback_host(&host) && (scheme == "http" || scheme == "https") {
+        return Ok(host);
+    }
+
+    if scheme != "https" {
+        return Err(PluginError::SandboxViolation(format!(
+            "插件内容必须通过 https 获取（本机回环地址可用 http 以便调试）: {}",
+            url.trim()
+        )));
+    }
+
+    Ok(host)
 }
 
 /// 校验并解析「宿主代表插件访问的本机路径」。
@@ -615,27 +636,48 @@ impl PluginManager {
     ///
     /// 这是"用户自己粘贴一个地址"的路径：没有可对照的期望值，因此无从校验。
     /// 插件市场的路径走 [`Self::install_from_url_verified`]。
+    ///
+    /// **地址约束只到传输层为止**（https，回环例外），**不做宿主白名单** ——
+    /// 用户可能从自建服务器或内网地址安装。推论是这条命令**不受 `network` /
+    /// `network-external` 权限约束**：一个已安装插件可以直接 `invoke` 它去下载任意
+    /// 地址的内容。之所以无法在这里加权限检查，是因为命令签名里没有插件 id，而在
+    /// 「插件与宿主共享同一个 JS 上下文」的模型下后端无法知道调用者是谁（见
+    /// `docs/06-项目/已知问题与技术债.md` 第 4 节）。市场路径反过来是受限的：它只
+    /// 接受插件仓库自己的地址，因此能施加宿主白名单。
     pub async fn install_from_url(&mut self, url: &str) -> PluginResult<InstalledPlugin> {
-        self.install_from_url_verified(url, None).await
+        ensure_https_or_loopback(url)?;
+        self.download_and_install(url, None).await
     }
 
-    /// 从 URL 下载 .lcp，可校验哈希后安装。
+    /// 从 URL 下载 .lcp，可校验哈希后安装。**插件市场唯一的入口。**
     ///
     /// `expected_sha256` 给定时，校验发生在**写盘与解压之前**：下载来源（CDN）与索引
     /// 本身都可能出问题，而一旦解压安装就晚了 —— 那时错误只能靠"卸载"来纠正。
-    /// 插件市场只用这个入口。
+    ///
+    /// **地址受 [`ensure_registry_url_allowed`] 约束**：市场的地址由
+    /// `src/config/pluginRegistry.ts` 的 `registrySources` 生成，只可能是插件仓库的
+    /// 两个宿主，所以这里可以收紧到白名单。用户配置的下载源（前缀式加速）由后端在
+    /// `fetch_via_sources` 内部拼接，不在本函数的校验范围内 —— 它改的是"经由哪里取"，
+    /// 不是"取什么"。
+    ///
+    /// 注意它**仍然无法识别调用者**：一个插件可以直接 invoke 本命令去下载白名单上的
+    /// 任意 `.lcp`（例如把某个插件装回旧版本）。约束它的是宿主白名单与调用方传入的
+    /// `sha256`，而不是调用者身份。
     pub async fn install_from_url_verified(
         &mut self,
         url: &str,
         expected_sha256: Option<&str>,
     ) -> PluginResult<InstalledPlugin> {
-        if !is_http_url(url) {
-            return Err(PluginError::InvalidPackage(format!(
-                "只支持 http/https 协议: {}",
-                url
-            )));
-        }
+        ensure_registry_url_allowed(url)?;
+        self.download_and_install(url, expected_sha256).await
+    }
 
+    /// 下载并安装的实际实现。地址校验由两个入口各自完成，这里假定传入地址已通过校验。
+    async fn download_and_install(
+        &mut self,
+        url: &str,
+        expected_sha256: Option<&str>,
+    ) -> PluginResult<InstalledPlugin> {
         let (bytes, used) = self.fetch_via_sources(url.trim()).await?;
 
         if bytes.len() as u64 > MAX_PLUGIN_BYTES {
@@ -960,7 +1002,35 @@ impl PluginManager {
         }
 
         let target = match dest {
-            Some(path) => normalize_export_path(path),
+            Some(path) => {
+                // **为什么 `dest` 只能是文件名，且不允许覆盖。**
+                //
+                // 本命令没有权限检查，也没有调用者身份 —— 插件可以直接 invoke 它。
+                // 若放任 `dest` 是任意路径，它就是一个"任意文件截断覆盖"原语（语义上
+                // 等同于 `filesystem-write`，而那条权限当前没有别的强制点）。收口之后
+                // 它最多只能在默认导出目录（通常是用户的下载目录）里创建一个**新**文件。
+                //
+                // 默认导出目录是下载目录，不是应用专有目录，所以"只允许新文件"这一条
+                // 不能省：否则插件仍可静默覆盖用户下载目录里的同名文件。
+                let file_name = export_file_name(&path)?;
+
+                let base = PathBuf::from(self.default_export_dir()?);
+                std::fs::create_dir_all(&base)?;
+                let target = base.join(file_name);
+
+                // 存在性检查与写入之间存在一个很短的竞态窗口（TOCTOU）。它无法在不改
+                // 写入路径的前提下彻底消除，但在这个位置代价可接受：能利用它的只有本机
+                // 同用户进程，而那样的进程本来就拥有更大的能力。这里挡的是"静默覆盖
+                // 用户已有文件"，不是提供原子性保证。
+                if target.exists() {
+                    return Err(PluginError::SandboxViolation(format!(
+                        "导出目标已存在，拒绝覆盖: {}",
+                        target.display()
+                    )));
+                }
+
+                target
+            }
             None => {
                 let suggested = format!("{}-{}.lcp", plugin.id, plugin.version);
                 let app = self.app.clone();
@@ -1608,7 +1678,10 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> PluginResult<()> {
         .canonicalize()
         .map_err(|e| PluginError::ExtractionFailed(e.to_string()))?;
 
-    let mut total: u64 = 0;
+    // 两个累计器：`declared_total` 用压缩包**声明**的大小做廉价预检，`written_total`
+    // 累加**实际**写出的字节数。真正的判据是后者。
+    let mut declared_total: u64 = 0;
+    let mut written_total: u64 = 0;
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
@@ -1636,9 +1709,13 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> PluginResult<()> {
             )));
         }
 
-        // 2) 体积上限（条目声明值）
-        total = total.saturating_add(entry.size());
-        if total > MAX_PLUGIN_BYTES {
+        // 2) 体积上限的**声明值预检**：明显超限时不必解压就能拒绝，是第一道廉价防线。
+        //
+        //    它不能作为唯一判据 —— `entry.size()` 是压缩包中央目录里**自己声明**的值，
+        //    可以被构造成"声明很小、实际很大"，也就是典型的解压炸弹。真正的判据是下面
+        //    写入循环里按实际字节累计的 `written_total`。
+        declared_total = declared_total.saturating_add(entry.size());
+        if declared_total > MAX_PLUGIN_BYTES {
             return Err(PluginError::InvalidPackage(format!(
                 "压缩包解压后体积超过上限 {} 字节",
                 MAX_PLUGIN_BYTES
@@ -1678,6 +1755,17 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> PluginResult<()> {
                 return Err(PluginError::InvalidPackage(format!(
                     "压缩包条目过大: {}",
                     raw_name
+                )));
+            }
+
+            // 整包体积按**实际**字节累计。这一条不信任压缩包的声明值，因此解压炸弹会在
+            // 写满上限的那一刻立即中止，而不是先把磁盘写满 —— 上面的 `declared_total`
+            // 只是廉价预检，撒谎的中央目录骗不过这里。
+            written_total = written_total.saturating_add(read as u64);
+            if written_total > MAX_PLUGIN_BYTES {
+                return Err(PluginError::InvalidPackage(format!(
+                    "压缩包解压后总体积超过上限 {} 字节",
+                    MAX_PLUGIN_BYTES
                 )));
             }
             out_file.write_all(&buffer[..read])?;
@@ -1725,14 +1813,20 @@ fn write_plugin_zip(root: &Path, dest: &Path) -> PluginResult<u64> {
     Ok(std::fs::metadata(dest)?.len())
 }
 
-/// 规范化导出目标路径
-fn normalize_export_path(path: PathBuf) -> PathBuf {
-    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) {
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            return canonical_parent.join(file_name);
+/// 从调用方给出的导出目标里取出**文件名**，拒绝任何带目录的写法。
+///
+/// 抽成纯函数是为了可测：`PluginManager` 持有 `AppHandle`，单测里造不出来。而这条
+/// 规则正是「`export_plugin` 不是任意文件覆盖原语」的唯一依据，必须被测试锁住。
+fn export_file_name(path: &Path) -> PluginResult<std::ffi::OsString> {
+    match path.file_name() {
+        Some(name) if path.parent().map_or(true, |p| p.as_os_str().is_empty()) => {
+            Ok(name.to_os_string())
         }
+        _ => Err(PluginError::SandboxViolation(format!(
+            "导出目标必须是文件名（不能包含目录），导出始终落在默认导出目录内: {}",
+            path.display()
+        ))),
     }
-    path
 }
 
 /// 把对话框返回的 FilePath 统一成 PathBuf
@@ -1770,6 +1864,94 @@ fn ensure_within(root_canon: &Path, path: &Path) -> PluginResult<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// **导出目标必须是裸文件名。**
+    ///
+    /// 这条规则是「`export_plugin` 不是任意文件截断覆盖原语」的唯一依据：`dest` 一旦
+    /// 允许目录成分，插件就能直接 invoke 它去覆盖 `auth.json` 或用户任意文件。
+    #[test]
+    fn export_target_must_be_a_bare_file_name() {
+        for rejected in [
+            "sub/x.lcp",
+            "sub\\x.lcp",
+            "/tmp/x.lcp",
+            "C:\\tmp\\x.lcp",
+            "../x.lcp",
+            "..",
+            ".",
+        ] {
+            assert!(
+                export_file_name(Path::new(rejected)).is_err(),
+                "带目录或非文件名的导出目标应当被拒绝: {}",
+                rejected
+            );
+        }
+
+        for accepted in ["x.lcp", "my-plugin-1.0.0.lcp", "导出.lcp"] {
+            assert_eq!(
+                export_file_name(Path::new(accepted))
+                    .unwrap()
+                    .to_string_lossy(),
+                accepted,
+                "纯文件名应当通过: {}",
+                accepted
+            );
+        }
+    }
+
+    /// **市场路径的地址只能是插件仓库本身。**
+    ///
+    /// `install_from_url_verified` 是市场唯一入口，而市场地址由
+    /// `src/config/pluginRegistry.ts` 生成，只可能是这两个宿主。收紧到白名单之后，
+    /// 一个插件即使直接 invoke 它，也下载不到白名单之外的内容。
+    #[test]
+    fn registry_url_requires_allowlisted_host() {
+        for allowed in [
+            "https://cdn.jsdelivr.net/gh/Rinntheor/modulith-plugins@main/index.json",
+            "https://raw.githubusercontent.com/Rinntheor/modulith-plugins/main/index.json",
+        ] {
+            assert!(
+                ensure_registry_url_allowed(allowed).is_ok(),
+                "白名单地址应当放行: {}",
+                allowed
+            );
+        }
+
+        // 其他宿主：即使走 https 也拒绝
+        for rejected in [
+            "https://attacker.example/x.lcp",
+            "https://evil.jsdelivr.net.attacker.example/x.lcp",
+        ] {
+            assert!(
+                ensure_registry_url_allowed(rejected).is_err(),
+                "非白名单宿主应当被拒绝: {}",
+                rejected
+            );
+        }
+
+        // 明文 http：非回环一律拒绝
+        assert!(ensure_registry_url_allowed("http://cdn.jsdelivr.net/x").is_err());
+        // 非 http(s) 协议：拒绝
+        assert!(ensure_registry_url_allowed("file:///C:/x.lcp").is_err());
+        assert!(ensure_registry_url_allowed("ftp://cdn.jsdelivr.net/x").is_err());
+        // 回环允许 http（本地调试）
+        assert!(ensure_registry_url_allowed("http://127.0.0.1:8080/index.json").is_ok());
+        assert!(ensure_registry_url_allowed("http://localhost:8080/index.json").is_ok());
+    }
+
+    /// **用户粘贴路径只约束传输层，不限制宿主。**
+    ///
+    /// 这条路径服务于「从 URL 安装」这个真实功能，因此不能施加白名单；但它同样必须
+    /// 拒绝明文 http —— 下载的是将要执行的代码。
+    #[test]
+    fn user_pasted_url_allows_any_https_host_but_not_plain_http() {
+        assert!(ensure_https_or_loopback("https://example.com/plugin.lcp").is_ok());
+        assert!(ensure_https_or_loopback("https://self-hosted.internal/plugin.lcp").is_ok());
+        assert!(ensure_https_or_loopback("http://example.com/plugin.lcp").is_err());
+        assert!(ensure_https_or_loopback("file:///C:/plugin.lcp").is_err());
+        // 回环是唯一允许 http 的情形
+        assert!(ensure_https_or_loopback("http://127.0.0.1/x.lcp").is_ok());
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

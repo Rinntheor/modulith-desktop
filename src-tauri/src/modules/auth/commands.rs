@@ -608,6 +608,12 @@ pub async fn change_access_key(
         cfg.push_log(log_entry(&device_id, &label, true, "key-changed"));
     });
 
+    // **其他会话必须失效。** 密钥一换，任何用旧密钥换来的会话都不该再有效 ——
+    // 这条路径此前完全没有撤销动作，于是改完密钥之后其他设备的会话仍能继续用到
+    // TTL（24 小时）结束。与 `reset_access_key_with_recovery_code` 的处理对齐，
+    // 唯一区别是**保留发起本次操作的那个会话**，否则用户刚改完就被自己登出。
+    state.drop_other_sessions(&token);
+
     state.attempts.clear(&device_id);
     state.limiter.clear(&device_id);
 
