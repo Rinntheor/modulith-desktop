@@ -27,6 +27,7 @@ import {
   Globe,
   FileText,
 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import ModuleEmbed from '../ModuleEmbed';
 import LoggingSettings from './LoggingSettings';
@@ -50,7 +51,7 @@ import {
   subscribeSettings,
   type AppSettings,
 } from '../../services/appSettings';
-import { resyncTabsFromSettings } from '../../services/tabStore';
+import { persistWindowStateNow, resyncTabsFromSettings } from '../../services/tabStore';
 
 export type SettingsSectionId =
   | 'general'
@@ -76,6 +77,18 @@ const SECTIONS: SectionDef[] = [
   { id: 'market', label: '市场', icon: Store },
   { id: 'about', label: '关于', icon: Info },
 ];
+
+/**
+ * 开机自启动的状态。
+ *
+ * `supported` 为 false 时（非 Windows 平台）界面显示 `reason` 而不是自己编一句话；
+ * 一个「显示为已关闭、实际什么都没做」的开关比不支持更糟。
+ */
+interface AutostartStatus {
+  supported: boolean;
+  enabled: boolean;
+  reason: string | null;
+}
 
 // ============================================================
 // 基础控件
@@ -227,6 +240,51 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
   onSettingsChanged,
 }) => {
   const [section, setSection] = useState<SettingsSectionId>(initialSection ?? 'general');
+
+  /**
+   * 开机自启动的状态。
+   *
+   * **刻意不放进 `settings`**：它是注册表里的系统状态，用户可以在任务管理器的
+   * 「启动」页里直接关掉它。把 `settings.json` 里的副本当成事实，界面就会显示一个
+   * 位置错误的开关。因此这里单独向后端查询，且每次切换后都以返回值刷新。
+   */
+  const [autostart, setAutostart] = useState<AutostartStatus | null>(null);
+
+  /**
+   * 自启动是否已开启。
+   *
+   * 下面三项启动行为（静默 / 全屏 / 最大化）只在开启时可用：它们描述的是"被系统
+   * 拉起时窗口怎么出现"，没有那次启动就无从谈起。
+   */
+  const autostartEnabled = autostart?.enabled ?? false;
+
+  const refreshAutostart = useCallback(async () => {
+    try {
+      setAutostart(await invoke<AutostartStatus>('get_autostart_status'));
+    } catch (error) {
+      console.warn('[Settings] 读取自启动状态失败:', error);
+      setAutostart({ supported: false, enabled: false, reason: '读取自启动状态失败' });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAutostart();
+  }, [refreshAutostart]);
+
+  const toggleAutostart = useCallback(
+    async (next: boolean) => {
+      try {
+        setAutostart(
+          await invoke<AutostartStatus>('set_autostart_enabled', { enabled: next })
+        );
+      } catch (error) {
+        console.error('[Settings] 设置自启动失败:', error);
+        // 回读一次：让界面回到真实状态，而不是停在用户点过的位置
+        await refreshAutostart();
+      }
+    },
+    [refreshAutostart]
+  );
   const [settings, setSettings] = useState<AppSettings>(getCachedSettings());
   const [feedback, setFeedback] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [dataDir, setDataDir] = useState<string>('');
@@ -503,14 +561,76 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                       </SettingRow>
 
                       <SettingRow
-                        title="恢复上次打开的模块"
-                        description="开启后忽略「默认启动模块」，直接回到上次停留的位置"
+                        title="恢复上次打开的模块与标签页"
+                        description="启动时恢复上次打开的标签页、当前标签与分屏布局，并回到上次停留的模块。关闭后每次启动都从「默认启动模块」开始，运行期间的标签变化也不再写入设置"
                       >
                         <Toggle
                           checked={settings.restoreLastModule}
-                          onChange={(next) => update({ restoreLastModule: next })}
+                          onChange={(next) => {
+                            update({ restoreLastModule: next });
+                            // 刚打开时立刻把**当前**窗口状态记下来。否则下次启动恢复的
+                            // 是关闭开关之前的那次布局 —— 用户记得的却是"我刚刚开着
+                            // 这几个标签"。见 tabStore 的 persistWindowStateNow。
+                            if (next) persistWindowStateNow();
+                          }}
                         />
                       </SettingRow>
+
+                      <SettingRow
+                        title="开机自启动"
+                        description={
+                          autostart && !autostart.supported
+                            ? autostart.reason ?? '当前平台不支持这个开关'
+                            : '随系统启动自动运行。默认关闭 —— 应用不会在你没有选择的情况下把自己加进开机项'
+                        }
+                      >
+                        <Toggle
+                          checked={autostart?.enabled ?? false}
+                          disabled={!autostart?.supported}
+                          onChange={(next) => void toggleAutostart(next)}
+                        />
+                      </SettingRow>
+
+                      {/* 这三项只有在**自启动开启**时才有意义：它们描述的是"被系统
+                          拉起时窗口怎么出现"，关掉自启动就没有那次启动。因此自启动
+                          关闭时它们显示为关且不可选 —— 而不是让用户先把它们打开、
+                          再发现什么也没发生。 */}
+                      {autostart?.supported && (
+                        <>
+                          <SettingRow
+                            title="静默启动"
+                            description="开机自启动拉起时：窗口最小化，不抢占前台。本应用没有托盘图标，因此它仍会出现在任务栏里 —— 这一点没有更好的做法，所以如实说明"
+                          >
+                            <Toggle
+                              checked={autostartEnabled && settings.autoStartSilent}
+                              disabled={!autostartEnabled}
+                              onChange={(next) => update({ autoStartSilent: next })}
+                            />
+                          </SettingRow>
+
+                          <SettingRow
+                            title="启动时全屏"
+                            description="开机自启动拉起时直接进入全屏。与「静默启动」同时开启时以静默为准 —— 窗口没到前台，全屏没有意义"
+                          >
+                            <Toggle
+                              checked={autostartEnabled && settings.autoStartFullscreen}
+                              disabled={!autostartEnabled}
+                              onChange={(next) => update({ autoStartFullscreen: next })}
+                            />
+                          </SettingRow>
+
+                          <SettingRow
+                            title="启动时最大化"
+                            description="开机自启动拉起时最大化窗口。与「启动时全屏」同时开启时以全屏为准 —— 两者都想尽可能大，而全屏更大"
+                          >
+                            <Toggle
+                              checked={autostartEnabled && settings.autoStartMaximized}
+                              disabled={!autostartEnabled}
+                              onChange={(next) => update({ autoStartMaximized: next })}
+                            />
+                          </SettingRow>
+                        </>
+                      )}
                     </Card>
 
                     <Card title="侧边栏">

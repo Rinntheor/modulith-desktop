@@ -1,6 +1,7 @@
 // src-tauri/src/modules/settings/commands.rs
 use crate::modules::logging;
 use crate::modules::settings::probe;
+use crate::modules::settings::autostart;
 use crate::modules::settings::settings::{self as store, AppSettings};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
@@ -125,9 +126,92 @@ pub async fn get_app_data_dir(app: AppHandle) -> Result<String, String> {
     Ok(app_dir.to_string_lossy().to_string())
 }
 
+// ============================================================
+// 开机自启动
+// ============================================================
+
+/// 开机自启动的状态
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutostartStatus {
+    /// 当前平台是否支持这个开关
+    pub supported: bool,
+    /// 系统里的**实际**状态（读注册表，不是设置文件里的副本）
+    pub enabled: bool,
+    /// 不支持时的原因，供界面直接显示而不是自己编一句
+    pub reason: Option<String>,
+}
+
+fn autostart_status() -> AutostartStatus {
+    match autostart::is_enabled() {
+        Ok(enabled) => AutostartStatus {
+            supported: true,
+            enabled,
+            reason: None,
+        },
+        Err(reason) => AutostartStatus {
+            supported: false,
+            enabled: false,
+            reason: Some(reason),
+        },
+    }
+}
+
+/// 读取开机自启动状态
+///
+/// 读的是**系统里的实际状态**而不是设置文件的副本：用户可以在任务管理器的
+/// 「启动」页里直接改它，因此设置文件里存一份必然与实际不符，界面会显示一个
+/// 位置错误的开关。见 `autostart.rs` 文件头。
+#[tauri::command]
+pub fn get_autostart_status() -> AutostartStatus {
+    autostart_status()
+}
+
+/// 开启 / 关闭开机自启动
+///
+/// 写入的命令行由后端用 `current_exe()` 现算，**不接受前端传入的路径** ——
+/// 那会变成一条「把任意程序写进启动项」的命令。
+#[tauri::command]
+pub fn set_autostart_enabled(enabled: bool) -> Result<AutostartStatus, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("无法确定程序路径：{e}"))?;
+    autostart::set_enabled(enabled, &autostart::autostart_command(&exe))?;
+    Ok(autostart_status())
+}
+
+/// 本次进程是否由开机自启动拉起
+///
+/// 前端据此决定要不要应用「静默启动 / 启动时全屏」—— 那两个设置只该作用于
+/// 「系统把我拉起来」的情形，不该影响用户双击图标启动。
+#[tauri::command]
+pub fn was_started_by_autostart() -> bool {
+    autostart::launched_by_autostart()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 自启动命令行必须带引号，且带 `--autostart` 标记。
+    ///
+    /// 引号防的是「含空格的路径被系统按空格拆成程序名 + 参数」—— 那种失败在开机时
+    /// 静默发生，用户只会看到"自启动没生效"；标记用于区分「系统拉起」与「用户双击」，
+    /// 没有它，静默启动与启动全屏会连用户自己点图标时也生效，表现为「点了一下界面
+    /// 不出来」。
+    #[test]
+    fn autostart_command_quotes_the_path_and_carries_the_flag() {
+        let exe = std::path::Path::new(r"C:\Program Files\Modulith Desktop\modulith-desktop.exe");
+        let command = autostart::autostart_command(exe);
+
+        assert!(command.starts_with('"'), "路径必须被引号包裹，实际: {command}");
+        assert!(
+            command.ends_with(autostart::AUTOSTART_FLAG),
+            "必须带自启动标记，实际: {command}"
+        );
+
+        // 本进程不是由自启动拉起的（cargo test 不会带那个参数）。这条断言锁的是
+        // 「检测逻辑不会被一个随机的 argv 误判成自启动」。
+        assert!(!was_started_by_autostart());
+    }
 
     /// 宿主版本必须同时满足两个条件：
     /// 1. 是合法 SemVer（否则插件校验器 `SemVer::parse` 会失败，

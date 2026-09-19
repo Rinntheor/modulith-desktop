@@ -3,6 +3,12 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.1.6] - 2026-09-19
+
+### Added
+
+- 窗口内分屏、全屏与开机自启动，并修正窗口状态的恢复开关
+
 ## [1.1.5] - 2026-09-19
 
 ### Changed

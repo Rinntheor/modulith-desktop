@@ -26,7 +26,19 @@ import {
 } from '@dnd-kit/sortable';
 import type { ModuleDescriptor } from '../../types/module';
 
-const Sidebar: React.FC = () => {
+const Sidebar: React.FC<{
+  /**
+   * 沉浸模式（全屏）。
+   *
+   * 侧边栏的定位里写死了 `top-10`（标题栏高度 40px）。全屏时标题栏被隐藏、内容区
+   * 上沿归零，如果这里不跟着变，侧边栏就会在顶部留出一条 40px 的空隙、同时底部
+   * 溢出 40px —— 也就是「全屏后侧边栏错位」。
+   *
+   * 选择**贴合而不是隐藏**：全屏时仍然可以导航，而且不改变用户的展开/折叠状态
+   * （退出全屏后与进入前一致）。想更沉浸可以按 Ctrl+B 自己收起来。
+   */
+  immersive?: boolean;
+}> = ({ immersive = false }) => {
   const { isOpen, isCollapsed, toggleSidebar, activeModule } = useSidebar();
   const navRef = useRef<HTMLElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
@@ -115,7 +127,9 @@ const Sidebar: React.FC = () => {
           initial="hidden"
           animate="visible"
           exit="hidden"
-          className="fixed left-0 top-10 h-[calc(100%-2.5rem)] z-40 flex"
+          className={`fixed left-0 z-40 flex ${
+            immersive ? 'top-0 h-full' : 'top-10 h-[calc(100%-2.5rem)]'
+          }`}
         >
           <div className="h-full w-64 bg-white/90 backdrop-blur-xl border-r border-gray-200/50 shadow-2xl flex flex-col">
             {/* 侧边栏头部 */}

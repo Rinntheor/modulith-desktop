@@ -1,6 +1,7 @@
 // src-tauri/src/modules/settings/mod.rs
 // 应用全局设置模块
 
+pub mod autostart;
 pub mod commands;
 pub mod network;
 pub mod probe;

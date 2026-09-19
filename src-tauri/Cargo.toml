@@ -1,6 +1,6 @@
 [package]
 name = "modulith-desktop"
-version = "1.1.5"
+version = "1.1.6"
 description = "A modular desktop framework built with Tauri"
 authors = ["环理论 (Rinntheor)"]
 edition = "2021"
@@ -60,10 +60,15 @@ minisign-verify = "0.2.5"
 # ---- Windows 平台专属：提取可执行文件图标（src/modules/plugins/icon.rs）----
 # 用 windows-sys 而不是 windows：这里只需要几个 Win32 函数的裸声明，
 # 不需要 COM 包装与 Result 化，编译时间与体积都小得多。
-# 只启用用到的那三个模块，其余 Win32 绑定不会被编进来。
+# 只启用用到的那几个模块，其余 Win32 绑定不会被编进来。
+#
+# `Win32_System_Registry` 供开机自启动使用（settings/autostart.rs）：只写
+# HKCU 的 Run 键，因此不需要管理员权限。同样不引 tauri-plugin-autostart ——
+# 要的只是"当前用户、单个值、一条命令行"这一种形态。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
     "Win32_UI_WindowsAndMessaging",
 ] }

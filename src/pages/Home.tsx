@@ -43,13 +43,17 @@ import {
   Bell,
   ChevronLeft,
   ChevronRight,
+  Columns2,
   Eye,
   LayoutGrid,
+  Maximize,
   RefreshCw,
   Settings,
   TriangleAlert,
   X,
 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { SidebarProvider, useSidebar } from '@/contexts/SidebarContext';
 import { ModuleRuntimeProvider } from '@/contexts/ModuleRuntimeContext';
 import Sidebar from '../components/Sidebar/Sidebar';
@@ -62,22 +66,56 @@ import SettingsDialog, { type SettingsSectionId } from '../components/Settings/S
 import GlobalContextMenu, { type GlobalMenuEntry } from '../components/GlobalContextMenu';
 import { moduleManager } from '../services/moduleManager';
 import { reloadPluginRuntime } from '../services/pluginRuntime';
-import { getCachedSettings, saveAppSettings, subscribeSettings } from '../services/appSettings';
+import {
+  clampSplitRatio,
+  getCachedSettings,
+  saveAppSettings,
+  subscribeSettings,
+} from '../services/appSettings';
 import { getReduceMotion, subscribeTheme } from '../services/theme';
 import { getBootResult } from '../services/boot';
 import { useTabs } from '../hooks/useTabs';
 import { useCatalog } from '../hooks/useCatalog';
-import { getFallbackModule, initializeTabs, openFallbackTab } from '../services/tabStore';
+import {
+  getFallbackModule,
+  getTabGroup,
+  getTabState,
+  initializeTabs,
+  moveTabInGroup,
+  moveTabToGroup,
+  openFallbackTab,
+  setFocusedGroup,
+  toggleSplit,
+  type TabGroupId,
+} from '../services/tabStore';
+import {
+  clearTabDrag,
+  getDragPointer,
+  getDraggingTab,
+  getDropTarget,
+  setDropTargetTarget,
+  subscribeTabDrag,
+} from '../services/tabDrag';
 import { loadNotifications } from '../services/notifications';
 import { autoCheckForAppUpdate } from '../services/appUpdater';
 import { useGlobalShortcuts } from '../hooks/useGlobalShortcuts';
 import { registerHostCommands } from '../services/commandRegistry';
 import { registerHostShortcuts } from '../services/hostShortcuts';
+import { registerFullscreenToggle } from '../services/fullscreenBridge';
 
 interface HomeContentProps {
   /** 初始化期间的非致命告警 */
   warnings: string[];
 }
+
+/**
+ * 侧边栏展开时的宽度（`w-64` = 16rem = 256px）。
+ *
+ * 内容区与标签栏行都用它作为左内边距来给侧边栏让位 —— 侧边栏是 `fixed` 定位、
+ * 不参与父级布局，所以这里只能自己留出这个数。写成常量而不是散落的 `ml-64`，
+ * 是为了让"让位"这件事只有一个数字来源。
+ */
+const SIDEBAR_WIDTH = 256;
 
 /**
  * 零标签时的空态。
@@ -117,7 +155,8 @@ const EmptyTabs: React.FC = () => {
 
 const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
   const { isOpen, canGoBack, canGoForward, goBack, goForward } = useSidebar();
-  const { openTabs, activeTab, mountedTabs } = useTabs();
+  const { openTabs, activeTab, splitTabs, splitActive, focusedGroup, mountedTabs } = useTabs();
+  const catalog = useCatalog();
   // 设置对话框当前显示的分页，以及它是否打开。
   //
   // settingsSection 现在确实是 state：更新通知里的「查看更新」必须把设置切到
@@ -147,6 +186,81 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
   // 设置变化 → 重新求值（「关闭动画」与「性能模式」都会改变这个有效值）
   useEffect(() => subscribeTheme(() => setReduceMotionState(getReduceMotion())), []);
   const bootstrappedRef = useRef(false);
+
+  /**
+   * 是否处于全屏（F11）。
+   *
+   * 这个状态必须由**前端**持有：全屏不只是窗口属性，它还要改变界面（隐藏标题栏与
+   * 二级标题栏、把内容区上沿归零）。让快捷键直接去调 Tauri 的 `setFullscreen` 而
+   * 不更新这里，就会得到「窗口全屏了、标题栏还在」。
+   *
+   * `ref` 与 `state` 并存：快捷键回调注册在 React 树之外，它的闭包捕获的是首次
+   * 渲染的值，因此切换时读 ref 才是最新状态。
+   */
+  const [fullscreen, setFullscreen] = useState(false);
+  const fullscreenRef = useRef(false);
+
+  const applyFullscreen = useCallback(async (next: boolean) => {
+    fullscreenRef.current = next;
+    setFullscreen(next);
+
+    try {
+      await getCurrentWindow().setFullscreen(next);
+    } catch (error) {
+      // 窗口操作失败时把界面状态回滚 —— 否则界面显示「已全屏」（标题栏消失），
+      // 而窗口并没有全屏，用户看到的是一个没有标题栏、也没全屏的普通窗口。
+      fullscreenRef.current = !next;
+      setFullscreen(!next);
+      console.error('[Home] 切换全屏失败:', error);
+    }
+  }, []);
+
+  useEffect(
+    () =>
+      registerFullscreenToggle(() => {
+        void applyFullscreen(!fullscreenRef.current);
+      }),
+    [applyFullscreen]
+  );
+
+  /**
+   * 自启动时的窗口行为（静默 / 全屏）。
+   *
+   * **只在由系统自启动拉起时生效**（命令行带 `--autostart`）。用户双击图标启动
+   * 不该受这两个设置影响 —— 否则「点了一下界面不出来」就是纯粹的故障。
+   *
+   * 静默实现为**最小化**而不是隐藏窗口：本应用没有托盘图标，隐藏之后用户只能靠
+   * 任务管理器找回它。设置界面里也照此如实描述，不写成「后台静默运行」。
+   *
+   * 静默优先于全屏：窗口没到前台，全屏没有意义。
+   */
+  const startupBehaviorRef = useRef(false);
+
+  useEffect(() => {
+    if (startupBehaviorRef.current) return;
+    startupBehaviorRef.current = true;
+
+    void (async () => {
+      try {
+        const byAutostart = await invoke<boolean>('was_started_by_autostart');
+        if (!byAutostart) return;
+
+        const settings = getCachedSettings();
+        // 优先级：静默 > 全屏 > 最大化。三者都想决定「窗口一出来是什么样」，
+        // 同时开两个必须有确定答案，否则用户面对的是「到底哪个生效」的不确定性。
+        if (settings.autoStartSilent) {
+          await getCurrentWindow().minimize();
+        } else if (settings.autoStartFullscreen) {
+          await applyFullscreen(true);
+        } else if (settings.autoStartMaximized) {
+          await getCurrentWindow().maximize();
+        }
+      } catch (error) {
+        // 启动行为失败不该影响使用：窗口就在那里，用户正常操作即可
+        console.warn('[Home] 应用自启动行为失败:', error);
+      }
+    })();
+  }, [applyFullscreen]);
 
   // 标题栏刷新：重新加载插件运行时与模块目录，并重挂载全部标签
   const handleRefresh = useCallback(async () => {
@@ -225,9 +339,13 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
 
   useGlobalShortcuts();
 
-  // 记录上次打开的模块，供「恢复上次打开的模块」使用（防抖，避免频繁写盘）
+  // 记录上次停留的模块，供「恢复上次的窗口状态」使用（防抖，避免频繁写盘）。
+  //
+  // 开关关闭时**不记**：`lastModule` 只在恢复窗口状态时才被读，而"关了开关却还在写"
+  // 会让以后重新打开开关时恢复出一个更早的位置。窗口状态本身同理，见 tabStore。
   useEffect(() => {
     if (!activeTab) return;
+    if (!getCachedSettings().restoreLastModule) return;
     const timer = setTimeout(() => {
       saveAppSettings({ lastModule: activeTab }).catch((error) => {
         console.warn('[Home] 记录上次打开的模块失败:', error);
@@ -269,6 +387,161 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
     setMenuPos({ x: event.clientX, y: event.clientY });
   }, []);
 
+  // 全屏时两级标题栏都不占位，内容区上沿归零。
+  const showTitlebar = !fullscreen;
+  const showTabBarInLayout = showTabBar && !fullscreen;
+
+  // 上沿用**像素**而不是 Tailwind 的 `top-19` / `top-10`：标签栏行与内容区必须落在
+  // 同一个计算上，两处各写一次很容易在某个组合（全屏 + 手动隐藏标签栏）下错开。
+  const contentTopPx = showTabBarInLayout ? 76 : showTitlebar ? 40 : 0;
+  const sidebarPx = isOpen ? SIDEBAR_WIDTH : 0;
+
+  const splitOn = splitTabs.length > 0;
+
+  /**
+   * 拖拽状态的镜像（画幽灵标签与落点用）。
+   *
+   * 真值在 `tabDrag` 的模块级状态里，这里只是它在 React 里的投影：拖拽的发起方是
+   * 标签栏，而落点判定有一半在内容区，两边都要读它；而 pointermove 每帧都变，
+   * 放进某一边的 React state 会让另一边读不到。
+   */
+  const [dragState, setDragState] = useState(() => ({
+    tab: getDraggingTab(),
+    pointer: getDragPointer(),
+    target: getDropTarget(),
+  }));
+  useEffect(
+    () =>
+      subscribeTabDrag(() =>
+        setDragState({
+          tab: getDraggingTab(),
+          pointer: getDragPointer(),
+          target: getDropTarget(),
+        })
+      ),
+    []
+  );
+
+  /**
+   * 拖拽结束的**提交**点。
+   *
+   * 放在 `Home` 而不是标签栏：只有这里同时知道"拖的是谁"和"落在内容区的哪一半"。
+   * 监听挂在 `window` 上 —— 用户可能在窗口外松开指针，挂在元素上会漏掉那次 pointerup，
+   * 标签就会一直粘在指针上。
+   */
+  useEffect(() => {
+    const commit = () => {
+      const tab = getDraggingTab();
+      if (!tab) return;
+
+      const target = getDropTarget();
+      // 先清拖拽状态再执行：搬运会让标签换组，留着旧落点会闪一下
+      clearTabDrag();
+      if (!target) return;
+
+      if (target.kind === 'splitzone') {
+        // 落到内容区的某一半：搬到那一组（落在自己那一组时是无操作）
+        moveTabToGroup(tab, target.zone);
+        return;
+      }
+
+      const current = getTabGroup(tab);
+      if (current === target.group) {
+        if (target.index === null) return; // 落在空白处 = 追加到末尾 = 原地不动
+        const { openTabs, splitTabs } = getTabState();
+        const tabs = target.group === 'primary' ? openTabs : splitTabs;
+        const from = tabs.indexOf(tab);
+        if (from !== -1 && from !== target.index) moveTabInGroup(target.group, from, target.index);
+        return;
+      }
+
+      moveTabToGroup(tab, target.group, target.index ?? undefined);
+    };
+
+    window.addEventListener('pointerup', commit);
+    window.addEventListener('pointercancel', commit);
+    return () => {
+      window.removeEventListener('pointerup', commit);
+      window.removeEventListener('pointercancel', commit);
+    };
+  }, []);
+
+  /** 拖拽落点区的样式：当前悬停的那一半高亮，其余淡出 */
+  const zoneClass = (zone: TabGroupId): string => {
+    const hovered =
+      dragState.target?.kind === 'splitzone' && dragState.target.zone === zone;
+    if (hovered) return 'border-indigo-400 bg-indigo-100/40';
+    // 未分屏时左半只是"留在原处"的无操作区，不画出来免得像是可放的目标
+    if (zone === 'primary' && !splitOn) return 'border-transparent';
+    return 'border-indigo-200 bg-indigo-50/20';
+  };
+
+  /**
+   * 分屏比例（左半占内容区的比例）。
+   *
+   * 放在前端 state 里、并持久化到设置：用户把它拖成 7:3 就是一个明确的偏好，
+   * 下次启动再回到 5:5 会让人以为设置没保存。
+   */
+  const [splitRatio, setSplitRatio] = useState(() => clampSplitRatio(getCachedSettings().splitRatio));
+  const splitRatioRef = useRef(splitRatio);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [resizing, setResizing] = useState(false);
+
+  splitRatioRef.current = splitRatio;
+
+  /**
+   * 拖动分隔条。
+   *
+   * 用指针事件而不是 HTML5 拖放：分隔条是"连续跟随"的交互，而 HTML5 拖放只有
+   * 离散的 dragover，做出来的手感是跳的。`setPointerCapture` 保证指针移出分隔条
+   * 甚至移出窗口后仍然收到事件 —— 不捕获的话快速拖动会在中途断掉。
+   */
+  const handleResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setResizing(true);
+  }, []);
+
+  const handleResizeMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizing) return;
+    const rect = contentRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return;
+
+    setSplitRatio(clampSplitRatio((event.clientX - rect.left) / rect.width));
+  }, [resizing]);
+
+  const handleResizeEnd = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (!resizing) return;
+      event.currentTarget.releasePointerCapture(event.pointerId);
+      setResizing(false);
+
+      // 只在拖动结束时写一次盘，而不是每一帧都写
+      void saveAppSettings({ splitRatio: splitRatioRef.current });
+    },
+    [resizing]
+  );
+
+  /**
+   * 点进哪一半就把焦点交给哪一半。
+   *
+   * 用坐标判断，而不是给两半各挂一个处理器：所有面板都在**同一个容器**里绝对定位
+   * （保活要求，见渲染处的说明），根本没有"两半"这两个 DOM 节点可以挂。
+   *
+   * 这一步决定「从侧边栏新开的模块落在哪一组」以及 `Ctrl+W` / `Ctrl+Tab` 作用于
+   * 哪一组 —— 用户点进右半，就是声明了"我现在在这边工作"。
+   */
+  const handleContentMouseDown = useCallback(
+    (event: React.MouseEvent) => {
+      if (!splitOn) return;
+      const rect = contentRef.current?.getBoundingClientRect();
+      if (!rect || rect.width === 0) return;
+      const ratio = (event.clientX - rect.left) / rect.width;
+      setFocusedGroup(ratio < splitRatio ? 'primary' : 'split');
+    },
+    [splitOn, splitRatio]
+  );
+
   const menuEntries: GlobalMenuEntry[] = [
     {
       label: '后退',
@@ -295,36 +568,81 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
       checked: showTabBar,
       action: toggleTabBar,
     },
+    {
+      // 分屏的入口之一（另外两个是标签右键菜单与拖动标签）。
+      // 只做**窗口内**分屏：独立窗口需要跨窗口状态同步，是另一件事。
+      label: splitOn ? '关闭分屏' : '把当前标签分屏',
+      icon: Columns2,
+      shortcut: 'Ctrl+\\',
+      disabled: !activeTab,
+      action: () => toggleSplit(),
+    },
+    {
+      label: fullscreen ? '退出全屏' : '全屏',
+      icon: Maximize,
+      shortcut: 'F11',
+      action: () => void applyFullscreen(!fullscreenRef.current),
+    },
   ];
 
   return (
     <div className="min-h-screen bg-gray-50" onContextMenu={handleGlobalContextMenu}>
-      <Titlebar
-        onRefresh={handleRefresh}
-        refreshing={refreshing}
-        onOpenSettings={handleOpenSettings}
-        onOpenNotifications={handleOpenNotifications}
-        notificationsOpen={notificationsOpen}
-      />
-      <Sidebar />
-      {/* 二级标题栏可以整体隐藏（全局右键 →「显示二级标题栏」），用于沉浸浏览。
-          注意只隐藏它，不隐藏标题栏：窗口是无边框的，标题栏承载窗口按钮。 */}
-      {showTabBar && <TabBar />}
+      {/*
+        全屏时连标题栏一起隐藏：全屏的意义就是「只看内容」，留着一条 40px 的标题栏
+        等于没全屏。窗口按钮（最小化 / 关闭）此时确实不可见，退出方式是再按一次
+        F11 —— 这是「全屏只由 F11 进入」的配套代价。
+
+        非全屏时标题栏必须保留：窗口是无边框的（`decorations: false`），隐藏它会让
+        用户没有关窗口的办法。
+      */}
+      {showTitlebar && (
+        <Titlebar
+          onRefresh={handleRefresh}
+          refreshing={refreshing}
+          onOpenSettings={handleOpenSettings}
+          onOpenNotifications={handleOpenNotifications}
+          notificationsOpen={notificationsOpen}
+        />
+      )}
+      {/* 全屏时侧边栏上移贴合：它的定位写死了标题栏高度（40px），不跟着变会在顶部
+          留出空隙、底部溢出。见 Sidebar 的 immersive prop 说明。 */}
+      <Sidebar immersive={fullscreen} />
+      {/*
+        标签栏行：**按组分列**。分屏后两条标签栏各占内容区的一半，分隔位置与下面
+        内容区的分隔条一致 —— 两边都用同一个 `splitRatio` 换算，所以拖分隔条时
+        标签栏与内容会一起动，不会出现"标题栏的分界和内容的分界对不上"。
+      */}
+      {showTabBarInLayout && (
+        <div
+          className="fixed left-0 right-0 z-40 flex h-9"
+          style={{ top: showTitlebar ? 40 : 0, paddingLeft: sidebarPx }}
+        >
+          <div className="flex min-w-0" style={{ flex: `${splitOn ? splitRatio : 1} 1 0%` }}>
+            <TabBar group="primary" focused={focusedGroup === 'primary'} />
+          </div>
+          {splitOn && (
+            <>
+              <div className="w-px shrink-0 bg-gray-200/70" />
+              <div className="flex min-w-0" style={{ flex: `${1 - splitRatio} 1 0%` }}>
+                <TabBar group="split" focused={focusedGroup === 'split'} />
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {/*
-        内容区结构说明见文件头。要点：
-          * 内容区上沿 = 标题栏 h-10(40px) + 二级标题栏 h-9(36px)；隐藏二级标题栏
-            时只剩 40px，因此这里必须是 `top-19` / `top-10` 二选一，写死会让内容
-            区上沿留出一条空白；
-          * 外层是 `overflow-hidden` 的**视口**，本身不滚动；
-          * 每个已挂载的标签是一个 `absolute inset-0 overflow-y-auto` 的独立滚动区，
-            非激活的用 `invisible + pointer-events-none` 隐藏 —— 保留盒子，
+        内容区。要点：
+          * 上沿与左内边距都用**像素**算（`contentTopPx` / `sidebarPx`），与上面
+            标签栏行同源 —— 侧边栏是 fixed 定位、不参与父级布局，这里只能自己让位；
+          * 外层 `overflow-hidden` 的视口本身不滚动；
+          * 每个已挂载的标签是一个绝对定位的独立滚动区，横向上按所属组铺到左半或
+            右半。不可见的用 `invisible + pointer-events-none` 隐藏 —— 保留盒子，
             因此 scrollTop 不会丢。
       */}
       <main
-        className={`fixed inset-x-0 bottom-0 flex flex-col overflow-hidden transition-[margin] duration-200 ${
-          showTabBar ? 'top-19' : 'top-10'
-        } ${isOpen ? 'ml-64' : 'ml-0'}`}
+        className="fixed inset-x-0 bottom-0 flex flex-col overflow-hidden"
+        style={{ top: contentTopPx, paddingLeft: sidebarPx }}
       >
         {/* 初始化期间的非致命告警（例如某个插件加载失败）：提示一次，可关闭 */}
         <AnimatePresence>
@@ -359,21 +677,40 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
           )}
         </AnimatePresence>
 
-        <div className="relative min-h-0 flex-1">
-          {openTabs.length === 0 && <EmptyTabs />}
+        <div
+          className="relative min-h-0 flex-1"
+          ref={contentRef}
+          onMouseDownCapture={handleContentMouseDown}
+        >
+          {openTabs.length === 0 && splitTabs.length === 0 && <EmptyTabs />}
 
           {/*
             只渲染「挂载过的」标签（惰性挂载）。重启后恢复 10 个标签时不会
             一次挂载 10 个模块，只有被激活过的才会进入这里。
             `mountedTabs` 里的标签**不会**因为切走而卸载，这就是保活。
+
+            **所有面板都待在同一个父容器里**，横向上按所属组铺到左半或右半。
+            这一点是刻意的：把标签从一组拖到另一组时，只有它的 `left/width` 变了，
+            React 仍然复用同一个元素（key 与父节点都没动），滚动位置与未提交的表单
+            因此不会丢。若按组分两个容器渲染，跨组移动就会重新挂载 —— 而那正是这个
+            应用最不该丢的东西。
           */}
           {mountedTabs.map((moduleId) => {
-            const isActive = moduleId === activeTab;
+            // **可见 = 它所在那一组正在显示它。** 分屏之后「激活」与「可见」不再
+            // 一一对应：两组各有一个激活标签，而两组都看得见。
+            //
+            // 传给模块的 `isActiveTab` 用的是可见性而不是焦点 —— 模块问的是
+            // 「我现在要不要继续跑后台工作」（`useModuleActive` 的语义），分屏时
+            // 两半都该正常活着；按焦点判定会让另一半自作主张地停掉后台轮询。
+            const isVisible =
+              moduleId === activeTab || (splitOn && moduleId === splitActive);
+
+            const inSplitGroup = getTabGroup(moduleId) === 'split';
 
             return (
               <section
                 key={`${moduleId}#${refreshToken}`}
-                // 非激活标签：内容仍在 DOM 中、状态与滚动位置都在（保活），
+                // 不可见的标签：内容仍在 DOM 中、状态与滚动位置都在（保活），
                 // 但既不显示、也不接收交互、辅助技术也读不到。
                 //
                 // 隐藏用 `visibility: hidden` 而**不是** `display:none`：
@@ -384,14 +721,25 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
                 // 暂停该子树内的 CSS 动画/过渡，并取消其合成层提升。
                 // 这是「切走时还有几个卡片停留一下」的修复点 ——
                 // 详见 index.css 里那段注释（根因是**动画没停**，不是没隐藏）。
-                data-active={isActive}
-                aria-hidden={!isActive}
-                className={`lc-tab-panel absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar ${
-                  isActive ? '' : 'invisible pointer-events-none'
+                data-active={isVisible}
+                aria-hidden={!isVisible}
+                // 横向位置按「属于哪一组」算：左半从 0 起，右半从 ratio 起；
+                // 未分屏时左半就是全宽。用内联样式而不是 Tailwind 的 w-1/2 ——
+                // 比例是运行期可变的值，类名表达不了。
+                style={{
+                  left: inSplitGroup ? `${splitRatio * 100}%` : 0,
+                  width: splitOn
+                    ? inSplitGroup
+                      ? `${(1 - splitRatio) * 100}%`
+                      : `${splitRatio * 100}%`
+                    : '100%',
+                }}
+                className={`lc-tab-panel absolute inset-y-0 overflow-y-auto overflow-x-hidden custom-scrollbar ${
+                  isVisible ? '' : 'invisible pointer-events-none'
                 }`}
               >
                 <div className="p-8">
-                  <ModuleRuntimeProvider moduleId={moduleId} isActiveTab={isActive}>
+                  <ModuleRuntimeProvider moduleId={moduleId} isActiveTab={isVisible}>
                     {/*
                       非激活标签：把入场动画「立即跳到终态」而不是继续播放。
 
@@ -421,16 +769,79 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
                       的说明）。
                     */}
                     <MotionConfig
-                      reducedMotion={isActive && !reduceMotion ? 'never' : 'always'}
-                      transition={isActive && !reduceMotion ? undefined : { duration: 0 }}
+                      reducedMotion={isVisible && !reduceMotion ? 'never' : 'always'}
+                      transition={isVisible && !reduceMotion ? undefined : { duration: 0 }}
                     >
-                      <ModuleRenderer moduleId={moduleId} initial={isActive} />
+                      <ModuleRenderer moduleId={moduleId} initial={isVisible} />
                     </MotionConfig>
                   </ModuleRuntimeProvider>
                 </div>
               </section>
             );
           })}
+
+          {/*
+            分隔条。只在分屏时存在，位置与标签栏行的分界同源（都用 `splitRatio`），
+            所以拖动时上下两条分界始终对齐。
+
+            用指针捕获：拖动过程中指针移出这条 4px 的窄条（甚至移出窗口）仍然能收到
+            事件，不会「拖到一半断掉」。
+            双击回到对半分 —— 拖歪之后有个确定的归位方式，不必靠手感找回来。
+          */}
+          {splitOn && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="调整分屏比例"
+              onPointerDown={handleResizeStart}
+              onPointerMove={handleResizeMove}
+              onPointerUp={handleResizeEnd}
+              onPointerCancel={handleResizeEnd}
+              onDoubleClick={() => {
+                setSplitRatio(0.5);
+                void saveAppSettings({ splitRatio: 0.5 });
+              }}
+              className={`absolute inset-y-0 z-30 w-1 cursor-col-resize transition-colors ${
+                resizing ? 'bg-indigo-400/60' : 'bg-gray-200 hover:bg-indigo-300/60'
+              }`}
+              style={{ left: `calc(${splitRatio * 100}% - 2px)` }}
+            />
+          )}
+
+          {/*
+            拖拽落点：内容区的左右两半。
+
+            **两个区在拖拽期间都在**，因此"在哪松手"总有明确含义；只画目标那一半
+            会让另一半的松手变成"什么也没发生"，而用户看不出区别。
+
+            未分屏时左半那个区不可见但仍捕获指针：落在它上面等于"留在左组"，
+            是个无操作，不需要提示。
+          */}
+          {dragState.tab && (
+            <>
+              <div
+                onPointerMove={() => setDropTargetTarget({ kind: 'splitzone', zone: 'primary' })}
+                className={`absolute inset-y-0 left-0 z-20 flex items-center justify-center border-2 border-dashed ${zoneClass('primary')}`}
+                style={{ width: `${splitRatio * 100}%` }}
+              >
+                {splitOn && (
+                  <span className="pointer-events-none rounded-lg bg-white/90 px-3 py-1.5 text-xs font-medium text-indigo-600 shadow-sm">
+                    移回左侧
+                  </span>
+                )}
+              </div>
+
+              <div
+                onPointerMove={() => setDropTargetTarget({ kind: 'splitzone', zone: 'split' })}
+                className={`absolute inset-y-0 right-0 z-20 flex items-center justify-center border-2 border-dashed ${zoneClass('split')}`}
+                style={{ width: `${(1 - splitRatio) * 100}%` }}
+              >
+                <span className="pointer-events-none rounded-lg bg-white/90 px-3 py-1.5 text-xs font-medium text-indigo-600 shadow-sm">
+                  {splitOn ? '放到右半' : '放到这里分屏'}
+                </span>
+              </div>
+            </>
+          )}
         </div>
       </main>
 
@@ -456,6 +867,22 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
           entries={menuEntries}
           onClose={() => setMenuPos(null)}
         />
+      )}
+
+      {/*
+        跟随指针的「幽灵标签」。
+        拖拽是用指针事件自己实现的（HTML5 拖放这个应用里不可用，见 tabDrag 的说明），
+        因此没有浏览器自带的拖动影像 —— 不给点反馈的话，用户看不出自己正在拖东西。
+        `pointer-events-none` 是必须的：它会跟着指针走，能接收指针事件就会把
+        `pointermove` 从下面的落点区抢走，落点判定随即失效。
+      */}
+      {dragState.tab && dragState.pointer && (
+        <div
+          className="pointer-events-none fixed z-[80] rounded-md border border-indigo-200 bg-white/95 px-2 py-1 text-[11px] font-medium text-gray-700 shadow-lg"
+          style={{ left: dragState.pointer.x + 12, top: dragState.pointer.y + 12 }}
+        >
+          {catalog.get(dragState.tab)?.name ?? dragState.tab}
+        </div>
       )}
     </div>
   );
