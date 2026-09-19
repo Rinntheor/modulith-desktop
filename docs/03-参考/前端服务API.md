@@ -254,9 +254,24 @@ interface EngineAdvisory {
 | `subscribeTheme(listener)` | `() => void` | 订阅主题变化 |
 | `getThemeMode()` / `getResolvedTheme()` | 同步读取 | 当前模式与实际主题 |
 | `setThemeMode(mode)` | `void` | 应用主题（不负责持久化） |
-| `getReduceMotion()` / `setReduceMotion(enabled)` | | 动效开关 |
+| `getReduceMotion()` | `boolean` | **有效**动效状态（下面两个开关的并集），`MotionConfig` 与 CSS 都读它 |
+| `setReduceMotion(enabled)` | `void` | 应用「关闭界面动画」（不负责持久化） |
+| `getPerformanceMode()` / `setPerformanceMode(enabled)` | | 应用「性能模式」；开启时会连带把有效动效置为已关闭 |
 
 主题有两个来源，职责明确分开：后端 `settings.json` 是权威来源，`localStorage` 只是**首帧缓存**——WebView 在 JS bundle 求值前就会绘制一次，等后端返回再决定配色会看到闪烁。`setThemeMode` 只负责应用，持久化由 `saveAppSettings` 完成，避免出现「设置没写成功但界面已经变了」。
+
+动效有**两个**开关（「关闭界面动画」与「性能模式」），但只有一个有效值：它由 `src/utils/motionPreference.ts` 的 `isMotionReduced(setting, performance)` 合并，结果同时喂给 CSS 类 `.lc-reduce-motion` 与 `MotionConfig`。性能模式包含关闭动画，反向不成立。详见[性能与内存](../02-开发指南/性能与内存.md)第 2 节。
+
+### 9.1 usePerformanceMode
+
+`src/hooks/usePerformanceMode.ts`。当**渲染**需要跟着开关变化时用它（而不是直接读设置）：
+
+| 导出 | 说明 |
+| --- | --- |
+| `usePerformanceMode()` | 性能模式是否开启 |
+| `useReduceMotion()` | 动效是否应当停用（两个开关的并集） |
+
+两者都通过 `subscribeTheme` 订阅，设置一改立即重渲染。典型用法是关掉那些「不受 `reducedMotion` 约束」的持续循环装饰（例如授权界面的粒子背景：framer-motion 只对位置类属性短路，`opacity` 循环会一直跑）。
 
 ## 10. accent
 
