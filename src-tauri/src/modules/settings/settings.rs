@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 use tauri::Manager;
 
+use super::network;
+
 /// 应用设置的文件名（位于 `app_data_dir()` 下）
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
@@ -118,6 +120,43 @@ pub struct AppSettings {
     /// 下次启动会重试 —— 否则一次离线启动就会让自动检查静默失效一整天。
     #[serde(default)]
     pub last_update_check_at: Option<String>,
+    /// 网络访问方式：`direct`（直连 GitHub）/ `proxy`（经由下载源）
+    ///
+    /// 默认 `direct`：不改动用户的网络路径是最安全的默认值 —— 一个默认打开的
+    /// 第三方加速源会把「装什么插件」这条路交给一个我们无法控制的中间人。
+    ///
+    /// 取值由 `network.rs` 校验。**直连与代理的差别只是地址前缀**，内容完整性
+    /// 仍由既有的哈希（`.lcp`）与签名（索引、更新包）保证，不由这个开关保证。
+    #[serde(default = "default_network_mode")]
+    pub network_mode: String,
+    /// 代理根地址（例如 `https://gh-proxy.org`）
+    ///
+    /// 空串表示「还没填」。**是否生效由 `network_mode` 单独决定**：只有
+    /// `network_mode == "proxy"` 且本字段非空时才走代理，两者缺一即直连。
+    /// 这样「切回直连」不会丢掉已填的地址，用户可以反复切换比较速度。
+    ///
+    /// 格式校验（https / 无空白 / 无查询串 / 无凭据）见 `network.rs`。
+    #[serde(default = "default_github_proxy")]
+    pub github_proxy: String,
+    /// 是否把运行日志实时写入文件
+    ///
+    /// 默认 `true`。日志是「出问题时唯一的证据」，而用户不会为了排查问题
+    /// 提前把它打开 —— 默认关闭等于默认没有证据。写入量受大小上限与轮转约束
+    /// （见 `logging` 模块），不会无限增长。
+    ///
+    /// 关掉之后仍然记录崩溃（由 `crash_logging_enabled` 单独控制）：崩溃是
+    /// 低频、高价值的事件，与高频的运行日志不该共用一个开关。
+    #[serde(default = "default_file_logging_enabled")]
+    pub file_logging_enabled: bool,
+    /// 是否把崩溃写入单独的崩溃日志文件
+    ///
+    /// 默认 `true`。崩溃日志与运行日志分成两个文件，因为它们的读取场景不同：
+    /// 用户报障时需要的往往是「崩在哪」，而不是「崩之前刷了多少行」。
+    ///
+    /// **它不受 `file_logging_enabled` 影响**：关掉实时记录正是为了少写磁盘，
+    /// 而崩溃记录是低频的；这也让「关了日志但仍然能拿到崩溃现场」成为可能。
+    #[serde(default = "default_crash_logging_enabled")]
+    pub crash_logging_enabled: bool,
 }
 
 /// 同时打开的标签页数量上限
@@ -147,6 +186,30 @@ fn default_tab_bar_visible() -> bool {
 
 /// 自动检查更新默认开启。理由见 `auto_check_updates` 字段上的说明。
 fn default_auto_check_updates() -> bool {
+    true
+}
+
+/// 默认直连。理由见 `network_mode` 字段上的说明。
+fn default_network_mode() -> String {
+    network::NETWORK_MODE_DIRECT.to_string()
+}
+
+/// 代理地址默认为空（= 还没填）。
+///
+/// 用显式的默认值函数而不是裸 `#[serde(default)]`，是为了让四个新字段的默认值
+/// 都出现在同一个位置 —— 混用两种写法时，「这个字段缺省是什么」要靠人记住
+/// `String` 的 `Default` 是空串，而那不是一眼能看出来的。
+fn default_github_proxy() -> String {
+    String::new()
+}
+
+/// 运行日志默认写入文件。理由见 `file_logging_enabled` 字段上的说明。
+fn default_file_logging_enabled() -> bool {
+    true
+}
+
+/// 崩溃记录默认开启。理由见 `crash_logging_enabled` 字段上的说明。
+fn default_crash_logging_enabled() -> bool {
     true
 }
 
@@ -202,6 +265,10 @@ impl Default for AppSettings {
             tab_bar_visible: default_tab_bar_visible(),
             auto_check_updates: default_auto_check_updates(),
             last_update_check_at: None,
+            network_mode: default_network_mode(),
+            github_proxy: default_github_proxy(),
+            file_logging_enabled: default_file_logging_enabled(),
+            crash_logging_enabled: default_crash_logging_enabled(),
         }
     }
 }
@@ -303,6 +370,24 @@ impl AppSettings {
                 ));
             }
         }
+
+        // 网络方式必须是两个枚举值之一。与 theme 同理：拒绝而不是悄悄回退，
+        // 否则前端收到的值与它提交的值不一致，反而更难排查。
+        if !network::is_valid_network_mode(&self.network_mode) {
+            return Err(format!(
+                "Invalid networkMode \"{}\": expected one of \"{}\", \"{}\"",
+                self.network_mode,
+                network::NETWORK_MODE_DIRECT,
+                network::NETWORK_MODE_PROXY
+            ));
+        }
+
+        // 代理地址**始终**校验格式，即使当前是直连模式。
+        //
+        // 理由是「切换模式」这个动作不该有额外的失败点：如果只在代理模式下校验，
+        // 用户可以先存下一个坏地址、切到直连（保存成功），再切回代理时才发现存不进去 ——
+        // 那时报错指向的是一个他刚刚没碰过的输入框。
+        network::validate_github_proxy(&self.github_proxy)?;
 
         Ok(())
     }

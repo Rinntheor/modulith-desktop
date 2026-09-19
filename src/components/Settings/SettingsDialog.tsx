@@ -24,9 +24,13 @@ import {
   Monitor,
   Check,
   Heart,
+  Globe,
+  FileText,
 } from 'lucide-react';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import ModuleEmbed from '../ModuleEmbed';
+import LoggingSettings from './LoggingSettings';
+import NetworkSettings from './NetworkSettings';
 import SecuritySettings from './SecuritySettings';
 import Toggle from './Toggle';
 import UpdateChecker from './UpdateChecker';
@@ -48,7 +52,14 @@ import {
 } from '../../services/appSettings';
 import { resyncTabsFromSettings } from '../../services/tabStore';
 
-export type SettingsSectionId = 'general' | 'security' | 'plugins' | 'market' | 'about';
+export type SettingsSectionId =
+  | 'general'
+  | 'network'
+  | 'logs'
+  | 'security'
+  | 'plugins'
+  | 'market'
+  | 'about';
 
 interface SectionDef {
   id: SettingsSectionId;
@@ -58,6 +69,8 @@ interface SectionDef {
 
 const SECTIONS: SectionDef[] = [
   { id: 'general', label: '通用', icon: SlidersHorizontal },
+  { id: 'network', label: '网络', icon: Globe },
+  { id: 'logs', label: '日志', icon: FileText },
   { id: 'security', label: '安全', icon: ShieldCheck },
   { id: 'plugins', label: '插件', icon: Puzzle },
   { id: 'market', label: '市场', icon: Store },
@@ -544,6 +557,12 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   </div>
                 )}
 
+                {section === 'network' && (
+                  <NetworkSettings settings={settings} onUpdate={update} />
+                )}
+
+                {section === 'logs' && <LoggingSettings settings={settings} onUpdate={update} />}
+
                 {section === 'security' && <SecuritySettings />}
 
                 {section === 'plugins' && (
@@ -566,7 +585,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   <div className="px-6 py-5">
                     {/* 软件更新。放在身份卡之前：它是这一页唯一"可以操作"的东西，
                         其余部分都是只读信息。 */}
-                    <UpdateChecker />
+                    <UpdateChecker onOpenNetwork={() => setSection('network')} onOpenLogs={() => setSection('logs')} />
 
                     {/* 身份卡：应用名 + 作者 + 外链 */}
                     <section className="bg-white rounded-xl border border-gray-200 px-5 py-5 mb-5">

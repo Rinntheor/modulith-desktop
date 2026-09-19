@@ -18,6 +18,8 @@
 import React from 'react';
 import { AlertOctagon, RefreshCw } from 'lucide-react';
 
+import { reportCrash } from '../services/logger';
+
 interface Props {
   children: React.ReactNode;
 }
@@ -41,6 +43,14 @@ class AppErrorBoundary extends React.Component<Props, State> {
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo): void {
     this.setState({ componentStack: errorInfo.componentStack ?? null });
     console.error('[AppErrorBoundary] 未捕获的渲染错误:', error, errorInfo);
+    // 渲染崩溃是用户能看到"白屏/错误页"的那一类，必须落到崩溃日志里 ——
+    // 用户能描述的现象只有"界面报错了"，而原因只存在于这条记录中。
+    reportCrash(
+      `渲染错误: ${error.name}: ${error.message}`,
+      [error.stack, errorInfo.componentStack ? `组件栈：${errorInfo.componentStack}` : '']
+        .filter(Boolean)
+        .join('\n')
+    );
   }
 
   private handleReload = (): void => {

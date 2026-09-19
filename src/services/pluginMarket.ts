@@ -14,10 +14,34 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
-import { PLUGIN_INDEX_REF, pluginIndexSources, registrySources } from '../config/pluginRegistry';
+import {
+  PLUGIN_INDEX_REF,
+  pluginIndexSources,
+  registrySources,
+  type SourcePreference,
+} from '../config/pluginRegistry';
 import { isNewer } from '../utils/semver';
+import { isProxyEffective } from '../utils/networkSettings';
+import { getCachedSettings } from './appSettings';
+import { logMessage } from './logger';
 import { getPermissionDescriptor } from './permissionRegistry';
 import { getInstalledPlugins } from './pluginRuntime';
+
+/**
+ * 候选地址的优先顺序
+ *
+ * 选了下载源（且地址非空）时把 GitHub 那条排前面：用户选它就是因为直连不通，
+ * 而 CDN 那一步在受限网络里要先等一个连接超时。判断与后端 `network::proxy_base`
+ * 用同一套规则（`isProxyEffective`），因此界面上的候选顺序与实际生效的设置一致。
+ *
+ * **每次调用都重新读**：用户可能刚在设置里改完就切回市场点刷新。
+ */
+function sourcePreference(): SourcePreference {
+  const settings = getCachedSettings();
+  return isProxyEffective(settings.networkMode, settings.githubProxy)
+    ? 'github-first'
+    : 'cdn-first';
+}
 
 /** 本应用能理解的索引格式版本。索引里的值高于它时，提示更新应用而不是硬解析。 */
 const SUPPORTED_SCHEMA_VERSION = 1;
@@ -215,7 +239,7 @@ function describeSource(url: string): string {
 async function fetchIndex(): Promise<MarketIndex> {
   const failures: string[] = [];
 
-  for (const source of pluginIndexSources()) {
+  for (const source of pluginIndexSources(Date.now(), sourcePreference())) {
     try {
       const text = await invoke<string>('fetch_registry_text', { url: source.index });
       const signature = await invoke<string>('fetch_registry_text', {
@@ -230,9 +254,12 @@ async function fetchIndex(): Promise<MarketIndex> {
     }
   }
 
-  fail(`无法获取插件索引。\n${failures.join('\n')}`);
+  // 两条来源都失败才算市场打不开。这条汇总要进日志：后端记录的是每一次
+  // 尝试与它的失败原因，前端记录的是「合起来意味着什么」。
+  const message = `无法获取插件索引。\n${failures.join('\n')}`;
+  logMessage('error', message, 'pluginMarket');
+  fail(message);
 }
-
 /**
  * 取回索引。默认命中缓存；`force` 会重新拉取（供"刷新"按钮使用）。
  *
@@ -373,7 +400,7 @@ export async function installMarketVersion(
 ): Promise<void> {
   const failures: string[] = [];
 
-  for (const url of registrySources(version.tag, version.package.path)) {
+  for (const url of registrySources(version.tag, version.package.path, sourcePreference())) {
     try {
       await invoke('install_plugin_url_verified', { url, sha256: version.package.sha256 });
       return;
@@ -383,7 +410,9 @@ export async function installMarketVersion(
     }
   }
 
-  fail(`安装 ${plugin.displayName} ${version.version} 失败。\n${failures.join('\n')}`);
+  const message = `安装 ${plugin.displayName} ${version.version} 失败。\n${failures.join('\n')}`;
+  logMessage('error', message, 'pluginMarket');
+  fail(message);
 }
 
 // ============================================================
@@ -421,7 +450,7 @@ export async function loadReadme(
   const cached = readmeCache.get(key);
   if (cached !== undefined) return cached;
 
-  for (const url of registrySources(version.tag, `${plugin.source}/README.md`)) {
+  for (const url of registrySources(version.tag, `${plugin.source}/README.md`, sourcePreference())) {
     try {
       const text = await invoke<string>('fetch_registry_text', { url });
       readmeCache.set(key, text);
@@ -514,7 +543,7 @@ export function loadMarketIcon(iconPath: string): Promise<MarketIconResult> {
 async function fetchMarketIcon(iconPath: string): Promise<MarketIconResult> {
   const failures: string[] = [];
 
-  for (const url of registrySources(PLUGIN_INDEX_REF, iconPath)) {
+  for (const url of registrySources(PLUGIN_INDEX_REF, iconPath, sourcePreference())) {
     try {
       const text = await invoke<string>('fetch_registry_text', { url });
       if (!isSvgMarkup(text)) {
@@ -530,5 +559,6 @@ async function fetchMarketIcon(iconPath: string): Promise<MarketIconResult> {
 
   const reason = failures.join('；') || '没有可用的来源';
   console.warn(`[pluginMarket] 图标 "${iconPath}" 取不到，将使用通用图标：${reason}`);
+  logMessage('warn', `市场图标 "${iconPath}" 取不到：${reason}`, 'pluginMarket');
   return { ok: false, reason };
 }

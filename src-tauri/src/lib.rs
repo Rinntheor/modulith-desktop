@@ -12,10 +12,12 @@ use core::registry::ModuleRegistry;
 use tauri::Manager;
 
 use modules::auth::commands::*;
+use modules::logging::commands::*;
 use modules::notifications::commands::*;
 use modules::plugins::commands::*;
 use modules::settings::commands::*;
 use modules::sidebar::commands::*;
+use modules::updater::commands::*;
 
 
 
@@ -97,6 +99,11 @@ pub fn run() -> Result<(), tauri::Error> {
         remove_known_device,
         get_login_logs,
         clear_login_logs,
+        get_log_dir,
+        read_log_tail,
+        clear_logs,
+        log_frontend,
+        report_frontend_crash,
         list_notifications,
         push_notification,
         mark_notification_read,
@@ -134,6 +141,7 @@ pub fn run() -> Result<(), tauri::Error> {
         get_app_info,
         update_app_settings,
         reset_app_settings,
+        probe_network,
         get_app_data_dir,
         get_sidebar_preferences,
         get_module_preferences,
@@ -147,6 +155,8 @@ pub fn run() -> Result<(), tauri::Error> {
         get_recent_modules,
         toggle_favorite_module,
         get_favorite_modules,
+        check_app_update,
+        install_app_update,
     ]);
 
     builder.run(tauri::generate_context!())

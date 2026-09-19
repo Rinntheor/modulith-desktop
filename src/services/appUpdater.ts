@@ -2,36 +2,58 @@
 // 应用更新：检查、下载、安装
 //
 // 与插件更新（`pluginMarket.ts`）的分工是清楚的：插件更新是我们自己的逻辑（拉索引、比
-// 版本、下 `.lcp`、交给已有的安装流水线），而**应用更新交给 Tauri 官方的 updater 插件**
-// —— 「校验更新包签名」与「调起安装程序」这两件事自己实现既危险又没有必要。
+// 版本、下 `.lcp`、交给已有的安装流水线），而应用更新交给 **Tauri 官方的 updater 插件**
+// ——「校验更新包签名」与「调起安装程序」这两件事自己实现既危险又没有必要。
+//
+// ============================================================
+// 为什么调用的是 Rust 命令而不是 `@tauri-apps/plugin-updater`
+// ============================================================
+//
+// 官方的前端 API 两处地址都不可配：清单地址在插件初始化时从 `tauri.conf.json`
+// 固定，安装包地址更是由清单文件自己写的。于是「用户选了下载源」这件事对它
+// 完全无效 —— 表现为「能检查到新版本，下载却卡住」，是最难归因的一种现象。
+//
+// 现在两步都走 `src-tauri/src/modules/updater/commands.rs`：那里能在**每次调用时**
+// 按当前设置改写这两个地址。下载、签名校验与调起安装程序仍然全部由官方插件完成。
+//
+// 因此**不要**再从这里 import `@tauri-apps/plugin-updater`：那条路会绕过下载源。
+// `src-tauri/capabilities/default.json` 里的 `updater:default` 也已经移除，
+// 即使有人重新引入它，调用也会因权限不足而失败。
 //
 // 三件必须处理对的事，都写在下面各自的注释里：
 //
-// 1. `check()` 返回的 `Update` 是 Rust 侧的资源句柄，**必须显式关闭**，否则会泄漏。
-// 2. 没有可用更新时 `check()` 返回 `null`，此时拿不到 `currentVersion`，
-//    所以当前版本号单独从宿主取。
-// 3. **Windows 上 `downloadAndInstall` 会在启动安装程序后结束本进程**，
-//    界面必须提前把这件事告诉用户。
+// 1. 句柄（`Update`）保存在 Rust 侧，前端不需要也无法忘记释放它。
+// 2. 没有可用更新时结果为 `null`，因此当前版本号由后端一并返回。
+// 3. **Windows 上安装会在启动安装程序后结束本进程**，界面必须提前把这件事
+//    告诉用户。
 
-import { check, type Update } from '@tauri-apps/plugin-updater';
+import { Channel, invoke } from '@tauri-apps/api/core';
 
 import { isUpdateCheckDue } from '../utils/updateCheck';
 import { getCachedSettings, saveAppSettings } from './appSettings';
+import { logMessage } from './logger';
 import { notifyHost } from './notifications';
-import { getHostVersion } from './pluginRuntime';
 
 /** 可用的更新 */
 export interface AvailableUpdate {
   version: string;
-  /** RFC3339 时间；发布方没写时为空 */
-  date?: string;
+  /** 发布时间；发布方没写时为空 */
+  date?: string | null;
   /** 发布说明（来自 `latest.json` 的 `notes`） */
-  notes?: string;
+  notes?: string | null;
+  /** 实际会去下载的地址（已经过下载源改写） */
+  downloadUrl?: string;
+  /** 本次检查使用的联网方式描述（「直连」/「经下载源 …」） */
+  source?: string;
 }
 
 export interface UpdateCheckResult {
   currentVersion: string;
   available: AvailableUpdate | null;
+  /** 本次检查真正请求的清单地址（按顺序尝试） */
+  endpoints: string[];
+  /** 本次检查使用的联网方式描述 */
+  source: string;
 }
 
 export interface DownloadProgress {
@@ -41,46 +63,28 @@ export interface DownloadProgress {
 }
 
 /**
- * 已检查到、但还没安装的更新。
+ * 下载事件（形状与官方插件一致，见 Rust 侧 `DownloadEvent`）
  *
- * 持有在模块级而不是返回给调用方，是因为它是一个需要配对的资源句柄：谁拿到它就得负责
- * 关闭。放在这里，界面组件卸载或重复检查时都不会泄漏。
+ * 保持一致的目的是让进度条的累加逻辑不必跟着换一套写法。
  */
-let pending: Update | null = null;
-
-async function releasePending(): Promise<void> {
-  if (!pending) return;
-  const handle = pending;
-  pending = null;
-  try {
-    await handle.close();
-  } catch {
-    // 释放失败不影响判断结果，也不该打断界面流程
-  }
-}
+type UpdateDownloadEvent =
+  | { event: 'Started'; data: { contentLength: number | null } }
+  | { event: 'Progress'; data: { chunkLength: number } }
+  | { event: 'Finished' };
 
 /**
- * 检查是否有新版本。重复调用是安全的 —— 会先释放上一次的结果。
+ * 检查是否有新版本。重复调用是安全的 —— 后端的实现会先释放上一次的结果。
  *
  * 需要联网。网络不可达时抛错，由调用方决定怎么呈现（而不是在这里吞掉：
  * 「检查失败」和「已是最新」是两件完全不同的事，混淆会让用户以为没问题）。
  */
 export async function checkForAppUpdate(): Promise<UpdateCheckResult> {
-  await releasePending();
-
-  const update = await check();
-  if (!update) {
-    return { currentVersion: getHostVersion(), available: null };
-  }
-
-  pending = update;
+  const result = await invoke<UpdateCheckResult>('check_app_update');
   return {
-    currentVersion: update.currentVersion,
-    available: {
-      version: update.version,
-      date: update.date,
-      notes: update.body,
-    },
+    currentVersion: result.currentVersion,
+    available: result.available,
+    endpoints: result.endpoints ?? [],
+    source: result.source ?? '',
   };
 }
 
@@ -96,34 +100,28 @@ export async function checkForAppUpdate(): Promise<UpdateCheckResult> {
 export async function installPendingAppUpdate(
   onProgress?: (progress: DownloadProgress) => void
 ): Promise<void> {
-  if (!pending) {
-    throw new Error('没有待安装的更新，请先检查更新。');
-  }
-
   let downloaded = 0;
   let total: number | null = null;
 
-  try {
-    await pending.downloadAndInstall((event) => {
-      switch (event.event) {
-        case 'Started':
-          total = event.data.contentLength ?? null;
-          downloaded = 0;
-          onProgress?.({ downloaded, total });
-          break;
-        case 'Progress':
-          downloaded += event.data.chunkLength;
-          onProgress?.({ downloaded, total });
-          break;
-        case 'Finished':
-          onProgress?.({ downloaded: total ?? downloaded, total });
-          break;
-      }
-    });
-  } finally {
-    // 安装失败时要释放；成功时进程通常已经退出，走不到这里也无妨。
-    await releasePending();
-  }
+  const channel = new Channel<UpdateDownloadEvent>();
+  channel.onmessage = (message) => {
+    switch (message.event) {
+      case 'Started':
+        total = message.data.contentLength ?? null;
+        downloaded = 0;
+        onProgress?.({ downloaded, total });
+        break;
+      case 'Progress':
+        downloaded += message.data.chunkLength;
+        onProgress?.({ downloaded, total });
+        break;
+      case 'Finished':
+        onProgress?.({ downloaded: total ?? downloaded, total });
+        break;
+    }
+  };
+
+  await invoke('install_app_update', { onEvent: channel });
 }
 
 // ============================================================
@@ -233,7 +231,12 @@ export async function autoCheckForAppUpdate(): Promise<AvailableUpdate | null> {
     await notifyUpdateAvailable(result);
     return result.available;
   } catch (error) {
+    // 用户没有发起这个动作，因此只记日志、不发通知。但**必须记日志**：
+    // 「自动检查悄悄失败」正是最需要留下证据的一类故障 —— 用户只会觉得
+    // 「这个软件从来不提示更新」。
+    const message = error instanceof Error ? error.message : String(error);
     console.warn('[appUpdater] 启动时检查更新失败（不影响使用）:', error);
+    logMessage('warn', `启动时自动检查更新失败：${message}`, 'appUpdater');
     return null;
   } finally {
     autoCheckInFlight = false;

@@ -38,6 +38,7 @@
 
 import React, { Suspense, useMemo } from 'react';
 import { createLazyComponent } from '../utils/lazyLoad';
+import { reportCrash } from '../services/logger';
 
 /** 内嵌占位：与 ModuleRenderer 的加载态保持一致的克制风格 */
 const EmbedLoading: React.FC = () => (
@@ -174,6 +175,12 @@ class EmbedBoundary extends React.Component<
 
   componentDidCatch(error: Error) {
     console.error(`[ModuleEmbed] 内嵌模块 ${this.props.moduleId} 加载失败:`, error);
+    // 内嵌的正是「插件」「市场」这两页：它们坏掉时用户只会说"设置里打不开"，
+    // 因此崩溃日志里必须留下是哪个内嵌模块。
+    reportCrash(
+      `内嵌模块 ${this.props.moduleId} 加载失败: ${error.name}: ${error.message}`,
+      error.stack
+    );
   }
 
   render() {

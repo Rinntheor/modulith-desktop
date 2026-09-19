@@ -40,7 +40,7 @@
 
 | 导出 | 签名 | 说明 |
 | --- | --- | --- |
-| `AppSettings` | 接口 | 设置结构（含 `theme`、`reduceMotion`、`deferPluginLoading`、`pluginLoadTimeoutMs`、`accent`、`openTabs`、`activeTab`、`tabBarVisible`、`autoCheckUpdates`、`lastUpdateCheckAt`） |
+| `AppSettings` | 接口 | 设置结构（含 `theme`、`reduceMotion`、`deferPluginLoading`、`pluginLoadTimeoutMs`、`accent`、`openTabs`、`activeTab`、`tabBarVisible`、`autoCheckUpdates`、`lastUpdateCheckAt`、`networkMode`、`githubProxy`、`fileLoggingEnabled`、`crashLoggingEnabled`） |
 | `DEFAULT_APP_SETTINGS` | 常量 | 默认设置，各字段与后端 `settings.rs` 的默认值一致 |
 | `MAX_OPEN_TABS` | 常量 | 标签页上限，值为 12，必须与后端 `settings.rs` 的同名常量一致 |
 | `loadAppSettings()` | `Promise<AppSettings>` | 从后端载入并缓存 |
@@ -54,6 +54,10 @@
 `saveAppSettings` 接收部分字段而非完整对象，内部与缓存合并后提交。
 
 `normalize()` 对从后端读回的 `openTabs` 会过滤非字符串项、**去重**并截断到 `MAX_OPEN_TABS`。去重是必要的：重复的 ID 会让 React 的 `key` 冲突，表现为其中一个标签永远无法激活。
+
+`normalize()` 对 `networkMode` 会把未知取值回落到 `direct`（后端只认两个取值，透传只会得到一个渲染不出文案的选项），对 `githubProxy` 会去掉首尾空白（一份被手工改过的 `settings.json` 会绕过保存时的校验，而拼接时多一个空格会拼出两个地址）。`fileLoggingEnabled` / `crashLoggingEnabled` 沿用「只有显式写成 `false` 才关闭」的约定。
+
+`networkSettings`（`src/utils/networkSettings.ts`）是这两个网络字段的纯逻辑：取值、校验、预设、以及地址拼接的预览。它的常量是后端 `network.rs` 的镜像，`scripts/check-network.ts` 会直接读那两个 Rust 文件来核对有没有漂移。**真正的改写永远由后端完成**，前端只做即时校验与预览。
 
 ## 4. auth
 
@@ -272,7 +276,36 @@ interface EngineAdvisory {
 
 **同步点（重要）。** `index.html` 的内联首帧脚本为了让配色不闪，内联了一份基色表与明度表——它与 `accentTheme.ts` / `accent.ts` 是**两份实现**。改配色表或推导算法时**必须同时改两处**，否则首帧与后续渲染会出现色差。
 
-## 11. globalErrorHandlers
+## 11. logger
+
+前端到后端日志文件的那条通道。在此之前前端的所有错误只有一个出口：WebView 的 devtools 控制台，而 release 版用户打不开它。
+
+| 导出 | 签名 | 说明 |
+| --- | --- | --- |
+| `LogLevel` | 类型 | `'trace' \| 'debug' \| 'info' \| 'warn' \| 'error'` |
+| `logMessage(level, message, context?)` | `void` | 写一条日志；`context` 会变成后端日志的 target |
+| `reportCrash(message, detail?)` | `void` | 报告一次崩溃，写进崩溃日志 |
+| `getLogDir()` | `Promise<string>` | 日志目录 |
+| `readLogTail(maxBytes?)` | `Promise<LogTail>` | 读取运行日志尾部（默认 32 KB） |
+| `clearLogs()` | `Promise<number>` | 清空全部日志文件 |
+
+三条硬约束：**永不抛错、永不 reject**；**失败一次就永久回落到控制台**（否则失败 → `console.error` → 被全局错误处理器接住 → 再调用这里，形成回环）；**不 await**（调用方是错误处理器与插件代码，不该因为写日志而变成异步）。
+
+调用点：`globalErrorHandlers`、`AppErrorBoundary`、`ModuleRenderer` 的模块边界、`ModuleEmbed` 的内嵌边界、`pluginRuntime` 的 `ctx.logger`、`appUpdater` 与 `pluginMarket` 的汇总失败。详见[日志系统](../02-开发指南/日志系统.md)。
+
+## 12. networkDiagnostics
+
+网络诊断：把「直连」与「下载源」两条路各实测一遍。
+
+| 导出 | 签名 | 说明 |
+| --- | --- | --- |
+| `ProbeTarget` / `ProbeRow` / `ProbeReport` | 接口 | 请求与结果的形状（见[后端命令参考](后端命令参考.md)第 4.3 节） |
+| `registryProbeTargets(now?)` | `ProbeTarget[]` | 插件仓库的两条待探测地址 |
+| `probeNetwork(targets?)` | `Promise<ProbeReport>` | 执行诊断 |
+
+只负责组织**插件仓库**那两条地址；更新清单那几条由后端从 `tauri.conf.json` 追加。返回的行数通常多于传入的目标数，因为后端会为每条目标补上「经下载源」那一版。
+
+## 13. globalErrorHandlers
 
 | 导出 | 签名 | 说明 |
 | --- | --- | --- |
@@ -284,7 +317,7 @@ interface EngineAdvisory {
 
 对应的 React 侧边界是 `src/components/AppErrorBoundary.tsx`（根级），以及 `src/components/ModuleRenderer.tsx` 内的模块级边界。三者的分工见[已知问题与技术债](../06-项目/已知问题与技术债.md)第 4.4 节。
 
-## 12. tabStore
+## 14. tabStore
 
 模块标签页的唯一状态来源。「当前显示哪个模块」由它持有，`SidebarContext.activeModule` 读的是它。
 
@@ -308,7 +341,7 @@ interface EngineAdvisory {
 
 `openTab` 被拒绝时会自己弹一条提示，调用方无需处理。
 
-## 13. notifications
+## 15. notifications
 
 应用内通知的前端封装。
 
@@ -331,9 +364,9 @@ interface EngineAdvisory {
 
 浮层的展示规则由这里决定：`silent` 为真时不弹；**合并键命中已有未读时不弹**（只增加计数），因为模块很容易在重试循环里反复推同一条；其余情况弹一次，时长由级别决定（错误级不自动消失）。后端不可用时推送仍会弹一次浮层，只是这条不会进通知中心。
 
-`category` 在这里被翻译成浮层的 `variant`（见第 14 节）：`app-update` 的浮层**不自动消失**，并带「查看更新」入口。映射写在这一层而不是让调用方自己传变体 —— 类别是持久化在通知里的信息，变体是它的呈现结果，分开传迟早会出现「存的是更新、弹的是普通」。之所以不让 `toast.ts` 直接认识 `NotificationCategory`，是因为 `notifications.ts` 已经 import 了 `toast.ts`，反向依赖会成环。
+`category` 在这里被翻译成浮层的 `variant`（见第 16 节）：`app-update` 的浮层**不自动消失**，并带「查看更新」入口。映射写在这一层而不是让调用方自己传变体 —— 类别是持久化在通知里的信息，变体是它的呈现结果，分开传迟早会出现「存的是更新、弹的是普通」。之所以不让 `toast.ts` 直接认识 `NotificationCategory`，是因为 `notifications.ts` 已经 import 了 `toast.ts`，反向依赖会成环。
 
-## 14. toast
+## 16. toast
 
 不持久化的一次性反馈队列。与 `notifications` 的分工见该文件头的说明。
 
@@ -349,7 +382,7 @@ interface EngineAdvisory {
 
 **定时器不在这个服务里，而在 `ToastLayer`**。自动消失需要支持「鼠标悬停时暂停」，那是纯粹的界面行为；服务层只维护「当前该显示哪些」。浮层实现的是「按剩余时间继续」而不是「移开后重新计时」——后者等于没暂停。
 
-## 15. commandRegistry
+## 17. commandRegistry
 
 全局搜索的命令注册表。
 
@@ -369,7 +402,7 @@ interface EngineAdvisory {
 
 **本文件刻意不 import `pluginRuntime`**：插件运行时要反过来 import 它（为了暴露注册命令的宿主 API），若这里也 import 就会形成循环依赖。因此与插件运行时有关的动作由调用方通过 `HostCommandHooks` 注入。
 
-## 16. eventBus
+## 18. eventBus
 
 进程内跨模块事件总线。
 
@@ -383,7 +416,7 @@ interface EngineAdvisory {
 
 主题名只能是 `^[a-z0-9][a-z0-9._-]*$`，最长 64 字符。默认**收不到自己发布的事件**（`receiveOwn: false`），以打断「发布 → 自己处理 → 再发布」的回环。单个处理函数抛错会被捕获，不影响其余处理函数与发布方。
 
-## 17. searchFocus
+## 19. searchFocus
 
 | 导出 | 签名 | 说明 |
 | --- | --- | --- |
@@ -392,7 +425,7 @@ interface EngineAdvisory {
 
 用 DOM 事件而不是状态或 Context：触发方是挂在 `window` 上的全局快捷键（不在 React 树内），接收方是标题栏里的搜索框。让快捷键持有搜索框的 ref 会引入跨组件的命令式耦合。
 
-## 18. lazyLoad
+## 20. lazyLoad
 
 | 导出 | 签名 |
 | --- | --- |
@@ -400,7 +433,7 @@ interface EngineAdvisory {
 
 包装 `React.lazy` 并在加载失败时输出错误日志。生成器为每个模块产出该函数的调用。返回对象上的 `preload()` 由启动流程的 `preload` 步骤调用：它先用 `resolveInitialModule()` 确定即将打开的模块，再取其描述符上的 `preload()` 预加载代码分块，以免进入首页时再出现一次加载态。`preload()` 内部带缓存，重复调用不会重复请求。
 
-## 19. 使用建议
+## 21. 使用建议
 
 **订阅优先于轮询**。需要响应状态变化的组件应使用对应的 `subscribe*` 函数，而不是定时查询。
 
@@ -410,7 +443,7 @@ interface EngineAdvisory {
 
 **服务层不持有 React 状态**。这些模块使用自己的订阅机制，组件通过 `useEffect`（配 `useState`）或 `useSyncExternalStore` 接入。这样服务层可以脱离 React 被测试。
 
-## 20. 相关文档
+## 22. 相关文档
 
 - 命令的 Rust 侧定义：[后端命令参考](后端命令参考.md)
 - 启动时序：[启动流程](../01-架构/启动流程.md)

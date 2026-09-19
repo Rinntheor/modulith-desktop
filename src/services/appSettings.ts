@@ -5,6 +5,7 @@
 // reset_app_settings / get_app_data_dir）。
 
 import { invoke } from '@tauri-apps/api/core';
+import { isNetworkMode, normalizeProxyBase, type NetworkMode } from '../utils/networkSettings';
 import { isThemeMode, type ThemeMode } from './theme';
 
 export interface AppSettings {
@@ -63,6 +64,39 @@ export interface AppSettings {
    * 会重试。节流窗口见 `src/utils/updateCheck.ts`。
    */
   lastUpdateCheckAt: string | null;
+  /**
+   * 网络访问方式：`direct`（直连 GitHub）/ `proxy`（经由下载源）。
+   *
+   * 与 `githubProxy` 是一对：**两者同时满足**才真的走代理。因此切回直连不会
+   * 丢掉已经填好的地址，用户可以来回切换比较速度。
+   *
+   * 生效范围是插件市场（索引、签名、README、图标、`.lcp` 包）与应用更新
+   * （清单地址、安装包地址）两条链路。
+   */
+  networkMode: NetworkMode;
+  /**
+   * 下载源根地址（例如 `https://gh-proxy.org`）。
+   *
+   * 语义是**前缀**：原始地址会被整条接在它后面
+   * （`<你的地址>/https://github.com/...`）。空串表示还没填。
+   *
+   * 校验规则见 `src/utils/networkSettings.ts`（与后端 `settings/network.rs` 一致）。
+   */
+  githubProxy: string;
+  /**
+   * 是否把运行日志实时写入文件。
+   *
+   * 关闭后 release 版不再写任何运行日志（调试构建仍然输出到 stderr）。
+   * **不影响崩溃记录** —— 那是另一个开关。
+   */
+  fileLoggingEnabled: boolean;
+  /**
+   * 是否把崩溃写入单独的崩溃日志文件。
+   *
+   * 与 `fileLoggingEnabled` 相互独立：关掉实时记录正是为了少写磁盘，
+   * 而崩溃是低频事件，两者的取舍不同。
+   */
+  crashLoggingEnabled: boolean;
 }
 
 /**
@@ -107,6 +141,16 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   autoCheckUpdates: true,
   // 首次启动必然要查一次：没有时间戳意味着"从没查过"
   lastUpdateCheckAt: null,
+  // 与后端 default_network_mode() / network.rs 的 NETWORK_MODE_DIRECT 一致。
+  // 默认直连：一个默认打开的第三方加速源会把"装什么插件"交给我们无法控制的中间人。
+  networkMode: 'direct',
+  // 与后端 default_github_proxy() 一致：还没填
+  githubProxy: '',
+  // 与后端 default_file_logging_enabled() 一致：日志默认开着。
+  // 用户不会为了排查问题提前打开它，默认关闭等于默认没有证据。
+  fileLoggingEnabled: true,
+  // 与后端 default_crash_logging_enabled() 一致
+  crashLoggingEnabled: true,
 };
 
 let cache: AppSettings = { ...DEFAULT_APP_SETTINGS };
@@ -163,6 +207,18 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
       typeof raw?.lastUpdateCheckAt === 'string' && raw.lastUpdateCheckAt
         ? raw.lastUpdateCheckAt
         : null,
+    // 未知模式回落到直连，而不是把坏值透传给界面 ——
+    // 后端的 network.rs 只认两个取值，透传只会得到一个渲染不出文案的选项
+    networkMode: isNetworkMode(raw?.networkMode)
+      ? raw.networkMode
+      : DEFAULT_APP_SETTINGS.networkMode,
+    // 去首尾空白：后端在保存时会拒绝带空白的地址，但一份被手工改过的
+    // settings.json 会绕过那次校验；而拼接时代理根里多一个空格会拼出两个地址。
+    // 与后端 proxy_base() 的处理保持一致（那里也是先 trim 再拼）。
+    githubProxy: normalizeProxyBase(raw?.githubProxy),
+    // 只有显式写成 false 才关闭，与 tabBarVisible / autoCheckUpdates 同一约定
+    fileLoggingEnabled: raw?.fileLoggingEnabled !== false,
+    crashLoggingEnabled: raw?.crashLoggingEnabled !== false,
   };
 }
 

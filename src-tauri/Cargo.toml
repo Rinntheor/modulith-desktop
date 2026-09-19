@@ -1,6 +1,6 @@
 [package]
 name = "modulith-desktop"
-version = "1.1.2"
+version = "1.1.3"
 description = "A modular desktop framework built with Tauri"
 authors = ["环理论 (Rinntheor)"]
 edition = "2021"
@@ -25,7 +25,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1.0"
 thiserror = "1.0"
-log = "0.4"
+# `std` 特性是 `log::set_boxed_logger` 的前提（log 0.4 默认不带 std），
+# 而我们的文件日志器正是靠它挂到全局门面上的。见 src/modules/logging/logger.rs。
+log = { version = "0.4", features = ["std"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 uuid = { version = "1.0", features = ["v4", "serde"] }

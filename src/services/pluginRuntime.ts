@@ -34,6 +34,7 @@ import { useModuleActive } from '../hooks/useModuleActive';
 import { isFileDropAvailable, subscribeFileDrop } from './fileDrop';
 import { clearModuleComponentCache } from './moduleComponentCache';
 import { loadPermissionRegistry } from './permissionRegistry';
+import { logMessage } from './logger';
 
 /**
  * 宿主版本号的**占位初值**。
@@ -426,17 +427,58 @@ function pluginAudio(pluginId: string) {
   };
 }
 
+/**
+ * 插件能用的 logger
+ *
+ * 除了控制台，还往宿主的日志文件里写一份。理由：插件作者的 `logger.info(...)`
+ * 在 release 版里此前只进 devtools（用户打不开），于是「插件不工作」这件事
+ * 既没有插件自己的证据，也没有宿主的证据。走宿主日志之后，插件排查问题
+ * 至少还有 plugin 作者留下的线索。
+ *
+ * 带上 `plugin:<id>` 作为 target，日志里一眼能看出是谁写的。
+ */
 function pluginLogger(pluginId: string) {
   const prefix = `[plugin:${pluginId}]`;
+  const context = `plugin:${pluginId}`;
+
+  const argsToText = (args: unknown[]): string =>
+    args.length === 0
+      ? ''
+      : ` ${args
+          .map((arg) => {
+            if (typeof arg === 'string') return arg;
+            try {
+              return JSON.stringify(arg) ?? String(arg);
+            } catch {
+              return String(arg);
+            }
+          })
+          .join(' ')}`;
 
   return {
-    debug: (msg: string, ...args: unknown[]) => console.debug(prefix, msg, ...args),
-    info: (msg: string, ...args: unknown[]) => console.info(prefix, msg, ...args),
-    warn: (msg: string, ...args: unknown[]) => console.warn(prefix, msg, ...args),
-    error: (msg: string, ...args: unknown[]) => console.error(prefix, msg, ...args),
+    debug: (msg: string, ...args: unknown[]) => {
+      console.debug(prefix, msg, ...args);
+      logMessage('debug', `${msg}${argsToText(args)}`, context);
+    },
+    info: (msg: string, ...args: unknown[]) => {
+      console.info(prefix, msg, ...args);
+      logMessage('info', `${msg}${argsToText(args)}`, context);
+    },
+    warn: (msg: string, ...args: unknown[]) => {
+      console.warn(prefix, msg, ...args);
+      logMessage('warn', `${msg}${argsToText(args)}`, context);
+    },
+    error: (msg: string, ...args: unknown[]) => {
+      console.error(prefix, msg, ...args);
+      logMessage('error', `${msg}${argsToText(args)}`, context);
+    },
     trace: (label: string) => {
       const start = performance.now();
-      return () => console.debug(`${prefix} ${label}: ${(performance.now() - start).toFixed(1)}ms`);
+      return () => {
+        const elapsed = (performance.now() - start).toFixed(1);
+        console.debug(`${prefix} ${label}: ${elapsed}ms`);
+        logMessage('debug', `${label}: ${elapsed}ms`, context);
+      };
     },
   };
 }
