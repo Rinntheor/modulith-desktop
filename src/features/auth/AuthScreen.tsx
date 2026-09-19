@@ -343,8 +343,25 @@ const AuthScreen: React.FC = () => {
         关掉它没有任何功能损失：这些粒子不承载任何信息。
       */}
       {!reduceMotion && <ParticleBackground />}
-      <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl" />
-      <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-violet-500/10 rounded-full blur-3xl" />
+      {/*
+        两个装饰球。
+
+        **尺寸与模糊必须跟随窗口**，否则窗口一放大两球就从「交叉」变成「各据一角」
+        （位置是百分比、尺寸固定时，重叠条件 `尺寸 > 0.25 × 窗口宽` 会失效）。
+
+        这里走**内联样式**而不是 Tailwind 任意值：上一版写的是 `w-[36vmax]` /
+        `blur-[3.5vmax]`，实测没有生成对应规则 —— 而 `absolute` 元素没有宽高就是
+        0×0，两个球直接「消失」了。对这类必须生效的尺寸，内联样式不依赖类名扫描，
+        可靠得多。
+      */}
+      <div
+        className="absolute top-1/4 left-1/4 bg-indigo-500/10 rounded-full"
+        style={{ width: '36vmax', height: '36vmax', filter: 'blur(3.5vmax)' }}
+      />
+      <div
+        className="absolute bottom-1/4 right-1/4 bg-violet-500/10 rounded-full"
+        style={{ width: '36vmax', height: '36vmax', filter: 'blur(3.5vmax)' }}
+      />
 
       {/* py-12 给顶部的窗口边框（BootChrome，高 2.5rem）留出空间，
           让内容在视觉上仍然居中 */}

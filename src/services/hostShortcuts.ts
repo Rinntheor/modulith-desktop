@@ -18,8 +18,9 @@
 
 import { registerShortcuts } from './shortcutRegistry';
 import { requestSearchFocus } from './searchFocus';
-import { activateRelativeTab, activateTabAt, closeTab, getTabState } from './tabStore';
+import { activateRelativeTab, activateTabAt, closeActiveTab, toggleSplit } from './tabStore';
 import { toggleSidebar } from './sidebarBridge';
+import { toggleFullscreen } from './fullscreenBridge';
 
 /**
  * 注册宿主内置快捷键。
@@ -41,10 +42,9 @@ export function registerHostShortcuts(): void {
       combo: 'mod+w',
       description: '关闭当前标签',
       allowInInput: true,
-      run: () => {
-        const { activeTab } = getTabState();
-        if (activeTab) closeTab(activeTab);
-      },
+      // 关的是**焦点组**里的激活标签：分屏后用户可能正在右半工作，
+      // 固定关左边那个会让他以为关错了。
+      run: () => closeActiveTab(),
     },
     {
       id: 'host:toggle-sidebar',
@@ -70,6 +70,29 @@ export function registerHostShortcuts(): void {
       allowInInput: true,
       // 注意是 -1：`activateRelativeTab` 对负数做了取模回绕
       run: () => activateRelativeTab(-1),
+    },
+    {
+      id: 'host:toggle-split',
+      // 反斜杠在这里是**普通字符**（`parseCombo` 按 `+` 切分），与编辑器里的
+      // 分屏习惯一致。
+      combo: 'mod+\\',
+      description: '把当前标签搬去分屏（再按一次收回）',
+      allowInInput: true,
+      // 未分屏时**搬走焦点组的当前标签**，而不是替他挑一个别的：用户按这个键时
+      // 想的是"把我在看的这个挪到旁边"。搬走后左边落到它的邻居上，那是搬走的
+      // 必然结果，不是副作用。
+      run: () => toggleSplit(),
+    },
+    {
+      id: 'host:toggle-fullscreen',
+      // F11 与浏览器一致。`matchesCombo` 比较的是 `event.key`，它的取值是 "F11"，
+      // 小写化之后正好是 `f11`。
+      combo: 'f11',
+      description: '切换全屏',
+      allowInInput: true,
+      // 全屏状态活在前端（进全屏要同时隐藏标题栏），因此经 fullscreenBridge 转发，
+      // 而不是在这里直接调 Tauri —— 否则会出现「窗口全屏了、标题栏还在」。
+      run: () => toggleFullscreen(),
     },
   ];
 

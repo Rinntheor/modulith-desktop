@@ -29,8 +29,12 @@ pub struct AppSettings {
     /// 而不是裸 `#[serde(default)]`（后者会得到 `false`）。
     #[serde(default = "default_confirm_before_uninstall")]
     pub confirm_before_uninstall: bool,
-    /// 启动时是否恢复上次打开的模块（优先级高于 default_module）
-    #[serde(default)]
+    /// 启动时是否恢复上次的**窗口状态**（标签页、当前标签、分屏布局，以及上次
+    /// 停留的模块，优先级高于 `default_module`）
+    ///
+    /// 默认 `true`。理由见前端 `appSettings.ts` 的说明：恢复现场是这个应用的主要
+    /// 卖点，替用户关掉它没有道理。
+    #[serde(default = "default_restore_last_module")]
     pub restore_last_module: bool,
     /// 上次打开的模块，由前端写入
     #[serde(default)]
@@ -171,6 +175,51 @@ pub struct AppSettings {
     /// `.lc-performance`）—— 与 `accent` 同理，视觉细节不该在后端复制一份。
     #[serde(default = "default_performance_mode")]
     pub performance_mode: bool,
+    /// 自启动时是否「静默」启动（不把窗口推到前台）
+    ///
+    /// **只在由系统自启动拉起时生效**（命令行带 `--autostart`）。用户自己双击图标
+    /// 启动不受影响 —— 否则用户点了图标却发现界面不出来，那是纯粹的故障。
+    ///
+    /// 实现为**最小化启动**而不是隐藏窗口：本应用没有托盘图标，把窗口隐藏之后
+    /// 用户只能通过任务管理器找到它。因此设置界面里也如实写作「最小化启动」，
+    /// 不写成「后台静默运行」。
+    #[serde(default)]
+    pub auto_start_silent: bool,
+    /// 自启动时是否直接进入全屏
+    ///
+    /// 与 `auto_start_silent` 同时开启时**静默优先**：窗口没到前台，全屏无从谈起。
+    #[serde(default)]
+    pub auto_start_fullscreen: bool,
+    /// 自启动时是否最大化窗口
+    ///
+    /// 与 `auto_start_fullscreen` 同时开启时**全屏优先**：两者都想「尽可能大」，
+    /// 而全屏更大，明确一个优先级比让用户猜哪个生效要好。与 `auto_start_silent`
+    /// 的关系同上 —— 静默优先。
+    #[serde(default)]
+    pub auto_start_maximized: bool,
+    /// 分屏组（第二组）的标签。空数组 = 未分屏
+    ///
+    /// 与 `open_tabs` 同属界面状态，由前端写入。同样**不校验模块是否存在**
+    /// （理由见 `open_tabs`），失效值由前端在目录对账时丢弃。
+    ///
+    /// 后端只保证每一项的格式合法与两组的总数不超上限；**「同一个标签不能同时在
+    /// 两组」这条互斥由前端保证** —— 那需要知道「标签在哪一组」的完整语义，
+    /// 在这里复制一份判断只会漂移。
+    ///
+    /// 注意「是否开启自启动」**不在这里** —— 那是注册表里的系统状态，注册表是
+    /// 它的唯一真相（用户可以在任务管理器的「启动」页里直接改）。在设置文件里
+    /// 再存一份必然会与事实不符。见 `autostart.rs`。
+    #[serde(default)]
+    pub split_tabs: Vec<String>,
+    /// 分屏组当前激活的标签
+    #[serde(default)]
+    pub split_active: Option<String>,
+    /// 分屏比例：左半占内容区的比例
+    ///
+    /// 与 `split_tabs` 一样属于界面状态。后端只校验区间 —— 具体怎么用（谁占左边、
+    /// 最小宽度是多少）是渲染层的事，在这里复制一份布局判断只会漂移。
+    #[serde(default = "default_split_ratio")]
+    pub split_ratio: f32,
 }
 
 /// 同时打开的标签页数量上限
@@ -182,6 +231,14 @@ pub struct AppSettings {
 pub const MAX_OPEN_TABS: usize = 12;
 
 fn default_confirm_before_uninstall() -> bool {
+    true
+}
+
+/// 恢复上次的窗口状态默认开启。理由见 `restore_last_module` 字段上的说明。
+///
+/// 用显式函数而不是裸 `#[serde(default)]`：后者的 `bool` 默认是 `false`，
+/// 而这里要的是 `true` —— 两者差一个字符，行为差一个默认值。
+fn default_restore_last_module() -> bool {
     true
 }
 
@@ -215,6 +272,19 @@ fn default_performance_mode() -> bool {
 fn default_network_mode() -> String {
     network::NETWORK_MODE_DIRECT.to_string()
 }
+
+/// 分屏比例默认对半分。
+///
+/// 与前端 `DEFAULT_SPLIT_RATIO` 必须一致 —— 两处不一致会让"第一次拖动前的宽度"
+/// 取决于读的是哪一份。
+fn default_split_ratio() -> f32 {
+    DEFAULT_SPLIT_RATIO
+}
+
+/// 分屏比例的默认值与允许区间（与前端 `appSettings.ts` 的三个常量必须一致）
+pub const DEFAULT_SPLIT_RATIO: f32 = 0.5;
+pub const MIN_SPLIT_RATIO: f32 = 0.2;
+pub const MAX_SPLIT_RATIO: f32 = 0.8;
 
 /// 代理地址默认为空（= 还没填）。
 ///
@@ -292,6 +362,12 @@ impl Default for AppSettings {
             file_logging_enabled: default_file_logging_enabled(),
             crash_logging_enabled: default_crash_logging_enabled(),
             performance_mode: default_performance_mode(),
+            auto_start_silent: false,
+            auto_start_fullscreen: false,
+            auto_start_maximized: false,
+            split_tabs: Vec::new(),
+            split_active: None,
+            split_ratio: default_split_ratio(),
         }
     }
 }
@@ -349,16 +425,20 @@ impl AppSettings {
             ));
         }
 
-        // 标签页：只校验数量上限与每个 ID 的格式。
+        // 标签页：校验数量上限与每个 ID 的格式。
         //
         // 数量上限是必须校验的：它约束的是保活机制下常驻的模块实例数，
         // 如果这里放行任意长度，一份被手工改坏的 settings.json 就能让前端
         // 在启动时尝试挂载上千个模块。
-        if self.open_tabs.len() > MAX_OPEN_TABS {
+        //
+        // **上限按两组之和算**：分屏不会让"同时存在的模块实例"变少，
+        // 每个标签仍然是一个常驻的挂载实例。只查 open_tabs 会让分屏成为绕过上限的
+        // 一个口子。
+        let stored_total = self.open_tabs.len() + self.split_tabs.len();
+        if stored_total > MAX_OPEN_TABS {
             return Err(format!(
-                "Invalid openTabs: expected at most {} entries, got {}",
-                MAX_OPEN_TABS,
-                self.open_tabs.len()
+                "Invalid openTabs + splitTabs: expected at most {} entries in total, got {}",
+                MAX_OPEN_TABS, stored_total
             ));
         }
 
@@ -378,6 +458,37 @@ impl AppSettings {
                     id, MAX_MODULE_ID_LEN
                 ));
             }
+        }
+
+        // 分屏组与第一组同源（都来自模块 ID），因此校验同一套格式
+        for id in &self.split_tabs {
+            if !is_valid_module_id(id) {
+                return Err(format!(
+                    "Invalid splitTabs entry \"{}\": only letters, digits, '.', '_', '/', '-' are allowed (max {} characters, must start with a letter or digit)",
+                    id, MAX_MODULE_ID_LEN
+                ));
+            }
+        }
+
+        if let Some(id) = &self.split_active {
+            if !is_valid_module_id(id) {
+                return Err(format!(
+                    "Invalid splitActive \"{}\": only letters, digits, '.', '_', '/', '-' are allowed (max {} characters, must start with a letter or digit)",
+                    id, MAX_MODULE_ID_LEN
+                ));
+            }
+        }
+
+        // 分屏比例：两端都拒绝而不是悄悄夹取。
+        //
+        // 这里与 `plugin_load_timeout_ms` 的处理不同 —— 那个是"夹取"（越界的超时
+        // 不值得让整份设置回落），而比例越界意味着前端记错了值，明确报错能让问题
+        // 在写入时就暴露，而不是变成一个"界面宽度看起来怪怪的"的现象。
+        if !(MIN_SPLIT_RATIO..=MAX_SPLIT_RATIO).contains(&self.split_ratio) {
+            return Err(format!(
+                "Invalid splitRatio {}: expected {}..={}",
+                self.split_ratio, MIN_SPLIT_RATIO, MAX_SPLIT_RATIO
+            ));
         }
 
         // 自动检查的时间戳只校验格式。
@@ -752,9 +863,16 @@ mod tests {
         assert!(settings.sidebar_collapsed);
         assert_eq!(settings.last_module.as_deref(), Some("finance/dashboard"));
         assert!(settings.confirm_before_uninstall);
-        assert!(!settings.restore_last_module);
+        // 「恢复上次的窗口状态」的默认值本轮从 false 改为 true，因此**缺字段**
+        // （老版本的 settings.json 就是这样）必须落到"开"。
+        assert!(settings.restore_last_module);
         // 缺少 theme 字段（老版本 settings.json）必须回落到 system，而不是空串
         assert_eq!(settings.theme, THEME_SYSTEM);
+
+        // 但**显式写着 false 必须被尊重**：默认值可以改，"用户关掉它"不能失效。
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"restoreLastModule": false}"#).expect("explicit false loads");
+        assert!(!settings.restore_last_module);
     }
 
     #[test]

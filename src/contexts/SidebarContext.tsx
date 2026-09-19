@@ -61,8 +61,12 @@ export const SidebarProvider: React.FC<SidebarProviderProps> = ({
   const [isCollapsed, setIsCollapsed] = useState(defaultCollapsed);
   const [expandedModules, setExpandedModules] = useState<Set<string>>(new Set());
 
-  // 唯一的模块来源：标签栏
-  const { activeTab } = useTabs();
+  // 唯一的模块来源：标签栏。
+  //
+  // **跟随焦点组**：分屏之后两组各有一个激活标签，侧边栏该高亮的是「用户正在操作
+  // 的那一半」。固定用第一组会让焦点在右半时侧边栏毫无变化 —— 看起来像点击没生效。
+  const { activeTab, splitActive, focusedGroup } = useTabs();
+  const focusedTab = focusedGroup === 'split' ? splitActive : activeTab;
 
   // 导航历史：用 ref 存栈，用 state 暴露「能否前进/后退」
   const historyRef = useRef<string[]>([]);
@@ -88,21 +92,21 @@ export const SidebarProvider: React.FC<SidebarProviderProps> = ({
    * 所有入口都会自动留下历史 —— 将来新增入口也不必记得再补一行。
    */
   useEffect(() => {
-    if (!activeTab) return;
+    if (!focusedTab) return;
 
     // 后退 / 前进落到的位置正是当前指针所指 —— 那不是新的访问，不记录。
     //
     // 用「指针指向的条目」判断，而不是一个「正在导航」的布尔标记：后者在目标与
     // 当前恰好相同时（例如历史里的标签已被关闭又重开）不会复位，会把下一次真实
     // 访问吞掉。这里只是一个比较，没有需要复位的东西。
-    if (historyRef.current[indexRef.current] === activeTab) return;
+    if (historyRef.current[indexRef.current] === focusedTab) return;
 
     const stack = historyRef.current.slice(0, indexRef.current + 1);
-    if (stack[stack.length - 1] !== activeTab) stack.push(activeTab);
+    if (stack[stack.length - 1] !== focusedTab) stack.push(focusedTab);
     historyRef.current = stack;
     indexRef.current = stack.length - 1;
     syncHistoryFlags();
-  }, [activeTab, syncHistoryFlags]);
+  }, [focusedTab, syncHistoryFlags]);
 
   const toggleSidebar = useCallback(() => {
     if (isOpen) {
@@ -214,7 +218,7 @@ export const SidebarProvider: React.FC<SidebarProviderProps> = ({
   const value = useMemo(() => ({
     isOpen,
     isCollapsed,
-    activeModule: activeTab,
+    activeModule: focusedTab,
     expandedModules,
     canGoBack: historyFlags.canBack,
     canGoForward: historyFlags.canForward,
@@ -229,7 +233,7 @@ export const SidebarProvider: React.FC<SidebarProviderProps> = ({
   }), [
     isOpen,
     isCollapsed,
-    activeTab,
+    focusedTab,
     expandedModules,
     historyFlags,
     toggleSidebar,

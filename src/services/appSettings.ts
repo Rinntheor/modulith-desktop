@@ -15,7 +15,17 @@ export interface AppSettings {
   sidebarCollapsed: boolean;
   /** 卸载插件前是否二次确认 */
   confirmBeforeUninstall: boolean;
-  /** 启动时恢复上次打开的模块（优先于 defaultModule） */
+  /**
+   * 是否在启动时恢复上次的**窗口状态**：打开的标签页、当前标签、分屏布局，
+   * 以及上次停留的模块（替代 `defaultModule`）。
+   *
+   * 默认 `true`：恢复现场正是这个应用的主要卖点，替用户关掉它没有道理 ——
+   * 想每次从干净状态开始的用户可以自己关。
+   *
+   * **它同时管"存"与"取"**：关闭时前端既不把标签变化写进设置，启动时也不读取
+   * 已存的那些值。只做一半（只不读、或者只不写）都会留下一个"关掉了却还是在恢复"
+   * 或者"重新打开后恢复出一个更早的陈旧布局"的错觉。
+   */
   restoreLastModule: boolean;
   /** 上次打开的模块，由应用自动写入 */
   lastModule: string | null;
@@ -108,6 +118,60 @@ export interface AppSettings {
    * 让用户必须同时打开两个开关才能得到完整效果，等于把这个功能藏起来。
    */
   performanceMode: boolean;
+  /**
+   * 由系统自启动拉起时，是否静默启动（最小化而不是推到前台）。
+   *
+   * **只在自启动时生效**（命令行带 `--autostart`）：用户双击图标启动不该受它影响，
+   * 否则「点了图标界面不出来」就是纯粹的故障。
+   *
+   * 注意「是否开启自启动」**不在这里** —— 它是注册表里的系统状态，由
+   * `get_autostart_status` 命令读取。用户能在任务管理器的「启动」页里直接改它，
+   * 在设置文件里再存一份副本必然与实际不符。
+   *
+   * 实现为**最小化**而不是隐藏窗口：本应用没有托盘图标，隐藏之后用户只能通过
+   * 任务管理器找回它。因此界面上也如实写作「最小化启动」。
+   */
+  autoStartSilent: boolean;
+  /**
+   * 由系统自启动拉起时，是否直接进入全屏。
+   *
+   * 与 `autoStartSilent` 同时开启时**静默优先**：窗口没到前台，全屏无从谈起。
+   */
+  autoStartFullscreen: boolean;
+  /**
+   * 由系统自启动拉起时，是否最大化窗口。
+   *
+   * 与 `autoStartFullscreen` 同时开启时**全屏优先**：两者都想「尽可能大」，而全屏
+   * 更大 —— 明确一个优先级，比让用户面对「到底哪个生效」的不确定性要好。
+   */
+  autoStartMaximized: boolean;
+  /**
+   * 分屏组（第二组）的标签。空数组 = 未分屏。
+   *
+   * 与 `openTabs` / `activeTab` 同属界面状态，它们一起描述「下次启动恢复到什么
+   * 样子」。两组**必须互斥**（同一个标签不能同时在两组），这一点由 `tabStore`
+   * 在初始化时去重保证 —— 设置文件可能被手工改坏。
+   */
+  splitTabs: string[];
+  /** 分屏组当前激活的标签 */
+  splitActive: string | null;
+  /**
+   * 分屏比例：左半占内容区的比例，取值 `[0.2, 0.8]`。
+   *
+   * 持久化它是因为「拖成 7:3」是一个明确的偏好，下次启动回到 5:5 会让人以为设置
+   * 没保存。区间限制在两端：太窄的一半等于不可用。
+   */
+  splitRatio: number;
+}
+
+export const MIN_SPLIT_RATIO = 0.2;
+export const MAX_SPLIT_RATIO = 0.8;
+export const DEFAULT_SPLIT_RATIO = 0.5;
+
+/** 把分屏比例夹到合法区间（与后端 settings.rs 的校验区间一致） */
+export function clampSplitRatio(raw: unknown): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return DEFAULT_SPLIT_RATIO;
+  return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, raw));
 }
 
 /**
@@ -133,7 +197,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   defaultModule: null,
   sidebarCollapsed: false,
   confirmBeforeUninstall: true,
-  restoreLastModule: false,
+  restoreLastModule: true,
   lastModule: null,
   // 与后端 settings.rs 的 default_theme() 保持一致；测试会锁定这一致性
   theme: 'system',
@@ -165,6 +229,16 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   // 与后端 default_performance_mode() 一致：默认关闭。
   // 它是有代价的取舍（去掉毛玻璃与装饰效果会让界面变朴素），只能是用户主动选择。
   performanceMode: false,
+  // 这两个默认也是「关」：它们只在自启动时才有意义，而自启动本身默认不开。
+  // 方向与 tabBarVisible 那类「默认为开」的字段相反，理由见 normalize() 里的说明。
+  autoStartSilent: false,
+  autoStartFullscreen: false,
+  autoStartMaximized: false,
+  // 首次启动不该是分屏状态
+  splitTabs: [],
+  splitActive: null,
+  // 与后端 default_split_ratio() 一致：对半分
+  splitRatio: DEFAULT_SPLIT_RATIO,
 };
 
 let cache: AppSettings = { ...DEFAULT_APP_SETTINGS };
@@ -240,6 +314,19 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     // 「关」，所以缺字段必须按关 —— 用 `!== false` 的写法会让一份缺字段的
     // settings.json 把性能模式打开，那是一个用户从未选择过的界面。
     performanceMode: raw?.performanceMode === true,
+    // 与 performanceMode 同一写法：这两个默认也是「关」，因此只有显式 true 才开。
+    // 用 `!== false` 会让一份缺字段的老 settings.json 把它们打开。
+    autoStartSilent: raw?.autoStartSilent === true,
+    autoStartFullscreen: raw?.autoStartFullscreen === true,
+    autoStartMaximized: raw?.autoStartMaximized === true,
+    // 分屏组：与 openTabs 同一套清洗规则（过滤非法项、去重、截断到上限）。
+    // 两组之间的互斥不在这里做 —— 那是 tabStore 初始化时的事，它才知道
+    // 「哪个标签在哪一组」的完整语义。
+    splitTabs: normalizeOpenTabs(raw?.splitTabs),
+    splitActive:
+      typeof raw?.splitActive === 'string' && raw.splitActive ? raw.splitActive : null,
+    // 夹取而不是拒绝：一个被手工改歪的比例不值得让整份设置回落到默认
+    splitRatio: clampSplitRatio(raw?.splitRatio),
   };
 }
 
