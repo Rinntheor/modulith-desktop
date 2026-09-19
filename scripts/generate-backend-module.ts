@@ -147,14 +147,32 @@ function scanExistingModules(): string[] {
 /**
  * 从 commands.rs 中提取 #[tauri::command] 标注的函数名。
  * 支持 pub / pub(crate) / async 等修饰，保持文件内的出现顺序。
+ *
+ * **属性可以带参数**（`#[tauri::command(rename_all = "snake_case")]`），因此参数列表
+ * 是可选的。这一点曾经是错的：旧正则只认 `#[tauri::command]` 这一种写法，遇到带参形式
+ * **匹配不到也不会报错**，命令就这么静默地漏掉，直到运行期 `invoke` 才表现为
+ * "command not found"。现在除了放宽正则，还做一次「属性数 = 解析数」的对账，
+ * 让任何没预料到的写法在构建期就失败。
  */
 function extractCommandFunctions(content: string): string[] {
   const commands: string[] = [];
-  const regex = /#\[tauri::command\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)/g;
+  const regex =
+    /#\[tauri::command(?:\s*\([^)]*\))?\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)/g;
 
   let match: RegExpExecArray | null;
   while ((match = regex.exec(content)) !== null) {
     commands.push(match[1]);
+  }
+
+  // 对账：文件里出现了几处 `#[tauri::command`，就应当解析出几个函数名。
+  // 只放宽正则而不对账的话，下一次 Rust 语法变化仍会以「少一条命令」的形式安静通过。
+  const attributeCount = (content.match(/#\[tauri::command\b/g) ?? []).length;
+  if (attributeCount !== commands.length) {
+    throw new Error(
+      `检测到 ${attributeCount} 处 #[tauri::command 属性，但只解析出 ${commands.length} 个函数名。` +
+        `请检查 generate-backend-module.ts 的 extractCommandFunctions 是否支持这种写法 —— ` +
+        `漏掉的命令不会被注册，且只有在运行期调用时才会暴露。`
+    );
   }
 
   return commands;

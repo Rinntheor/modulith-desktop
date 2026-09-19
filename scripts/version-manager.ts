@@ -1012,7 +1012,14 @@ function checkVersion(): void {
 
   if (existsSync(CONFIG_FILES.cargo)) {
     const content = readFileSync(CONFIG_FILES.cargo, 'utf-8');
-    const m = content.match(/^version\s*=\s*"(.*)"$/m);
+    // **必须在 [package] 段内匹配。** 原实现对整文件取第一个 `version = "..."`：
+    // 当前 Cargo.toml 的第一个恰好是包版本，所以能通过；一旦依赖表里出现更靠前的
+    // `version = "..."`（新增 [patch]、或把某个依赖挪到前面），这里就会拿依赖版本与
+    // version.toml 比对，报出误导性的「out of sync」。
+    // `updateCargoToml` 早就用了这个截断，两处现在一致。
+    const packageEnd = content.indexOf('\n[', content.indexOf('[package]') + 1);
+    const head = packageEnd === -1 ? content : content.slice(0, packageEnd);
+    const m = head.match(/^version\s*=\s*"(.*)"$/m);
     check('Cargo.toml', m?.[1], config.app.version);
   } else {
     printWarning('Cargo.toml not found', 'skipped');

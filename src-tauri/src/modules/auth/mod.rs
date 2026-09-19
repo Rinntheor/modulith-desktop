@@ -1,6 +1,9 @@
 // src-tauri/src/modules/auth/mod.rs
 //
-// 访问授权模块：访问密钥（Argon2id）+ 会话 + 设备白名单 + 登录审计。
+// 访问授权模块：访问密钥（Argon2id）+ 会话 + 设备记录 + 登录审计。
+//
+// 注意「设备记录」**不是白名单**：`known_devices` 只用于界面展示、限流与审计，
+// 代码中没有任何一处据此拒绝登录。此前把它称作"设备白名单"是名实不符。
 //
 // 迁移自 hive_atelier 的 src/auth + src/module_config（认证相关部分），
 // 但按 Modulith 的模块规范重组：所有状态由 `Module::setup` 注入，
@@ -34,7 +37,7 @@ impl Module for AuthModule {
     }
 
     fn description(&self) -> &'static str {
-        "访问密钥、会话管理、设备白名单与登录审计"
+        "访问密钥、会话管理、设备记录与登录审计"
     }
 
     fn setup(&self, app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {

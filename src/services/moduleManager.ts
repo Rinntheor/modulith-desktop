@@ -237,12 +237,17 @@ class RuntimeModuleManager {
       throw new Error(`Module not found: ${moduleId}`);
     }
 
+    // **先落盘、再改本地。**
+    //
+    // 此前是先改本地 `hidden_modules`、再 `invoke`：后端一旦失败，本地数组已经被污染，
+    // 而随后任何一次 `notify()`（目录变化、插件加载完成…）都会把这份不一致当成事实渲染
+    // 出去 —— 用户看到模块已隐藏，重启后又回来。这里反过来做，失败时本地保持原样。
+    await invoke('toggle_module_visibility', { moduleId, hidden: true });
     await this.updatePreference('hidden_modules', (hidden) => {
       if (!hidden.includes(moduleId)) {
         hidden.push(moduleId);
       }
     });
-    await invoke('toggle_module_visibility', { moduleId, hidden: true });
     this.notify();
   }
 
@@ -259,11 +264,12 @@ class RuntimeModuleManager {
       throw new Error(`Module not found: ${moduleId}`);
     }
 
+    // 先落盘、再改本地（理由同 hideModule）
+    await invoke('toggle_module_visibility', { moduleId, hidden: false });
     await this.updatePreference('hidden_modules', (hidden) => {
       const index = hidden.indexOf(moduleId);
       if (index !== -1) hidden.splice(index, 1);
     });
-    await invoke('toggle_module_visibility', { moduleId, hidden: false });
     this.notify();
   }
 
@@ -282,6 +288,8 @@ class RuntimeModuleManager {
 
     const isPinned = this.preferences!.pinned_modules.includes(moduleId);
 
+    // 先落盘、再改本地（理由同 hideModule）
+    await invoke('toggle_module_pin', { moduleId, pinned: !isPinned });
     await this.updatePreference('pinned_modules', (pinned) => {
       if (isPinned) {
         const index = pinned.indexOf(moduleId);
@@ -290,7 +298,6 @@ class RuntimeModuleManager {
         pinned.unshift(moduleId);
       }
     });
-    await invoke('toggle_module_pin', { moduleId, pinned: !isPinned });
     this.notify();
   }
 
