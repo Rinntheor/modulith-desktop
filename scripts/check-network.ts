@@ -12,8 +12,8 @@
 // 2. **校验与拼接的行为。** 界面上的即时校验必须与后端一致，否则会出现
 //    「界面放行、后端拒绝」这种最让人困惑的保存失败。
 
-import { readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -306,6 +306,69 @@ for (const preset of PROXY_PRESETS) {
   check(validateProxyBase(preset.base) === null, `预设 ${preset.label} 本身就是合法地址`);
   check(preset.label.length > 0, `预设 ${preset.base} 有显示名`);
 }
+
+// ============================================================
+// 6. 出站收口：所有请求必须经过 net::client
+// ============================================================
+
+// 这一节守的是一个**真实发生过的 bug**，而不是一个假想的风险：
+//
+// 上一版把"出站策略判定 + 流量日志"手写在 `manager.rs` 的 `plugin_http_request`
+// 里。结果是同一个文件的 `fetch_once`（插件市场拉索引 / 说明 / 插件包）漏掉了它 ——
+// 用户把设置改成「禁止出站」、打开离线模式，刷新后市场照样加载。
+//
+// 原因不是谁忘了写，而是**那种写法要求每个新调用点都记得写**。现在判定被收进
+// `net::client::NetClient`，裸 `reqwest::Client` 只由它持有、且不对外提供。
+//
+// 于是纪律可以变成一条静态断言：
+//   * `reqwest::Client` 这个类型只能出现在 `net/client.rs` 里；
+//   * `.send()`（真正的发送动作）同理。
+// 任何试图绕过门面的新代码，都会先撞上这里。
+console.log('\n出站收口：');
+
+function walkRust(dir: string, out: string[] = []): string[] {
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    if (statSync(full).isDirectory()) walkRust(full, out);
+    else if (entry.endsWith('.rs')) out.push(full);
+  }
+  return out;
+}
+
+/** 去掉 Rust 注释：注释里提到某个类型名是正常的，不该算违规 */
+function stripRustComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+}
+
+const NET_CLIENT = 'src-tauri/src/modules/net/client.rs';
+const rustSources = walkRust(join(PROJECT_ROOT, 'src-tauri/src')).map((file) => ({
+  path: relative(PROJECT_ROOT, file).replace(/\\/g, '/'),
+  source: stripRustComments(readFileSync(file, 'utf-8')),
+}));
+
+// 规则 1：裸客户端**只能被门面持有**。
+//
+// 断言是"恰好一处且就是门面"，而不是"其它地方没有"：后者在有人换成别的 HTTP 库
+// （于是门面自己也不再出现这个类型）时会安静通过，检查就空转了。
+const clientHolders = rustSources
+  .filter((file) => /reqwest::Client\b/.test(file.source))
+  .map((file) => file.path);
+check(
+  clientHolders.length === 1 && clientHolders[0] === NET_CLIENT,
+  clientHolders.length === 1 && clientHolders[0] === NET_CLIENT
+    ? '裸 reqwest::Client 只被出站门面持有（持有它的文件可以绕开策略与日志）'
+    : `裸 reqwest::Client 的持有者应当恰好是 ${NET_CLIENT}，实际：${clientHolders.join('、') || '（无）'}`
+);
+
+// 规则 2：`.send()` 在任何地方都不该出现 —— 门面用的是 `Client::execute`。
+// 因此它一旦出现，就意味着有人自己建了一个客户端，或者绕过了门面。
+const senders = rustSources.filter((file) => /\.send\(\)/.test(file.source)).map((file) => file.path);
+check(
+  senders.length === 0,
+  senders.length === 0
+    ? '没有任何地方直接调用 .send()（发送动作只发生在门面里）'
+    : `.send() 出现在了：${senders.join('、')} —— 这是真正把请求发出去的动作，绕过门面就意味着绕过策略与日志`
+);
 
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
