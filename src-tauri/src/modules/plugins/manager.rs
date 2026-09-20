@@ -361,6 +361,38 @@ impl PluginManager {
             manager.registry = HashMap::new();
         }
 
+        // 旧注册表里没有 `size_bytes` —— 它此前是每次列出插件时现算的。这里**一次性**
+        // 补齐并落盘，之后 `list()` 就只读缓存。
+        //
+        // 两条约束：
+        //   * **只在真的缺的时候写盘。** 正常启动一个字节都不写 —— 否则一个纯读的
+        //     启动路径会变成写路径，而写盘会失败（只读介质、权限、磁盘满），
+        //     那些失败不该出现在启动流程里。
+        //   * **失败不回滚、不阻断。** `to_installed` 里还有一层兜底会现算，
+        //     所以最坏情况只是回到改动之前的行为。
+        let missing: Vec<String> = manager
+            .registry
+            .values()
+            .filter(|entry| entry.size_bytes.is_none())
+            .map(|entry| entry.id.clone())
+            .collect();
+
+        if !missing.is_empty() {
+            for id in &missing {
+                let size = match manager.registry.get(id) {
+                    Some(entry) => dir_size(&manager.asset_root(entry)),
+                    None => continue,
+                };
+                if let Some(entry) = manager.registry.get_mut(id) {
+                    entry.size_bytes = Some(size);
+                }
+            }
+            log::info!("已为 {} 个插件补齐体积缓存", missing.len());
+            if let Err(e) = manager.save_registry() {
+                log::warn!("体积缓存写入注册表失败（下次启动会重试）: {}", e);
+            }
+        }
+
         Ok(manager)
     }
 
@@ -475,8 +507,11 @@ impl PluginManager {
 
     /// 从注册表条目 + 磁盘上的 manifest.json 重建 InstalledPlugin
     fn to_installed(&self, entry: &RegistryEntry) -> PluginResult<InstalledPlugin> {
-        // 开发链接优先：清单、样式、README、体积都跟着源目录走，
+        // 开发链接优先：清单、样式与体积都跟着源目录走，
         // 界面上看到的版本/权限与运行时实际执行的内容才是一致的。
+        //
+        // **README 不在这条路径上**（理由见下面的构造）。它由 `read_plugin_readme`
+        // 按需读取，那里同样会走源目录。
         let dir = self.asset_root(entry);
 
         let (manifest, loaded) = match read_manifest(&dir) {
@@ -511,27 +546,55 @@ impl PluginManager {
             }
         };
 
+        // 只有开发目录**实际生效**时才认它是开发链接：源目录被删掉后这里必须是
+        // false，否则界面会显示一个名不副实的「开发模式」标记。
+        let dev_linked = dir != self.version_dir(entry);
+
+        // 体积：开发链接的插件**实时算** —— 它的源目录随时在变，读缓存只会显示一个
+        // 过期数字。其余插件读安装时存下的值；`None` 说明是旧注册表，这里兜底算一次
+        // （`PluginManager::new` 也做过一次性补齐，两者互为保险，都不会在常态下触发）。
+        //
+        // **README 不在这里读。** 它是详情页才需要的东西，而这条路径每次启停插件、
+        // 每次进插件页都会走一遍 —— 500 个插件就是十几 MB 的文本被读出来、再跨 IPC
+        // 传给前端，而列表页一个字节都用不到它。按需走 `read_plugin_readme`。
+        let size_bytes = if dev_linked {
+            dir_size(&dir)
+        } else {
+            entry.size_bytes.unwrap_or_else(|| dir_size(&dir))
+        };
+
         Ok(InstalledPlugin {
             id: entry.id.clone(),
             version: entry.version.clone(),
             path: dir.to_string_lossy().to_string(),
             has_style: has_style(&dir, &manifest),
-            readme: read_readme(&dir),
-            size_bytes: dir_size(&dir),
+            size_bytes,
             manifest,
             enabled: entry.enabled,
             status,
             installed_at: entry.installed_at.clone(),
             source: entry.source.clone(),
-            // 只有开发目录**实际生效**时才报告它：源目录被删掉后这里必须是 None，
-            // 否则界面会显示一个名不副实的「开发模式」标记。
-            dev_source: if dir != self.version_dir(entry) {
+            dev_source: if dev_linked {
                 Some(dir.to_string_lossy().to_string())
             } else {
                 None
             },
             engine_advisory,
         })
+    }
+
+    /// 按需读取某个插件的 README（详情页用）。
+    ///
+    /// 与 `list()` 分开的理由见 `to_installed` 里的说明：它只在用户真的打开详情时
+    /// 才有价值，而列表每次都要走。走 `asset_root`，因此开发链接的插件读到的是
+    /// 源目录里那一份 —— 与界面上显示的其它信息保持一致。
+    pub fn readme(&self, id: &str) -> PluginResult<Option<String>> {
+        let entry = self
+            .registry
+            .get(id)
+            .ok_or_else(|| PluginError::NotFound(format!("插件 {} 未安装", id)))?;
+
+        Ok(read_readme(&self.asset_root(entry)))
     }
 
     /// 读取已安装插件的清单（权限检查用）
@@ -887,6 +950,9 @@ impl PluginManager {
             source: source.to_string(),
             // 存「可读」形式：canonicalize 的 `\\?\` 前缀不该进注册表与界面
             source_path: dev_source.map(|p| normalize_source_path(&p)),
+            // 体积在这里算过（上面校验包大小时），顺手存下来 —— 之后每次列表都读它，
+            // 不再递归遍历目录
+            size_bytes: Some(size),
         };
         self.registry.insert(id.clone(), entry.clone());
         self.save_registry()?;
@@ -1963,7 +2029,12 @@ mod tests {
         for index in 0..count {
             let dir = root.join(format!("com.example.plugin{index}"));
             std::fs::create_dir_all(dir.join("assets")).unwrap();
-            std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+            // 真实形状的清单：组 B 要真的解析它，`"{}"` 解析不出来，那一组的数字
+            // 就会变成一个假的"很快"
+            let manifest = format!(
+                r#"{{"name":"com.example.plugin{index}","displayName":"插件 {index}","version":"1.0.0","description":"规模基线","author":{{"name":"harness"}},"license":"MIT","engines":{{"loopcore":">=1.0.0"}},"main":"index.js","icon":"icon.svg"}}"#
+            );
+            std::fs::write(dir.join("manifest.json"), manifest).unwrap();
             std::fs::write(dir.join("index.js"), "x".repeat(JS_KB * 1024)).unwrap();
             std::fs::write(dir.join("index.css"), "x".repeat(CSS_KB * 1024)).unwrap();
             std::fs::write(dir.join("README.md"), "x".repeat(README_KB * 1024)).unwrap();
@@ -1976,6 +2047,11 @@ mod tests {
             .map(|index| root.join(format!("com.example.plugin{index}")))
             .collect();
 
+        // ---- 组 A：列表路径**已经不做**的工作 ----
+        //
+        // 它们此前每次列出插件都要付一遍：体积每次递归遍历目录，README 每次读最多
+        // 64 KB。现在体积读注册表里的缓存，README 走 `read_plugin_readme`（只有打开
+        // 详情页才调）。
         let started = std::time::Instant::now();
         let mut total_bytes = 0u64;
         for dir in &dirs {
@@ -1990,6 +2066,19 @@ mod tests {
         }
         let readme_cost = started.elapsed();
 
+        // ---- 组 B：列表路径**现在**做的工作 ----
+        //
+        // `read_manifest` 是其中主要的一项。`has_style` 是每插件一次 stat，
+        // 量级可忽略，不单列。
+        let started = std::time::Instant::now();
+        let mut parsed = 0usize;
+        for dir in &dirs {
+            if read_manifest(dir).is_ok() {
+                parsed += 1;
+            }
+        }
+        let manifest_cost = started.elapsed();
+
         let per_plugin_us = |elapsed: std::time::Duration| elapsed.as_micros() as f64 / count as f64;
 
         println!(
@@ -1997,29 +2086,42 @@ mod tests {
             ASSETS + 4,
             JS_KB + CSS_KB + README_KB
         );
+        println!("\n  列表路径现在做的：");
         println!(
-            "  dir_size    {:>9.2?} 合计，每插件 {:>7.1} µs（共 {} MB）",
+            "    read_manifest {:>9.2?} 合计，每插件 {:>7.1} µs（解析成功 {parsed} 个）",
+            manifest_cost,
+            per_plugin_us(manifest_cost)
+        );
+        println!("\n  列表路径已经不做的（此前每次列出插件都要付）：");
+        println!(
+            "    dir_size      {:>9.2?} 合计，每插件 {:>7.1} µs（{} MB）",
             size_cost,
             per_plugin_us(size_cost),
             total_bytes / 1024 / 1024
         );
         println!(
-            "  read_readme {:>9.2?} 合计，每插件 {:>7.1} µs（共 {} MB）",
+            "    read_readme   {:>9.2?} 合计，每插件 {:>7.1} µs（{} MB）",
             readme_cost,
             per_plugin_us(readme_cost),
             readme_bytes / 1024 / 1024
         );
+
+        let saved = size_cost + readme_cost;
+        let total_before = saved + manifest_cost;
         println!(
-            "  合计        {:>9.2?} —— 而这套动作在**每次** reloadPluginRuntime 时都会重跑\n",
-            size_cost + readme_cost
+            "\n  每次列出插件省下 {:>9.2?}（占原先的 {:.0}%），外加 {} MB 不再跨 IPC 传输\n",
+            saved,
+            100.0 * saved.as_secs_f64() / total_before.as_secs_f64(),
+            readme_bytes / 1024 / 1024
         );
 
         let _ = std::fs::remove_dir_all(&root);
 
-        // 唯一的断言：确实读到了东西。防止这个测试在"什么都没做"的情况下安静通过，
-        // 那样它打印的数字会全是 0，而 0 看起来像"很快"。
+        // 唯一的断言：两组都真的做到了事。否则"什么都没做"也会打印出一串 0，
+        // 而 0 看起来像"很快"。
         assert!(total_bytes > 0, "应当统计到体积");
         assert!(readme_bytes > 0, "应当读到 README");
+        assert_eq!(parsed, count, "清单应当都能解析 —— 否则组 B 的数字没有意义");
     }
 
     /// **导出目标必须是裸文件名。**

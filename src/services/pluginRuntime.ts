@@ -164,6 +164,19 @@ export interface PluginManifest {
   replacedBy?: string;
 }
 
+/**
+ * 按需读取插件的 README。
+ *
+ * 它**不在** `InstalledPlugin` 上（见那个接口里的说明）：列表页用不到它，而挂在
+ * 列表上意味着每次启停插件、每次进插件页都要把每个插件的 README 读出来再跨 IPC
+ * 传过去。只有用户打开插件详情时才调它。
+ *
+ * 返回 `null` 表示这个插件没有 README —— 那是正常情况，不是错误。
+ */
+export function readPluginReadme(id: string): Promise<string | null> {
+  return invoke<string | null>('read_plugin_readme', { id });
+}
+
 export interface InstalledPlugin {
   id: string;
   version: string;
@@ -175,7 +188,15 @@ export interface InstalledPlugin {
   source: string;
   sizeBytes: number;
   hasStyle: boolean;
-  readme: string | null;
+  /**
+   * **README 不在这里，这是刻意的。**
+   *
+   * 它曾经是这个接口上的 `readme: string | null`，于是每次列出插件都会把每个插件的
+   * README 读出来并跨 IPC 传过来。500 个插件的实测是十几 MB 文本，而列表页一个
+   * 字节都用不到 —— 唯一的使用点是插件详情抽屉。
+   *
+   * 现在按需取：`readPluginReadme(id)`。
+   */
   /**
    * 开发链接：该插件当前正从哪个源目录实时读取（只有「从目录安装」且该目录
    * 仍然有效时才有值）。

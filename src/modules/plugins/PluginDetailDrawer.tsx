@@ -29,6 +29,7 @@ import { getPermissionDescriptor } from '../../services/permissionRegistry';
 import { DRAWER_ENTER, DRAWER_EXIT } from '../../utils/motionCurves';
 import Markdown from '../../components/Markdown';
 import type { InstalledPlugin, PluginLoadState } from '../../services/pluginRuntime';
+import { readPluginReadme } from '../../services/pluginRuntime';
 
 interface PluginDetailDrawerProps {
   plugin: InstalledPlugin | null;
@@ -65,6 +66,35 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
     onUninstall,
   }) => {
     const [openError, setOpenError] = useState<string | null>(null);
+
+    /**
+     * README 现在**按需取**，不再是 `InstalledPlugin` 上的一个字段。
+     *
+     * 为什么：列表每列一次都会把每个插件的 README 读出来再跨 IPC 传过来，500 个
+     * 插件是十几 MB 文本 —— 而只有这一处用得到。抽屉打开时才取，关掉就丢弃。
+     *
+     * `null` 有两种含义（"还没取到"与"这个插件确实没有"），这里用 `undefined`
+     * 表示前者，因此区块在取回之前不渲染 —— 与它"没有 README 时不渲染"是同一个
+     * 视觉结果，也就不会闪一个空标题出来。
+     */
+    const [readme, setReadme] = useState<string | null | undefined>(undefined);
+
+    useEffect(() => {
+      if (!plugin) return;
+      let alive = true;
+      setReadme(undefined);
+      void readPluginReadme(plugin.id)
+        .then((text) => {
+          if (alive) setReadme(text);
+        })
+        .catch(() => {
+          // 取不到就当作没有 README：详情页不该因为一个补充性的区块而报错
+          if (alive) setReadme(null);
+        });
+      return () => {
+        alive = false;
+      };
+    }, [plugin]);
 
     useEffect(() => {
       if (!plugin) return;
@@ -390,7 +420,7 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                   </div>
                 </section>
 
-                {plugin.readme && (
+                {readme && (
                   <section>
                     <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                       <FileText className="w-3.5 h-3.5" />
@@ -398,7 +428,7 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                     </h3>
                     <div className="bg-gray-50 border border-gray-100 rounded-xl p-3 max-h-80 overflow-y-auto custom-scrollbar">
                       {/* 与市场详情走同一个渲染器：同一份 README 在两处不该长得不一样 */}
-                      <Markdown source={plugin.readme} />
+                      <Markdown source={readme} />
                     </div>
                   </section>
                 )}
