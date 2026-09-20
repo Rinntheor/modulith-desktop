@@ -1919,6 +1919,109 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// 规模基线：一个插件在 `list_plugins` 里要付多少**磁盘工作**。
+    ///
+    /// ---------------------------------------------------------------------------
+    /// 为什么需要它
+    ///
+    /// `list_plugins` 对**每一个**已安装插件都要递归算体积（`dir_size`）、读最多
+    /// 64 KB 的 README（`read_readme`）、再 stat 一次样式文件。而这条命令在**每次**
+    /// `reloadPluginRuntime()` 里都会跑（安装 / 卸载 / 启用 / 禁用 / 手动重载 / 启动），
+    /// 插件页刷新也调它。
+    ///
+    /// 而列表页用得到其中任何一项吗？用不到 —— 它们是插件**详情**才需要的东西。
+    /// 但在测量之前，"这是不是真的值得改"只能靠感觉。这个测试提供数字。
+    ///
+    /// ---------------------------------------------------------------------------
+    /// 它测的是什么，不是什么
+    ///
+    /// 测的是**下界**：三个下层动作本身的成本。不含 manifest 解析、IPC 序列化与
+    /// 前端处理 —— 那些都在它之上，只会让真实总耗时更大。
+    ///
+    /// **不写时间断言。** 时间是机器相关的，把它变成断言只会制造一个必然在别人
+    /// 机器上随机失败的测试。它打印数字，供人对照、写进文档，并作为优化前后的基准。
+    ///
+    /// 规模由环境变量控制：默认 50（保持 `cargo test` 快）；
+    /// `SCALE_PLUGINS=500 cargo test --lib scale_baseline -- --nocapture` 跑大规模。
+    #[test]
+    fn scale_baseline_of_the_per_plugin_disk_work() {
+        let count: usize = std::env::var("SCALE_PLUGINS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50);
+
+        // 形状照着真实插件来：入口 + 样式 + README + 一批资源文件。
+        // **文件个数**决定 `dir_size` 的成本，**字节数**决定 `read_readme` 的成本。
+        const ASSETS: usize = 20;
+        const JS_KB: usize = 64;
+        const CSS_KB: usize = 8;
+        const README_KB: usize = 32;
+
+        let root = std::env::temp_dir().join(format!("modulith-scale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        for index in 0..count {
+            let dir = root.join(format!("com.example.plugin{index}"));
+            std::fs::create_dir_all(dir.join("assets")).unwrap();
+            std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+            std::fs::write(dir.join("index.js"), "x".repeat(JS_KB * 1024)).unwrap();
+            std::fs::write(dir.join("index.css"), "x".repeat(CSS_KB * 1024)).unwrap();
+            std::fs::write(dir.join("README.md"), "x".repeat(README_KB * 1024)).unwrap();
+            for asset in 0..ASSETS {
+                std::fs::write(dir.join("assets").join(format!("a{asset}.bin")), "x").unwrap();
+            }
+        }
+
+        let dirs: Vec<std::path::PathBuf> = (0..count)
+            .map(|index| root.join(format!("com.example.plugin{index}")))
+            .collect();
+
+        let started = std::time::Instant::now();
+        let mut total_bytes = 0u64;
+        for dir in &dirs {
+            total_bytes = total_bytes.saturating_add(dir_size(dir));
+        }
+        let size_cost = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let mut readme_bytes = 0usize;
+        for dir in &dirs {
+            readme_bytes += read_readme(dir).map(|text| text.len()).unwrap_or(0);
+        }
+        let readme_cost = started.elapsed();
+
+        let per_plugin_us = |elapsed: std::time::Duration| elapsed.as_micros() as f64 / count as f64;
+
+        println!(
+            "\n[规模基线] {count} 个插件，每个 {} 个文件 / {} KB",
+            ASSETS + 4,
+            JS_KB + CSS_KB + README_KB
+        );
+        println!(
+            "  dir_size    {:>9.2?} 合计，每插件 {:>7.1} µs（共 {} MB）",
+            size_cost,
+            per_plugin_us(size_cost),
+            total_bytes / 1024 / 1024
+        );
+        println!(
+            "  read_readme {:>9.2?} 合计，每插件 {:>7.1} µs（共 {} MB）",
+            readme_cost,
+            per_plugin_us(readme_cost),
+            readme_bytes / 1024 / 1024
+        );
+        println!(
+            "  合计        {:>9.2?} —— 而这套动作在**每次** reloadPluginRuntime 时都会重跑\n",
+            size_cost + readme_cost
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 唯一的断言：确实读到了东西。防止这个测试在"什么都没做"的情况下安静通过，
+        // 那样它打印的数字会全是 0，而 0 看起来像"很快"。
+        assert!(total_bytes > 0, "应当统计到体积");
+        assert!(readme_bytes > 0, "应当读到 README");
+    }
+
     /// **导出目标必须是裸文件名。**
     ///
     /// 这条规则是「`export_plugin` 不是任意文件截断覆盖原语」的唯一依据：`dest` 一旦
