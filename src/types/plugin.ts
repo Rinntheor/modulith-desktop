@@ -8,6 +8,8 @@
 //
 //   【已实现】—— 与运行时一致，可以照着写：
 //     * `PluginManifest`（清单字段，以后端 Rust `PluginManifest` 为准）
+//     * `PluginContributions` 与它的四个成员（`contributes`，宿主会真正消费）
+//     * `ActivationEvent`（`activationEvents`，宿主会真正消费）
 //     * `PluginPermission`（权限名，kebab-case）
 //     * `PluginNotificationAPI`（`ctx.notifications`）
 //     * `PluginEventAPI` / `PluginBusEvent`（`ctx.events`）
@@ -16,14 +18,14 @@
 //     * `PluginShellAPI`（`ctx.shell`）
 //     * `PluginFileDropAPI`（`ctx.fileDrop`）
 //     * `PluginAudioAPI`（`ctx.audio`）
+//     * `PluginSettingsAPI` / `PluginDisposablesAPI`（`ctx.settings` / `ctx.disposables`）
+//     * `ModulithCapabilities`（`Modulith.capabilities`）
 //
-//   【设计草案】—— 尚未实现的长期设想，**照它写会直接失败**：
-//     * `PluginContext`（真实的上下文见 `createContext()`，字段是
-//       `pluginId / pluginVersion / manifest / version / storage / http /
-//       logger / notifications / events / launcher / icons / shell / fileDrop /
-//       audio`，与这里列的 commands / views / menus / fs / plugins 完全不同）
+//   【设计草案】—— 尚未实现的长期设想，**照它写会直接失败**（集中在文件末尾）：
+//     * `PluginContext`（真实的上下文见 `createContext()`）
 //     * `PluginLifecycle` 的各个钩子（`activate` / `deactivate` / `onInstall` …）
-//       运行时都不会被调用，宿主也没有调用它们的时机
+//       —— 注意：**卸载时的收尾现在有了**，但用的不是这组钩子，而是
+//       `ctx.disposables` / `Modulith.onDeactivate()`，见 `PluginDisposablesAPI`。
 //     * `PluginCommandAPI` / `PluginViewAPI` / `PluginMenuAPI` /
 //       `PluginFileSystemAPI` / `PluginPluginAPI`
 //     * `PluginAPI`（`getVersion` / `checkCompatibility` …）
@@ -107,92 +109,162 @@ export interface PluginEngines {
 }
 
 /**
- * 命令贡献定义
+ * 模块贡献定义（`contributes.modules`）
+ *
+ * 这是「插件往侧边栏放一个模块」的**声明**。声明之后，宿主**不需要执行插件代码**
+ * 就能把这个模块放进侧边栏、放进搜索、接受深链 —— 代码只在激活时才跑。
+ *
+ * `component` 不在这里：清单是数据，React 组件是行为，两者必须是分开的两件事。
+ * 行为在激活时通过 `Modulith.registerModule({ id, component })` 提供，`id` 与这里对齐。
+ *
+ * 与「旧式插件」的区别：旧式插件在加载期直接 `registerModule()`，目录条目是那时候
+ * 才出现的；声明式插件在**读到清单**时目录就完整了。
+ */
+export interface ModuleContribution {
+  /** 模块 ID，在插件内唯一 */
+  id: string;
+  /** 模块名（界面显示） */
+  name: string;
+  /** 更长的显示名；缺省时用 `name` */
+  displayName?: string;
+  /** 一句话描述，用于搜索与提示 */
+  description?: string;
+  /**
+   * 图标：宿主内置的 lucide 图标名，或插件目录内的 `.svg` 路径。
+   * 缺省时回落到清单的 `icon` / `iconSvg`。
+   */
+  icon?: string;
+  /**
+   * 是否出现在侧边栏，默认 `true`。
+   *
+   * 置为 `false` 的模块只能通过命令、深链或其它模块的入口打开 ——
+   * 这正是「功能性插件需要一个界面，但那个界面不该占侧边栏一行」的用法。
+   */
+  sidebar?: boolean;
+  /** 挂到某个已有模块下作为子模块 */
+  parent?: string;
+  /** 排序权重，越小越靠前，默认 100 */
+  priority?: number;
+  /** 分类，默认 `plugin` */
+  category?: string;
+  /** 侧边栏徽标文本 */
+  badge?: string;
+}
+
+/**
+ * 命令贡献定义（`contributes.commands`）
+ *
+ * 与模块同理：面板里的条目来自**声明**，`run` 在激活时才通过
+ * `Modulith.registerCommand({ id, run })` 绑定。
+ *
+ * 因此一个「只加几条命令、没有任何界面」的插件现在是合法的 ——
+ * 这在 1.2.0 之前不可能存在（那时没注册模块会被判为加载失败）。
  */
 export interface CommandContribution {
-  command: string;
-  title: string;
-  icon?: string;
-  category?: string;
-  shortcut?: string;
-}
-
-/**
- * 视图贡献定义
- */
-export interface ViewContribution {
+  /** 命令 ID，在插件内唯一。宿主会加上 `plugin:<插件ID>:` 前缀 */
   id: string;
-  name: string;
+  /** 面板里显示的名称 */
+  title: string;
+  /** 右侧的补充说明 */
+  subtitle?: string;
+  /** 参与匹配但不显示的额外关键词 */
+  keywords?: string[];
+  /** lucide 图标名 */
   icon?: string;
-  priority?: number;
-  component?: string;
+}
+
+/** 设置项的取值类型 */
+export type SettingType = 'boolean' | 'string' | 'number' | 'select';
+
+export interface SettingOption {
+  value: string;
+  label: string;
 }
 
 /**
- * 设置项定义
+ * 设置项贡献（`contributes.settings`）
+ *
+ * **零代码贡献。** 宿主照这份声明渲染界面，值存在插件自己的存储命名空间里
+ * （因此需要 `storage` 权限），插件在激活后用 `ctx.settings` 读回。
+ *
+ * 为什么不做成「插件提供一个 React 设置组件」：那会让设置界面必须执行插件代码
+ * 才能渲染，等于把「读清单即可建立完整界面」这个前提毁掉 —— 而那个前提正是
+ * 按需激活与将来沙箱化的基础。
  */
 export interface SettingContribution {
-  key: string;
-  type: 'string' | 'number' | 'boolean' | 'object' | 'array';
-  default?: any;
+  /** 设置项 ID，在插件内唯一 */
+  id: string;
+  /** 界面上的标签 */
+  label: string;
+  /** 说明文字 */
   description?: string;
-  enum?: any[];
-  minimum?: number;
-  maximum?: number;
+  type: SettingType;
+  /** 缺省值；用户没有改过时 `ctx.settings` 返回它 */
+  default?: boolean | string | number;
+  /** `type === 'select'` 时的候选项 */
+  options?: SettingOption[];
+  /** `type === 'number'` 时的范围与步长 */
+  min?: number;
+  max?: number;
+  step?: number;
+  /** `type === 'string'` 时的占位提示 */
+  placeholder?: string;
 }
 
 /**
- * 菜单贡献定义
+ * 右键菜单贡献（`contributes.contextMenus`）
+ *
+ * 菜单项执行的是**一条已声明的命令** —— 因此它不需要自己的 handler 绑定，
+ * 也不需要新的宿主 API。
  */
-export interface MenuContribution {
-  location: string;
+export interface ContextMenuContribution {
+  /** 在插件内唯一 */
+  id: string;
+  /** 菜单里显示的文字 */
+  label: string;
+  /** 被执行命令的**本地** ID（与 `commands[].id` 对齐） */
   command: string;
+  /** lucide 图标名 */
+  icon?: string;
+  /** 分组。同一组的条目相邻显示；宿主自己的动作始终排在插件条目之前 */
   group?: string;
-  when?: string;
 }
 
 /**
- * 插件贡献点
+ * 插件贡献点（`contributes`）
+ *
+ * 四个成员都是**可选**的，但 `contributes` 一旦出现，插件就被当作「声明式插件」：
+ * 目录从清单建立，代码按 `activationEvents` 激活。
+ *
+ * 宿主**不校验**未知的贡献点名称（后端把 `contributes` 当作不透明 JSON 保留），
+ * 这是有意的：将来新增贡献点（`themes` / `statusBar` / …）不必先改清单格式，
+ * 旧宿主会忽略它，而不是让整份清单解析失败。
  */
 export interface PluginContributions {
+  modules?: ModuleContribution[];
   commands?: CommandContribution[];
-  views?: ViewContribution[];
   settings?: SettingContribution[];
-  menus?: MenuContribution[];
-  themes?: ThemeContribution[];
-  languages?: LanguageContribution[];
+  contextMenus?: ContextMenuContribution[];
 }
 
 /**
- * 主题贡献定义
- */
-export interface ThemeContribution {
-  id: string;
-  label: string;
-  uiTheme: 'vs-dark' | 'vs-light' | 'hc-black';
-  path: string;
-}
-
-/**
- * 语言贡献定义
- */
-export interface LanguageContribution {
-  id: string;
-  aliases: string[];
-  extensions: string[];
-  configuration?: string;
-}
-
-/**
- * 激活事件
+ * 激活事件（`activationEvents`）
+ *
+ * 语义是「**宿主可以在这些时刻激活我**」，而不是「宿主必须立刻执行我」——
+ * 宿主有权把一个 `onStartup` 的插件推到机器空闲时再跑。
+ *
+ * 只有下面这四种会被消费。早期草案里的 `onView` / `onFile` / `onPlugin` /
+ * `onRestore` **没有被实现**，写它们不会有任何效果（宿主会在控制台警告一次）。
  */
 export type ActivationEvent =
-  | 'onStartup'                          // 应用启动时
-  | `onCommand:${string}`                // 命令执行时
-  | `onView:${string}`                   // 视图打开时
-  | `onFile:${string}`                   // 文件类型匹配时
-  | `onPlugin:${string}`                 // 依赖插件激活时
-  | 'onRestore';                         // 工作区恢复时
+  /** 应用进入可用状态之后，由宿主在空闲时激活 */
+  | 'onStartup'
+  /** 打开某个已声明模块时 */
+  | `onModule:${string}`
+  /** 执行某条已声明命令时（写本地 ID） */
+  | `onCommand:${string}`
+  /** 展开右键菜单并点击某项时（写本地 ID） */
+  | `onContextMenu:${string}`;
 
 /**
  * 配置迁移定义
@@ -469,7 +541,33 @@ export interface PluginCommandAPI {
 }
 
 /**
- * 插件视图 API
+ * 视图贡献定义（**草案专用**）
+ *
+ * 1.2.0 起，真正被消费的贡献点是 `PluginContributions` 的四个成员；
+ * 这个形状只服务于下面 `PluginViewAPI` 那份**未实现**的草案，因此它留在这里
+ * 而不是和实现放在一起 —— 免得被当成可以写进 `contributes` 的字段。
+ */
+export interface ViewContribution {
+  id: string;
+  name: string;
+  icon?: string;
+  priority?: number;
+  component?: string;
+}
+
+/**
+ * 菜单贡献定义（**草案专用**）。见 `ViewContribution` 的说明。
+ * 真正可用的右键菜单贡献是 `ContextMenuContribution`。
+ */
+export interface MenuContribution {
+  location: string;
+  command: string;
+  group?: string;
+  when?: string;
+}
+
+/**
+ * 插件视图 API（**未实现**）
  */
 export interface PluginViewAPI {
   register(view: ViewContribution, component: React.ComponentType): () => void;
@@ -478,11 +576,96 @@ export interface PluginViewAPI {
 }
 
 /**
- * 插件菜单 API
+ * 插件菜单 API（**未实现**）
  */
 export interface PluginMenuAPI {
   register(menu: MenuContribution): () => void;
   unregister(location: string, command: string): void;
+}
+
+/**
+ * 宿主能力表（`Modulith.capabilities`）的**实际**签名。
+ *
+ * 用途：插件在运行时判断宿主有没有某个能力，而不是靠 `Modulith.version` 做字符串
+ * 比较。`engines.loopcore` 只表达「我要求宿主至少多新」，而且它**只提示、不阻断**；
+ * 真正决定一段代码能不能跑的，是这里列出的东西。
+ *
+ * 典型用法：
+ *
+ * ```js
+ * if (Modulith.capabilities.contributions.includes('settings')) { ... }
+ * ```
+ *
+ * `api` 是这份能力表自身的版本号。它和 `Modulith.version` 是两件事 ——
+ * 宿主可以发一个补丁版本而不动能力表。
+ *
+ * **这里刻意不列权限名。** 权限的权威是后端 `PluginPermission` 枚举，前端已经有一条
+ * 取回它的路径（`list_plugin_permissions` / `permissionRegistry`）；在这里再放一份
+ * 就是同一份名单的第二个副本，而副本必然漂移 —— 这正是 1.1.x 反复记录过的教训。
+ *
+ * `scripts/check-contributions.ts` 把下面四个数组钉成了断言：增删成员必须同时改
+ * 检查脚本，因此它不会悄悄漂移。
+ */
+export interface ModulithCapabilities {
+  /** 能力表自身的版本，从 1 开始 */
+  api: number;
+  /** `window.Modulith` 上可用的成员名 */
+  host: string[];
+  /** `createContext()` 返回的服务名 */
+  context: string[];
+  /** 宿主会消费的贡献点名（`contributes` 的键） */
+  contributions: string[];
+  /** 宿主会消费的激活事件名（不含冒号后的参数） */
+  activationEvents: string[];
+}
+
+/**
+ * 插件设置 API（`ctx.settings` 的**实际**签名）。
+ *
+ * 读的是 `contributes.settings` 里那些设置项的当前值。宿主负责渲染界面、
+ * 落盘与缺省值，插件只读结果 —— 因此插件**不需要**自己发明键名，
+ * 也不需要自己处理「用户从没改过」这种情况（那时返回清单里的 `default`）。
+ *
+ * 需要清单声明 `storage` 权限：值存在插件自己的存储命名空间里，
+ * 与 `ctx.storage` 共用同一套后端命令。未声明时读取返回缺省值、写入抛错。
+ *
+ * `getAll()` 是同步的：值在插件激活前就已随贡献目录读好，因此插件可以在
+ * 顶层（激活期）直接读它来决定怎么做，不必先 `await`。
+ */
+export interface PluginSettingsAPI {
+  /** 权限已声明且设置已读入 */
+  isAvailable(): boolean;
+  /** 单项；没有声明过该 id 时返回 `undefined` */
+  get<T = unknown>(id: string): T | undefined;
+  /** 全部设置项（键是设置项 id） */
+  getAll(): Record<string, unknown>;
+  /** 写入一项；返回的 Promise 在落盘后完成 */
+  set(id: string, value: unknown): Promise<void>;
+  /** 订阅变更（宿主设置界面写入时也会触发），返回取消订阅函数 */
+  onChange(handler: (id: string, value: unknown) => void): () => void;
+}
+
+/**
+ * 插件资源回收 API（`ctx.disposables` 的**实际**签名）。
+ *
+ * 这是功能型插件的前提：一个后台服务会创建定时器、事件监听、观察者、
+ * WebSocket、音频节点 —— 这些**宿主一个都不知道**，插件被禁用之后
+ * 它们会一直活着。把清理函数交到这里，宿主会在卸载/禁用/重新加载时
+ * 按**逆序**执行。
+ *
+ * 三条保证：
+ *   1. 逆序执行（后申请的先释放，与栈一致）；
+ *   2. 单个清理函数抛错**不影响**其余；
+ *   3. 每个清理函数只执行一次（重复注册同一个函数不会重复执行）。
+ *
+ * 插件若需要在使用之后立刻释放（而不是等到卸载），应当直接调用 `dispose()`
+ * 并把该函数从表里摘掉 —— `dispose()` 返回后 `size` 会相应减少。
+ */
+export interface PluginDisposablesAPI {
+  /** 注册一个清理函数；返回一个「提前执行并移除它」的函数 */
+  add(dispose: () => void): () => void;
+  /** 当前待执行的清理函数数量 */
+  size(): number;
 }
 
 /**

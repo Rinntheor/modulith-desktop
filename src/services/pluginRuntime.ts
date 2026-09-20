@@ -23,12 +23,20 @@ import { createLazyComponent } from '../utils/lazyLoad';
 import {
   clearDynamicModules,
   registerDynamicModule,
+  setModuleIconSvg,
   setPluginCatalogLoading,
   unregisterDynamicModules,
   getPluginModuleIds,
 } from './moduleCatalog';
 import type { ModuleDescriptor } from '../types/module';
-import type { PickedAudio } from '../types/plugin';
+import type {
+  ActivationEvent,
+  CommandContribution,
+  ModulithCapabilities,
+  ModuleContribution,
+  PickedAudio,
+  PluginSettingsAPI,
+} from '../types/plugin';
 import { pushNotification, type NotificationLevel } from './notifications';
 import { publish, subscribe, unsubscribeBySource, type EventHandler } from './eventBus';
 import { registerCommand, unregisterCommandsByPrefix } from './commandRegistry';
@@ -37,6 +45,27 @@ import { isFileDropAvailable, subscribeFileDrop } from './fileDrop';
 import { clearModuleComponentCache } from './moduleComponentCache';
 import { loadPermissionRegistry } from './permissionRegistry';
 import { logMessage } from './logger';
+import {
+  HOST_CAPABILITIES,
+  activationEventForCommand,
+  activationEventForContextMenu,
+  activationEventForModule,
+  commandFullId,
+  commandPrefix,
+  resolveLoadContract,
+  type PluginLoadContract,
+} from './pluginContributions';
+import {
+  clearPluginSettings,
+  getAllPluginSettings,
+  getPluginSetting,
+  getPluginSettingContributions,
+  loadPluginSettingValues,
+  registerPluginSettings,
+  setPluginSetting,
+  subscribePluginSettings,
+  unregisterPluginSettings,
+} from './pluginSettings';
 
 /**
  * 宿主版本号的**占位初值**。
@@ -216,6 +245,408 @@ const injectedAssets = new Map<string, { scripts: HTMLScriptElement[]; styles: H
  * 否则重新启用同名插件会拿到上一次的旧图标。
  */
 const pluginIcons = new Map<string, string>();
+
+// ============================================================
+// 贡献与激活（1.2.0）
+//
+// 这一节引入了「插件不必是一个模块」这件事。核心是两组状态：
+//
+//   * **贡献目录**（contracts）—— 从清单算出来的、宿主**不执行任何插件代码**
+//     就能拥有的界面形状：侧边栏条目、命令面板条目、设置项、右键菜单项。
+//   * **激活状态**（activationStates）—— 插件代码到底跑没跑过，以及为什么跑。
+//
+// 于是「插件存在」与「插件提供的东西可见」被解耦了：一个只加三条命令的插件，
+// 在它一行代码都没执行过的时候，那三条命令就已经在面板里了。
+// ============================================================
+
+/** 插件激活状态 */
+export type PluginActivationStatus = 'inactive' | 'activating' | 'active' | 'failed';
+
+export interface PluginActivationState {
+  pluginId: string;
+  status: PluginActivationStatus;
+  /** 触发它的激活事件；旧式插件在后台加载期激活时为 `'legacy'` */
+  reason: ActivationEvent | 'legacy';
+  activatedAt?: string;
+  error?: string;
+}
+
+/** pluginId → 装载契约（由清单算出） */
+const contracts = new Map<string, PluginLoadContract>();
+
+/** pluginId → 激活状态 */
+const activationStates = new Map<string, PluginActivationState>();
+
+/**
+ * `插件ID::模块ID` → 插件在激活期交出来的组件。
+ *
+ * 用复合键而不是裸模块 ID：声明式插件注册一个**未声明**的模块时，组件会先落进
+ * 这里、再走目录的重复校验 —— 那时模块 ID 还没有被目录接受，用它当键会让
+ * 两个插件抢同一个 ID 时互相覆盖。
+ */
+const providedModules = new Map<string, React.ComponentType<Record<string, never>>>();
+
+/** 全局面板命令 ID → 插件绑定上来的处理函数 */
+const commandHandlers = new Map<string, () => void | Promise<void>>();
+
+/** pluginId → 待执行的清理函数（`ctx.disposables` / `Modulith.onDeactivate`） */
+const disposableRegistry = new Map<string, Array<() => void>>();
+
+/** 正在进行的激活（去重：多个模块同时打开时只跑一次 bundle） */
+const activating = new Map<string, Promise<PluginActivationState>>();
+
+/** 本次激活由什么触发（`ctx.activationEvent` 的来源） */
+const activationReasons = new Map<string, ActivationEvent | 'legacy'>();
+
+/** 单个插件的加载超时，由 `reloadPluginRuntime` 从设置里带进来 */
+let configuredTimeoutMs = 5000;
+
+function providedModuleKey(pluginId: string, moduleId: string): string {
+  return `${pluginId}::${moduleId}`;
+}
+
+/** 某个插件的装载契约（没有则 undefined，例如插件已被卸载） */
+export function getPluginContract(pluginId: string): PluginLoadContract | undefined {
+  return contracts.get(pluginId);
+}
+
+/** 全部装载契约（供设置界面、诊断页枚举） */
+export function getPluginContracts(): Array<{ pluginId: string; contract: PluginLoadContract }> {
+  return [...contracts.entries()].map(([pluginId, contract]) => ({ pluginId, contract }));
+}
+
+/** 某个插件的激活状态 */
+export function getActivationState(pluginId: string): PluginActivationState | undefined {
+  return activationStates.get(pluginId);
+}
+
+/** 全部激活状态 */
+export function getActivationStates(): Map<string, PluginActivationState> {
+  return activationStates;
+}
+
+/** 某个插件是否已经跑过代码 */
+export function isPluginActive(pluginId: string): boolean {
+  return activationStates.get(pluginId)?.status === 'active';
+}
+
+/**
+ * 记录一个清理函数。返回「立刻执行并摘掉它」的函数。
+ *
+ * 只执行一次是硬要求：`ctx.disposables` 的典型用法是
+ * `disposables.add(() => clearInterval(t))`，而插件也常常会自己提前调用它 ——
+ * 若宿主的卸载路径再执行一遍，就会对同一个定时器 clear 两次（无害），或者对
+ * 一个已经关闭的连接再关一次（有害）。
+ */
+function addDisposable(pluginId: string, dispose: () => void): () => void {
+  if (typeof dispose !== 'function') return () => {};
+
+  let done = false;
+  const wrapped = () => {
+    if (done) return;
+    done = true;
+    const list = disposableRegistry.get(pluginId);
+    if (list) {
+      const index = list.indexOf(wrapped);
+      if (index !== -1) list.splice(index, 1);
+    }
+    dispose();
+  };
+
+  const list = disposableRegistry.get(pluginId) ?? [];
+  list.push(wrapped);
+  disposableRegistry.set(pluginId, list);
+  return wrapped;
+}
+
+/**
+ * 逆序执行某个插件的全部清理函数。
+ *
+ * 三条保证，与 `PluginDisposablesAPI` 的文档一一对应：逆序、单个抛错不牵连其余、
+ * 每个只执行一次。返回真正执行掉的个数。
+ */
+function runDisposables(pluginId: string): number {
+  const list = disposableRegistry.get(pluginId);
+  if (!list || list.length === 0) {
+    disposableRegistry.delete(pluginId);
+    return 0;
+  }
+  // 先摘掉整份表再执行：清理函数自己也可能 add() 新的清理函数，
+  // 那些应当留到下一次卸载，而不是在这一次的循环里被顺手跑掉。
+  disposableRegistry.delete(pluginId);
+
+  let ran = 0;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    try {
+      list[index]();
+      ran += 1;
+    } catch (error) {
+      console.error(
+        `[pluginRuntime] 插件 "${pluginId}" 的第 ${index + 1} 个清理函数抛出错误（其余仍会执行）:`,
+        error
+      );
+    }
+  }
+  return ran;
+}
+
+/**
+ * 执行一条插件命令。
+ *
+ * 「先激活、再执行」是这个函数的全部意义：命令在面板里的**条目**来自清单，
+ * 因此用户在插件一行代码都没跑过时就能看到它；点下去的那一刻才付执行的代价。
+ */
+export async function runPluginCommand(pluginId: string, localId: string): Promise<void> {
+  await activatePlugin(pluginId, activationEventForCommand(localId));
+
+  const fullId = commandFullId(pluginId, localId);
+  const handler = commandHandlers.get(fullId);
+  if (!handler) {
+    throw new Error(
+      `命令 "${localId}" 已在清单里声明，但插件激活后没有绑定处理函数。` +
+        `请确认 bundle 在顶层调用了 Modulith.registerCommand({ id: "${localId}", run })`
+    );
+  }
+  await handler();
+}
+
+/**
+ * 把清单里声明的命令登记进全局命令面板。
+ *
+ * 条目的 `run` 是一个**包装**：它先激活插件，再调用插件绑定的处理函数。
+ * 这个包装在插件未激活时也一直存在 —— 那正是「命令可见但不执行」的形态。
+ */
+function registerDeclaredCommands(pluginId: string, commands: CommandContribution[]): void {
+  for (const command of commands) {
+    const fullId = commandFullId(pluginId, command.id);
+    registerCommand({
+      id: fullId,
+      title: command.title,
+      subtitle: command.subtitle,
+      keywords: command.keywords,
+      // 插件命令归入「动作」组，与宿主动作并列显示
+      group: 'actions',
+      icon: command.icon,
+      run: async () => {
+        try {
+          await runPluginCommand(pluginId, command.id);
+        } catch (error) {
+          // 命令面板不会 await 这个 Promise，因此这里必须自己把失败变成可见的东西。
+          // 抛出去只会变成一条无人处理的 rejection —— 用户看到的是「点了没反应」。
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`[pluginRuntime] 插件命令 "${command.id}" 执行失败:`, error);
+          await pushNotification({
+            title: `插件命令执行失败：${command.title}`,
+            body: message,
+            level: 'error',
+            source: pluginId,
+          }).catch(() => {});
+        }
+      },
+    });
+  }
+}
+
+/** 由清单声明建立的模块描述符：组件在**渲染时**才触发激活 */
+function buildDeclaredModuleDescriptor(
+  plugin: InstalledPlugin,
+  contribution: ModuleContribution
+): ModuleDescriptor {
+  const pluginId = plugin.id;
+  const moduleId = contribution.id;
+
+  return {
+    id: moduleId,
+    name: contribution.name,
+    displayName: contribution.displayName ?? contribution.name,
+    description: contribution.description ?? '',
+    icon: contribution.icon ?? plugin.manifest.icon ?? 'Package',
+    path: `/plugins/${moduleId}`,
+    priority: contribution.priority ?? 100,
+    category: contribution.category ?? 'plugin',
+    // `sidebar: false` 落到「默认收进隐藏模块面板」而不是彻底不可见：
+    // 用户仍然能找到它、能把它固定出来 —— 一个连发现路径都没有的界面更糟。
+    visible: contribution.sidebar !== false,
+    disabled: false,
+    badge: contribution.badge,
+    // 这里是整块设计的落点：条目现在就有，组件要等到有人真的打开它。
+    component: createLazyComponent(async () => {
+      const Component = await ensureProvidedModule(pluginId, moduleId);
+      return { default: Component };
+    }),
+    children: undefined,
+    pluginId,
+    iconSvg: resolveInlineIconSvg(pluginId, plugin.manifest),
+  };
+}
+
+/** 旧式插件在加载期直接注册模块时用的描述符 */
+function buildRuntimeModuleDescriptor(
+  pluginId: string,
+  manifest: PluginManifest | undefined,
+  registration: PluginModuleRegistration,
+  Component: React.ComponentType<Record<string, never>>
+): ModuleDescriptor {
+  return {
+    id: registration.id,
+    name: registration.name || registration.id,
+    displayName: registration.displayName ?? registration.name ?? registration.id,
+    description: registration.description ?? '',
+    icon: registration.icon ?? manifest?.icon ?? 'Package',
+    path: registration.path ?? `/plugins/${registration.id}`,
+    priority: typeof registration.priority === 'number' ? registration.priority : 100,
+    category: registration.category ?? 'plugin',
+    visible: true,
+    disabled: false,
+    badge: registration.badge,
+    component: createLazyComponent(async () => ({ default: Component })),
+    children: undefined,
+    pluginId,
+    // 内联 SVG 随描述符一起传给渲染层。渲染图标是同步路径，
+    // 若等到渲染时再 invoke 读取就会先出现一帧空框，因此在这里取好。
+    iconSvg: resolveInlineIconSvg(pluginId, manifest),
+  };
+}
+
+/**
+ * 取回某个已声明模块的组件，必要时先把插件激活。
+ *
+ * 失败的两种情况必须分开报，因为作者的修法完全不同：
+ *   * 激活失败 —— 插件的 bundle 有问题，错误在 `state.error` 里；
+ *   * 激活成功但没提供这个模块 —— 清单声明了 `modules` 却没在代码里
+ *     `registerModule({ id, component })`。
+ */
+async function ensureProvidedModule(
+  pluginId: string,
+  moduleId: string
+): Promise<React.ComponentType<Record<string, never>>> {
+  const key = providedModuleKey(pluginId, moduleId);
+  const provided = providedModules.get(key);
+  if (provided) return provided;
+
+  const state = await activatePlugin(pluginId, activationEventForModule(moduleId));
+
+  const after = providedModules.get(key);
+  if (after) return after;
+
+  throw new Error(
+    state.status === 'failed'
+      ? `插件 "${pluginId}" 激活失败：${state.error ?? '未知错误'}`
+      : `插件 "${pluginId}" 激活后没有提供模块 "${moduleId}" 的组件。` +
+        `清单声明了它，因此 bundle 顶层需要调用 ` +
+        `Modulith.registerModule({ id: "${moduleId}", name: "…", component: … })`
+  );
+}
+
+/**
+ * 激活一个插件（执行它的 bundle）。重复调用是幂等的。
+ *
+ * 这是 1.2.0 之前不存在的入口：那时插件只有「在后台加载阶段全部执行」一条路，
+ * 因此「有 500 个插件」与「启动后要跑 500 段第三方代码」是同一件事。
+ */
+export async function activatePlugin(
+  pluginId: string,
+  event: ActivationEvent | 'legacy'
+): Promise<PluginActivationState> {
+  const current = activationStates.get(pluginId);
+  if (current?.status === 'active') return current;
+
+  const inFlight = activating.get(pluginId);
+  if (inFlight) return inFlight;
+
+  const plugin = installed.find((item) => item.id === pluginId);
+  if (!plugin) {
+    throw new Error(`插件 "${pluginId}" 不在已安装列表中，无法激活`);
+  }
+  if (!plugin.enabled) {
+    throw new Error(`插件 "${pluginId}" 已被禁用，无法激活`);
+  }
+  if (plugin.status === 'error') {
+    throw new Error(`插件 "${pluginId}" 的清单无法读取，无法激活`);
+  }
+
+  activationStates.set(pluginId, { pluginId, status: 'activating', reason: event });
+  activationReasons.set(pluginId, event);
+  notify();
+
+  const run = (async (): Promise<PluginActivationState> => {
+    const result = await loadPlugin(plugin, configuredTimeoutMs);
+    const next: PluginActivationState =
+      result.status === 'loaded'
+        ? {
+            pluginId,
+            status: 'active',
+            reason: event,
+            activatedAt: new Date().toISOString(),
+          }
+        : {
+            pluginId,
+            status: 'failed',
+            reason: event,
+            activatedAt: new Date().toISOString(),
+            error: result.error,
+          };
+    activationStates.set(pluginId, next);
+    notify();
+    return next;
+  })();
+
+  activating.set(pluginId, run);
+  try {
+    return await run;
+  } finally {
+    activating.delete(pluginId);
+  }
+}
+
+/** 右键菜单里的一条插件贡献 */
+export interface PluginContextMenuEntry {
+  pluginId: string;
+  pluginDisplayName: string;
+  id: string;
+  label: string;
+  icon?: string;
+  group?: string;
+  /** 该插件是否已经激活（界面上可以据此做些区分） */
+  active: boolean;
+}
+
+/** 全部右键菜单贡献（宿主外壳把它们排在自己的动作之后） */
+export function getPluginContextMenuEntries(): PluginContextMenuEntry[] {
+  const entries: PluginContextMenuEntry[] = [];
+
+  for (const plugin of installed) {
+    if (!plugin.enabled || plugin.status === 'error') continue;
+    const contract = contracts.get(plugin.id);
+    if (!contract?.declarative) continue;
+
+    for (const menu of contract.contributions.contextMenus) {
+      entries.push({
+        pluginId: plugin.id,
+        pluginDisplayName: plugin.manifest.displayName || plugin.id,
+        id: menu.id,
+        label: menu.label,
+        icon: menu.icon,
+        group: menu.group,
+        active: isPluginActive(plugin.id),
+      });
+    }
+  }
+
+  return entries;
+}
+
+/** 执行一条右键菜单贡献 */
+export async function runPluginContextMenuEntry(entry: PluginContextMenuEntry): Promise<void> {
+  const contract = contracts.get(entry.pluginId);
+  const menu = contract?.contributions.contextMenus.find((item) => item.id === entry.id);
+  if (!menu) {
+    throw new Error(`右键菜单项 "${entry.id}" 已不存在（插件可能已被卸载）`);
+  }
+
+  await activatePlugin(entry.pluginId, activationEventForContextMenu(menu.id));
+  await runPluginCommand(entry.pluginId, menu.command);
+}
 
 function notify(): void {
   listeners.forEach((fn) => {
@@ -596,6 +1027,78 @@ function pluginEvents(pluginId: string, manifest: PluginManifest | undefined) {
   };
 }
 
+/**
+ * 插件设置 API（`ctx.settings`）。
+ *
+ * **需要 `storage` 权限** —— 值就存在插件自己的存储命名空间里，与 `ctx.storage`
+ * 共用同一套后端命令。未声明时读取回落到缺省值、写入抛错，并且只提示一次
+ * （与 notifications / events 的处理一致）。
+ *
+ * `get` / `getAll` 是**同步**的：设置值在插件激活前就已随贡献目录读好，
+ * 因此插件可以在 IIFE 顶层直接读它来决定怎么做，不必先 `await`。
+ * 这一点很重要 —— 插件的顶层是同步执行的，一个异步的设置读取根本来不及参与。
+ */
+function pluginSettingsAPI(
+  pluginId: string,
+  manifest: PluginManifest | undefined
+): PluginSettingsAPI {
+  const allowed = pluginHasPermission(manifest, 'storage');
+
+  let warned = false;
+  const warnOnce = () => {
+    if (warned) return;
+    warned = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 使用了设置接口，但清单里没有声明 "storage" 权限，读取将回落到缺省值、写入会失败（后续同类调用不再重复提示）`
+    );
+  };
+
+  return {
+    isAvailable: () => allowed,
+    get: <T = unknown>(id: string): T | undefined => {
+      if (!allowed) {
+        warnOnce();
+        return undefined;
+      }
+      return getPluginSetting(pluginId, id) as T | undefined;
+    },
+    getAll: () => {
+      if (!allowed) {
+        warnOnce();
+        return {};
+      }
+      return getAllPluginSettings(pluginId);
+    },
+    set: async (id: string, value: unknown): Promise<void> => {
+      if (!allowed) {
+        warnOnce();
+        throw new Error(
+          `插件 "${pluginId}" 没有声明 "storage" 权限，设置 "${id}" 无法保存`
+        );
+      }
+      await setPluginSetting(pluginId, id, value);
+    },
+    /**
+     * 订阅变更。
+     *
+     * `pluginSettings` 的通知不带参数（它只知道「有东西变了」），因此这里比对
+     * 前后两份快照把它还原成 (id, value)。用快照而不是让存储层广播具体键：
+     * 后者要求每个写入点都记得带上键，而写入点不止一处（插件、宿主设置界面）。
+     */
+    onChange: (handler: (id: string, value: unknown) => void): (() => void) => {
+      let snapshot = allowed ? getAllPluginSettings(pluginId) : {};
+      return subscribePluginSettings(() => {
+        if (!allowed) return;
+        const next = getAllPluginSettings(pluginId);
+        for (const key of Object.keys(next)) {
+          if (snapshot[key] !== next[key]) handler(key, next[key]);
+        }
+        snapshot = next;
+      });
+    },
+  };
+}
+
 /** 为「正在加载的插件」创建上下文；在插件代码之外调用会抛错 */
 function createContext() {
   if (!loadingPluginId) {
@@ -610,6 +1113,15 @@ function createContext() {
     pluginVersion: manifest?.version ?? '0.0.0',
     manifest,
     version: resolvedVersion,
+    /**
+     * 本次激活由什么触发（`onModule:xxx` / `onCommand:xxx` / `onContextMenu:xxx`
+     * / `onStartup` / 旧式插件的 `'legacy'`）。
+     *
+     * 存在的理由：一个声明了多条激活事件的插件，往往只需要为**被用到的那部分**
+     * 做准备（例如被 `onCommand:export` 唤醒时不必先去建界面）。没有它，插件只能
+     * 全部初始化一遍，那等于把按需激活省下的钱又花回去。
+     */
+    activationEvent: activationReasons.get(pluginId) ?? null,
     storage: pluginStorage(pluginId),
     http: pluginHttp(pluginId),
     logger: pluginLogger(pluginId),
@@ -620,6 +1132,15 @@ function createContext() {
     shell: pluginShell(pluginId),
     fileDrop: pluginFileDrop(pluginId, manifest),
     audio: pluginAudio(pluginId),
+    settings: pluginSettingsAPI(pluginId, manifest),
+    /**
+     * 收尾登记的入口。**这是功能型插件的前提**：一个后台服务会创建定时器、
+     * 事件监听、观察者、WebSocket —— 宿主一个都不知道，禁用之后它们会一直活着。
+     */
+    disposables: {
+      add: (dispose: () => void) => addDisposable(pluginId, dispose),
+      size: () => (disposableRegistry.get(pluginId) ?? []).length,
+    },
   };
 }
 
@@ -662,26 +1183,31 @@ function registerModule(registration: PluginModuleRegistration): void {
   const pluginId = loadingPluginId;
   const Component = registration.component;
   const manifest = installed.find((p) => p.id === pluginId)?.manifest;
+  const contract = contracts.get(pluginId);
 
-  const descriptor: ModuleDescriptor = {
-    id: registration.id,
-    name: registration.name || registration.id,
-    displayName: registration.displayName ?? registration.name ?? registration.id,
-    description: registration.description ?? '',
-    icon: registration.icon ?? manifest?.icon ?? 'Package',
-    path: registration.path ?? `/plugins/${registration.id}`,
-    priority: typeof registration.priority === 'number' ? registration.priority : 100,
-    category: registration.category ?? 'plugin',
-    visible: true,
-    disabled: false,
-    badge: registration.badge,
-    component: createLazyComponent(async () => ({ default: Component })),
-    children: undefined,
-    pluginId,
-    // 内联 SVG 随描述符一起传给渲染层。渲染图标是同步路径，
-    // 若等到渲染时再 invoke 读取就会先出现一帧空框，因此在这里取好。
-    iconSvg: resolveInlineIconSvg(pluginId, manifest),
-  };
+  if (contract?.declarative) {
+    // 声明式插件：目录条目在**读清单**时就建立好了，这里只把组件交出去。
+    // 组件不会立刻进目录，而是等那个懒组件被渲染时按 ID 取回 ——
+    // 因此「目录在插件未激活时也是完整的」这件事不会因为这次注册而改变。
+    providedModules.set(providedModuleKey(pluginId, registration.id), Component);
+
+    if (contract.contributions.modules.some((item) => item.id === registration.id)) {
+      console.info(
+        `[pluginRuntime] 声明式插件 "${pluginId}" 提供了模块 "${registration.id}" 的组件`
+      );
+      return;
+    }
+
+    // 没声明的模块：宽容地补进目录，但记一条警告。
+    // 「声明」的价值是让宿主**不必执行代码**就能画界面，而不是限制插件能注册什么；
+    // 但未声明的模块不会出现在那份目录里，因此插件未激活时侧边栏上是没有它的。
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 注册了未在 contributes.modules 里声明的模块 "${registration.id}"，` +
+        `已按注册信息补进目录；声明它才能在插件未激活时也显示在侧边栏`
+    );
+  }
+
+  const descriptor = buildRuntimeModuleDescriptor(pluginId, manifest, registration, Component);
 
   const ok = registerDynamicModule(descriptor, pluginId);
   if (ok) {
@@ -791,6 +1317,23 @@ export interface ModulithHost {
    * 无法可靠地代为暂停。
    */
   useModuleActive: typeof useModuleActive;
+  /**
+   * 宿主能力表。插件用它做**特性探测**，而不是拿 `Modulith.version` 做字符串比较：
+   * `engines.loopcore` 只表达「我要求宿主至少多新」，而且它只提示、不阻断；
+   * 真正决定一段代码能不能跑的，是这里列出的东西。
+   */
+  capabilities: ModulithCapabilities;
+  /**
+   * 登记一个「插件被卸载/禁用/重载时执行」的清理函数。
+   *
+   * 这是**功能型插件**成立的前提。一个只注册模块的插件不需要它 —— 宿主清掉
+   * DOM 与目录条目就够了；但一个后台服务会创建定时器、监听器、观察者、连接，
+   * 宿主一个都不知道，禁用之后它们会一直活着。
+   *
+   * 只在插件加载期间可调用（清理函数必须归属到具体插件，而「当前正在加载哪个插件」
+   * 只有加载期才有确定值）。`ctx.disposables.add` 是它的另一个入口。
+   */
+  onDeactivate: (dispose: () => void) => void;
 }
 
 /** 插件注册命令的实现：加前缀、校验、写入命令注册表 */
@@ -807,9 +1350,27 @@ function registerPluginCommand(command: PluginCommandRegistration): void {
   }
 
   const pluginId = loadingPluginId;
+  const fullId = commandFullId(pluginId, command.id);
+  const contract = contracts.get(pluginId);
+
+  if (contract?.declarative) {
+    // 声明式插件：面板里的**条目**在声明期就登记好了，这里只把 handler 交出去。
+    // 那个条目自己的 run 已经会「先激活、再查 handler」，因此这里**不能**覆盖它 ——
+    // 覆盖掉就等于把「未激活也能看见」这件事一起丢了。
+    if (contract.contributions.commands.some((item) => item.id === command.id)) {
+      commandHandlers.set(fullId, command.run);
+      console.info(`[pluginRuntime] 声明式插件 "${pluginId}" 绑定了命令 "${command.id}"`);
+      return;
+    }
+
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 注册了未在 contributes.commands 里声明的命令 "${command.id}"，` +
+        `已直接加进命令面板；声明它才能在插件未激活时也被搜到`
+    );
+  }
 
   registerCommand({
-    id: `plugin:${pluginId}:${command.id}`,
+    id: fullId,
     title: command.title,
     subtitle: command.subtitle,
     keywords: command.keywords,
@@ -838,6 +1399,22 @@ function installHostGlobals(): void {
     createContext,
     registerCommand: registerPluginCommand,
     useModuleActive,
+    capabilities: HOST_CAPABILITIES,
+    /**
+     * 登记一个「插件被卸载/禁用/重载时执行」的清理函数。
+     *
+     * 与 `ctx.disposables.add` 是同一件事的两个入口：后者需要先 `createContext()`，
+     * 而这个可以在任何地方用。两者都只在加载期可用 —— 清理函数必须归属到具体插件，
+     * 而「当前正在加载哪个插件」只有加载期才有确定值。
+     */
+    onDeactivate: (dispose: () => void) => {
+      if (!loadingPluginId) {
+        throw new Error(
+          'Modulith.onDeactivate() 只能在插件 bundle 加载期间调用（例如 IIFE 顶层）'
+        );
+      }
+      addDisposable(loadingPluginId, dispose);
+    },
   };
 
   (window as unknown as { Modulith: ModulithHost }).Modulith = host;
@@ -860,21 +1437,46 @@ function cleanupInjected(pluginId: string): void {
 /**
  * 清理与插件绑定的非 DOM 资源。
  *
- * 三样东西必须一起摘掉，否则插件被禁用/卸载后会留下指向失效代码的引用：
+ * 四样东西必须一起摘掉，否则插件被禁用/卸载后会留下指向失效代码的引用：
  *   * 图标 SVG 缓存；
  *   * 事件总线上的全部订阅（`unsubscribeBySource`）；
  *   * 它注册到命令注册表的命令（`unregisterCommandsByPrefix`）——
- *     留着的话搜索框里会出现指向已经不存在的能力的条目。
+ *     留着的话搜索框里会出现指向已经不存在的能力的条目；
+ *   * 插件自己登记的清理函数（`ctx.disposables` / `Modulith.onDeactivate`）——
+ *     定时器、监听器、观察者、连接，宿主没有别的途径知道它们存在。
+ *
+ * **声明式插件有一个例外：命令的「声明」要在清理之后贴回去。** 那些条目本来就
+ * 应该在插件未激活时也存在（它们是清单的一部分，不是运行期的产物）；如果不贴回去，
+ * 禁用一次再启用就会让命令面板少掉几条，直到下一次完整重载才恢复。
  */
 function cleanupPluginResources(pluginId: string): void {
   pluginIcons.delete(pluginId);
+  activationStates.delete(pluginId);
+  activationReasons.delete(pluginId);
 
   const removedSubscriptions = unsubscribeBySource(pluginId);
-  const removedCommands = unregisterCommandsByPrefix(`plugin:${pluginId}:`);
 
-  if (removedSubscriptions > 0 || removedCommands > 0) {
+  // 已提供但未落进目录的组件也要一并丢弃：它们闭包指向的旧 bundle 已经作废
+  for (const key of [...providedModules.keys()]) {
+    if (key.startsWith(`${pluginId}::`)) providedModules.delete(key);
+  }
+
+  const removedCommands = unregisterCommandsByPrefix(commandPrefix(pluginId));
+
+  const contract = contracts.get(pluginId);
+  if (contract?.declarative) {
+    for (const key of [...commandHandlers.keys()]) {
+      if (key.startsWith(commandPrefix(pluginId))) commandHandlers.delete(key);
+    }
+    registerDeclaredCommands(pluginId, contract.contributions.commands);
+  }
+
+  const removedDisposables = runDisposables(pluginId);
+
+  if (removedSubscriptions > 0 || removedCommands > 0 || removedDisposables > 0) {
     console.info(
-      `[pluginRuntime] 已清理插件 "${pluginId}" 的资源：事件订阅 ${removedSubscriptions} 个，命令 ${removedCommands} 条`
+      `[pluginRuntime] 已清理插件 "${pluginId}" 的资源：事件订阅 ${removedSubscriptions} 个，` +
+        `命令 ${removedCommands} 条，清理函数 ${removedDisposables} 个`
     );
   }
 }
@@ -920,15 +1522,51 @@ async function loadPlugin(plugin: InstalledPlugin, timeoutMs?: number): Promise<
   }
 }
 
+/**
+ * 提示「清单声明了模块，但插件激活后没有提供对应的组件」。
+ *
+ * 这是一类很具体的笔误：`contributes.modules[].id` 与代码里
+ * `registerModule({ id })` 的 id 对不上。它不会让插件加载失败（另一个模块可能
+ * 一切正常），只会让某一个模块点开时报错，因此在这里一次性把差异说清楚 ——
+ * 否则作者看到的是「插件是好的，只有某一页坏了」，很难联想到是 ID 对不上。
+ */
+function warnAboutUnprovidedModules(
+  pluginId: string,
+  contract: PluginLoadContract | undefined
+): void {
+  if (!contract?.declarative) return;
+
+  const missing = contract.contributions.modules
+    .filter((item) => !providedModules.has(providedModuleKey(pluginId, item.id)))
+    .map((item) => item.id);
+
+  if (missing.length === 0) return;
+
+  console.warn(
+    `[pluginRuntime] 插件 "${pluginId}" 在清单里声明了模块 ${missing.join('、')}，` +
+      `但激活后没有为它们提供组件；打开这些模块时会看到明确的错误提示。` +
+      `请确认 registerModule({ id }) 里的 id 与 contributes.modules[].id 一致`
+  );
+}
+
 /** 插件的实际加载过程（不含超时控制） */
 async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState> {
   const pluginId = plugin.id;
   const manifest = plugin.manifest;
+  const contract = contracts.get(pluginId);
 
-  // 允许重复加载：先清理旧资源与旧模块
+  // 允许重复加载：先清理旧资源与旧模块。
+  //
+  // 目录条目要不要一起清掉，取决于它从哪来：
+  //   * 旧式插件的条目由它自己的 `registerModule()` 建立，因此重载前必须清掉，
+  //     否则改过 ID 的旧条目会一直留在侧边栏里；
+  //   * 声明式插件的条目来自**清单**，清掉就再也回不来 —— 下一次注册发生在激活期，
+  //     而「未激活时侧边栏也应该是完整的」正是这次改动要保住的东西。
   cleanupInjected(pluginId);
   cleanupPluginResources(pluginId);
-  unregisterDynamicModules(pluginId);
+  if (!contract?.declarative) {
+    unregisterDynamicModules(pluginId);
+  }
 
   const assets = { scripts: [] as HTMLScriptElement[], styles: [] as HTMLStyleElement[] };
   injectedAssets.set(pluginId, assets);
@@ -975,11 +1613,32 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
     }
 
     const moduleIds = getPluginModuleIds(pluginId);
-    if (moduleIds.length === 0) {
+
+    // 「加载成功」的判据从 1.2.0 起换了一条。
+    //
+    // 旧判据是「至少注册了一个模块」，它把「插件是什么」与「插件往侧边栏放了什么」
+    // 焊死在一起 —— 于是一个只加三条命令的插件、一个只做后台监听的插件，都会被判为
+    // 加载失败。新判据是「**至少贡献了一样东西**」，而那样东西可以是清单里的声明。
+    //
+    // 这条检查仍然保留，是因为它抓的是另一个真实错误：bundle 不是预期的 IIFE
+    // （打包配置错了、入口文件写错了）—— 那种情况下插件确实什么都没做。
+    const contributed =
+      moduleIds.length > 0 ||
+      (contract?.declarative === true &&
+        (contract.contributions.commands.length > 0 ||
+          contract.contributions.settings.length > 0 ||
+          contract.contributions.contextMenus.length > 0 ||
+          contract.events.length > 0));
+
+    if (!contributed) {
       throw new Error(
-        '插件已加载，但没有注册任何模块。请确认 bundle 调用了 Modulith.registerModule(...)'
+        '插件已加载，但既没有贡献任何东西，也没有声明激活事件。' +
+          '请确认 bundle 调用了 Modulith.registerModule(...)，' +
+          '或在清单里声明 contributes / activationEvents'
       );
     }
+
+    warnAboutUnprovidedModules(pluginId, contract);
 
     const state: PluginLoadState = {
       pluginId,
@@ -994,7 +1653,9 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
     console.error(`[pluginRuntime] 插件 "${pluginId}" 加载失败:`, error);
     cleanupInjected(pluginId);
     cleanupPluginResources(pluginId);
-    unregisterDynamicModules(pluginId);
+    if (!contract?.declarative) {
+      unregisterDynamicModules(pluginId);
+    }
 
     const state: PluginLoadState = {
       pluginId,
@@ -1045,6 +1706,8 @@ export async function reloadPluginRuntime(
   installed = await invoke<InstalledPlugin[]>('list_plugins');
   runtimeLoadedOnce = true;
 
+  configuredTimeoutMs = options.timeoutMs ?? configuredTimeoutMs;
+
   // 清空全部动态模块，避免残留已卸载插件注册的模块
   clearDynamicModules();
 
@@ -1055,10 +1718,51 @@ export async function reloadPluginRuntime(
   // 也就是必须删掉插件重装才生效。统一放在重载入口，所有路径都被覆盖。
   clearModuleComponentCache();
 
-  // 移除列表中已不存在或已禁用的插件资源
-  const activeIds = new Set(
-    installed.filter((p) => p.enabled && p.status !== 'error').map((p) => p.id)
+  // ---- 贡献目录：**只读清单，不执行任何插件代码** ----
+  //
+  // 这一段是 1.2.0 的核心。它跑完之后，侧边栏、命令面板、设置界面、右键菜单
+  // 就已经是完整的了 —— 而此刻一个插件 bundle 都还没有执行过。
+  //
+  // 由此得到三件事：
+  //   * 功能性插件成立（只加命令、只做后台服务，都不再有"必须注册模块"的门槛）；
+  //   * 按需激活成立（插件代码等到用户真的用到它才跑）；
+  //   * 将来把插件挪进独立进程时，宿主仍然画得出完整界面 —— 这是沙箱的前提，
+  //     因为跨 realm 之后"先执行再问它有什么"本身就是一次远程调用。
+  contracts.clear();
+  clearPluginSettings();
+
+  const enabledPlugins = installed.filter((plugin) => plugin.enabled && plugin.status !== 'error');
+  for (const plugin of enabledPlugins) {
+    const contract = resolveLoadContract(plugin.manifest);
+    contracts.set(plugin.id, contract);
+
+    for (const item of contract.issues) {
+      const where = item.index >= 0 ? `${item.kind}[${item.index}]` : item.kind;
+      const text = `[pluginRuntime] 插件 "${plugin.id}" 的清单：${where} ${item.message}`;
+      if (item.level === 'error') console.error(text);
+      else console.warn(text);
+    }
+
+    if (!contract.declarative) continue;
+
+    for (const contribution of contract.contributions.modules) {
+      registerDynamicModule(buildDeclaredModuleDescriptor(plugin, contribution), plugin.id);
+    }
+    registerDeclaredCommands(plugin.id, contract.contributions.commands);
+    registerPluginSettings(plugin.id, contract.contributions.settings);
+  }
+
+  // 设置值要读回来，插件的 `ctx.settings.get()` 才是同步可用的。
+  // 与插件代码一样是异步的，但**必须先于激活完成** —— 因此它在这里 await，
+  // 而不是丢进后台。声明了设置项的插件通常不多，代价可控。
+  await Promise.all(
+    enabledPlugins.map((plugin) =>
+      loadPluginSettingValues(plugin.id, getPluginSettingContributions(plugin.id))
+    )
   );
+
+  // 移除列表中已不存在或已禁用的插件资源
+  const activeIds = new Set(enabledPlugins.map((p) => p.id));
   for (const pluginId of [...injectedAssets.keys()]) {
     if (!activeIds.has(pluginId)) {
       cleanupInjected(pluginId);
@@ -1066,11 +1770,29 @@ export async function reloadPluginRuntime(
       loadStates.delete(pluginId);
     }
   }
+  for (const pluginId of [...contracts.keys()]) {
+    if (!activeIds.has(pluginId)) {
+      contracts.delete(pluginId);
+      unregisterPluginSettings(pluginId);
+    }
+  }
 
-  const pending = installed.filter((plugin) => plugin.enabled && plugin.status !== 'error');
-  const total = pending.length;
+  // 需要**立刻**执行代码的只有两类：旧式插件，以及声明式里标了 eager 的
+  // （`onStartup`，或没有可用激活事件时的降级）。其余插件的 bundle 一直等到
+  // 它被真正用到 —— 这正是「500 个插件」与「500 段代码在启动后全部执行」
+  // 不再是同一件事的地方。
+  const eager = enabledPlugins.filter((plugin) => contracts.get(plugin.id)?.eager !== false);
+  const lazyCount = enabledPlugins.length - eager.length;
+  const total = eager.length;
 
-  onProgress?.(0, total, total === 0 ? '没有已启用的插件' : `发现 ${total} 个已启用插件`);
+  onProgress?.(
+    0,
+    total,
+    enabledPlugins.length === 0
+      ? '没有已启用的插件'
+      : `发现 ${enabledPlugins.length} 个已启用插件` +
+          (lazyCount > 0 ? `，其中 ${lazyCount} 个按需激活` : '')
+  );
 
   // 只取清单：不执行任何插件 bundle。
   // 供「插件延后加载」使用 —— 启动阶段先知道有哪些插件，
@@ -1081,12 +1803,25 @@ export async function reloadPluginRuntime(
   }
 
   let done = 0;
-  for (const plugin of pending) {
+  for (const plugin of eager) {
     await loadPlugin(plugin, options.timeoutMs);
     done += 1;
     const name = plugin.manifest.displayName || plugin.id;
     const failed = loadStates.get(plugin.id)?.status === 'error';
     onProgress?.(done, total, failed ? `${name}（加载失败）` : name);
+  }
+
+  // 执行过的插件要记成"已激活"，否则 `getActivationState()` 会显示成从未激活
+  for (const plugin of eager) {
+    const state = loadStates.get(plugin.id);
+    if (!state) continue;
+    activationStates.set(plugin.id, {
+      pluginId: plugin.id,
+      status: state.status === 'loaded' ? 'active' : 'failed',
+      reason: contracts.get(plugin.id)?.declarative ? 'onStartup' : 'legacy',
+      activatedAt: state.loadedAt,
+      error: state.error,
+    });
   }
 
   notify();
@@ -1095,12 +1830,48 @@ export async function reloadPluginRuntime(
 
 /** 插件运行时加载结果（供后台加载汇报） */
 export interface PluginLoadSummary {
-  /** 尝试加载的插件数 */
+  /** 已启用的插件数 */
   total: number;
-  /** 成功加载的插件数 */
+  /** 本次真正执行了代码的插件数 */
   loaded: number;
+  /** 排队等待激活的插件数（声明式且没有 onStartup） */
+  lazy: number;
   /** 失败的插件 ID 与原因 */
   failures: Array<{ pluginId: string; name: string; error: string }>;
+}
+
+/**
+ * 错峰读取插件图标。
+ *
+ * 为什么不在建立目录时顺手读：那会产生「插件数 × 一次 IPC」的尖峰 ——
+ * 500 个插件就是 500 次读盘，而它们要等到侧边栏真的画出来才有用。放在这里
+ * 让出事件循环，界面先可用，图标随后逐个补上（`setModuleIconSvg` 会通知目录）。
+ *
+ * 只处理**声明式且尚未激活**的插件：已经激活的插件在 `prefetchPluginIcon`
+ * 里读过了 —— 那条路径必须同步读好，因为 `registerModule()` 在 bundle 顶层
+ * 就要把 `iconSvg` 写进描述符。
+ */
+async function prefetchDeclaredIcons(): Promise<void> {
+  const targets = installed.filter((plugin) => {
+    if (!plugin.enabled || plugin.status === 'error') return false;
+    const contract = contracts.get(plugin.id);
+    if (!contract?.declarative) return false;
+    if (pluginIcons.has(plugin.id)) return false;
+    return iconIsSvgFile(plugin.manifest.icon);
+  });
+
+  if (targets.length === 0) return;
+
+  for (const plugin of targets) {
+    await prefetchPluginIcon(plugin);
+    const svg = pluginIcons.get(plugin.id);
+    if (!svg) continue;
+    for (const contribution of contracts.get(plugin.id)?.contributions.modules ?? []) {
+      setModuleIconSvg(contribution.id, svg);
+    }
+    // 让出事件循环：图标不在关键路径上，不该和用户交互抢同一个任务
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
 }
 
 /**
@@ -1122,14 +1893,20 @@ export function loadPluginsInBackground(options: { timeoutMs?: number } = {}): P
   if (backgroundLoad) return backgroundLoad;
 
   const run = async (): Promise<PluginLoadSummary> => {
-    const summary: PluginLoadSummary = { total: 0, loaded: 0, failures: [] };
+    const summary: PluginLoadSummary = { total: 0, loaded: 0, lazy: 0, failures: [] };
     // 让目录进入「加载中」：此时打不开的插件模块应显示「等待插件」
     // 而不是「模块不存在」。
     setPluginCatalogLoading(true);
     try {
+      // 第一步：清单 → 贡献目录（**不执行任何插件代码**），顺带执行其中
+      // 需要立刻跑的那部分（旧式插件与 onStartup）。
       await reloadPluginRuntime(undefined, options);
+
+      // 第二步：错峰补齐图标。它不是关键路径，放在目录建立之后。
+      await prefetchDeclaredIcons();
+
       const states = getLoadStates();
-      const enabled = installed.filter((p) => p.enabled);
+      const enabled = installed.filter((p) => p.enabled && p.status !== 'error');
       summary.total = enabled.length;
       for (const plugin of enabled) {
         const state = states.get(plugin.id);
@@ -1141,10 +1918,14 @@ export function loadPluginsInBackground(options: { timeoutMs?: number } = {}): P
             name: plugin.manifest.displayName || plugin.id,
             error: state.error ?? '未知错误',
           });
+        } else if (contracts.get(plugin.id) && !contracts.get(plugin.id)?.eager) {
+          // 既没执行也没失败：它正等着被用到。这是正常状态，不是问题。
+          summary.lazy += 1;
         }
       }
       console.info(
-        `[pluginRuntime] 后台插件加载完成：${summary.loaded}/${summary.total} 成功` +
+        `[pluginRuntime] 后台插件加载完成：${summary.loaded}/${summary.total} 已执行` +
+          (summary.lazy > 0 ? `，${summary.lazy} 个按需激活` : '') +
           (summary.failures.length > 0 ? `，${summary.failures.length} 个失败` : '')
       );
     } catch (error) {

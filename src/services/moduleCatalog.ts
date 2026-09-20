@@ -147,6 +147,29 @@ export function unregisterDynamicModules(pluginId: string): void {
   if (changed) notifyCatalog();
 }
 
+/**
+ * 补上某个模块的内联 SVG 图标。
+ *
+ * 为什么需要「后补」这条路：声明式插件的模块条目在**读清单**时就建立了，
+ * 那一刻只拿得到图标**路径**；而 SVG 的内容要通过 `read_plugin_asset` 异步读
+ * （模块图标的渲染路径是同步的，见 `prefetchPluginIcon` 的说明）。
+ *
+ * 于是图标分两步：先建立条目（侧边栏立刻出现，用回退图标），随后在错峰的
+ * 后台 pass 里逐个读回来补上。**这样启动时不产生「插件数 × 一次 IPC」的尖峰** ——
+ * 而那正是「读清单即可建立完整界面」要保住的东西。
+ *
+ * 返回是否命中了一个已存在的模块：没命中（模块已被卸载）时调用方不必报错。
+ */
+export function setModuleIconSvg(moduleId: string, iconSvg: string): boolean {
+  const module = dynamicModules.get(moduleId);
+  if (!module || !iconSvg) return false;
+  if (module.iconSvg === iconSvg) return false;
+
+  dynamicModules.set(moduleId, { ...module, iconSvg });
+  notifyCatalog();
+  return true;
+}
+
 /** 清空全部动态模块（重新加载插件前调用） */
 export function clearDynamicModules(): void {
   const changed = dynamicModules.size > 0;
