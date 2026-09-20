@@ -29,6 +29,13 @@ export interface NetLogEntry {
   direction: 'outbound' | 'inbound';
   /** `host` / `plugin:<id>` / `module:<id>` */
   source: string;
+  /**
+   * 这次请求是干什么用的（"插件市场索引"/"网络诊断"/"插件包下载"…）。
+   *
+   * 只有 `source` 时，用户看到"模块 plugins 连了 cdn.jsdelivr.net"仍然分不清
+   * 那是在取索引、取说明还是在下载插件包 —— 而"要不要放它过去"恰恰取决于这个。
+   */
+  purpose: string;
   method: string;
   host: string;
   url: string;

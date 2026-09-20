@@ -576,6 +576,41 @@ if (!existsSync(join(PROJECT_ROOT, NOTES_PLAIN))) {
   }
 }
 
+// ============================================================
+// 界面文本里的字面 Markdown
+// ============================================================
+
+// 与上面 release notes 那条**是同一个问题**：一段不经过 Markdown 渲染的文本里
+// 写了 `**粗体**`，用户看到的就是一串星号。区别只在载体 —— 那边是更新卡片，
+// 这边是界面本身。
+//
+// 起因是一次真实的笔误：网络设置页的说明从文档里抄过来，把
+// `**本地回环地址不受影响**` 原样留在了 JSX 里。这类错误看界面能发现，
+// 但前提是你正好看到那一页；而它出现的规律恰恰是"新写的、还没人看过的文案"。
+//
+// 注释已被 `stripComments` 剥掉，因此本仓库里大量**刻意**写在注释里的星号写法
+// 不会被误判 —— 这是这条检查能成立的前提（第一版没剥干净，53 个文件报了 24 处，
+// 其中 23 处是注释）。
+console.log('界面文本：');
+
+const literalStars: string[] = [];
+for (const file of walk(join(PROJECT_ROOT, 'src'))) {
+  if (extname(file) !== '.tsx') continue;
+  const source = stripComments(readFileSync(file, 'utf-8'));
+  source.split(/\r?\n/).forEach((line, index) => {
+    if (/\*\*[^*\n]+\*\*/.test(line)) {
+      literalStars.push(`${relative(PROJECT_ROOT, file).replace(/\\/g, '/')}:${index + 1}`);
+    }
+  });
+}
+
+check(
+  literalStars.length === 0,
+  literalStars.length === 0
+    ? '没有 JSX 文本把 Markdown 粗体当字面量显示'
+    : `JSX 文本里出现了字面 Markdown 粗体（用户会看到星号）：\n      ${literalStars.join('\n      ')}`
+);
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

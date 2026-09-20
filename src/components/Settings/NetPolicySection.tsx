@@ -107,8 +107,9 @@ const NetPolicySection: React.FC<Props> = ({ settings, onUpdate }) => {
           <div className="min-w-0">
             <p className="text-sm font-medium text-gray-900">离线模式</p>
             <p className="mt-0.5 text-[11px] text-gray-500 leading-relaxed">
-              开启后一切对外请求被拒。**本地回环地址不受影响** —— 拒绝 localhost
-              会让本地开发与诊断一起失效。
+              开启后一切对外请求被拒。
+              <span className="font-medium text-gray-700">本地回环地址不受影响</span>
+              —— 拒绝 localhost 会让本地开发与诊断一起失效。
             </p>
           </div>
           <Toggle
@@ -188,8 +189,14 @@ const NetPolicySection: React.FC<Props> = ({ settings, onUpdate }) => {
           <div className="min-w-0">
             <p className="text-sm font-medium text-gray-900">流量日志</p>
             <p className="mt-0.5 text-[11px] text-gray-500 leading-relaxed">
-              最近 {entries.length} 条出站记录。**它是诊断用的，不是审计**：存在内存里、
-              有上限、应用重启即清空。
+              最近 {entries.length} 条出站记录。
+              <span className="font-medium text-gray-700">它是诊断用的，不是审计</span>
+              ：存在内存里、有上限、应用重启即清空。
+            </p>
+            <p className="mt-1 text-[11px] text-gray-400 leading-relaxed">
+              应用更新（检查与下载）走更新器自带的传输，
+              <span className="font-medium text-gray-500">不在这张表里</span>
+              —— 它只在发起前受策略拦截。
             </p>
           </div>
           <div className="shrink-0 flex items-center gap-1.5">
@@ -232,8 +239,9 @@ const NetPolicySection: React.FC<Props> = ({ settings, onUpdate }) => {
                       <td className="px-3 py-2 whitespace-nowrap text-gray-400">
                         {entry.at.slice(11, 19)}
                       </td>
-                      <td className="px-2 py-2 whitespace-nowrap text-gray-600">
-                        {describeSource(entry.source)}
+                      <td className="px-2 py-2 whitespace-nowrap">
+                        <div className="text-gray-600">{describeSource(entry.source)}</div>
+                        <div className="text-[10px] text-gray-400">{entry.purpose}</div>
                       </td>
                       <td className="px-2 py-2 whitespace-nowrap text-gray-500">
                         {entry.method}
