@@ -3,6 +3,21 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.1.8] - 2026-09-20
+
+### Added
+
+- 插件说明按 Markdown 渲染
+
+### Fixed
+
+- 发行版里毛玻璃开关失效 —— 只在打包后复现
+- 修掉 private_interfaces 警告
+
+### Documentation
+
+- 同步文档，并记录本轮改动与一处未处理的注入面
+
 ## [1.1.7] - 2026-09-20
 
 ### Added
