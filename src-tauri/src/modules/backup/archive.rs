@@ -200,7 +200,12 @@ fn walk_dir(dir: &Path, prefix: &str, out: &mut Vec<CollectedEntry>) -> Result<(
 }
 
 /// 收集要写进备份的全部文件（已按包内路径排序）
-pub fn collect_entries(
+///
+/// **不对外公开。** `CollectedEntry` 是本模块的内部表示（它带着磁盘上的绝对路径），
+/// 而导出与统计只需要「有多少、有多大」。此前它是 `pub` 而返回类型是私有的，
+/// 于是 rustc 报 `private_interfaces` —— 那个警告指出的其实是真实的设计问题：
+/// 一个不该被外部调用的函数暴露在了模块边界上，只是平时没人注意。
+fn collect_entries(
     roots: &Roots,
     selected: &[&CategorySpec],
 ) -> Result<Vec<CollectedEntry>, String> {
