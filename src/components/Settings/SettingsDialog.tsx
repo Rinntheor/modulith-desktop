@@ -28,6 +28,7 @@ import {
   FileText,
   Bell,
   Archive,
+  Settings2,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
@@ -37,6 +38,7 @@ import NetworkSettings from './NetworkSettings';
 import NotificationSettings from './NotificationSettings';
 import BackupSettings from './BackupSettings';
 import SecuritySettings from './SecuritySettings';
+import PluginSettingsSection from './PluginSettingsSection';
 import Toggle from './Toggle';
 import UpdateChecker from './UpdateChecker';
 import { getCatalogModules } from '../../services/moduleCatalog';
@@ -65,6 +67,7 @@ export type SettingsSectionId =
   | 'backup'
   | 'security'
   | 'plugins'
+  | 'plugin-settings'
   | 'market'
   | 'about';
 
@@ -82,6 +85,7 @@ const SECTIONS: SectionDef[] = [
   { id: 'backup', label: '备份', icon: Archive },
   { id: 'security', label: '安全', icon: ShieldCheck },
   { id: 'plugins', label: '插件', icon: Puzzle },
+  { id: 'plugin-settings', label: '插件设置', icon: Settings2 },
   { id: 'market', label: '市场', icon: Store },
   { id: 'about', label: '关于', icon: Info },
 ];
@@ -729,6 +733,15 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                     {/* 经 ModuleEmbed 动态导入：外壳不静态依赖业务模块，
                         因此删除 src/modules/plugins/ 不会让外壳编译失败。 */}
                     <ModuleEmbed moduleId="plugins" />
+                  </div>
+                )}
+
+                {section === 'plugin-settings' && (
+                  <div className="px-6 py-5">
+                    {/* 内容是**清单声明**驱动渲染的，不执行任何插件代码 ——
+                        这与上面那一格（插件管理页要读运行时状态）是两回事，
+                        因此它是普通组件而不是 ModuleEmbed。 */}
+                    <PluginSettingsSection onOpenPlugins={() => setSection('plugins')} />
                   </div>
                 )}
 
