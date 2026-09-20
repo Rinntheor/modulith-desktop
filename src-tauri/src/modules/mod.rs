@@ -10,6 +10,7 @@
 pub mod auth;
 pub mod backup;
 pub mod logging;
+pub mod net;
 pub mod notifications;
 pub mod plugins;
 pub mod settings;
@@ -24,6 +25,7 @@ pub fn register_all(registry: &mut ModuleRegistry) -> Result<(), crate::core::re
     registry.register(Box::new(auth::AuthModule))?;
     registry.register(Box::new(backup::BackupModule))?;
     registry.register(Box::new(logging::LoggingModule))?;
+    registry.register(Box::new(net::NetModule))?;
     registry.register(Box::new(notifications::NotificationsModule))?;
     registry.register(Box::new(plugins::PluginsModule))?;
     registry.register(Box::new(settings::SettingsModule))?;
@@ -38,6 +40,7 @@ pub fn list_all_module_ids() -> Vec<String> {
         auth::AuthModule.id().to_string(),
         backup::BackupModule.id().to_string(),
         logging::LoggingModule.id().to_string(),
+        net::NetModule.id().to_string(),
         notifications::NotificationsModule.id().to_string(),
         plugins::PluginsModule.id().to_string(),
         settings::SettingsModule.id().to_string(),

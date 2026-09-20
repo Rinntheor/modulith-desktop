@@ -90,6 +90,20 @@ export interface AppSettings {
    */
   networkMode: NetworkMode;
   /**
+   * 出站策略：`allow`（默认，放行并记录）/ `ask`（**尚未实现，界面禁用**）/ `deny`。
+   *
+   * **判定点不在前端。** 判定在 Rust（`modules/net/policy.rs`，纯函数、有真值表测试），
+   * 因为请求由 Rust 发起；这里只存值。前端再判一次只会多出一套可能与后端分叉的规则。
+   */
+  networkPolicy: 'allow' | 'ask' | 'deny';
+  /**
+   * 离线模式：开启后**一切对外请求被拒**，本地回环不受影响。
+   *
+   * 它与 `networkPolicy` **互不覆盖**：离线是"现在别联网"，策略是"默认怎么办"。
+   * 把离线做成策略的第四档，会让用户改回默认档时顺手把离线一起解除。
+   */
+  offlineMode: boolean;
+  /**
    * 下载源根地址（例如 `https://gh-proxy.org`）。
    *
    * 语义是**前缀**：原始地址会被整条接在它后面
@@ -268,6 +282,11 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   networkMode: 'direct',
   // 与后端 default_github_proxy() 一致：还没填
   githubProxy: '',
+  // 与后端 default_network_policy() 一致：默认放行并记录。
+  // 出站管控的第一版是"先看得见"，不是"先拦得住" —— 用户要先能看到这软件在连什么，
+  // 才有依据决定要不要收紧。
+  networkPolicy: 'allow',
+  offlineMode: false,
   // 与后端 default_file_logging_enabled() 一致：日志默认开着。
   // 用户不会为了排查问题提前打开它，默认关闭等于默认没有证据。
   fileLoggingEnabled: true,
@@ -361,6 +380,13 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     // settings.json 会绕过那次校验；而拼接时代理根里多一个空格会拼出两个地址。
     // 与后端 proxy_base() 的处理保持一致（那里也是先 trim 再拼）。
     githubProxy: normalizeProxyBase(raw?.githubProxy),
+    // 未知取值退回默认档（放行），而不是拒绝 —— 与 Rust 侧 decide() 的选择一致：
+    // 一个损坏的设置不该让应用失去联网能力
+    networkPolicy:
+      raw?.networkPolicy === 'allow' || raw?.networkPolicy === 'ask' || raw?.networkPolicy === 'deny'
+        ? raw.networkPolicy
+        : DEFAULT_APP_SETTINGS.networkPolicy,
+    offlineMode: raw?.offlineMode === true,
     // 只有显式写成 false 才关闭，与 tabBarVisible / autoCheckUpdates 同一约定
     fileLoggingEnabled: raw?.fileLoggingEnabled !== false,
     crashLoggingEnabled: raw?.crashLoggingEnabled !== false,

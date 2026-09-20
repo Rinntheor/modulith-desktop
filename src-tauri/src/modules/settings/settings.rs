@@ -142,6 +142,20 @@ pub struct AppSettings {
     /// 格式校验（https / 无空白 / 无查询串 / 无凭据）见 `network.rs`。
     #[serde(default = "default_github_proxy")]
     pub github_proxy: String,
+    /// 出站策略：`allow`（默认）/ `ask`（**尚未实现，界面禁用**）/ `deny`
+    ///
+    /// 默认是**放行并记录** —— 出站管控的第一版是"先看得见"，不是"先拦得住"。
+    /// 判定逻辑在 `modules/net/policy.rs`（纯函数、有真值表测试），这里只存取值：
+    /// 权限与策略的检查点都必须落在**动作真正发生**的那一侧（Rust），前端不重复判断。
+    #[serde(default = "default_network_policy")]
+    pub network_policy: String,
+    /// 离线模式：开启后**一切对外请求被拒**，本地回环不受影响。
+    ///
+    /// 它与 `network_policy` **互不覆盖**：离线是"现在别联网"，策略是"默认怎么办"。
+    /// 把离线做成策略的第四档，会让用户改回默认档时顺手把离线一起解除 ——
+    /// 那不是他按这个开关时想要的事。
+    #[serde(default)]
+    pub offline_mode: bool,
     /// 是否把运行日志实时写入文件
     ///
     /// 默认 `true`。日志是「出问题时唯一的证据」，而用户不会为了排查问题
@@ -382,6 +396,11 @@ pub const MAX_SPLIT_RATIO: f32 = 0.8;
 /// 用显式的默认值函数而不是裸 `#[serde(default)]`，是为了让四个新字段的默认值
 /// 都出现在同一个位置 —— 混用两种写法时，「这个字段缺省是什么」要靠人记住
 /// `String` 的 `Default` 是空串，而那不是一眼能看出来的。
+/// 默认放行。见 `network_policy` 字段上的说明：第一版的目标是可观测性
+fn default_network_policy() -> String {
+    "allow".to_string()
+}
+
 fn default_github_proxy() -> String {
     String::new()
 }
@@ -461,6 +480,8 @@ impl Default for AppSettings {
             last_update_check_at: None,
             network_mode: default_network_mode(),
             github_proxy: default_github_proxy(),
+            network_policy: default_network_policy(),
+            offline_mode: false,
             file_logging_enabled: default_file_logging_enabled(),
             crash_logging_enabled: default_crash_logging_enabled(),
             performance_mode: default_performance_mode(),

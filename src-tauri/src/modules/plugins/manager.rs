@@ -1401,6 +1401,34 @@ impl PluginManager {
             )));
         }
 
+        // ---- 出站策略与流量日志 ----
+        //
+        // 判定点放在这里：**Rust 侧、真正发请求之前**，与权限检查同一位置。
+        // 前端不重复判断 —— 一套可能与后端分叉的规则比没有规则更糟。
+        //
+        // 每次请求读一次设置，而不是把策略缓存在内存里：缓存需要回答"设置什么时候变了"，
+        // 而那是一条必然会漏一处的同步路径。代价是每个请求一次文件读 —— 网络请求本身
+        // 比它贵几个数量级，这笔账划得来。
+        let net_settings = settings_store::load(&self.app);
+        let decision =
+            crate::modules::net::policy::decide(&net_settings.network_policy, net_settings.offline_mode);
+        let log_entry = crate::modules::net::log::NetLogEntry::outbound(
+            &crate::modules::net::plugin_source(id),
+            &method.to_uppercase(),
+            url,
+            &host,
+        );
+
+        if let crate::modules::net::policy::Decision::Deny(reason) = decision {
+            crate::modules::net::log::record(
+                log_entry.with_outcome("denied", Some(reason.to_string())),
+            );
+            return Err(PluginError::PermissionDenied(format!(
+                "插件 {} 的请求被出站策略拒绝：{}",
+                id, reason
+            )));
+        }
+
         let mut request = self
             .client
             .request(
@@ -1425,8 +1453,19 @@ impl PluginManager {
             request = request.body(body);
         }
 
-        let response = request.send().await?;
+        // 失败也要留痕：一条"没发出去"的日志，比一条缺失的日志有用得多 ——
+        // 后者会让用户以为插件根本没尝试过联网
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                crate::modules::net::log::record(
+                    log_entry.clone().with_outcome("failed", Some(error.to_string())),
+                );
+                return Err(error.into());
+            }
+        };
         let status = response.status().as_u16();
+        crate::modules::net::log::record(log_entry.with_response(status, response.content_length()));
 
         let mut response_headers: HashMap<String, String> = HashMap::new();
         for (name, value) in response.headers().iter() {
