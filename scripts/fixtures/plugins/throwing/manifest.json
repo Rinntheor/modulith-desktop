@@ -1,0 +1,11 @@
+{
+  "name": "fixture.throwing",
+  "displayName": "顶层抛错的插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具：bundle 顶层抛错，不得影响其它插件",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "index.js",
+  "icon": "Package"
+}

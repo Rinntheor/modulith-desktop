@@ -1,0 +1,13 @@
+{
+  "name": "fixture.duplicate-module",
+  "displayName": "抢占他人模块 ID 的插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具：注册别的插件已声明的模块 ID，必须被拒绝",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "index.js",
+  "icon": "Package",
+  "contributes": { "modules": [{ "id": "shadow-panel", "name": "影子面板" }] },
+  "activationEvents": ["onModule:shadow-panel"]
+}

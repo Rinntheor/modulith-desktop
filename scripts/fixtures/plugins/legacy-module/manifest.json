@@ -1,0 +1,11 @@
+{
+  "name": "fixture.legacy-module",
+  "displayName": "旧式模块插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具：清单里没有 contributes，行为必须与 1.2.0 之前逐字一致",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "index.js",
+  "icon": "Package"
+}

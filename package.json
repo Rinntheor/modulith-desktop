@@ -16,6 +16,7 @@
     "check:performance": "node scripts/check-performance.ts",
     "check:theme": "node scripts/check-theme.ts",
     "check:contributions": "node scripts/check-contributions.ts",
+    "check:plugin-runtime": "node --import ./scripts/harness/loader.mjs scripts/check-plugin-runtime.ts",
     "check:sounds": "node scripts/check-sounds.ts",
     "check:backup": "node scripts/check-backup.ts",
     "check:markdown": "node scripts/check-markdown.ts",

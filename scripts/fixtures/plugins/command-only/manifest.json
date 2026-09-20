@@ -1,0 +1,16 @@
+{
+  "name": "fixture.command-only",
+  "displayName": "纯命令插件",
+  "version": "1.0.0",
+  "description": "没有任何界面，只加命令与右键菜单项",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "index.js",
+  "icon": "Package",
+  "contributes": {
+    "commands": [{ "id": "ping", "title": "探测一次" }],
+    "contextMenus": [{ "id": "menu-ping", "label": "探测端口", "command": "ping" }]
+  },
+  "activationEvents": ["onCommand:ping", "onContextMenu:menu-ping"]
+}
