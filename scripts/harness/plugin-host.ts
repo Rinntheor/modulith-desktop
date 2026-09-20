@@ -240,6 +240,11 @@ export async function createPluginHost(): Promise<PluginHost> {
       throw new Error(`插件 "${id}" 没有资源 "${rel}"`);
     },
 
+    // 夹具的插件都没有 README（磁盘上确实没有那个文件），因此如实返回 null。
+    // 详情页那条路径的覆盖留给将来真的需要它的测试 —— 一个"编造一份 README"的桩
+    // 只会让测试更容易通过，而不是更可信。
+    read_plugin_readme: () => null,
+
     plugin_storage_get: ({ id, key }) => {
       requireStorage(String(id));
       return bucket(String(id)).get(String(key)) ?? null;

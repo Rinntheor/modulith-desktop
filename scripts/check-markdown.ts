@@ -545,12 +545,33 @@ check(libRs.includes('read_plugin_asset'), 'README 仍由后端资源接口提�
 //     **不解析 Markdown**，所以 `#` 与 `**` 会原样露出来。
 //   * `release/notes-github.md` → 直接贴到 GitHub Release，那里解析 Markdown。
 //
-// 这条断言把两者的分工固定下来：纯文本那份不许出现块级 Markdown 语法。
+// 这条断言把两者的分工固定下来：纯文本那份不许出现块级 Markdown 语法；
+// 两份说明必须指的是同一个版本。
+//
+// ---------------------------------------------------------------------------
+// 这里原先还有一条「`notes-github.md` 里指明了纯文本版的位置」。它**在正确使用
+// 的情况下必然失败**，因此删掉：
+//
+// 要它成立，就得在 `notes-github.md` 开头写一段指向 `release/notes.md` 的内部
+// 注记；而那段话是给自己看的（"这份不进 latest.json，直接贴到 GitHub 即可"），
+// 贴在公开的 Release 页面上并不合适。于是每个照做的人都要在发布前删掉它，删掉
+// 之后检查就红 —— **它逼着人在「检查通过」与「发布得体」之间二选一**。
+//
+// 分工其实已经由上面两条固定住了（一边有 Markdown 标题、一边没有）。真正值得
+// 守的是另一件事：两份说明指的是不是**同一个版本** —— 那才是"拿错"的实际后果，
+// 而不是"没写指针"。
+// ---------------------------------------------------------------------------
 
 console.log('\n发布说明的两份形态：');
 
 const NOTES_PLAIN = 'release/notes.md';
 const NOTES_GITHUB = 'release/notes-github.md';
+
+/** 第一行非空内容，并去掉 Markdown 标题记号 —— 两份文件的"同一版本"就比对它 */
+function titleOf(source: string): string {
+  const first = source.split(/\r?\n/).find((line) => line.trim().length > 0) ?? '';
+  return first.replace(/^#+\s*/, '').trim();
+}
 
 if (!existsSync(join(PROJECT_ROOT, NOTES_PLAIN))) {
   console.log(`  • 跳过：${NOTES_PLAIN} 不存在（release/ 与 .gitignore 一同排除）`);
@@ -570,7 +591,14 @@ if (!existsSync(join(PROJECT_ROOT, NOTES_PLAIN))) {
   if (existsSync(join(PROJECT_ROOT, NOTES_GITHUB))) {
     const github = read(NOTES_GITHUB);
     check(/^#{1,6}\s/m.test(github), `${NOTES_GITHUB} 确实用了 Markdown 标题（它是给 GitHub 的那份）`);
-    check(github.includes(NOTES_PLAIN), `${NOTES_GITHUB} 里指明了纯文本版的位置，避免拿错`);
+    // 两份说明写的是同一个版本 —— 这是"拿错"真正的后果：把上一版的说明贴到这一版
+    const plainTitle = titleOf(plain);
+    check(
+      plainTitle.length > 0 && plainTitle === titleOf(github),
+      plainTitle.length > 0 && plainTitle === titleOf(github)
+        ? `两份说明指的是同一个版本（"${plainTitle}"）`
+        : `两份说明的首行指的不是同一个版本：${NOTES_PLAIN} 是 "${plainTitle}"，${NOTES_GITHUB} 是 "${titleOf(github)}"`
+    );
   } else {
     console.log(`  • 跳过：${NOTES_GITHUB} 不存在`);
   }

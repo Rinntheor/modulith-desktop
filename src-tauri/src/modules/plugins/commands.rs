@@ -163,6 +163,23 @@ pub async fn read_plugin_asset(
     manager.read_asset(&id, &rel).map_err(to_msg)
 }
 
+/// 按需读取某个插件的 README（详情页用）。
+///
+/// **与 `list_plugins` 分开是刻意的。** README 只在用户真的打开插件详情时才有价值，
+/// 而列表在每次启停插件、每次进插件页时都会重新拉一遍。500 个插件一起列出时，
+/// 那些文本会被逐个读出来再跨 IPC 传过去 —— 十几 MB，而列表页一个字节都用不到。
+///
+/// 返回 `None` 表示这个插件没有 README（不是错误）。走 `asset_root`，因此开发链接
+/// 的插件读到的是源目录里那一份。
+#[tauri::command]
+pub async fn read_plugin_readme(
+    state: State<'_, PluginState>,
+    id: String,
+) -> Result<Option<String>, String> {
+    let manager = state.inner().0.read().await;
+    manager.readme(&id).map_err(to_msg)
+}
+
 #[tauri::command]
 pub async fn export_plugin(
     state: State<'_, PluginState>,

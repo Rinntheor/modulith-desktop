@@ -532,7 +532,6 @@ pub struct InstalledPlugin {
     pub source: String,
     pub size_bytes: u64,
     pub has_style: bool,
-    pub readme: Option<String>,
     /// 开发链接：该插件正在从哪个源目录实时读取（「从目录安装」才有）。
     ///
     /// 界面据此显示「开发模式」标记，让用户明白为什么改完源目录点刷新就生效、
@@ -564,6 +563,19 @@ pub struct RegistryEntry {
     /// 旧注册表里没有这个字段，`serde(default)` 让它们照常加载。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
+    /// 插件目录的字节数，**安装时算一次存下来**。
+    ///
+    /// 为什么缓存：`dir_size` 要递归遍历整个插件目录，500 个插件就是 500 次递归 ——
+    /// 而它只为在卡片上显示一行"磁盘占用"。列表是每次启停插件都会重走的路，
+    /// 这个成本不该由它承担。
+    ///
+    /// 为什么是 `Option`：旧注册表没有这个字段。`None` 表示"还没算过"，
+    /// 由 `PluginManager::new` 做一次性补齐（见那里的说明），而不是每次列表都算。
+    ///
+    /// **开发链接的插件不读这个值** —— 它的源目录随时在变，实时算才是对的
+    /// （见 `to_installed`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
 }
 
 /// registry.json 文件结构

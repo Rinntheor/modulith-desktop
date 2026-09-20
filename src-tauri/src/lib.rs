@@ -134,6 +134,7 @@ pub fn run() -> Result<(), tauri::Error> {
         set_plugin_enabled,
         uninstall_plugin,
         read_plugin_asset,
+        read_plugin_readme,
         export_plugin,
         pick_plugin_package,
         pick_plugin_folder,
