@@ -1,0 +1,13 @@
+{
+  "name": "fixture.declarative-icon",
+  "displayName": "带 SVG 图标的声明式插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具：图标文件的读取与目录重建后的补全",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "index.js",
+  "icon": "icon.svg",
+  "contributes": { "modules": [{ "id": "icon-panel", "name": "图标面板" }] },
+  "activationEvents": ["onModule:icon-panel"]
+}

@@ -64,7 +64,6 @@ import {
   registerPluginSettings,
   setPluginSetting,
   subscribePluginSettings,
-  unregisterPluginSettings,
 } from './pluginSettings';
 
 /**
@@ -1761,21 +1760,31 @@ export async function reloadPluginRuntime(
     )
   );
 
-  // 移除列表中已不存在或已禁用的插件资源
+  // 移除列表中已不存在或已禁用的插件资源。
+  //
+  // **不能只遍历 `injectedAssets`**：只有执行过代码的插件才有条目，而
+  // `pluginIcons` 会被错峰预取填充（`prefetchDeclaredIcons`）—— 一个从未被激活过的
+  // 声明式插件同样会在里面留下一条。卸载时漏掉它，重装后那份**旧图标**会被后面
+  // 的 `prefetchDeclaredIcons` 当成"已经有了"继续使用（`iconIsSvgFile` 只看清单里
+  // 的路径，路径没变），表现是「重装之后显示的仍是上一个插件的图标」。
   const activeIds = new Set(enabledPlugins.map((p) => p.id));
-  for (const pluginId of [...injectedAssets.keys()]) {
-    if (!activeIds.has(pluginId)) {
-      cleanupInjected(pluginId);
-      cleanupPluginResources(pluginId);
-      loadStates.delete(pluginId);
-    }
+  const knownIds = new Set<string>([
+    ...injectedAssets.keys(),
+    ...pluginIcons.keys(),
+    ...loadStates.keys(),
+    ...activationStates.keys(),
+  ]);
+  for (const pluginId of knownIds) {
+    if (activeIds.has(pluginId)) continue;
+    cleanupInjected(pluginId);
+    cleanupPluginResources(pluginId);
+    loadStates.delete(pluginId);
   }
-  for (const pluginId of [...contracts.keys()]) {
-    if (!activeIds.has(pluginId)) {
-      contracts.delete(pluginId);
-      unregisterPluginSettings(pluginId);
-    }
-  }
+
+  // 原先这里还有一个遍历 `contracts.keys()` 的清理循环。它是**死代码**：
+  // 上面第 1735 行刚刚 `contracts.clear()`，因此此时的键全是本次的活跃插件，
+  // `!activeIds.has(...)` 永远不成立。它想清的东西（契约与插件设置）已经由
+  // `contracts.clear()` 与 `clearPluginSettings()` 覆盖。
 
   // 需要**立刻**执行代码的只有两类：旧式插件，以及声明式里标了 eager 的
   // （`onStartup`，或没有可用激活事件时的降级）。其余插件的 bundle 一直等到
@@ -1824,6 +1833,16 @@ export async function reloadPluginRuntime(
     });
   }
 
+  // 补齐**没有执行过**的声明式插件的图标。
+  //
+  // 放在这个入口，而不是只放在 `loadPluginsInBackground` 里：目录每次重载都被
+  // `clearDynamicModules()` 清空重建，而图标是"后补"的（见 `setModuleIconSvg`）。
+  // 「安装 / 卸载 / 启用 / 禁用」这四条路径只调 `reloadPluginRuntime()`，
+  // 重建完目录就没有下文了 —— 表现正是「装完插件图标不出现，重启之后才出现」。
+  //
+  // 补全是错峰的（内部每次读盘之间让出事件循环），不是在这里同步读完。
+  await prefetchDeclaredIcons();
+
   notify();
   return installed;
 }
@@ -1852,18 +1871,23 @@ export interface PluginLoadSummary {
  * 就要把 `iconSvg` 写进描述符。
  */
 async function prefetchDeclaredIcons(): Promise<void> {
-  const targets = installed.filter((plugin) => {
+  const candidates = installed.filter((plugin) => {
     if (!plugin.enabled || plugin.status === 'error') return false;
     const contract = contracts.get(plugin.id);
     if (!contract?.declarative) return false;
-    if (pluginIcons.has(plugin.id)) return false;
     return iconIsSvgFile(plugin.manifest.icon);
   });
 
-  if (targets.length === 0) return;
-
-  for (const plugin of targets) {
-    await prefetchPluginIcon(plugin);
+  for (const plugin of candidates) {
+    // 缓存只用来省掉**读盘**，不能用来省掉 `setModuleIconSvg`。
+    //
+    // 这里原先写的是「已经有图标就整个跳过」，那是一个真实的缺陷：目录在每次
+    // 重载时都被 `clearDynamicModules()` 清空重建，而重建出来的条目 `iconSvg`
+    // 是空的 —— 跳过它，图标就再也没人补。表现是「装完插件图标不出现，
+    // 刷新（重启）之后才出现」，因为只有重启才会让这份缓存一起消失。
+    if (!pluginIcons.has(plugin.id)) {
+      await prefetchPluginIcon(plugin);
+    }
     const svg = pluginIcons.get(plugin.id);
     if (!svg) continue;
     for (const contribution of contracts.get(plugin.id)?.contributions.modules ?? []) {
@@ -1899,11 +1923,9 @@ export function loadPluginsInBackground(options: { timeoutMs?: number } = {}): P
     setPluginCatalogLoading(true);
     try {
       // 第一步：清单 → 贡献目录（**不执行任何插件代码**），顺带执行其中
-      // 需要立刻跑的那部分（旧式插件与 onStartup）。
+      // 需要立刻跑的那部分（旧式插件与 onStartup），并在末尾补齐未激活插件的图标。
+      // 图标补全在 `reloadPluginRuntime` 内部完成，这里不再重复调用。
       await reloadPluginRuntime(undefined, options);
-
-      // 第二步：错峰补齐图标。它不是关键路径，放在目录建立之后。
-      await prefetchDeclaredIcons();
 
       const states = getLoadStates();
       const enabled = installed.filter((p) => p.enabled && p.status !== 'error');

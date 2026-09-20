@@ -356,7 +356,7 @@ console.log('\n规模（全部夹具一起装）：');
   const lazyFixtures = ['fixture.declarative-module', 'fixture.command-only', 'fixture.duplicate-module'];
   const ranLazy = ran.filter((id) => lazyFixtures.includes(id));
 
-  check(all.length === 8, `夹具数量为 8（当前 ${all.length}）`);
+  check(all.length === 9, `夹具数量为 9（当前 ${all.length}）`);
   check(
     ranLazy.length === 0,
     `★ 按需激活的插件一个都没执行（实际执行了：${ranLazy.join('、') || '无'}）`
@@ -381,6 +381,56 @@ console.log('\n规模（全部夹具一起装）：');
   );
 
   host.useAll();
+}
+
+// ============================================================
+// 9. SVG 图标：目录重建之后必须还在
+// ============================================================
+
+// 这一节守的是一个真实缺陷。图标是**后补**进目录的（`setModuleIconSvg`：清单期
+// 只知道路径，内容要异步读），而目录在每次重载时都被清空重建。于是"补过一次"
+// 被当成了"永远有了"，只有重启（内存清空）才能恢复。
+//
+// 用户看到的是两句话 —— 「删除重装后图标不能立马加载出来，有时要刷新」与
+// 「图标怎么不是它自带的」。两者是同一个根因的两个面：
+//   * `reloadPluginRuntime()` 重建目录后不补图标 → 图标不出现；
+//   * 卸载时只清执行过的插件，`pluginIcons` 里的残留活到重装之后 → 显示旧的。
+console.log('\nSVG 图标在目录重建后的存活：');
+
+{
+  const id = 'fixture.declarative-icon';
+  const svgOf = (): string | undefined =>
+    (catalog.getCatalogFlatMap().get('icon-panel') as { iconSvg?: string } | undefined)?.iconSvg;
+  const isSvg = (value: string | undefined): boolean =>
+    typeof value === 'string' && value.trimStart().startsWith('<svg');
+
+  await loadAll([id]);
+  check(isSvg(svgOf()), '★ 图标在装配完成后被补进了目录');
+  check(
+    !executed().includes(id),
+    '它同时是「按需激活」的 —— 因此图标只能来自补全，不能来自 bundle 执行'
+  );
+
+  // 再重载一次：目录被清空重建。这一步以前会丢图标 —— `prefetchDeclaredIcons`
+  // 看到缓存里已经有它，就把整个循环体跳过了，重建出来的条目再也拿不到 iconSvg。
+  await loadAll([id]);
+  check(isSvg(svgOf()), '★ 重载运行时之后图标仍然在（这是它以前会丢的地方）');
+
+  // 卸载路径：插件从列表里消失时，它的图标缓存必须一起清掉。
+  // 只遍历 `injectedAssets` 是不够的 —— 这个插件从来没执行过代码，在那里根本
+  // 没有条目，而它的图标已经被预取填进了 `pluginIcons`。
+  host.setEnabled(id, false);
+  await runtime.reloadPluginRuntime();
+  check(!catalog.isDynamicModule('icon-panel'), '禁用后模块条目从目录消失');
+
+  host.backendCalls.length = 0;
+  host.setEnabled(id, true);
+  await loadAll([id]);
+  check(isSvg(svgOf()), '禁用再启用之后图标重新补上');
+  check(
+    host.backendCalls.filter((command) => command === 'read_plugin_asset').length > 0,
+    '★ 重新启用后**重新读了图标文件** —— 说明卸载时缓存被清掉了，用的不是上一份'
+  );
 }
 
 // ------------------------------------------------------------

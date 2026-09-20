@@ -67,13 +67,6 @@ export function registerPluginSettings(
   contributionsByPlugin.set(pluginId, contributions);
 }
 
-/** 撤销某个插件的全部设置状态（禁用/卸载时调用） */
-export function unregisterPluginSettings(pluginId: string): void {
-  contributionsByPlugin.delete(pluginId);
-  valuesByPlugin.delete(pluginId);
-  unavailablePlugins.delete(pluginId);
-}
-
 /** 清空全部（重载插件运行时前调用） */
 export function clearPluginSettings(): void {
   contributionsByPlugin.clear();
