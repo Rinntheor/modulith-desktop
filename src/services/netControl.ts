@@ -62,6 +62,46 @@ export function netLogLength(): Promise<number> {
   return invoke<number>('net_log_len');
 }
 
+/**
+ * 上报一次**前端门面拦下的**出站尝试（见 `netGuard.ts`）。
+ *
+ * 后端拿到它之后**用自己的规则重新判一次**并记日志 —— 前端传的是"发生过这件事"，
+ * 不是"结果是什么"。让调用方决定日志内容，等于让日志变成它自己的说法。
+ *
+ * 是 fire-and-forget：判定已经在前端同步做完了，这条只是为了留痕。
+ */
+export function netNoteFrontendOutbound(
+  url: string,
+  method: string,
+  source: string
+): Promise<boolean> {
+  return invoke<boolean>('net_note_frontend_outbound', { url, method, source });
+}
+
+// ============================================================
+// 判定常量（前端镜像）
+// ============================================================
+
+/**
+ * 出站策略的三个取值与两条拒绝原因的原文。
+ *
+ * **这是 `src-tauri/src/modules/net/policy.rs` 的镜像，也是全项目唯一允许存在的
+ * 第二份。** 它存在的理由是同步上下文：WebView 里的 `XMLHttpRequest.send()` 与
+ * `new WebSocket()` 都是同步的，没法等一次 IPC 往返再决定发不发。
+ *
+ * 漂移由 `pnpm check:network` 钉住 —— 那边读 Rust 源文件，断言这里的字面量与它一致。
+ * 这与本文件开头第 1 条纪律（档位描述不手写第二份）不矛盾：那条说的是**给用户看的
+ * 档位说明**（会随实现变化，必须由后端给），这里说的是**判定用的取值**（是协议的一部分，
+ * 两侧必须逐字相同，而"读后端"在同步上下文里做不到）。
+ */
+export const NET_MODE_ALLOW = 'allow';
+export const NET_MODE_ASK = 'ask';
+export const NET_MODE_DENY = 'deny';
+
+export const NET_DENY_OFFLINE = '离线模式已开启';
+export const NET_DENY_POLICY = '出站策略为「禁止出站」';
+export const NET_DENY_DIRECT = '插件不能直接联网，请改用 ctx.http（它带权限检查、出站策略与流量日志）';
+
 // ============================================================
 // 显示辅助
 // ============================================================
