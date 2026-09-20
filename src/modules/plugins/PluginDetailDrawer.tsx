@@ -27,6 +27,7 @@ import {
 } from './pluginMeta';
 import { getPermissionDescriptor } from '../../services/permissionRegistry';
 import { DRAWER_ENTER, DRAWER_EXIT } from '../../utils/motionCurves';
+import Markdown from '../../components/Markdown';
 import type { InstalledPlugin, PluginLoadState } from '../../services/pluginRuntime';
 
 interface PluginDetailDrawerProps {
@@ -400,9 +401,10 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                       <FileText className="w-3.5 h-3.5" />
                       README
                     </h3>
-                    <pre className="text-[11px] leading-relaxed text-gray-700 bg-gray-50 border border-gray-100 rounded-xl p-3 whitespace-pre-wrap break-words max-h-80 overflow-y-auto custom-scrollbar">
-                      {plugin.readme}
-                    </pre>
+                    <div className="bg-gray-50 border border-gray-100 rounded-xl p-3 max-h-80 overflow-y-auto custom-scrollbar">
+                      {/* 与市场详情走同一个渲染器：同一份 README 在两处不该长得不一样 */}
+                      <Markdown source={plugin.readme} />
+                    </div>
                   </section>
                 )}
               </div>

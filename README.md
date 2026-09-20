@@ -171,6 +171,7 @@ modulith-desktop/
 | `pnpm check:theme` | 深色映射覆盖率、遮罩保持半透明、亚层判据与外壳命中区域 |
 | `pnpm check:sounds` | 提示音音色表、包络形状与峰值归一化（用桩音频上下文真跑一遍） |
 | `pnpm check:backup` | 备份的命令接线、恢复门槛与敏感数据两道门 |
+| `pnpm check:markdown` | Markdown 解析的边界（内容不丢、标识符不被当成斜体、危险协议不生成链接），以及两份发布说明的分工 |
 
 ## 提交前检查
 
@@ -183,7 +184,7 @@ cd src-tauri && cargo test --offline --lib
 pnpm check:samples                    # 改了 samples/ 才需要
 pnpm check:semver && pnpm check:update && pnpm check:network
 pnpm check:memory && pnpm check:performance && pnpm check:theme
-pnpm check:sounds && pnpm check:backup
+pnpm check:sounds && pnpm check:backup && pnpm check:markdown
 ```
 
 `cargo test` 里有一条检查**示例包是否与源码一致**：它解压那个 `.lcp` 并逐个文件比对，

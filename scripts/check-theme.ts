@@ -18,7 +18,7 @@
 // 文本核对而不是渲染核对：这个脚本跑在 Node 里，没有浏览器。它守的是
 // 「表是完整的」这个不变量，像素级的观感仍由人看。
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname, relative, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -255,6 +255,59 @@ const tabBarRow = read('src/components/Tabs/TabBar.tsx');
 check(
   tabBarRow.includes('pointer-events-auto'),
   'TabBar 自己声明 pointer-events-auto，交互不受外层容器影响'
+);
+
+// ============================================================
+// 7. 构建产物：只在打包之后才成立的断言
+// ============================================================
+//
+// 为什么必须查产物，而不是只查源码 —— v1.1.7 出过一次**只在发行版复现**的缺陷：
+//
+// `index.css` 里那一对声明原本写作
+//     backdrop-filter: none !important;
+//     -webkit-backdrop-filter: none !important;
+// 压缩器把后者当成前者的等价替代并去重，**删掉了标准的那一份**，产物里只剩
+// `-webkit-backdrop-filter`。开发服务器不做这层压缩，两份都在，所以开发时一切
+// 正常；打包后毛玻璃开关就"直接失效"了。
+//
+// 教训是：「源码里写了」不等于「产物里有」。压缩、tree-shaking、按目标浏览器
+// 降级都会改写产物，而它们失败时是静默的。这一节的断言因此直接读 `dist/`。
+
+console.log('\n构建产物（需要先 pnpm build）：');
+
+const distAssets = join(PROJECT_ROOT, 'dist', 'assets');
+let builtCss: string | null = null;
+if (existsSync(distAssets)) {
+  const candidate = readdirSync(distAssets).find((name) => name.endsWith('.css'));
+  if (candidate) builtCss = readFileSync(join(distAssets, candidate), 'utf-8');
+}
+
+if (builtCss === null) {
+  console.log('  • 跳过：dist/assets 下没有 CSS。改动样式后请先 pnpm build 再看本节。');
+} else {
+  check(
+    /:root\.lc-no-glass[^{]*\{[^}]*backdrop-filter:none!important/.test(builtCss),
+    '产物里 lc-no-glass 规则保留了**标准**的 backdrop-filter: none'
+  );
+  check(
+    /:root\.lc-no-glass[^{]*\{[^}]*-webkit-backdrop-filter:none!important/.test(builtCss),
+    '产物里同时有 -webkit- 前缀版（旧 WebKit 内核需要它）'
+  );
+}
+
+// 源码侧：**不许手写前缀**。
+//
+// 手写 `-webkit-backdrop-filter` 正是让压缩器去重、进而删掉标准声明的**原因**：
+// 工具本来就会按目标浏览器自己补前缀（产物里 Tailwind 的工具类两份都在，就是
+// 它补的）。手写等于替工具做决定，而工具会因此删掉另一份。
+const glassRule = /:root\.lc-no-glass[\s\S]*?\}/.exec(indexCss)?.[0] ?? '';
+check(
+  glassRule.includes('backdrop-filter: none !important'),
+  'lc-no-glass 规则含标准 backdrop-filter 声明'
+);
+check(
+  !glassRule.includes('-webkit-backdrop-filter'),
+  'lc-no-glass 规则里不手写 -webkit- 前缀（手写会让压缩器删掉标准声明）'
 );
 
 if (failed > 0) {
