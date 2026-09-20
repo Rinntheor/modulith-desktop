@@ -6,6 +6,7 @@ pub mod commands;
 pub mod network;
 pub mod probe;
 pub mod settings;
+pub mod sound;
 
 use crate::prelude::*;
 use tauri::Manager;

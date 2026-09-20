@@ -97,10 +97,26 @@
 }
 
 /* 标题栏与标签栏：窗口亚层，一律用不透明面板色，且**同一取值** ——
-   两块亚层在视觉上必须连成一片，否则窗口顶部会出现一条色带分界。 */
-:root.dark [class~='bg-white/90'][class~='backdrop-blur-xl'],
-:root.dark [class~='bg-white/85'][class~='backdrop-blur-xl'],
-:root.dark [class~='bg-white/95'][class~='backdrop-blur-xl'] {
+   两块亚层在视觉上必须连成一片，否则窗口顶部会出现一条色带分界。
+
+   判据是语义类 `lc-chrome`（标题栏 / 标签栏 / 侧边栏各带一个），
+   而不是某个工具类的组合。
+
+   **这里换过判据，原因值得记下来。** 原判据是
+   `[class~='bg-white/9x'][class~='backdrop-blur-xl']`，注释当时写着
+   「本项目里只有窗口亚层用它」—— 那句话是错的：全局右键菜单、模块右键菜单、
+   隐藏模块面板、插件卡片的下拉、插件页的下拉**全都**同时带
+   `bg-white/95` 与 `backdrop-blur-xl`。于是这些浮层被当成亚层处理，拿到了
+   更暗的 #151823，而 §2.5 的设计是「浮层比卡片亮一档」（#1a1e2b）。
+   同一个误判还让它们拿到了近黑的描边（见 §5），而那里的注释恰好写着
+   「深色下给浮层描一道近黑边，会让它看起来像一块硬邦邦的补丁」。
+   也就是说：规则与注释互相矛盾，而注释是对的。
+
+   顺带一提，这三个亚层现在已经不带 `backdrop-blur-xl` 了（它们永久不使用
+   毛玻璃，见 index.css）。若继续用原来的判据，这条规则会**整体失效**且
+   不报任何错 —— 只表现为顶部两块亚层变浅、出现一道色带。
+   语义类比"猜哪组工具类意味着亚层"更耐改。 */
+:root.dark [class~='lc-chrome'] {
   background-color: #151823;
 }
 
@@ -133,7 +149,12 @@
 }
 
 :root.dark [class~='bg-gray-200'],
-:root.dark [class~='bg-gray-200/80'] {
+:root.dark [class~='bg-gray-200/80'],
+/* `bg-gray-200/70` 是分屏时两条标签栏之间的那条 1px 分隔线（Home.tsx）。
+   它此前漏在映射表外，于是深色下是一条 70% 的**浅灰**竖线压在 #151823 的
+   亚层上 —— 亮得刺眼。这一档是扫描 src/ 里所有半透明背景 token 时发现的，
+   现在由 `scripts/check-theme.ts` 兜住：新写的档位漏了映射会直接失败。 */
+:root.dark [class~='bg-gray-200/70'] {
   background-color: #2a3040;
 }
 
@@ -147,9 +168,63 @@
   background-color: #151823;
 }
 
-:root.dark [class~='bg-gray-900'],
-:root.dark [class~='bg-gray-900/40'] {
+:root.dark [class~='bg-gray-900'] {
   background-color: #0b0d14;
+}
+
+/* ============================================================
+ * 遮罩（scrim）：对话框与抽屉背后那一层。
+ *
+ * **这里曾经把它们映射成不透明色，那是一个真实的缺陷。**
+ *
+ * 原来的规则是 `[class~='bg-gray-900'], [class~='bg-gray-900/40']` 一起映射成
+ * 不透明的 #0b0d14。前半段是对的（`bg-gray-900` 是实心深色按钮），后半段
+ * 把「40% 黑的半透明遮罩」变成了一块**实心近黑板**：浅色模式下还能看见背后
+ * 界面，深色模式下背后被完全糊住 —— 用户看到的是「设置界面背景是纯黑，
+ * 和浅色模式不一样」。而 `bg-gray-900/30`（插件市场用的那一档）不在映射表里，
+ * 反而保留了正确的半透明，所以只有在设置与插件页才会看到这个问题。
+ *
+ * 遮罩的语义就是**半透明**：它的职责是压暗背后的内容、把注意力交给浮层，
+ * 而不是把背后擦掉。因此这里按原有的档位分别给一个真正的半透明黑，
+ * 并且**保留档位之间的深浅差**（市场原本就比设置浅一档，那是设计意图）。
+ *
+ * 取值比浅色模式更黑，是因为深色界面的底本身就暗：同样的透明度压暗幅度
+ * 看起来更小，不足以把浮层从背景里分出来。
+ *
+ * 注意与上面的 `bg-gray-900` 是两条规则，**不要合并** —— 一个是实心表面，
+ * 一个是半透明遮罩，合并就会重演上面那个缺陷。
+ * ============================================================ */
+:root.dark [class~='bg-gray-900/20'] {
+  background-color: rgba(0, 0, 0, 0.42);
+}
+:root.dark [class~='bg-gray-900/30'] {
+  background-color: rgba(0, 0, 0, 0.5);
+}
+:root.dark [class~='bg-gray-900/40'] {
+  background-color: rgba(0, 0, 0, 0.55);
+}
+:root.dark [class~='bg-gray-900/50'] {
+  background-color: rgba(0, 0, 0, 0.62);
+}
+:root.dark [class~='bg-gray-900/60'] {
+  background-color: rgba(0, 0, 0, 0.68);
+}
+
+/* `bg-black/NN` 是另一族遮罩（隐藏模块面板、市场的安装确认框）。
+   它们此前完全不在表里：20%~30% 的黑叠在深色底上几乎看不出压暗，
+   遮罩等于不存在 —— 浮层与其背后的内容分不开。
+   与上面同一取向：深色模式下要更深一档才等效。 */
+:root.dark [class~='bg-black/20'] {
+  background-color: rgba(0, 0, 0, 0.5);
+}
+:root.dark [class~='bg-black/30'] {
+  background-color: rgba(0, 0, 0, 0.55);
+}
+:root.dark [class~='bg-black/40'] {
+  background-color: rgba(0, 0, 0, 0.6);
+}
+:root.dark [class~='bg-black/50'] {
+  background-color: rgba(0, 0, 0, 0.65);
 }
 
 /* 深色下「更深的灰」当浮层底用：下拉菜单、右键菜单、抽屉。
@@ -356,10 +431,11 @@
  * **只对窗口亚层生效**，不波及浮层：右键菜单、插件卡片、下拉面板也用
  * `/50`、`/70`，但它们需要的是常规边框色 —— 深色下给浮层描一道近黑边，
  * 会让它看起来像一块硬邦邦的补丁，而不是浮在内容之上。
- * 判据用 `backdrop-blur-xl`：本项目里只有窗口亚层（标题栏、标签栏）用它。
+ *
+ * 判据是语义类 `lc-chrome`。这里同样换过判据：原先用 `backdrop-blur-xl`，
+ * 而它并不是亚层独有的 —— 上面 §2 的说明记录了这次误判的全部后果。
  */
-:root.dark [class~='border-gray-200/50'][class~='backdrop-blur-xl'],
-:root.dark [class~='border-gray-200/70'][class~='backdrop-blur-xl'] {
+:root.dark [class~='lc-chrome'] {
   border-color: #0a0c12;
 }
 
@@ -481,6 +557,7 @@
 }
 
 :root.dark [class~='hover:bg-gray-200']:hover,
+:root.dark [class~='hover:bg-gray-200/70']:hover,
 :root.dark [class~='hover:bg-gray-200/80']:hover {
   background-color: #2a3040;
 }
@@ -500,6 +577,15 @@
 
 /* 深色底上"更暗"的方向没有对比度，反转为提亮 */
 :root.dark [class~='hover:bg-gray-900/10']:hover {
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+/* 同一个 token 的 group-hover 形式（关于页的外链 chip，`.group` 在它外层按钮上）。
+   它与上面那条是**两个不同的类名**，只补 `hover:` 那一份会让 chip 在深色下
+   悬停时几乎没有反馈 —— 10% 的深色叠在深色底上等于没有。
+   选择器必须是「祖先 hover」而不是「自身 hover」：要跟 Tailwind 生成的
+   `.group:hover .group-hover\:...` 对上，否则规则永远不命中。 */
+:root.dark .group:hover [class~='group-hover:bg-gray-900/10'] {
   background-color: rgba(255, 255, 255, 0.12);
 }
 

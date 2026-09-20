@@ -611,10 +611,26 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
         标签栏行：**按组分列**。分屏后两条标签栏各占内容区的一半，分隔位置与下面
         内容区的分隔条一致 —— 两边都用同一个 `splitRatio` 换算，所以拖分隔条时
         标签栏与内容会一起动，不会出现"标题栏的分界和内容的分界对不上"。
+
+        `pointer-events-none` 是必需的，不是优化。这一层是 `fixed left-0 right-0`
+        的全宽盒子，靠 `paddingLeft` 把**内容**推到侧边栏右边让位；但**元素盒子
+        仍然横跨整窗**。一个没有背景的 div 照样参与命中测试，于是 x∈[0,256)、
+        y∈[40,76) 这条透明条带会挡住侧边栏头部 —— 而它 z-40 与侧边栏同级、又在
+        DOM 里更靠后，因此正好压在上面。
+
+        实际表现：侧边栏的折叠按钮 y∈[56,84)，其中 56~76 被这条带子吃掉，
+        只剩底部 8px 可点，鼠标放在按钮上（尤其是图标上）毫无反应，必须往下移。
+        全屏时本行整个不渲染，所以那个按钮在全屏下反而是好的 —— 这也是这个
+        问题看起来"和全屏有关"的原因。
+
+        修法只在这一层：容器不接收指针事件（它纯粹是布局壳），需要交互的
+        TabBar 自己声明 `pointer-events-auto`（见 Tabs/TabBar.tsx）。
+        比"把侧边栏的 z-index 抬上去"更准：真正的错误是**透明的布局盒子
+        本就不该命中测试**，抬高 z 只是掩盖它，其它压在下面的元素还会再中一次。
       */}
       {showTabBarInLayout && (
         <div
-          className="fixed left-0 right-0 z-40 flex h-9"
+          className="pointer-events-none fixed left-0 right-0 z-40 flex h-9"
           style={{ top: showTitlebar ? 40 : 0, paddingLeft: sidebarPx }}
         >
           <div className="flex min-w-0" style={{ flex: `${splitOn ? splitRatio : 1} 1 0%` }}>
@@ -878,7 +894,7 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
       */}
       {dragState.tab && dragState.pointer && (
         <div
-          className="pointer-events-none fixed z-[80] rounded-md border border-indigo-200 bg-white/95 px-2 py-1 text-[11px] font-medium text-gray-700 shadow-lg"
+          className="pointer-events-none fixed z-80 rounded-md border border-indigo-200 bg-white/95 px-2 py-1 text-[11px] font-medium text-gray-700 shadow-lg"
           style={{ left: dragState.pointer.x + 12, top: dragState.pointer.y + 12 }}
         >
           {catalog.get(dragState.tab)?.name ?? dragState.tab}

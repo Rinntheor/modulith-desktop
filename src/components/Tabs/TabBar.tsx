@@ -352,7 +352,10 @@ const TabBar: React.FC<TabBarProps> = ({ group, focused = true }) => {
 
   return (
     <div
-      className="relative flex h-9 min-w-0 flex-1 items-stretch overflow-hidden border-b border-gray-200/70 bg-white/85 backdrop-blur-xl"
+      // `pointer-events-auto`：外层标签栏行是 pointer-events-none（它是纯布局壳，
+      // 全宽盒子会挡住侧边栏头部 —— 见 Home.tsx 的说明）。这里把它显式恢复，
+      // 标签本身、滚轮横向滚动与拖拽落点判定都需要指针事件。
+      className="pointer-events-auto lc-chrome relative flex h-9 min-w-0 flex-1 items-stretch overflow-hidden border-b border-gray-200/70 bg-white/95"
       role="tablist"
       aria-label={group === 'primary' ? '模块标签页' : '分屏标签页'}
       onPointerMove={handleBarPointerMove}

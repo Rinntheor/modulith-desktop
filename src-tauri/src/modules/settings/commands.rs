@@ -3,6 +3,7 @@ use crate::modules::logging;
 use crate::modules::settings::probe;
 use crate::modules::settings::autostart;
 use crate::modules::settings::settings::{self as store, AppSettings};
+use crate::modules::settings::sound;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::RwLock;
@@ -83,6 +84,32 @@ pub async fn update_app_settings(
     Ok(settings)
 }
 
+/// 从磁盘重新读取设置并刷新后端内存状态
+///
+/// 用途：设置文件被**外部**改动之后，后端内存里那份就成了陈旧副本。最典型的场景
+/// 是从备份恢复 `settings.json` —— 那时磁盘上已经是另一份配置，而 `SettingsState`
+/// 还是进程启动时读进来的旧值，界面读到的、日志开关实际生效的都会是旧的。
+///
+/// 它不只刷新数据，也**重新套用运行期开关**（日志记录），否则会出现"设置页显示
+/// 日志已关闭，而它还在写盘"这种只靠观察发现不了的不一致。
+#[tauri::command]
+pub async fn reload_app_settings(
+    app: AppHandle,
+    state: State<'_, SettingsState>,
+) -> Result<AppSettings, String> {
+    let loaded = store::load(&app);
+
+    {
+        let mut current = state.inner().0.write().await;
+        *current = loaded.clone();
+    }
+
+    logging::apply(loaded.file_logging_enabled, loaded.crash_logging_enabled);
+
+    log::info!("应用设置已从磁盘重新载入");
+    Ok(loaded)
+}
+
 /// 恢复默认设置并返回
 #[tauri::command]
 pub async fn reset_app_settings(
@@ -124,6 +151,40 @@ pub async fn get_app_data_dir(app: AppHandle) -> Result<String, String> {
     std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
 
     Ok(app_dir.to_string_lossy().to_string())
+}
+
+// ============================================================
+// 通知提示音
+// ============================================================
+
+/// 选择一个自定义提示音并导入到应用数据目录
+///
+/// 返回 `Ok(None)` 表示用户取消了选择 —— 那是正常操作，不是错误。
+/// 安全边界（扩展名白名单、体积上限、固定文件名、复制进应用数据目录）全部收在
+/// `sound.rs`，这条命令只做转发，因此不存在"某一处忘了校验"的空间。
+#[tauri::command]
+pub async fn pick_notification_sound(app: AppHandle) -> Result<Option<sound::CustomSound>, String> {
+    sound::pick(&app).await
+}
+
+/// 读取设置里记着的自定义提示音，返回可直接播放的 data URL
+///
+/// 文件名从**后端托管的设置**里读，而不是由前端传入：前端因此从来没有
+/// 「让宿主打开某个文件」的能力，这条命令的可达输入只剩"当前设置值"一个。
+/// 与 `pick_notification_sound` 配合，形成"选择时导入、播放时只读自己那份"的闭环。
+#[tauri::command]
+pub async fn load_notification_sound(
+    app: AppHandle,
+    state: State<'_, SettingsState>,
+) -> Result<Option<String>, String> {
+    let file_name = {
+        let settings = state.inner().0.read().await;
+        settings.notification_sound_custom_file.clone()
+    };
+
+    // 在锁外做文件 IO：读一个最大 2 MB 的文件没必要握着设置锁，
+    // 那会让同时进行的设置写入排队等它。
+    sound::load(&app, file_name.as_deref())
 }
 
 // ============================================================

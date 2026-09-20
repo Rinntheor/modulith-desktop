@@ -31,6 +31,7 @@ import {
 import { openUrl } from '@tauri-apps/plugin-opener';
 
 import { PLUGIN_INDEX_REF, PLUGIN_REPO_URL } from '../../config/pluginRegistry';
+import { DRAWER_ENTER, DRAWER_EXIT } from '../../utils/motionCurves';
 import { getPermissionDescriptor, type PermissionRisk } from '../../services/permissionRegistry';
 import {
   installMarketVersion,
@@ -395,9 +396,8 @@ const MarketDetailDrawer: React.FC<{
 
       <motion.aside
         initial={{ x: '100%' }}
-        animate={{ x: 0 }}
-        exit={{ x: '100%' }}
-        transition={{ type: 'spring', stiffness: 380, damping: 38 }}
+        animate={{ x: 0, transition: DRAWER_ENTER }}
+        exit={{ x: '100%', transition: DRAWER_EXIT }}
         className="fixed right-0 top-0 h-full w-full max-w-[560px] bg-white z-50 flex flex-col shadow-2xl"
       >
         <div className="shrink-0 px-6 py-5 border-b border-gray-100">

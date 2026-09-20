@@ -8,6 +8,7 @@
 // 需要追溯时间时查 git 历史即可。
 
 pub mod auth;
+pub mod backup;
 pub mod logging;
 pub mod notifications;
 pub mod plugins;
@@ -21,6 +22,7 @@ use crate::core::module::Module;
 /// 注册所有后端模块
 pub fn register_all(registry: &mut ModuleRegistry) -> Result<(), crate::core::registry::RegistryError> {
     registry.register(Box::new(auth::AuthModule))?;
+    registry.register(Box::new(backup::BackupModule))?;
     registry.register(Box::new(logging::LoggingModule))?;
     registry.register(Box::new(notifications::NotificationsModule))?;
     registry.register(Box::new(plugins::PluginsModule))?;
@@ -34,6 +36,7 @@ pub fn register_all(registry: &mut ModuleRegistry) -> Result<(), crate::core::re
 pub fn list_all_module_ids() -> Vec<String> {
     vec![
         auth::AuthModule.id().to_string(),
+        backup::BackupModule.id().to_string(),
         logging::LoggingModule.id().to_string(),
         notifications::NotificationsModule.id().to_string(),
         plugins::PluginsModule.id().to_string(),

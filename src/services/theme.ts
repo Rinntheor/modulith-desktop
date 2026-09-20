@@ -1,6 +1,6 @@
 // src/services/theme.ts
 //
-// 主题（深色 / 浅色 / 跟随系统）与动效开关。
+// 主题（深色 / 浅色 / 跟随系统）与动效、毛玻璃开关。
 //
 // 权威来源是后端 `settings.json`（`theme` / `reduceMotion`），但**首帧**
 // 不能等后端：WebView 会在 JS bundle 求值前就绘制一次，若那时才决定配色，
@@ -13,6 +13,7 @@
 // 地方，缓存丢失（清空 WebView 数据）只会让首帧闪一下，不会丢设置。
 
 import { isMotionReduced } from '../utils/motionPreference';
+import { isGlassEnabled, NO_GLASS_CLASS } from '../utils/glassPreference';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -94,6 +95,15 @@ let reduceMotion = false;
 let reduceMotionSetting = false;
 /** 性能模式（用户在设置里存的那个值） */
 let performanceMode = false;
+/**
+ * **有效**的毛玻璃开关 —— 与 `reduceMotion` 同构，不是用户存的那个值。
+ *
+ * 它等于「用户没关毛玻璃」且「没开性能模式」。对外只暴露这一个有效值，
+ * CSS 只读它，因此不可能出现「两个开关各关一半」的状态。
+ */
+let glassEnabled = true;
+/** 用户在设置里存的「浮层毛玻璃」值 */
+let glassSetting = true;
 
 const listeners = new Set<() => void>();
 
@@ -129,6 +139,16 @@ export function getReduceMotion(): boolean {
 /** 性能模式是否开启（用户在设置里选的那个值） */
 export function getPerformanceMode(): boolean {
   return performanceMode;
+}
+
+/**
+ * 有效的毛玻璃状态（浮层毛玻璃）。
+ *
+ * 注意窗口亚层（标题栏 / 标签栏 / 侧边栏）**不受这个值影响** —— 它们已经
+ * 永久不使用 `backdrop-filter`，理由见 `utils/glassPreference.ts`。
+ */
+export function getGlassEnabled(): boolean {
+  return glassEnabled;
 }
 
 // ============================================================
@@ -194,6 +214,26 @@ export function setPerformanceMode(enabled: boolean): void {
     document.documentElement.classList.toggle('lc-performance', enabled);
   }
   applyMotionPreference();
+  // 性能模式**包含**关闭毛玻璃（方向不对称，见 isGlassEnabled）。
+  // 少了这一行，「开了性能模式界面还是卡」就会原样回来。
+  applyGlassPreference();
+}
+
+/**
+ * 浮层毛玻璃开关（设置 → 通用 → 毛玻璃效果）。
+ *
+ * 只负责**应用**，不负责持久化 —— 与主题、动效开关走同一条链路：
+ * 持久化由 `appSettings.saveAppSettings` 完成，那边的订阅回调再调回这里。
+ *
+ * 明确不受它控制的是那三个常驻亚层（标题栏 / 标签栏 / 侧边栏）：它们背后
+ * 永远是应用纯色底，模糊没有视觉效果，只有每帧重新合成的开销，因此永久关闭
+ * 而不做成选项。理由与取舍见 `utils/glassPreference.ts` 与 index.css。
+ */
+export function setGlassEffect(enabled: boolean): void {
+  if (enabled === glassSetting) return;
+
+  glassSetting = enabled;
+  applyGlassPreference();
 }
 
 /**
@@ -212,6 +252,23 @@ function applyMotionPreference(): void {
     document.documentElement.classList.toggle('lc-reduce-motion', effective);
   }
   notify();
+}
+
+/**
+ * 把两个毛玻璃输入合并成**有效**状态，并同步到 document。
+ *
+ * 与 `applyMotionPreference` 同构，理由也一样：一旦有多于一个输入，散在各处
+ * 各写一遍判断就必然漂移。这里只切一个类，`backdrop-filter` 的存废全部交给
+ * CSS 的 `:root.lc-no-glass` —— 组件里没有任何一处需要知道这个开关。
+ */
+function applyGlassPreference(): void {
+  const effective = isGlassEnabled(glassSetting, performanceMode);
+  if (effective === glassEnabled) return;
+
+  glassEnabled = effective;
+  if (typeof document !== 'undefined') {
+    document.documentElement.classList.toggle(NO_GLASS_CLASS, !effective);
+  }
 }
 
 // ============================================================

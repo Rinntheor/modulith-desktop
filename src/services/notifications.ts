@@ -19,6 +19,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { showToast, type ToastLevel, type ToastVariant } from './toast';
+import { playNotificationSound } from './sound';
 
 export type NotificationLevel = 'info' | 'success' | 'warning' | 'error';
 
@@ -137,6 +138,28 @@ export function getNotificationSummary(): NotificationSummary {
 }
 
 /**
+ * 呈现一条**新通知**：弹浮层 + 响提示音。
+ *
+ * 两者收在同一个函数里是有意的：它们是同一条规则的两种呈现，都表示「出现了一条
+ * 你还没看到的信息」。分开判断迟早会出现「弹了浮层但没响」或「响了一声却找不到
+ * 是什么」—— 而这类不一致正是本项目反复记录过的那种缺陷。
+ *
+ * 调用点只有下面两处，且都在 `silent` / `willMerge` 的早退之后：声音与浮层
+ * 共享同一组例外。其中「合并键命中不响」尤其重要 —— 模块在重试循环里反复产生
+ * 同一条通知时，每次都响一声会从提醒变成骚扰。
+ */
+function presentNotification(input: {
+  title: string;
+  body?: string;
+  level: ToastLevel;
+  variant: ToastVariant;
+  source: string;
+}): void {
+  showToast(input);
+  playNotificationSound();
+}
+
+/**
  * 推送一条通知。
  *
  * 浮层提示的展示规则：`silent` 为真时完全不弹；合并键命中已有未读时不弹
@@ -169,12 +192,12 @@ export async function pushNotification(input: PushNotificationInput): Promise<vo
     // 落盘失败时仍然弹一次浮层：用户至少该知道刚才发生了什么，
     // 只是这条不会出现在通知中心里
     if (!input.silent) {
-      showToast({
+      presentNotification({
         title: input.title,
         body: input.body,
         level,
         variant: toastVariantFor(category),
-        source: input.source,
+        source: input.source ?? HOST_SOURCE,
       });
     }
     return;
@@ -184,7 +207,7 @@ export async function pushNotification(input: PushNotificationInput): Promise<vo
 
   if (input.silent || willMerge) return;
 
-  showToast({
+  presentNotification({
     title: input.title,
     body: input.body,
     level: level as ToastLevel,

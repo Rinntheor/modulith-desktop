@@ -131,7 +131,7 @@ const Sidebar: React.FC<{
             immersive ? 'top-0 h-full' : 'top-10 h-[calc(100%-2.5rem)]'
           }`}
         >
-          <div className="h-full w-64 bg-white/90 backdrop-blur-xl border-r border-gray-200/50 shadow-2xl flex flex-col">
+          <div className="lc-chrome h-full w-64 bg-white/95 border-r border-gray-200/50 shadow-2xl flex flex-col">
             {/* 侧边栏头部 */}
             <div className="shrink-0">
               <motion.div
