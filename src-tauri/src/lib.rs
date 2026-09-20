@@ -114,6 +114,7 @@ pub fn run() -> Result<(), tauri::Error> {
         net_log_list,
         net_log_clear,
         net_log_len,
+        net_note_frontend_outbound,
         list_notifications,
         push_notification,
         mark_notification_read,

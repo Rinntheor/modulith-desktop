@@ -25,6 +25,14 @@ pub const MODE_ALLOW: &str = "allow";
 pub const MODE_ASK: &str = "ask";
 pub const MODE_DENY: &str = "deny";
 
+/// 两条拒绝原因的原文。
+///
+/// 提成常量而不是内联在 `decide` 里，是因为前端 `netGuard.ts` 需要**逐字相同**
+/// 的镜像（同步上下文里等不了 IPC），而 `pnpm check:network` 要能按名字把两侧
+/// 对上 —— 内联字符串没法被那句断言找到。
+pub const DENY_OFFLINE: &str = "离线模式已开启";
+pub const DENY_POLICY: &str = "出站策略为「禁止出站」";
+
 /// 一次请求的判定结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -54,10 +62,10 @@ pub fn decide(mode: &str, offline: bool, loopback: bool) -> Decision {
         return Decision::Allow;
     }
     if offline {
-        return Decision::Deny("离线模式已开启");
+        return Decision::Deny(DENY_OFFLINE);
     }
     match mode {
-        MODE_DENY => Decision::Deny("出站策略为「禁止出站」"),
+        MODE_DENY => Decision::Deny(DENY_POLICY),
         MODE_ASK => Decision::AllowPendingPrompt,
         // 含未知取值：见文件头第 3 条
         _ => Decision::Allow,
@@ -70,6 +78,33 @@ pub fn outcome_of(decision: Decision) -> &'static str {
         Decision::Allow => "allowed",
         Decision::AllowPendingPrompt => "allowed-pending-prompt",
         Decision::Deny(_) => "denied",
+    }
+}
+
+/// WebView 里"直接联网"被拒的原因。
+///
+/// 前端 `netGuard.ts` 有一份**逐字相同**的镜像（同步上下文里等不了 IPC），
+/// 由 `pnpm check:network` 断言两侧一致。
+pub const DENY_DIRECT: &str =
+    "插件不能直接联网，请改用 ctx.http（它带权限检查、出站策略与流量日志）";
+
+/// WebView 里**直接**出站的判定。
+///
+/// 与 [`decide`] 的差别只有一处：**即使策略是"放行"，WebView 里的直接请求也不行。**
+///
+/// 原因不是洁癖，而是三项能力的归属：权限检查（哪个插件、有没有声明 `network`）、
+/// 出站策略、流量日志，全部落在 Rust 侧的 `plugin_http_request` 上。一个直达网络的
+/// `fetch` 把它们一起绕过去了 —— 而且连"是谁发的"都无从知道。
+///
+/// 所以插件联网的唯一合法通道是宿主给的 `ctx.http`。
+///
+/// **回环仍然放行**：它不出本机，而且"插件连本地开发服务器"是正当场景。
+pub fn decide_frontend_direct(mode: &str, offline: bool, loopback: bool) -> Decision {
+    match decide(mode, offline, loopback) {
+        // 用户自己关掉了网络时，他的原因比"该走 ctx.http"更相关
+        Decision::Deny(reason) => Decision::Deny(reason),
+        _ if loopback => Decision::Allow,
+        _ => Decision::Deny(DENY_DIRECT),
     }
 }
 
@@ -181,6 +216,47 @@ mod tests {
                 mode.id
             );
             assert_eq!(mode.available, mode.unavailable_reason.is_empty());
+        }
+    }
+
+    #[test]
+    fn frontend_direct_is_denied_even_when_the_policy_allows() {
+        // 这一条是"CSP + 门面"两条路能自洽的关键：WebView 里的直接 fetch 不是
+        // "被策略允许的请求"，而是"走错了通道的请求"。放行档下它也发不出去，
+        // 因为权限检查、策略与日志都在后端那条通道上。
+        for mode in [MODE_ALLOW, MODE_ASK, "垃圾值"] {
+            assert!(
+                matches!(decide_frontend_direct(mode, false, false), Decision::Deny(_)),
+                "{mode} 档下前端直接出站应当被拒"
+            );
+        }
+    }
+
+    #[test]
+    fn frontend_direct_reports_the_users_reason_first() {
+        // 离线/禁止出站时，用户按下那个开关的原因比"该走 ctx.http"更相关：
+        // 前者是他自己的决定，后者是插件作者的实现建议
+        assert_eq!(
+            decide_frontend_direct(MODE_ALLOW, true, false),
+            Decision::Deny("离线模式已开启")
+        );
+        assert_eq!(
+            decide_frontend_direct(MODE_DENY, false, false),
+            Decision::Deny("出站策略为「禁止出站」")
+        );
+    }
+
+    #[test]
+    fn frontend_direct_still_allows_loopback() {
+        // 本地开发（插件连本机服务）是正当场景，且回环不出本机
+        for mode in [MODE_ALLOW, MODE_ASK, MODE_DENY] {
+            for offline in [false, true] {
+                assert_eq!(
+                    decide_frontend_direct(mode, offline, true),
+                    Decision::Allow,
+                    "{mode} / offline={offline}"
+                );
+            }
         }
     }
 
