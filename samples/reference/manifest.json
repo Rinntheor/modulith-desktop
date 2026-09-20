@@ -21,6 +21,5 @@
   "main": "index.js",
   "style": "index.css",
   "icon": "icon.svg",
-  "permissions": ["storage", "notification", "plugin-communicate"],
-  "sandboxLevel": 1
+  "permissions": ["storage", "notification", "plugin-communicate"]
 }

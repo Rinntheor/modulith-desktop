@@ -157,7 +157,6 @@ export interface PluginManifest {
   icon?: string;
   iconSvg?: string;
   permissions?: string[];
-  sandboxLevel?: number;
   activationEvents?: string[];
   contributes?: unknown;
   preview?: boolean;

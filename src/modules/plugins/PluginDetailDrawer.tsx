@@ -41,12 +41,10 @@ interface PluginDetailDrawerProps {
   onUninstall: (plugin: InstalledPlugin) => void;
 }
 
-const SANDBOX_LABELS: Record<number, string> = {
-  0: 'L0 · 仅界面，无网络与文件访问',
-  1: 'L1 · 受限：本地存储与受限网络',
-  2: 'L2 · 扩展：完整网络与受限文件系统',
-  3: 'L3 · 完全访问（需用户确认）',
-};
+// 这里曾有 `SANDBOX_LABELS` 与一行「沙箱级别」的展示。**已删除**：
+// 插件与宿主运行在同一个 JS 上下文里，`sandboxLevel` 是一个宿主无法核实的自述字段，
+// 把它显示给用户等于给出一句空话 —— 用户会以为宿主能对插件分级管控。
+// 权限列表（下面那一块）才是真正说明"这个插件能做什么"的地方。
 
 const Row: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
   <div className="flex items-start gap-3 py-2 border-b border-gray-50 last:border-0">
@@ -349,9 +347,6 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                     {plugin.manifest.engines?.loopcore && (
                       <Row label="引擎要求">Modulith {plugin.manifest.engines.loopcore}</Row>
                     )}
-                    <Row label="沙箱级别">
-                      {SANDBOX_LABELS[plugin.manifest.sandboxLevel ?? 1] ?? '未声明'}
-                    </Row>
                     <Row label="入口文件">
                       <code className="font-mono">{plugin.manifest.main}</code>
                     </Row>

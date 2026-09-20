@@ -24,8 +24,7 @@ const MANIFEST_EXAMPLE = `{
   "main": "dist/index.js",
   "style": "dist/index.css",
   "icon": "FileText",
-  "permissions": ["storage"],
-  "sandboxLevel": 1
+  "permissions": ["storage"]
 }`;
 
 const BUNDLE_EXAMPLE = `// dist/index.js —— 由打包器输出为 IIFE，react 等必须是 external
