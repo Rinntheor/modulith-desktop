@@ -37,7 +37,7 @@
 // 会把 ThemeProvider 上的全局开关在激活标签上重新打开 —— 一个「关了动画却只对
 // 没在看的标签生效」的开关，而这正是「关了动画还是卡」的直接来源。
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'framer-motion';
 import {
   Bell,
@@ -64,8 +64,15 @@ import ToastLayer from '../components/Notifications/ToastLayer';
 import NotificationCenter from '../components/Notifications/NotificationCenter';
 import SettingsDialog, { type SettingsSectionId } from '../components/Settings/SettingsDialog';
 import GlobalContextMenu, { type GlobalMenuEntry } from '../components/GlobalContextMenu';
+import ModuleIcon from '../components/ModuleIcon';
 import { moduleManager } from '../services/moduleManager';
-import { reloadPluginRuntime } from '../services/pluginRuntime';
+import {
+  getPluginContextMenuEntries,
+  reloadPluginRuntime,
+  runPluginContextMenuEntry,
+  subscribePlugins,
+  type PluginContextMenuEntry,
+} from '../services/pluginRuntime';
 import {
   clampSplitRatio,
   getCachedSettings,
@@ -116,6 +123,36 @@ interface HomeContentProps {
  * 是为了让"让位"这件事只有一个数字来源。
  */
 const SIDEBAR_WIDTH = 256;
+
+/**
+ * 把一条插件右键菜单贡献转成外壳菜单的条目。
+ *
+ * 图标走 `ModuleIcon`：插件在清单里写的是 lucide 图标**名**（或插件包内的 svg 路径），
+ * 而外壳菜单要的是一个组件。这里必须自带 Suspense 边界 ——
+ * `ModuleIcon` 对尚未解析的图标会抛 Promise（它的按需加载约定），而右键菜单
+ * 不在任何 Suspense 边界内，让它冒泡出去的结果是整个菜单消失。
+ */
+function pluginMenuEntry(entry: PluginContextMenuEntry): GlobalMenuEntry {
+  const Icon = entry.icon
+    ? ({ className }: { className?: string }) => (
+        <Suspense fallback={null}>
+          <ModuleIcon icon={entry.icon} className={className} />
+        </Suspense>
+      )
+    : undefined;
+
+  return {
+    label: entry.label,
+    icon: Icon,
+    action: () => {
+      // 不 await：菜单已经关了，这里只需要把失败记下来。
+      // 真正的失败提示由 runPluginCommand 内部的命令包装负责（它会推一条通知）。
+      void runPluginContextMenuEntry(entry).catch((error) => {
+        console.error(`[Home] 插件右键菜单项「${entry.label}」执行失败:`, error);
+      });
+    },
+  };
+}
 
 /**
  * 零标签时的空态。
@@ -542,6 +579,19 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
     [splitOn, splitRatio]
   );
 
+  /**
+   * 插件贡献的右键菜单项。
+   *
+   * 订阅插件运行时：贡献来自**清单**，因此插件一行代码都没跑过时这些条目也该在 ——
+   * 用户点下去的那一刻才激活它。这和「命令面板里的插件命令」是同一条规则。
+   */
+  const [pluginMenuVersion, setPluginMenuVersion] = useState(0);
+  useEffect(() => subscribePlugins(() => setPluginMenuVersion((value) => value + 1)), []);
+  const pluginMenuEntries = useMemo(() => {
+    void pluginMenuVersion;
+    return getPluginContextMenuEntries();
+  }, [pluginMenuVersion]);
+
   const menuEntries: GlobalMenuEntry[] = [
     {
       label: '后退',
@@ -583,6 +633,10 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
       shortcut: 'F11',
       action: () => void applyFullscreen(!fullscreenRef.current),
     },
+    // 插件贡献的条目排在宿主条目**之后**：宿主动作的位置是用户已经熟悉的东西，
+    // 而插件条目数量不确定 —— 插在中间会让每次装插件都挪动已有动作的位置。
+    ...(pluginMenuEntries.length > 0 ? [{ type: 'divider' } as GlobalMenuEntry] : []),
+    ...pluginMenuEntries.map(pluginMenuEntry),
   ];
 
   return (
