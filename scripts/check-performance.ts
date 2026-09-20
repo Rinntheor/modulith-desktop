@@ -214,9 +214,23 @@ check(
   (css.match(/^\s*backdrop-filter: none !important;$/gm) ?? []).length === 1,
   '「去掉毛玻璃」只有一处定义 —— 写两遍迟早会漏改一处'
 );
+/*
+ * **不要手写 `-webkit-` 前缀。**
+ *
+ * 这条断言在 v1.1.7 时是反的（那时要求"前缀版同样只有一处"），而那个要求本身
+ * 造成了 v1.1.7 最麻烦的一个缺陷：手写的
+ *     backdrop-filter: none !important;
+ *     -webkit-backdrop-filter: none !important;
+ * 被 CSS 压缩器判定为同一件事、去重时删掉了**标准**的那一份，于是发行版里
+ * 毛玻璃开关完全失效（开发服务器不压缩，所以只在打包后复现）。
+ *
+ * 压缩器本来就会按目标浏览器自己补前缀（产物里 Tailwind 的工具类两份都在，
+ * 就是它补的）。手写等于替工具做决定，而工具会因此删掉另一份。
+ * 构建产物侧的断言在 `check-theme.ts` 的第 7 节。
+ */
 check(
-  (css.match(/^\s*-webkit-backdrop-filter: none !important;$/gm) ?? []).length === 1,
-  '-webkit- 前缀版同样只有一处'
+  (css.match(/^\s*-webkit-backdrop-filter:/gm) ?? []).length === 0,
+  '源码里不手写 -webkit- 前缀（手写会让压缩器删掉标准声明，只在发行版暴露）'
 );
 // 性能模式块本身不再重复那条规则：它通过 isGlassEnabled 连带关闭毛玻璃。
 const performanceBlock = css.slice(
