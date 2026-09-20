@@ -308,7 +308,7 @@ interface EngineAdvisory {
 
 调用点：`globalErrorHandlers`、`AppErrorBoundary`、`ModuleRenderer` 的模块边界、`ModuleEmbed` 的内嵌边界、`pluginRuntime` 的 `ctx.logger`、`appUpdater` 与 `pluginMarket` 的汇总失败。详见[日志系统](../02-开发指南/日志系统.md)。
 
-## 12. networkDiagnostics
+## 12. networkDiagnostics / netControl
 
 网络诊断：把「直连」与「下载源」两条路各实测一遍。
 
@@ -319,6 +319,20 @@ interface EngineAdvisory {
 | `probeNetwork(targets?)` | `Promise<ProbeReport>` | 执行诊断 |
 
 只负责组织**插件仓库**那两条地址；更新清单那几条由后端从 `tauri.conf.json` 追加。返回的行数通常多于传入的目标数，因为后端会为每条目标补上「经下载源」那一版。
+
+出站管控（`netControl.ts`）是同一条链路的另一半：诊断自己也要受策略约束，因此离线模式下它会逐行显示"离线模式已开启"，而不是笼统的连接失败。
+
+| 导出 | 签名 | 说明 |
+| --- | --- | --- |
+| `NetPolicyMode` / `NetLogEntry` | 接口 | 档位描述与一条日志的形状 |
+| `loadPolicyModes()` | `Promise<NetPolicyMode[]>` | 三档策略的 label / hint / 是否可用 |
+| `loadNetLog(limit?)` | `Promise<NetLogEntry[]>` | 最近的出站记录，最新的在前 |
+| `clearNetLog()` / `netLogLength()` | `Promise<void>` / `Promise<number>` | 清空 / 取条数 |
+| `OUTCOME_LABELS` | 常量 | 四种结果的显示文案 |
+| `describeSource(source)` | `string` | `plugin:com.x` → `插件 com.x` |
+| `splitUrl(url)` | `{ host, path, hasQuery }` | **丢掉查询串**（它常带令牌，而日志会被截图） |
+
+**前端不做策略判定，也不手写档位描述。** 判定在 Rust（请求由它发起），档位与原因由 `net_policy_modes` 给出 —— 前端手写一份的后果是某一档后来实现了、界面还标着"未实现"，或者反过来。这与权限注册表是同一个理由：同一份名单的第二份副本必然漂移。
 
 ## 13. globalErrorHandlers
 

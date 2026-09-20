@@ -16,6 +16,8 @@ use super::types::{
     PluginPermission, PluginResult, PluginStatus, RegistryEntry, RegistryFile,
 };
 use super::validator;
+use crate::modules::net::client::{NetClient, NetError, NetOrigin};
+use crate::modules::net::is_loopback_host;
 use crate::modules::settings::{network, settings as settings_store};
 
 /// 单个插件包解压后的最大体积（64 MB）
@@ -314,7 +316,9 @@ pub struct PluginManager {
     plugins_dir: PathBuf,
     data_dir: PathBuf,
     registry: HashMap<String, RegistryEntry>,
-    client: reqwest::Client,
+    /// 出站门面。**没有裸 `reqwest::Client` 字段** —— 理由见 `net/client.rs`：
+    /// 上一版正是靠"每个调用点各自记得判定"，结果市场索引那条路漏掉了。
+    net: NetClient,
 }
 
 // ============================================================
@@ -338,17 +342,17 @@ impl PluginManager {
         std::fs::create_dir_all(&plugins_dir)?;
         std::fs::create_dir_all(&data_dir)?;
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| PluginError::NetworkError(e.to_string()))?;
+        // 30 秒是**下载整包**用的超时，不是诊断用的短超时 —— 门面按调用方给的值构造，
+        // 因为"慢"与"坏"在这里是两件不同的事。
+        let net = NetClient::new(app.clone(), std::time::Duration::from_secs(30))
+            .map_err(PluginError::NetworkError)?;
 
         let mut manager = Self {
             app,
             plugins_dir,
             data_dir,
             registry: HashMap::new(),
-            client,
+            net,
         };
 
         // 注册表损坏不应阻止应用启动，退化为空注册表并告警
@@ -678,7 +682,7 @@ impl PluginManager {
         url: &str,
         expected_sha256: Option<&str>,
     ) -> PluginResult<InstalledPlugin> {
-        let (bytes, used) = self.fetch_via_sources(url.trim()).await?;
+        let (bytes, used) = self.fetch_via_sources(url.trim(), "插件包下载").await?;
 
         if bytes.len() as u64 > MAX_PLUGIN_BYTES {
             return Err(PluginError::InvalidPackage(format!(
@@ -728,13 +732,17 @@ impl PluginManager {
     ///
     /// 两条路都失败时，返回**最后一次**的错误：用户看到的应当是「两个地址都不行」，
     /// 而 `PluginError` 是单个错误类型，因此把两次尝试都写进日志（那才是排查入口）。
-    async fn fetch_via_sources(&self, url: &str) -> PluginResult<(Vec<u8>, String)> {
+    async fn fetch_via_sources(
+        &self,
+        url: &str,
+        purpose: &'static str,
+    ) -> PluginResult<(Vec<u8>, String)> {
         let proxy = self.proxy_base();
         let candidate = network::rewrite_url(url, proxy.as_deref());
 
         if candidate != url {
             log::info!("经下载源取回插件仓库内容：{}", candidate);
-            match self.fetch_once(&candidate).await {
+            match self.fetch_once(&candidate, purpose).await {
                 Ok(bytes) => return Ok((bytes, candidate)),
                 Err(e) => {
                     log::warn!(
@@ -747,7 +755,7 @@ impl PluginManager {
             }
         }
 
-        match self.fetch_once(url).await {
+        match self.fetch_once(url, purpose).await {
             Ok(bytes) => Ok((bytes, url.to_string())),
             Err(e) => {
                 log::warn!("直连取回失败（{}）：{}", url, e);
@@ -759,13 +767,15 @@ impl PluginManager {
     /// 发一次 GET 并读回全部正文
     ///
     /// 体积上限由调用方检查：这里不知道调用方要的是几 KB 的索引还是几十 MB 的包。
-    async fn fetch_once(&self, url: &str) -> PluginResult<Vec<u8>> {
+    ///
+    /// 请求经 [`NetClient`] 发出 —— 出站策略与流量日志在那一层，不在本函数里。
+    /// `purpose` 只用于日志：它回答"为什么发"，与 `source` 一起才让一条记录能被读懂。
+    async fn fetch_once(&self, url: &str, purpose: &'static str) -> PluginResult<Vec<u8>> {
         let response = self
-            .client
-            .get(url)
-            .send()
+            .net
+            .get_and_send(url, NetOrigin::module("plugins", purpose))
             .await
-            .map_err(|e| PluginError::NetworkError(network::describe_error_chain(&e)))?;
+            .map_err(net_error_to_plugin)?;
 
         if !response.status().is_success() {
             return Err(PluginError::DownloadFailed(format!(
@@ -797,7 +807,9 @@ impl PluginManager {
     pub async fn fetch_registry_text(&self, url: &str) -> PluginResult<String> {
         ensure_registry_url_allowed(url)?;
 
-        let (bytes, used) = self.fetch_via_sources(url.trim()).await?;
+        let (bytes, used) = self
+            .fetch_via_sources(url.trim(), registry_text_purpose(url))
+            .await?;
 
         if bytes.len() as u64 > MAX_REGISTRY_TEXT_BYTES {
             return Err(PluginError::InvalidPackage(format!(
@@ -1401,8 +1413,16 @@ impl PluginManager {
             )));
         }
 
+        // ---- 出站策略与流量日志 ----
+        //
+        // **不在这里判定，也不在这里记日志。** 两件事都在 `NetClient::execute` 里，
+        // 与市场索引、诊断走同一条出口。
+        //
+        // 上一版把这段逻辑手写在这里，结果是同一个文件里的 `fetch_once` 没写 ——
+        // 用户设了「禁止出站」后市场照样能加载。一个必须靠"记得写"才生效的纪律，
+        // 迟早会在某个新加的调用点上漏掉；收口到门面之后，漏掉是编译不过的。
         let mut request = self
-            .client
+            .net
             .request(
                 reqwest::Method::from_bytes(method.as_bytes())
                     .map_err(|e| PluginError::NetworkError(e.to_string()))?,
@@ -1425,7 +1445,19 @@ impl PluginManager {
             request = request.body(body);
         }
 
-        let response = request.send().await?;
+        let response = self
+            .net
+            .execute(request, NetOrigin::plugin(id, "插件网络请求"))
+            .await
+            .map_err(|error| match error {
+                // 被策略拒绝时给出带插件名的说明：用户需要知道是哪一支插件在撞策略，
+                // 而不是只看到"离线模式已开启"却不知道谁在试
+                NetError::Denied(reason) => PluginError::PermissionDenied(format!(
+                    "插件 {} 的请求被出站策略拒绝：{}",
+                    id, reason
+                )),
+                other => PluginError::NetworkError(other.message()),
+            })?;
         let status = response.status().as_u16();
 
         let mut response_headers: HashMap<String, String> = HashMap::new();
@@ -1564,15 +1596,37 @@ fn is_http_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host == "[::1]"
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
+/// 回环判定已移到 `net::is_loopback_host`（策略、门面与权限检查要用同一份）。
+/// 这里原先有一份私有实现 —— 两份实现迟早会在某个边界值上分叉。
+
+/// 出站门面的错误 → 插件错误
+///
+/// **被策略拒绝与请求失败必须分开。** 前者是用户自己关掉的结果（"离线模式已开启"），
+/// 后者才是故障。把它们折成同一句"网络请求失败"，会让离线模式看起来像坏了。
+fn net_error_to_plugin(error: NetError) -> PluginError {
+    match error {
+        NetError::Denied(reason) => PluginError::PermissionDenied(reason),
+        other => PluginError::NetworkError(other.message()),
+    }
+}
+
+/// 这条文本请求取的是索引还是说明文件
+///
+/// 只影响日志里的"用途"一列。判断刻意保守：**认不出来就说"仓库文本"**，
+/// 不去猜一个可能错的用途 —— 日志里出现错误的用途比出现笼统的用途更糟。
+fn registry_text_purpose(url: &str) -> &'static str {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if path.ends_with(".json") {
+        "插件索引"
+    } else if path.ends_with(".md") {
+        "插件说明"
+    } else {
+        "插件仓库文本"
+    }
 }
 
 fn is_valid_storage_key(key: &str) -> bool {

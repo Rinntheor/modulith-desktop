@@ -1,5 +1,37 @@
 // src/components/Titlebar/Titlebar.tsx
 import React, { useState, useEffect } from 'react';
+import { WifiOff } from 'lucide-react';
+import { getCachedSettings, subscribeSettings } from '../../services/appSettings';
+
+/**
+ * 离线模式的常驻指示。
+ *
+ * 为什么必须在标题栏，而不是只在设置页里：开了忘了关的用户，症状是"市场打不开、
+ * 更新失败、插件联网全坏" —— 那看起来像应用坏了。一个只存在于设置页里的开关，
+ * 对这些人等于不存在。
+ *
+ * 做成独立组件而不是在主组件里加一个 hook 调用：这样"订阅"与"显示"在同一个地方，
+ * 插进 JSX 时不必碰 Titlebar 的函数体。
+ */
+const OfflineBadge: React.FC = () => {
+  const [offline, setOffline] = useState(() => getCachedSettings().offlineMode);
+
+  useEffect(
+    () => subscribeSettings(() => setOffline(getCachedSettings().offlineMode)),
+    []
+  );
+
+  if (!offline) return null;
+  return (
+    <span
+      className="flex items-center gap-1 px-2 py-1 rounded-md bg-amber-100 text-amber-800 text-[11px] font-medium"
+      title="离线模式已开启：应用不会发出任何对外请求。在「设置 → 网络」里关闭。"
+    >
+      <WifiOff className="w-3.5 h-3.5" />
+      离线
+    </span>
+  );
+};
 import {
   Minus,
   Square,
@@ -257,6 +289,7 @@ const Titlebar: React.FC<TitlebarProps> = ({
             <Settings className="w-4 h-4 text-gray-600" />
           </button>
         )}
+        <OfflineBadge />
         <WindowControls />
       </div>
     </div>

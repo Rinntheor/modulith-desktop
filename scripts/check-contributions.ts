@@ -408,6 +408,73 @@ console.log('\n能力表：');
   const objectKeys = keysAtIndent(hostObject, 4);
   const contextKeys = keysAtIndent(contextObject, 4);
 
+  // ----------------------------------------------------------
+  // 执行模型：**过渡**，成本由一条接口纪律压住
+  //
+  // 插件与宿主现在同处一个 WebView、一个 JS 上下文。这是**过渡状态**，不是永久形态 ——
+  // 触发真正隔离的条件必须是可判定的（当前定为「索引里出现第一个非维护者发布的插件」）。
+  //
+  // 过渡的全部成本只取决于一件事：**新加的宿主 API 会不会给将来添迁移面**。判据是一条：
+  //
+  //     传值进、传值出；传引用的，将来都得改。
+  //
+  // 因为跨 realm 之后函数与对象引用过不去，只能变成「按 ID 调用 + 消息传递」。
+  // 1.2.0 的声明式贡献正是为此而做：registerModule / registerCommand 从「交出组件、
+  // 交出函数」变成了「交出可寻址的行为」。
+  //
+  // 下面这个分类把**哪些成员是传引用的**钉死。新增成员会让断言失败 ——
+  // 这不是禁止你加，而是要求你先回答"它将来怎么跨 realm"，并在这里显式登记。
+  //
+  // 读这份分类时请注意一件容易被低估的事：**共享 React 实例本身就是最深的一处耦合。**
+  // React / jsx / jsxs / Fragment 全都过不去 realm 边界，而它们不是"两个函数"那么小 ——
+  // 沙箱化之后插件不能再用宿主的 React，界面必须改成"插件交出可序列化的界面描述、
+  // 宿主负责渲染"。这才是迁移里最大的一块。
+  // ----------------------------------------------------------
+  const REFERENCE_PASSING = [
+    'React',
+    'jsx',
+    'jsxs',
+    'Fragment',
+    'createContext',
+    'registerModule',
+    'registerCommand',
+    'onDeactivate',
+    'useModuleActive',
+  ];
+  /** 传值的：跨 realm 只要序列化，天然安全 */
+  const VALUE_PASSING = ['version', 'platform', 'capabilities'];
+
+  /** 取出接口里每个成员的**名字**（成员声明的续行会被折叠掉） */
+  const memberNames = (block: string, indent: number): string[] => {
+    const pad = ' '.repeat(indent);
+    return block
+      .split('\n')
+      .slice(1)
+      .filter((line) => line.startsWith(pad) && !line.startsWith(`${pad} `))
+      .map((line) => /^([A-Za-z_$][\w$]*)\s*[?:]/.exec(line.slice(indent))?.[1] ?? '')
+      .filter(Boolean);
+  };
+
+  const actualHostMembers = memberNames(hostInterface, 2).sort();
+  const expectedHostMembers = [...REFERENCE_PASSING, ...VALUE_PASSING].sort();
+  const added = actualHostMembers.filter((name) => !expectedHostMembers.includes(name));
+  const gone = expectedHostMembers.filter((name) => !actualHostMembers.includes(name));
+
+  check(
+    actualHostMembers.length > 0,
+    '解析出了 ModulithHost 的成员列表（解析失败会让下面那条断言变成假通过）'
+  );
+  check(
+    added.length === 0 && gone.length === 0,
+    `★ 宿主 API 表面未变（新增：${added.join('、') || '无'}；移除：${gone.join('、') || '无'}）` +
+      ` —— 新增成员必须在本文件里分类：它传的是值还是引用？传引用的跨不过 realm`
+  );
+  check(
+    REFERENCE_PASSING.every((name) => HOST_CAPABILITIES.host.includes(name)) &&
+      VALUE_PASSING.every((name) => HOST_CAPABILITIES.host.includes(name)),
+    '分类里的每个成员都在能力表里（否则分类本身已经过期）'
+  );
+
   const missingFromInterface = HOST_CAPABILITIES.host.filter(
     (name) => !interfaceKeys.includes(name)
   );

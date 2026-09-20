@@ -80,11 +80,6 @@ export type PluginPermission =
   | 'process-spawn';             // 启动外部程序（已强制）
 
 /**
- * 插件沙箱级别
- */
-export type SandboxLevel = 0 | 1 | 2 | 3;
-
-/**
  * 插件作者信息
  */
 export interface PluginAuthor {
@@ -313,8 +308,12 @@ export interface PluginManifest {
   icon?: string;                   // 图标文件
   
   // 权限
+  //
+  // 这里曾有 `sandboxLevel?: SandboxLevel`。**已删除**：插件与宿主运行在同一个
+  // WebView、同一个 JS 上下文里，宿主无法按等级限制它 —— 那是一个插件自己声明、
+  // 宿主无法核实的字段，只会让作者与用户以为存在分级管控。
+  // 替代它的是 `permissions`（正在逐步变成真强制）与出站网络策略。
   permissions?: PluginPermission[];
-  sandboxLevel?: SandboxLevel;
   
   // 依赖
   dependencies?: Record<string, string>;

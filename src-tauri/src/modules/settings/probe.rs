@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::modules::net::client::{NetClient, NetOrigin};
 use crate::modules::plugins::manager::ALLOWED_REGISTRY_HOSTS;
 use crate::modules::updater::commands::configured_endpoints;
 use crate::prelude::*;
@@ -148,8 +149,12 @@ fn ensure_allowed(url: &str, endpoint_hosts: &[String]) -> Result<(), String> {
 }
 
 /// 探测一条路径
+///
+/// 请求经 [`NetClient`] 发出：**诊断自己也要受出站策略约束**。用户刚把出站关了，
+/// 然后点"网络诊断" —— 每一行都会明确写成"离线模式已开启"，而不是笼统的连接失败。
+/// 后者会让他去查网线、改 DNS，而真实原因就在他三秒前按下的那个开关上。
 async fn probe_one(
-    client: reqwest::Client,
+    net: NetClient,
     label: String,
     via: &'static str,
     url: String,
@@ -167,10 +172,15 @@ async fn probe_one(
         error: None,
     };
 
-    match client.get(&url).send().await {
+    match net
+        .get_and_send(&url, NetOrigin::module("settings", "网络诊断"))
+        .await
+    {
         Err(error) => {
             row.elapsed_ms = started.elapsed().as_millis() as u64;
-            row.error = Some(network::describe_error_chain(&error));
+            // `NetError::message()` 已经区分了"被策略拒绝"与"传输失败" ——
+            // 前者返回策略原因原文，后者返回错误链
+            row.error = Some(error.message());
         }
         Ok(response) => {
             let status = response.status();
@@ -259,18 +269,14 @@ pub async fn run(app: &AppHandle, mut targets: Vec<ProbeTarget>) -> Result<Probe
         network::describe_mode(&settings)
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("无法创建诊断用 HTTP 客户端：{}", e))?;
+    // 8 秒而不是 30 秒：诊断要的是「快」，一次挂住 30 秒会让整张表等上几分钟
+    let net = NetClient::new(app.clone(), Duration::from_secs(PROBE_TIMEOUT_SECS))?;
 
     // 并发发出：串行时最坏情况是「条数 × 超时」，用户会以为界面卡住了。
     let mut handles = Vec::with_capacity(planned.len());
     for (label, via, url) in planned {
-        let client = client.clone();
-        handles.push(tauri::async_runtime::spawn(probe_one(
-            client, label, via, url,
-        )));
+        let net = net.clone();
+        handles.push(tauri::async_runtime::spawn(probe_one(net, label, via, url)));
     }
 
     let mut rows = Vec::with_capacity(handles.len());

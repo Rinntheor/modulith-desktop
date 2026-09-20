@@ -26,6 +26,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { AlertCircle, CheckCircle, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
 
+import NetPolicySection from './NetPolicySection';
+
 import {
   NETWORK_MODE_DIRECT,
   NETWORK_MODE_LABELS,
@@ -321,6 +323,11 @@ const NetworkSettings: React.FC<Props> = ({ settings, onUpdate }) => {
           </p>
         )}
       </section>
+
+      {/* 出站管控与流量日志。放在连通性诊断**之后**：
+          诊断回答"这条路通不通"，管控回答"允不允许走、以及刚才走了什么"——
+          先解释眼前的问题，再给长期的控制。 */}
+      <NetPolicySection settings={settings} onUpdate={onUpdate} />
     </div>
   );
 };

@@ -303,40 +303,9 @@ impl PluginPermission {
     ];
 }
 
-/// 沙箱级别（序列化为数字 0-3）
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(from = "u8", into = "u8")]
-#[repr(u8)]
-pub enum SandboxLevel {
-    /// 无网络、无文件系统、仅 UI
-    #[default]
-    L0 = 0,
-    /// 有限网络、localStorage
-    L1 = 1,
-    /// 完全网络、受限文件系统
-    L2 = 2,
-    /// 完全访问（需用户确认）
-    L3 = 3,
-}
-
-impl From<SandboxLevel> for u8 {
-    fn from(level: SandboxLevel) -> Self {
-        level as u8
-    }
-}
-
-impl From<u8> for SandboxLevel {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => SandboxLevel::L0,
-            1 => SandboxLevel::L1,
-            2 => SandboxLevel::L2,
-            3 => SandboxLevel::L3,
-            // 未知级别按最保守（L1）处理，而不是让整份清单解析失败
-            _ => SandboxLevel::L1,
-        }
-    }
-}
+// 这里曾有 `SandboxLevel`（L0..L3，"沙箱级别"）。**它已被删除**，理由见
+// `PluginManifest` 权限段上的说明 —— 一句话：宿主在同一个 JS 上下文里跑插件，
+// 分级管控做不到，而一个做不到的字段会被当成承诺。
 
 // ============================================================
 // 清单
@@ -427,10 +396,20 @@ pub struct PluginManifest {
     pub icon_svg: Option<String>,
 
     // ---- 权限 ----
+    //
+    // 这里曾有 `sandbox_level`（0..3，"沙箱级别"）。**已删除，且删除是向后兼容的**：
+    // 本结构没有 `deny_unknown_fields`，因此清单里残留的 `sandboxLevel` 会被静默忽略，
+    // 不会让安装失败。
+    //
+    // 删它的理由不是"没实现"，而是"做不到"：插件与宿主运行在**同一个 WebView、
+    // 同一个 JS 上下文**里，因此宿主无法按等级限制它 —— 一个自己声明等级、宿主无法
+    // 核实的字段。而它此前还被渲染进插件详情页（"沙箱级别 L1"），那就从"死字段"
+    // 变成了**界面上的一句空话**：用户会以为宿主能对插件分级管控。
+    //
+    // 替代它的是两样真东西：`permissions`（声明式，正在逐步变成真强制）与
+    // 出站网络策略（`modules/net`）。用一个真能生效的机制替掉一个不能生效的字段。
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
-    #[serde(default = "default_sandbox_level")]
-    pub sandbox_level: SandboxLevel,
 
     // ---- 激活事件 ----
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,10 +426,6 @@ pub struct PluginManifest {
     pub deprecated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_by: Option<String>,
-}
-
-fn default_sandbox_level() -> SandboxLevel {
-    SandboxLevel::L1
 }
 
 impl PluginManifest {
@@ -473,7 +448,6 @@ impl PluginManifest {
             icon: None,
             icon_svg: None,
             permissions: Vec::new(),
-            sandbox_level: default_sandbox_level(),
             activation_events: None,
             contributes: None,
             preview: None,

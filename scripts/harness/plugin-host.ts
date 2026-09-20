@@ -210,8 +210,22 @@ export async function createPluginHost(): Promise<PluginHost> {
     }
   };
 
+  /** 设置的可变状态。夹具自己持有；**默认值交给前端的 normalize 补** */
+  const appSettings: Record<string, any> = {};
+
   const handlers: Record<string, (args: Record<string, any>) => unknown> = {
     get_app_info: () => ({ version: '1.2.0', platform: 'windows', tauriVersion: '2.0.0' }),
+
+    // 设置：前端门面的同步判定读的就是它（`netGuard.ts` → `getCachedSettings()`），
+    // 因此夹具必须能改这两个值 —— 否则"离线时直接出站会被拒"这条断言根本没法写。
+    //
+    // 返回空对象让前端自己的 normalize 补默认值：夹具**不复制**一份默认设置，
+    // 那正是"同一份名单的第二份副本"。
+    get_app_settings: () => ({ ...appSettings }),
+    update_app_settings: ({ settings }) => {
+      Object.assign(appSettings, settings ?? {});
+      return { ...appSettings };
+    },
 
     list_plugins: () => installedPlugins(),
 

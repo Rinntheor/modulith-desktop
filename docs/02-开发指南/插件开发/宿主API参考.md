@@ -205,6 +205,14 @@ var keys = await ctx.storage.keys();
 
 网络请求服务。返回标准 `Response` 对象，因此可以像 `fetch` 一样使用。
 
+> **这是插件联网的唯一通道。** 直接用 `fetch`、`XMLHttpRequest`、`WebSocket`
+> 或 `navigator.sendBeacon` 会被拒绝：CSP 的 `connect-src` 只放行 IPC 与回环地址，
+> 宿主还会在调用时给出明确原因并记一条流量日志。走 `ctx.http` 才能带上权限检查、
+> 出站策略与日志 —— 三者都落在后端，直接发请求会把它们一起绕过去。
+>
+> 唯一例外是**回环地址**（`127.0.0.1` / `localhost` / `::1`）：连本机不出这台机器，
+> 因此直接连也放行。即便如此，`ctx.http` 仍然是首选 —— 它会留下日志。
+
 | 方法 | 签名 | 说明 |
 | --- | --- | --- |
 | `fetch` | `fetch(url, init?) => Promise<Response>` | 通用请求，方法取自 `init.method`，默认 GET |

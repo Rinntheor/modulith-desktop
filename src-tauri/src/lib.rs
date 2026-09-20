@@ -14,6 +14,7 @@ use tauri::Manager;
 use modules::auth::commands::*;
 use modules::backup::commands::*;
 use modules::logging::commands::*;
+use modules::net::commands::*;
 use modules::notifications::commands::*;
 use modules::plugins::commands::*;
 use modules::settings::commands::*;
@@ -109,6 +110,11 @@ pub fn run() -> Result<(), tauri::Error> {
         clear_logs,
         log_frontend,
         report_frontend_crash,
+        net_policy_modes,
+        net_log_list,
+        net_log_clear,
+        net_log_len,
+        net_note_frontend_outbound,
         list_notifications,
         push_notification,
         mark_notification_read,

@@ -43,6 +43,7 @@ import { registerCommand, unregisterCommandsByPrefix } from './commandRegistry';
 import { useModuleActive } from '../hooks/useModuleActive';
 import { isFileDropAvailable, subscribeFileDrop } from './fileDrop';
 import { clearModuleComponentCache } from './moduleComponentCache';
+import { installNetGuard, setGuardSource } from './netGuard';
 import { loadPermissionRegistry } from './permissionRegistry';
 import { logMessage } from './logger';
 import {
@@ -156,7 +157,6 @@ export interface PluginManifest {
   icon?: string;
   iconSvg?: string;
   permissions?: string[];
-  sandboxLevel?: number;
   activationEvents?: string[];
   contributes?: unknown;
   preview?: boolean;
@@ -1599,11 +1599,15 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
     scriptEl.textContent = code;
 
     loadingPluginId = pluginId;
+    // 门面要知道"现在是谁在跑"：来源标记是日志里唯一能回答"是谁发的"的东西，
+    // 而它只能在插件脚本执行的**这个窗口**里拿到。
+    setGuardSource(pluginId);
     try {
       document.head.appendChild(scriptEl);
       assets.scripts.push(scriptEl);
     } finally {
       loadingPluginId = null;
+      setGuardSource(null);
       window.removeEventListener('error', onError);
     }
 
@@ -1915,6 +1919,10 @@ let backgroundLoad: Promise<PluginLoadSummary> | null = null;
 export function loadPluginsInBackground(options: { timeoutMs?: number } = {}): Promise<PluginLoadSummary> {
   // 去重：重入时复用同一次加载，避免重复执行插件 bundle
   if (backgroundLoad) return backgroundLoad;
+
+  // 门面必须在**任何**插件代码执行之前装好 —— 包括 reloadPluginRuntime 里那批
+  // eager 插件。放在 run() 内部会晚一步。
+  installNetGuard();
 
   const run = async (): Promise<PluginLoadSummary> => {
     const summary: PluginLoadSummary = { total: 0, loaded: 0, lazy: 0, failures: [] };

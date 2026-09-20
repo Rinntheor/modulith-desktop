@@ -31,8 +31,57 @@ use tauri::ipc::Channel;
 use tauri::State;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::modules::net::log::NetLogEntry;
+use crate::modules::net::policy::{self, Decision};
 use crate::modules::settings::{network, settings as settings_store};
 use crate::prelude::*;
+
+/// 出站策略判定 —— **在命令入口，不在传输层**
+///
+/// ---------------------------------------------------------------------------
+/// 为什么只能到这一步，说清楚：
+///
+/// 应用更新走 `tauri-plugin-updater` 自带的 HTTP 传输，那段代码不经过我们的
+/// `NetClient`，我们无法在传输层拦它，也无法把它的连接记进流量日志。
+///
+/// 这里能保证的是：**我们不会主动发起这次检查或下载**。用户开了离线模式后点
+/// "检查更新"，会直接得到"离线模式已开启"，而不是等一次真实的网络往返。
+///
+/// 这条边界必须写在能被读到的地方 —— 一个未被覆盖的传输，不该因为界面上有个
+/// 开关就被读成已覆盖。流量日志的说明里也写了同一条。
+/// ---------------------------------------------------------------------------
+fn ensure_outbound_allowed(
+    app: &AppHandle,
+    purpose: &'static str,
+    url: &str,
+) -> Result<(), String> {
+    let settings = settings_store::load(app);
+    let decision = policy::decide(&settings.network_policy, settings.offline_mode, false);
+
+    let Decision::Deny(reason) = decision else {
+        return Ok(());
+    };
+
+    // 记一条。被拒绝的尝试也要留痕：否则用户点了"检查更新"、看到被拒、打开流量日志
+    // 却发现空无一物 —— 那会让他以为日志本身坏了。
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default();
+    crate::modules::net::log::record(
+        NetLogEntry::outbound("host", purpose, "GET", url, &host)
+            .with_outcome("denied", Some(reason.to_string())),
+    );
+
+    log::info!("{}被出站策略拒绝：{}", purpose, reason);
+    Err(format!(
+        "{}已被出站策略拒绝：{}。可在「设置 → 网络」中调整。",
+        purpose, reason
+    ))
+}
+
+const P_UPDATER_CHECK: &str = "应用更新检查";
+const P_UPDATER_INSTALL: &str = "应用更新下载";
 
 /// 已检查到、还没安装的更新
 ///
@@ -162,6 +211,17 @@ pub async fn check_app_update(
     let source = network::describe_mode(&settings);
     let endpoints = resolved_endpoints(&app, proxy)?;
 
+    // 入口拦截：离线/禁止出站时**不发起检查**。判断放在解析地址之后，是为了让被拒的
+    // 那一条日志能带上真实的目标地址而不是空串。
+    ensure_outbound_allowed(
+        &app,
+        P_UPDATER_CHECK,
+        &endpoints
+            .first()
+            .map(|url| url.to_string())
+            .unwrap_or_default(),
+    )?;
+
     log::info!(
         "检查应用更新：当前版本 {}，{}，清单地址 {}",
         env!("CARGO_PKG_VERSION"),
@@ -261,6 +321,7 @@ pub async fn check_app_update(
 /// 默认安装完成后重新拉起应用）。界面必须提前把这件事告诉用户。
 #[tauri::command]
 pub async fn install_app_update(
+    app: AppHandle,
     state: State<'_, UpdateState>,
     on_event: Channel<DownloadEvent>,
 ) -> Result<(), String> {
@@ -274,6 +335,10 @@ pub async fn install_app_update(
     let Some(update) = update else {
         return Err("没有待安装的更新，请先检查更新。".to_string());
     };
+
+    // 入口拦截。**检查通过之后到下载之间，用户可能已经把离线打开了** ——
+    // 所以这一处不是重复判定，它覆盖的正是那个时间窗。
+    ensure_outbound_allowed(&app, P_UPDATER_INSTALL, update.download_url.as_str())?;
 
     log::info!(
         "开始下载更新 {}：{}",
