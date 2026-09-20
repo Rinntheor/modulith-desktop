@@ -13,7 +13,7 @@
 // 「在后台乖乖待着」的唯一依据。
 
 import { useEffect, useState } from 'react';
-import { useModuleRuntime } from '../contexts/ModuleRuntimeContext';
+import { useModuleRuntime } from '../contexts/moduleRuntime';
 
 /**
  * 当前文档是否可见（窗口是否没被最小化 / 隐藏）。
