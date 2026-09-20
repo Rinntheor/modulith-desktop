@@ -370,6 +370,116 @@ check(
     : `.send() 出现在了：${senders.join('、')} —— 这是真正把请求发出去的动作，绕过门面就意味着绕过策略与日志`
 );
 
+// ============================================================
+// 7. CSP：IPC 的源必须在 connect-src 里
+// ============================================================
+
+// 这一节守的是一个"改错了应用直接白屏"的配置。
+//
+// Tauri v2 的 IPC 在 WebView 里表现为一次对 `ipc:` / `http://ipc.localhost` 的
+// 请求，而 **connect-src 一旦列了值就不再回退到 default-src**。漏掉它们，所有
+// invoke 一起失败 —— 症状是应用启动即白屏，而那看起来像"应用坏了"，
+// 不像"少写了一行配置"。
+//
+// 同时断言它**没有放开任意外部宿主**：配了 CSP 却把外面放开，等于既拿不到边界、
+// 又以为自己有。这条白名单必须与 `netGuard.ts` 的判定口径一致 —— 外部地址在
+// 两个层上都被挡，只是理由与可读性不同。
+console.log('\nCSP：');
+
+const tauriConfig = JSON.parse(read('src-tauri/tauri.conf.json')) as {
+  app?: { security?: { csp?: unknown } };
+};
+const csp = tauriConfig.app?.security?.csp;
+
+function cspDirective(name: string): string[] {
+  if (!csp || typeof csp !== 'object') return [];
+  const raw = (csp as Record<string, unknown>)[name];
+  if (typeof raw === 'string') return raw.split(/\s+/).filter(Boolean);
+  if (Array.isArray(raw)) {
+    return raw.flatMap((entry) => String(entry).split(/\s+/).filter(Boolean));
+  }
+  return [];
+}
+
+const ALLOWED_CONNECT_SRC = [
+  "'self'",
+  'ipc:',
+  'http://ipc.localhost',
+  'http://localhost:*',
+  'http://127.0.0.1:*',
+  'ws://localhost:*',
+  'ws://127.0.0.1:*',
+];
+const connectSrc = cspDirective('connect-src');
+const joined = (list: string[]) => [...list].sort().join(' ');
+check(
+  joined(connectSrc) === joined(ALLOWED_CONNECT_SRC),
+  joined(connectSrc) === joined(ALLOWED_CONNECT_SRC)
+    ? `connect-src 恰好是白名单里的 ${ALLOWED_CONNECT_SRC.length} 项（含 IPC 的两个源，且没有放开任意外部宿主）`
+    : `connect-src 与白名单不符。\n      实际：${connectSrc.join(' ')}\n      白名单：${ALLOWED_CONNECT_SRC.join(' ')}`
+);
+
+// ============================================================
+// 8. 前端镜像：判定常量必须与 Rust 逐字相同
+// ============================================================
+
+// WebView 里的 `XMLHttpRequest.send()` 与 `new WebSocket()` 都是**同步**的，
+// 等不了一次 IPC 往返，所以 `netGuard.ts` 必须持有一份判定规则的镜像。
+//
+// 这是全项目**唯一**允许存在的第二份规则。允许它的前提就是这个脚本能把它钉住：
+// 逐个常量比对两侧的字面量，任何一处改动漏了对面都会在这里失败。
+console.log('\n判定镜像：');
+
+const policyRs = read('src-tauri/src/modules/net/policy.rs');
+const netControlTs = read('src/services/netControl.ts');
+
+function rustConst(name: string): string | null {
+  const match = policyRs.match(new RegExp(`pub const ${name}: &str =[\\s\\S]*?"([^"]*)"`));
+  return match ? match[1] : null;
+}
+function tsConst(name: string): string | null {
+  const match = netControlTs.match(new RegExp(`export const ${name} = '([^']*)'`));
+  return match ? match[1] : null;
+}
+
+for (const [rustName, tsName] of [
+  ['MODE_ALLOW', 'NET_MODE_ALLOW'],
+  ['MODE_ASK', 'NET_MODE_ASK'],
+  ['MODE_DENY', 'NET_MODE_DENY'],
+  ['DENY_OFFLINE', 'NET_DENY_OFFLINE'],
+  ['DENY_POLICY', 'NET_DENY_POLICY'],
+  ['DENY_DIRECT', 'NET_DENY_DIRECT'],
+] as const) {
+  const rust = rustConst(rustName);
+  const ts = tsConst(tsName);
+  check(
+    rust !== null && rust === ts,
+    rust !== null && rust === ts
+      ? `${tsName} 与 Rust 的 ${rustName} 逐字相同`
+      : `${tsName} 与 Rust 的 ${rustName} 不一致。Rust：${JSON.stringify(rust)}／前端：${JSON.stringify(ts)}`
+  );
+}
+
+// 回环判定同样是两份（后端 `net/mod.rs` 的 `is_loopback_host`、前端
+// `utils/networkSettings.ts` 的 `isLoopbackHost`）。这里用**同一张输入表**：
+// Rust 侧在 `net/mod.rs` 的单元测试里，前端侧在这里。
+console.log('\n回环判定的输入表：');
+const LOOPBACK_TRUE = ['localhost', 'LOCALHOST', '127.0.0.1', '127.1.2.3', '::1', '[::1]'];
+const LOOPBACK_FALSE = [
+  'localhost.evil.tld',
+  'notlocalhost',
+  '128.0.0.1',
+  'example.com',
+  '0.0.0.0',
+  '',
+];
+for (const host of LOOPBACK_TRUE) {
+  check(isLoopbackHost(host), `前端把 ${JSON.stringify(host)} 判为回环（与 Rust 同一张表）`);
+}
+for (const host of LOOPBACK_FALSE) {
+  check(!isLoopbackHost(host), `前端不把 ${JSON.stringify(host)} 判为回环`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);
