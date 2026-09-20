@@ -6,6 +6,7 @@ import BootGate from './components/boot/BootGate';
 import ThemeProvider from './components/ThemeProvider';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { installGlobalErrorHandlers } from './services/globalErrorHandlers';
+import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
 /*
@@ -23,6 +24,17 @@ import "@styles/global/index.css";
  * （事件处理器、定时器、未处理的 Promise 拒绝）。见该模块的说明。
  */
 installGlobalErrorHandlers();
+
+/*
+ * 提示音的解锁监听也要尽早装。
+ *
+ * WebView 的自动播放策略要求音频上下文在有用户交互之后才能出声。这个监听只是
+ * 在 `document` 上挂一次 pointerdown / keydown，代价接近零；装得越早，解锁
+ * 机会越多 —— 解锁界面上的那次输入按键就能把它解开。
+ * 音频上下文本身仍然是**第一次真的要响时才创建**：启动过程中建一个 AudioContext
+ * 会让它一直占着音频设备，而绝大多数启动根本不会产生通知。
+ */
+primeSound();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

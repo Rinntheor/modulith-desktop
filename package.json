@@ -1,7 +1,7 @@
 {
   "name": "modulith-desktop",
   "private": true,
-  "version": "1.1.6",
+  "version": "1.1.7",
   "type": "module",
   "scripts": {
     "dev": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && vite",
@@ -14,6 +14,9 @@
     "check:network": "node scripts/check-network.ts",
     "check:memory": "node scripts/check-memory.ts",
     "check:performance": "node scripts/check-performance.ts",
+    "check:theme": "node scripts/check-theme.ts",
+    "check:sounds": "node scripts/check-sounds.ts",
+    "check:backup": "node scripts/check-backup.ts",
     "release": "node scripts/release.ts",
     "release:manifest": "node scripts/generate-latest-json.ts",
     "ver": "node scripts/version-manager.ts",

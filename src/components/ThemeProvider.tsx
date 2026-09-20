@@ -18,6 +18,7 @@ import { getCachedSettings, subscribeSettings } from '../services/appSettings';
 import {
   getReduceMotion,
   primeThemeFromDocument,
+  setGlassEffect,
   setPerformanceMode,
   setReduceMotion,
   setThemeMode,
@@ -39,13 +40,14 @@ primeThemeFromDocument();
 // 缓存写过一次，这里把它读回内存，保证 React 首帧就有正确的主色。
 primeAccentFromDocument();
 
-/** 把当前设置里的主题、配色、动效与性能模式应用到 document（后端 → 界面 的单向同步） */
+/** 把当前设置里的主题、配色、动效、毛玻璃与性能模式应用到 document（后端 → 界面 的单向同步） */
 function applySettingsToTheme(): void {
   const settings = getCachedSettings();
   setThemeMode(settings.theme);
   setAccentId(settings.accent);
   setReduceMotion(settings.reduceMotion);
-  // 顺序无关：两者都由 `applyMotionPreference` 合并成同一个有效值，
+  setGlassEffect(settings.glassEffect);
+  // 顺序无关：动效与毛玻璃两个有效值各自都由一个合并函数求出，
   // 先设哪个都不会留下中间态。
   setPerformanceMode(settings.performanceMode);
 }

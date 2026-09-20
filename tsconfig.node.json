@@ -37,6 +37,7 @@
    * check-update-throttle.ts / check-network.ts / check-memory.ts /
    * check-performance.ts 会分别引入 `src/utils/semver.ts`、`src/utils/updateCheck.ts`、
    * `src/utils/networkSettings.ts`、`src/utils/motionPreference.ts`、
+   * `src/utils/glassPreference.ts`、`src/utils/notificationSounds.ts`、
    * `src/services/moduleComponentCache.ts` 与 `src/config/pluginRegistry.ts`。
    *
    * **这些文件必须自身不依赖 DOM**（`theme.ts` 这类要操作 `document` 的模块
@@ -51,6 +52,8 @@
     "src/config/pluginRegistry.ts",
     "src/services/moduleComponentCache.ts",
     "src/utils/motionPreference.ts",
+    "src/utils/glassPreference.ts",
+    "src/utils/notificationSounds.ts",
     "src/utils/semver.ts",
     "src/utils/updateCheck.ts",
     "src/utils/networkSettings.ts"

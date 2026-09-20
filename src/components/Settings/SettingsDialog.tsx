@@ -26,12 +26,16 @@ import {
   Heart,
   Globe,
   FileText,
+  Bell,
+  Archive,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import ModuleEmbed from '../ModuleEmbed';
 import LoggingSettings from './LoggingSettings';
 import NetworkSettings from './NetworkSettings';
+import NotificationSettings from './NotificationSettings';
+import BackupSettings from './BackupSettings';
 import SecuritySettings from './SecuritySettings';
 import Toggle from './Toggle';
 import UpdateChecker from './UpdateChecker';
@@ -55,8 +59,10 @@ import { persistWindowStateNow, resyncTabsFromSettings } from '../../services/ta
 
 export type SettingsSectionId =
   | 'general'
+  | 'notifications'
   | 'network'
   | 'logs'
+  | 'backup'
   | 'security'
   | 'plugins'
   | 'market'
@@ -70,8 +76,10 @@ interface SectionDef {
 
 const SECTIONS: SectionDef[] = [
   { id: 'general', label: '通用', icon: SlidersHorizontal },
+  { id: 'notifications', label: '通知', icon: Bell },
   { id: 'network', label: '网络', icon: Globe },
   { id: 'logs', label: '日志', icon: FileText },
+  { id: 'backup', label: '备份', icon: Archive },
   { id: 'security', label: '安全', icon: ShieldCheck },
   { id: 'plugins', label: '插件', icon: Puzzle },
   { id: 'market', label: '市场', icon: Store },
@@ -522,7 +530,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
 
                       <SettingRow
                         title="性能模式"
-                        description="在关闭动画的基础上，再停用毛玻璃（标题栏、标签栏、侧边栏各有一层常驻模糊）、装饰性大半径模糊与持续循环的粒子背景。它们不表现为动画，而是让每一帧都要重新合成，因此「关了动画还是卡」通常出在这里"
+                        description="在关闭动画的基础上，再停用装饰性大半径模糊、合成层提升提示与持续循环的粒子背景，并关闭毛玻璃。它们不表现为动画，而是让每一帧都要重新合成，因此「关了动画还是卡」通常出在这里"
                       >
                         <Toggle
                           checked={settings.performanceMode}
@@ -530,9 +538,19 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                         />
                       </SettingRow>
 
+                      <SettingRow
+                        title="毛玻璃效果"
+                        description="对话框、菜单、抽屉这些浮层用背景模糊做出景深。窗口亚层（标题栏、标签栏、侧边栏）不使用它 —— 它们背后永远是应用的纯色底，模糊没有视觉效果却要每帧重新合成，因此已永久关闭，不需要在这里开关"
+                      >
+                        <Toggle
+                          checked={settings.glassEffect}
+                          onChange={(next) => update({ glassEffect: next })}
+                        />
+                      </SettingRow>
+
                       {settings.performanceMode && (
                         <p className="pb-4 -mt-1 text-[11px] text-gray-500 leading-relaxed">
-                          性能模式已包含「关闭界面动画」的效果，两者不需要同时打开。
+                          性能模式已包含「关闭界面动画」与「毛玻璃效果」的效果，三者不需要同时打开。
                           代价是界面不再有毛玻璃层次与粒子背景 —— 看起来会更朴素。
                         </p>
                       )}
@@ -698,7 +716,11 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   <NetworkSettings settings={settings} onUpdate={update} />
                 )}
 
+                {section === 'notifications' && (
+                  <NotificationSettings settings={settings} onUpdate={update} />
+                )}
                 {section === 'logs' && <LoggingSettings settings={settings} onUpdate={update} />}
+                {section === 'backup' && <BackupSettings />}
 
                 {section === 'security' && <SecuritySettings />}
 

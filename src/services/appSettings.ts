@@ -7,6 +7,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { isNetworkMode, normalizeProxyBase, type NetworkMode } from '../utils/networkSettings';
 import { isThemeMode, type ThemeMode } from './theme';
+import {
+  clampSoundVolume,
+  DEFAULT_SOUND_VOLUME,
+  DEFAULT_NOTIFICATION_SOUND_ID,
+} from '../utils/notificationSounds';
 
 export interface AppSettings {
   /** 启动后默认打开的模块 ID（null = 内置默认 dashboard） */
@@ -119,6 +124,48 @@ export interface AppSettings {
    */
   performanceMode: boolean;
   /**
+   * 是否启用**浮层**毛玻璃（对话框、菜单、抽屉、下拉面板）。
+   *
+   * 窗口亚层（标题栏、标签栏、侧边栏）**不受它控制**：那三处背后永远是应用的
+   * 纯色底，`backdrop-filter` 既没有视觉效果、又要让合成器每帧把下层读回来
+   * 做一次模糊，因此已永久关闭。本开关管的是剩下那些真正「浮在内容之上」的
+   * 表面 —— 它们背后有会变化的内容，模糊在那里才有意义。
+   *
+   * 默认**开启**。它确实有视觉收益（浮层与背后内容之间多一层景深），而代价
+   * 只发生在浮层打开的那几秒；这与 `performanceMode` 默认关闭并不矛盾 ——
+   * 两者的差别是「临时开销」对「常驻开销」。
+   *
+   * 性能模式**包含**关闭毛玻璃（见 `services/theme.ts` 的有效值计算）：
+   * 让用户为了去掉模糊再去打开一个代价更大的开关，等于把这件事藏起来。
+   */
+  glassEffect: boolean;
+  /**
+   * 是否播放通知提示音。
+   *
+   * 默认**开启**。通知在这个应用里是低频且有意义的事件（插件加载失败、有可用
+   * 更新），不是每次操作的反馈；一条没被注意到的通知等于一条失败的通知。
+   */
+  notificationSoundEnabled: boolean;
+  /**
+   * 提示音 id。
+   *
+   * 内置取值见 `utils/notificationSounds.ts` 的 `BUILTIN_SOUNDS`，另有保留值
+   * `custom`（使用 `notificationSoundCustomFile` 指向的音效）。
+   * 未知取值由 `resolveSoundId` 回退到第一个内置音色，**不在这里纠正** ——
+   * 与 `accent` 同一取向：保留原值可以避免「用户手工改了 settings.json，被静默改回」。
+   */
+  notificationSoundId: string;
+  /**
+   * 自定义提示音的文件名（位于 `<app_data>/sounds/` 下），没有则为 `null`。
+   *
+   * **存的是文件名而不是路径**：设置文件可被手工编辑，存路径等于把「读取任意
+   * 文件」变成一条常驻能力。后端 `sound.rs` 只认 `custom.<白名单扩展名>`
+   * 这一个形状，因此这里不需要（也无法）做路径处理。
+   */
+  notificationSoundCustomFile: string | null;
+  /** 提示音音量，取值 `[0, 1]` */
+  notificationSoundVolume: number;
+  /**
    * 由系统自启动拉起时，是否静默启动（最小化而不是推到前台）。
    *
    * **只在自启动时生效**（命令行带 `--autostart`）：用户双击图标启动不该受它影响，
@@ -229,6 +276,16 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   // 与后端 default_performance_mode() 一致：默认关闭。
   // 它是有代价的取舍（去掉毛玻璃与装饰效果会让界面变朴素），只能是用户主动选择。
   performanceMode: false,
+  // 与后端 default_glass_effect() 一致：默认开启。
+  // 浮层毛玻璃是临时开销（只在浮层打开时），与三个常驻亚层的取舍不同。
+  glassEffect: true,
+  // 与后端 default_notification_sound_* 保持一致：默认开启、默认音色、默认音量。
+  // 音量默认 0.8 而不是 1：合成音本身已经按峰值归一化过，留一点余量给多个通知
+  // 叠加的情形，避免同时响几声时被压缩器压扁。
+  notificationSoundEnabled: true,
+  notificationSoundId: DEFAULT_NOTIFICATION_SOUND_ID,
+  notificationSoundCustomFile: null,
+  notificationSoundVolume: DEFAULT_SOUND_VOLUME,
   // 这两个默认也是「关」：它们只在自启动时才有意义，而自启动本身默认不开。
   // 方向与 tabBarVisible 那类「默认为开」的字段相反，理由见 normalize() 里的说明。
   autoStartSilent: false,
@@ -314,6 +371,25 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     // 「关」，所以缺字段必须按关 —— 用 `!== false` 的写法会让一份缺字段的
     // settings.json 把性能模式打开，那是一个用户从未选择过的界面。
     performanceMode: raw?.performanceMode === true,
+    // 与上面几个相反，这里默认是「开」，因此只有显式写成 false 才关闭。
+    // 用 `=== true` 会让一份缺该字段的老 settings.json 静默关掉毛玻璃 ——
+    // 那是一次用户从未做过的选择。判据与 tabBarVisible / fileLoggingEnabled 一致。
+    glassEffect: raw?.glassEffect !== false,
+    // 与 glassEffect 同一约定：默认「开」，只有显式 false 才关闭
+    notificationSoundEnabled: raw?.notificationSoundEnabled !== false,
+    // 音色 id 只做类型清洗，未知取值交给 resolveSoundId 回退（理由见接口注释）
+    notificationSoundId:
+      typeof raw?.notificationSoundId === 'string' && raw.notificationSoundId
+        ? raw.notificationSoundId
+        : DEFAULT_APP_SETTINGS.notificationSoundId,
+    // 文件名只接受非空字符串；**合法性由后端判定**（它才知道白名单扩展名与
+    // `custom.` 前缀的规则）—— 前端复制一份判断只会漂移成两份。
+    notificationSoundCustomFile:
+      typeof raw?.notificationSoundCustomFile === 'string' && raw.notificationSoundCustomFile
+        ? raw.notificationSoundCustomFile
+        : null,
+    // 夹取而不是拒绝：一个被手工改歪的音量不值得让整份设置回落到默认
+    notificationSoundVolume: clampSoundVolume(raw?.notificationSoundVolume),
     // 与 performanceMode 同一写法：这两个默认也是「关」，因此只有显式 true 才开。
     // 用 `!== false` 会让一份缺字段的老 settings.json 把它们打开。
     autoStartSilent: raw?.autoStartSilent === true,
@@ -389,6 +465,25 @@ export async function loadAppSettings(): Promise<AppSettings> {
     console.warn('[appSettings] 读取设置失败，使用默认值:', error);
     cache = { ...DEFAULT_APP_SETTINGS };
   }
+  loaded = true;
+  notify();
+  return cache;
+}
+
+/**
+ * 让后端**从磁盘重新读取**设置，并把结果同步到前端缓存。
+ *
+ * 与 `loadAppSettings` 的区别是它调用的是 `reload_app_settings`：后端的
+ * `SettingsState` 是进程启动时读进来的一份内存副本，只在 `update_app_settings`
+ * 时被更新。因此设置文件被**外部**改动之后（最典型的是从备份恢复
+ * `settings.json`），只调 `get_app_settings` 拿到的仍是旧值 —— 后端自己就不知道
+ * 磁盘变了。
+ *
+ * 那条命令同时会重新套用运行期开关（日志记录），所以它修的不只是"读到的值"。
+ */
+export async function reloadAppSettings(): Promise<AppSettings> {
+  const fresh = await invoke<AppSettings>('reload_app_settings');
+  cache = normalize(fresh);
   loaded = true;
   notify();
   return cache;

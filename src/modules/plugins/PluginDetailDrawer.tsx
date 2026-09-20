@@ -26,6 +26,7 @@ import {
   formatRelativeTime,
 } from './pluginMeta';
 import { getPermissionDescriptor } from '../../services/permissionRegistry';
+import { DRAWER_ENTER, DRAWER_EXIT } from '../../utils/motionCurves';
 import type { InstalledPlugin, PluginLoadState } from '../../services/pluginRuntime';
 
 interface PluginDetailDrawerProps {
@@ -99,9 +100,8 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
 
             <motion.aside
               initial={{ x: '100%' }}
-              animate={{ x: 0 }}
-              exit={{ x: '100%' }}
-              transition={{ type: 'spring', stiffness: 380, damping: 38 }}
+              animate={{ x: 0, transition: DRAWER_ENTER }}
+              exit={{ x: '100%', transition: DRAWER_EXIT }}
               className="fixed right-0 top-0 h-full w-full max-w-[560px] bg-white z-50 flex flex-col shadow-2xl"
             >
               {/* 头部 */}

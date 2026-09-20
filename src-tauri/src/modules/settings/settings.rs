@@ -175,6 +175,53 @@ pub struct AppSettings {
     /// `.lc-performance`）—— 与 `accent` 同理，视觉细节不该在后端复制一份。
     #[serde(default = "default_performance_mode")]
     pub performance_mode: bool,
+    /// 是否启用**浮层**毛玻璃（对话框、菜单、抽屉、下拉面板）
+    ///
+    /// 窗口亚层（标题栏、标签栏、侧边栏）**不受它控制**：那三处背后永远是应用的
+    /// 纯色底，`backdrop-filter` 没有视觉效果却要让合成器每帧重新合成，因此已在
+    /// 前端永久关闭（见 `src/styles/global/index.css` 与 `utils/glassPreference.ts`）。
+    ///
+    /// 默认 `true`。它确实有视觉收益，而代价只发生在浮层打开的那几秒 ——
+    /// 这与 `performance_mode` 默认关闭不矛盾，差别是「临时开销」对「常驻开销」。
+    ///
+    /// 性能模式**包含**关闭毛玻璃（见前端 `services/theme.ts` 的合并逻辑）：
+    /// 让用户为了去掉模糊再去打开一个代价更大的开关，等于把这件事藏起来。
+    ///
+    /// 后端只存这个布尔量，具体停用什么由前端决定 —— 与 `performance_mode`、
+    /// `accent` 同理，视觉细节不该在后端复制一份（复制一份必然漂移）。
+    #[serde(default = "default_glass_effect")]
+    pub glass_effect: bool,
+    /// 是否播放通知提示音
+    ///
+    /// 默认 `true`。通知在这个应用里是**低频且有意义**的事件（插件加载失败、
+    /// 有可用更新），不是每次操作的反馈；一条没被注意到的通知等于一条失败的通知。
+    /// 用户随时可以在「设置 → 通知」里关掉。
+    #[serde(default = "default_notification_sound_enabled")]
+    pub notification_sound_enabled: bool,
+    /// 提示音 id
+    ///
+    /// 内置取值由前端 `src/utils/notificationSounds.ts` 的 `BUILTIN_SOUNDS` 定义
+    /// （`chime` / `drop` / `pulse` / `alert` / `soft`），另有保留值 `custom`。
+    /// **这里不校验是否属于已知集合** —— 音色表在前端，后端复制一份清单必然漂移，
+    /// 后果是「前端新增了音色，后端拒绝保存」。未知 id 由前端回退到默认音色，
+    /// 因此这里只校验格式（非空、长度、字符集）。与 `accent` 同一取向。
+    #[serde(default = "default_notification_sound_id")]
+    pub notification_sound_id: String,
+    /// 自定义提示音的文件名（位于 `<app_data>/sounds/` 下）
+    ///
+    /// **只存文件名，不存路径。** 存绝对路径会让「读取任意用户文件」成为一条
+    /// 常驻能力，而它只需要在用户主动选择的那一刻发生一次；文件名 + 把字节复制进
+    /// 应用数据，换来三件事：原文件移动/删除后提示音仍可用、不存在任意路径读取面、
+    /// 备份迁移只需要带上应用数据目录。取值由 `sound.rs` 严格校验
+    /// （只认 `custom.<白名单扩展名>` 这一个形状）。
+    #[serde(default)]
+    pub notification_sound_custom_file: Option<String>,
+    /// 提示音音量（`0.0..=1.0`）
+    ///
+    /// 提供音量而不是只给一个开关，是因为系统音量与应用音量是两件事：用户可能把
+    /// 系统音量调得很低用于其它程序，却仍希望这个应用的提示音听得见（或者相反）。
+    #[serde(default = "default_notification_sound_volume")]
+    pub notification_sound_volume: f32,
     /// 自启动时是否「静默」启动（不把窗口推到前台）
     ///
     /// **只在由系统自启动拉起时生效**（命令行带 `--autostart`）。用户自己双击图标
@@ -268,6 +315,50 @@ fn default_performance_mode() -> bool {
     false
 }
 
+/// 浮层毛玻璃默认开启。
+///
+/// 与 `default_performance_mode` 的方向相反，因为两者的取舍不同：性能模式
+/// 换来的是**常驻**的朴素界面（三个亚层、装饰模糊、合成层提升一直在），
+/// 而毛玻璃的代价只发生在浮层打开的那几秒。默认关掉一件只在打开浮层时才
+/// 有代价、却有实际视觉收益的效果，没有道理。
+fn default_glass_effect() -> bool {
+    true
+}
+
+/// 提示音默认开启。理由见 `notification_sound_enabled` 字段上的说明。
+fn default_notification_sound_enabled() -> bool {
+    true
+}
+
+/// 默认音色 id（与前端 `BUILTIN_SOUNDS[0].id` 必须一致）
+fn default_notification_sound_id() -> String {
+    DEFAULT_NOTIFICATION_SOUND_ID.to_string()
+}
+
+/// 默认音色。取第一个内置音色 —— 前端回退到未知 id 时用的也是它。
+pub const DEFAULT_NOTIFICATION_SOUND_ID: &str = "chime";
+
+/// 音效 id 的最大长度（与前端 `utils/notificationSounds.ts` 的校验一致）
+pub const MAX_SOUND_ID_LEN: usize = 32;
+
+/// 音量区间与默认值（与前端 `MIN/MAX/DEFAULT_SOUND_VOLUME` 必须一致）
+pub const MIN_NOTIFICATION_SOUND_VOLUME: f32 = 0.0;
+pub const MAX_NOTIFICATION_SOUND_VOLUME: f32 = 1.0;
+pub const DEFAULT_NOTIFICATION_SOUND_VOLUME: f32 = 0.8;
+
+fn default_notification_sound_volume() -> f32 {
+    DEFAULT_NOTIFICATION_SOUND_VOLUME
+}
+
+/// 校验音效 id 的**格式**（不校验是否为已知音色，理由见 `notification_sound_id`）
+pub fn is_valid_sound_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SOUND_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// 默认直连。理由见 `network_mode` 字段上的说明。
 fn default_network_mode() -> String {
     network::NETWORK_MODE_DIRECT.to_string()
@@ -345,7 +436,18 @@ impl Default for AppSettings {
             default_module: None,
             sidebar_collapsed: false,
             confirm_before_uninstall: true,
-            restore_last_module: false,
+            // **必须与 `default_restore_last_module()` 的返回值一致。**
+            //
+            // 这里以前写的是 `false`，而 serde 的缺省值是 `true` —— 两者不一致的
+            // 后果很具体：`load()` 在设置文件缺失或损坏时回落到 `AppSettings::default()`，
+            // 因此「全新安装」与「字段缺失的老文件」会得到**相反**的默认行为。
+            // 用户看到的现象是「恢复上次打开的模块与标签页」这个开关在全新安装时
+            // 默认是关的，而文档与界面上的默认值都写着开。
+            //
+            // 同一个错误的第二种表现更难发现：手工改坏 settings.json 会让这个开关
+            // 静默地变成关闭，而用户什么也没做。
+            // `impl_default_matches_serde_defaults` 测试把两处钉在一起。
+            restore_last_module: default_restore_last_module(),
             last_module: None,
             theme: default_theme(),
             reduce_motion: false,
@@ -362,6 +464,11 @@ impl Default for AppSettings {
             file_logging_enabled: default_file_logging_enabled(),
             crash_logging_enabled: default_crash_logging_enabled(),
             performance_mode: default_performance_mode(),
+            glass_effect: default_glass_effect(),
+            notification_sound_enabled: default_notification_sound_enabled(),
+            notification_sound_id: default_notification_sound_id(),
+            notification_sound_custom_file: None,
+            notification_sound_volume: default_notification_sound_volume(),
             auto_start_silent: false,
             auto_start_fullscreen: false,
             auto_start_maximized: false,
@@ -423,6 +530,44 @@ impl AppSettings {
                 "Invalid accent \"{}\": expected 1..={} chars of [a-z0-9-]",
                 self.accent, MAX_ACCENT_ID_LEN
             ));
+        }
+
+        // 提示音 id：与 accent 同一取向，只校验格式。
+        // 未知音色由前端回退到默认值，是安全的降级；在这里拒绝一份只是带了新音色的
+        // 设置，会让「前端加了音色、后端拒绝保存」这种跨版本问题出现。
+        if !is_valid_sound_id(&self.notification_sound_id) {
+            return Err(format!(
+                "Invalid notificationSoundId \"{}\": expected 1..={} chars of [a-z0-9-]",
+                self.notification_sound_id, MAX_SOUND_ID_LEN
+            ));
+        }
+
+        // 音量越界拒绝而不是夹取：这个值由界面上的滑块产生，任何合法交互都不会
+        // 越界，因此越界只可能来自被手工改坏的文件或前端的错误。静默纠正会让前端的
+        // 值与存下来的值不一致，反而更难排查（与 theme 同一理由）。
+        if !(MIN_NOTIFICATION_SOUND_VOLUME..=MAX_NOTIFICATION_SOUND_VOLUME)
+            .contains(&self.notification_sound_volume)
+            || !self.notification_sound_volume.is_finite()
+        {
+            return Err(format!(
+                "Invalid notificationSoundVolume {}: expected {}..={}",
+                self.notification_sound_volume,
+                MIN_NOTIFICATION_SOUND_VOLUME,
+                MAX_NOTIFICATION_SOUND_VOLUME
+            ));
+        }
+
+        // 自定义提示音的文件名：**必须在这里就拒绝非法取值**。
+        // 读取端（`sound.rs::load`）也有一道同样的校验，但两道的意义不同 ——
+        // 这里防的是"把非法名字写进设置文件"，那里防的是"文件已经被手工改坏"。
+        // 只在读取端校验会让一份坏设置一直躺在磁盘上。
+        if let Some(file_name) = &self.notification_sound_custom_file {
+            if !file_name.is_empty() && !super::sound::is_valid_custom_sound_file_name(file_name) {
+                return Err(format!(
+                    "Invalid notificationSoundCustomFile \"{file_name}\": expected \"custom.<{}>\"",
+                    super::sound::SOUND_EXTENSIONS.join("|")
+                ));
+            }
         }
 
         // 标签页：校验数量上限与每个 ID 的格式。
@@ -670,7 +815,7 @@ mod tests {
         assert_eq!(defaults.default_module, None);
         assert!(!defaults.sidebar_collapsed);
         assert!(defaults.confirm_before_uninstall);
-        assert!(!defaults.restore_last_module);
+        assert!(defaults.restore_last_module);
         assert_eq!(defaults.last_module, None);
         // 主题默认跟随系统；动效默认开启（不打扰用户的既有体验）
         assert_eq!(defaults.theme, THEME_SYSTEM);
@@ -693,6 +838,39 @@ mod tests {
         assert!(defaults.crash_logging_enabled);
         // 性能模式默认关闭：它是有代价的取舍，只能是用户主动选择的结果
         assert!(!defaults.performance_mode);
+        // 毛玻璃默认开启：它的代价只发生在浮层打开的那几秒，
+        // 与性能模式那种「常驻换来朴素界面」的取舍方向相反
+        assert!(defaults.glass_effect);
+        // 提示音默认开启、默认音色、默认音量，且没有自定义文件
+        assert!(defaults.notification_sound_enabled);
+        assert_eq!(defaults.notification_sound_id, DEFAULT_NOTIFICATION_SOUND_ID);
+        assert_eq!(
+            defaults.notification_sound_volume,
+            DEFAULT_NOTIFICATION_SOUND_VOLUME
+        );
+        assert_eq!(defaults.notification_sound_custom_file, None);
+    }
+
+    /// `impl Default` 与 serde 的缺省值必须逐字段一致。
+    ///
+    /// 这两处表达的是同一件事（"用户没有做过这个选择"），却有两条独立的代码路径：
+    /// 字段缺失时走 `#[serde(default = "...")]`，文件缺失或损坏时走
+    /// `AppSettings::default()`。任何一处漏改，都会让「全新安装」与「老设置文件」
+    /// 得到不同的默认行为 —— 而这类分叉不会有任何报错，只会让某个开关在两个本该
+    /// 相同的情形下一个开一个关。
+    ///
+    /// 逐字段比对而不是只比一个：这样将来新增字段时，只补了一处就会被立刻发现。
+    #[test]
+    fn impl_default_matches_serde_defaults() {
+        let from_impl = AppSettings::default();
+        let from_json: AppSettings =
+            serde_json::from_str("{}").expect("空对象应当能反序列化出全部默认值");
+
+        assert_eq!(
+            serde_json::to_value(&from_impl).unwrap(),
+            serde_json::to_value(&from_json).unwrap(),
+            "AppSettings::default() 与「全字段缺失」必须得到完全相同的设置"
+        );
     }
 
     /// 引入网络与日志设置之前写下的 settings.json 没有这五个字段，
@@ -706,6 +884,22 @@ mod tests {
         assert!(settings.file_logging_enabled, "缺失时应当按开启处理");
         assert!(settings.crash_logging_enabled, "缺失时应当按开启处理");
         assert!(!settings.performance_mode, "缺失时应当按关闭处理");
+        assert!(
+            settings.glass_effect,
+            "缺失时应当按开启处理 —— 用 `=== true` 那类判据会让老设置文件静默关掉毛玻璃"
+        );
+        assert!(
+            settings.notification_sound_enabled,
+            "缺失时应当按开启处理"
+        );
+        assert_eq!(
+            settings.notification_sound_id, DEFAULT_NOTIFICATION_SOUND_ID,
+            "缺失时落到默认音色"
+        );
+        assert_eq!(
+            settings.notification_sound_volume, DEFAULT_NOTIFICATION_SOUND_VOLUME,
+            "缺失时落到默认音量（不是 0 —— 那会让提示音静音）"
+        );
 
         // 回落到默认值的一份设置本身必须是合法的，否则老用户的第一次保存就会失败
         assert!(settings.validate().is_ok());
@@ -893,6 +1087,11 @@ mod tests {
         assert!(json.contains("\"fileLoggingEnabled\""));
         assert!(json.contains("\"crashLoggingEnabled\""));
         assert!(json.contains("\"performanceMode\""));
+        assert!(json.contains("\"glassEffect\""));
+        assert!(json.contains("\"notificationSoundEnabled\""));
+        assert!(json.contains("\"notificationSoundId\""));
+        assert!(json.contains("\"notificationSoundVolume\""));
+        assert!(json.contains("\"notificationSoundCustomFile\""));
     }
 
     #[test]
@@ -915,6 +1114,52 @@ mod tests {
     }
 
     // ---------- 主题配色 ----------
+
+    /// 提示音字段的三条校验规则。
+    ///
+    /// 重点是最后一条：**非法文件名必须在写入时就被拒绝**。只在读取端
+    /// （`sound.rs::load`）校验的话，一份坏设置会一直躺在磁盘上 ——
+    /// 每次启动都记一条警告，但用户看不到任何异常。
+    #[test]
+    fn validate_covers_notification_sound_fields() {
+        let mut settings = AppSettings::default();
+        assert!(settings.validate().is_ok(), "默认值必须合法");
+
+        // 音色 id 只校验格式：未知但格式合法的取值要放行（音色表在前端，
+        // 后端复制一份清单必然漂移）
+        settings.notification_sound_id = "some-future-sound".to_string();
+        assert!(settings.validate().is_ok());
+        settings.notification_sound_id = "Bad Id".to_string();
+        let err = settings.validate().expect_err("非法音色 id 必须被拒绝");
+        assert!(err.contains("notificationSoundId"), "错误信息应点明字段: {err}");
+        settings.notification_sound_id = default_notification_sound_id();
+
+        // 音量越界拒绝而不是夹取：合法交互不会产生越界值
+        settings.notification_sound_volume = 1.5;
+        let err = settings.validate().expect_err("音量越界必须被拒绝");
+        assert!(err.contains("notificationSoundVolume"), "错误信息应点明字段: {err}");
+        settings.notification_sound_volume = DEFAULT_NOTIFICATION_SOUND_VOLUME;
+        assert!(settings.validate().is_ok());
+
+        // 合法文件名
+        settings.notification_sound_custom_file = Some("custom.mp3".to_string());
+        assert!(settings.validate().is_ok());
+        // 空串按「没有自定义音效」处理（前端清空选择时写的就是它）
+        settings.notification_sound_custom_file = Some(String::new());
+        assert!(settings.validate().is_ok());
+
+        // 非法文件名：路径穿越与非白名单扩展名都必须被拒绝
+        for bad in ["../settings.json", "custom.exe", "other.mp3", r"C:\x\y.mp3"] {
+            settings.notification_sound_custom_file = Some(bad.to_string());
+            let err = settings
+                .validate()
+                .expect_err(&format!("非法文件名 {bad} 必须被拒绝"));
+            assert!(
+                err.contains("notificationSoundCustomFile"),
+                "错误信息应点明字段: {err}"
+            );
+        }
+    }
 
     #[test]
     fn accent_defaults_to_indigo_and_survives_old_settings_files() {

@@ -209,7 +209,7 @@ const Titlebar: React.FC<TitlebarProps> = ({
 
   return (
     <div
-      className={`fixed top-0 left-0 right-0 z-50 flex items-center h-10 px-3 bg-white/90 backdrop-blur-xl border-b border-gray-200/50 select-none ${className}`}
+      className={`lc-chrome fixed top-0 left-0 right-0 z-50 flex items-center h-10 px-3 bg-white/95 border-b border-gray-200/50 select-none ${className}`}
       data-tauri-drag-region
     >
       {/* 左侧：应用标题 + 导航按钮 */}

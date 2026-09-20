@@ -3,6 +3,16 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.1.7] - 2026-09-20
+
+### Added
+
+- 毛玻璃开关、通知提示音、备份机制，并修掉一批深色模式与外壳缺陷
+
+### Documentation
+
+- 按代码事实同步文档，并记录本轮改动
+
 ## [1.1.6] - 2026-09-19
 
 ### Added

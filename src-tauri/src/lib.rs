@@ -12,6 +12,7 @@ use core::registry::ModuleRegistry;
 use tauri::Manager;
 
 use modules::auth::commands::*;
+use modules::backup::commands::*;
 use modules::logging::commands::*;
 use modules::notifications::commands::*;
 use modules::plugins::commands::*;
@@ -99,6 +100,10 @@ pub fn run() -> Result<(), tauri::Error> {
         remove_known_device,
         get_login_logs,
         clear_login_logs,
+        list_backup_categories,
+        export_backup,
+        open_backup,
+        restore_backup,
         get_log_dir,
         read_log_tail,
         clear_logs,
@@ -140,9 +145,12 @@ pub fn run() -> Result<(), tauri::Error> {
         get_app_settings,
         get_app_info,
         update_app_settings,
+        reload_app_settings,
         reset_app_settings,
         probe_network,
         get_app_data_dir,
+        pick_notification_sound,
+        load_notification_sound,
         get_autostart_status,
         set_autostart_enabled,
         was_started_by_autostart,
