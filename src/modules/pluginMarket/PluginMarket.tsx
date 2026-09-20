@@ -32,6 +32,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 
 import { PLUGIN_INDEX_REF, PLUGIN_REPO_URL } from '../../config/pluginRegistry';
 import { DRAWER_ENTER, DRAWER_EXIT } from '../../utils/motionCurves';
+import Markdown from '../../components/Markdown';
 import { getPermissionDescriptor, type PermissionRisk } from '../../services/permissionRegistry';
 import {
   installMarketVersion,
@@ -527,9 +528,15 @@ const MarketDetailDrawer: React.FC<{
             {readme === 'loading' ? (
               <p className="text-xs text-gray-400">正在读取说明…</p>
             ) : readme ? (
-              <pre className="text-[11px] leading-relaxed text-gray-700 bg-gray-50 border border-gray-100 rounded-xl p-3 whitespace-pre-wrap break-words max-h-80 overflow-y-auto custom-scrollbar">
-                {readme}
-              </pre>
+              /*
+                README 按 Markdown 渲染。**用 <Markdown> 而不是直接写 HTML** ——
+                它是远程内容，而宿主与插件共享同一个 JS 上下文。渲染成 React
+                元素意味着源码里的 HTML 只能作为文本显示。
+                `max-h-80 overflow-y-auto` 保留原来的滚动约束。
+              */
+              <div className="bg-gray-50 border border-gray-100 rounded-xl p-3 max-h-80 overflow-y-auto custom-scrollbar">
+                <Markdown source={readme} />
+              </div>
             ) : (
               <p className="text-xs leading-relaxed text-gray-500">
                 {plugin.source

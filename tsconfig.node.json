@@ -54,6 +54,7 @@
     "src/utils/motionPreference.ts",
     "src/utils/glassPreference.ts",
     "src/utils/notificationSounds.ts",
+    "src/utils/markdown.ts",
     "src/utils/semver.ts",
     "src/utils/updateCheck.ts",
     "src/utils/networkSettings.ts"
