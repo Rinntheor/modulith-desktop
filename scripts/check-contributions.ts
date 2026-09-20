@@ -713,6 +713,85 @@ console.log('\n插件形态的派生：');
   );
 }
 
+// ============================================================
+// 插件 API 类型包：与能力表对上
+// ============================================================
+
+// `modulith-plugins/types/modulith.d.ts` 是给插件作者用的**手写镜像**，而能力表
+// 是宿主这一侧的真源 —— 上面的断言已经把它与 `pluginRuntime.ts` 的实际实现对上了，
+// 所以这里只需要接上最后一段：类型包。
+//
+// 为什么值得专门守：**类型说错了比没有类型更糟**。作者会相信自动补全，把参数顺序
+// 搞反、或以为某个方法是异步的，而错误要到运行时才暴露，且症状指向插件自己写的
+// 代码。这与权限注册表是同一个道理：同一份名单的第二份副本必然漂移，除非有东西
+// 钉住它。
+console.log('\n插件 API 类型包：');
+
+/** 从 `interface X { ... }` 里抓成员名（含 `readonly` 与方法） */
+function typeInterfaceMembers(source: string, name: string): string[] {
+  // 按声明**自身的缩进**推算成员缩进，而不是写死两个空格：类型包里的接口在
+  // `declare global { }` 内部，比顶层多一层。写死会让它一处都解析不到 —— 而
+  // "解析不到"与"真的不一致"在断言里长得一样，那就成了一个永远在误报的门禁。
+  const declaration = new RegExp(`^([ \\t]*)interface ${name} \\{`, 'm');
+  const found = declaration.exec(source);
+  if (!found) return [];
+
+  const baseIndent = found[1].length;
+  const open = source.indexOf('{', found.index);
+
+  // 从 `{` 开始按花括号配平找结尾 —— 里面有嵌套的对象字面量与泛型签名，
+  // 用"下一个右花括号"会截在半路
+  let depth = 0;
+  let end = -1;
+  for (let i = open; i < source.length; i += 1) {
+    if (source[i] === '{') depth += 1;
+    else if (source[i] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end < 0) return [];
+
+  const body = source.slice(open + 1, end);
+  const members = new Set<string>();
+  // 恰好 `baseIndent + 2` 个空格开头：多行签名的续行缩进更深，注释行以 `*` 开头，
+  // 两者都不会命中
+  const memberPattern = new RegExp(
+    `^[ \\t]{${baseIndent + 2}}(?:readonly\\s+)?([A-Za-z_$][\\w$]*)\\s*[?:(<]`
+  );
+  for (const line of body.split(/\r?\n/)) {
+    const member = line.match(memberPattern);
+    if (member) members.add(member[1]);
+  }
+  return [...members].sort();
+}
+
+{
+  const typePackage = resolve(here, '../../modulith-plugins/types/modulith.d.ts');
+
+  if (!existsSync(typePackage)) {
+    console.log(`  ⏭ 跳过：找不到 ${typePackage}（插件仓库不在旁边时属正常）`);
+  } else {
+    const dts = readFileSync(typePackage, 'utf8');
+
+    for (const [interfaceName, expected] of [
+      ['ModulithHost', [...HOST_CAPABILITIES.host].sort()],
+      ['ModulithContext', [...HOST_CAPABILITIES.context].sort()],
+    ] as const) {
+      const actual = typeInterfaceMembers(dts, interfaceName);
+      check(
+        actual.join(',') === expected.join(','),
+        actual.join(',') === expected.join(',')
+          ? `${interfaceName} 的 ${expected.length} 个成员与能力表一致`
+          : `${interfaceName} 与能力表不一致。\n      能力表：${expected.join('、')}\n      类型包：${actual.join('、') || '（一处都没解析到 —— 正则或格式变了）'}`
+      );
+    }
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);
