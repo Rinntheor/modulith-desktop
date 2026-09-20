@@ -3,6 +3,23 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.2.1] - 2026-09-20
+
+> 本版本**未发行**：它只含测试基础设施、一处内部拆分与文档，没有任何用户可见的变化。
+> 版本号与 tag 存在，是为了让这批改动在历史里有明确的归属。
+
+### Added
+
+- `scripts/check-plugin-runtime.ts`：插件运行时稳定性夹具。把真实的 `pluginRuntime` 装进 Node，配一套手写浏览器垫片与桩后端，用 8 个合成插件验证「未激活时不执行代码」「按需激活」「卸载时收尾」「模块 ID 抢占被拒」等机制，共 60 项断言
+
+### Changed
+
+- `ModuleRuntimeContext` 拆出无 JSX 的 `moduleRuntime`，使插件运行时的依赖图可以在没有构建步骤的环境里被加载
+
+### Documentation
+
+- 记录夹具的设计、手写垫片的代价与未覆盖面（已知问题 7.31），并订正 7.30 里「稳定性夹具还没有」那一条
+
 ## [1.2.0] - 2026-09-20
 
 ### Added
