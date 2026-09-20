@@ -14,6 +14,9 @@
 //      "现在别联网"，而不是"把默认策略改成拒绝"（后者会连同他的选择一起被覆盖）。
 //   3. **未知取值退回默认档（放行），而不是拒绝。** 一个损坏的设置不该让应用失去
 //      联网能力 —— 策略的失效方向应当由用户显式选择，不该由解析失败决定。
+//   4. **回环地址一律放行，离线模式下也是。** 见 `decide` 里的展开。这条最初只写在
+//      "禁止出站"的档位说明里，而当时的 `decide` 根本没看过地址 —— 文案说的是行为，
+//      实现里没有。现在两处一致了。
 // ---------------------------------------------------------------------------
 
 use serde::Serialize;
@@ -38,7 +41,18 @@ pub fn is_valid_mode(value: &str) -> bool {
 }
 
 /// 判定。纯函数 —— 这是本模块唯一需要被断言的东西。
-pub fn decide(mode: &str, offline: bool) -> Decision {
+///
+/// `loopback` 由调用方从 URL 里算出来（[`super::is_loopback_host`]），而不是在这里
+/// 解析地址：这一层只做判定，解析属于调用方。
+///
+/// **回环先于一切。**"禁止出站"与"离线模式"要挡住的是**数据离开这台机器**；
+/// 连 `localhost` 不构成离开，它既不消耗流量也不把数据交给第三方。把它一起挡掉的
+/// 代价是两个正当场景同时失效：插件连本地开发服务器、以及网络诊断的自检 ——
+/// 而这两个场景恰恰是用户最需要"网络别被自己挡住"的时候。
+pub fn decide(mode: &str, offline: bool, loopback: bool) -> Decision {
+    if loopback {
+        return Decision::Allow;
+    }
     if offline {
         return Decision::Deny("离线模式已开启");
     }
@@ -108,32 +122,51 @@ mod tests {
         // 离线模式的语义是"现在别联网"，它必须压过默认档，否则用户改回默认档会
         // 顺手把离线一起解除 —— 那不是他按这个开关时想要的事
         for mode in [MODE_ALLOW, MODE_ASK, MODE_DENY, "垃圾值"] {
-            assert!(matches!(decide(mode, true), Decision::Deny(_)), "{mode}");
+            assert!(
+                matches!(decide(mode, true, false), Decision::Deny(_)),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_is_never_blocked() {
+        // 这一条防的是本文件头第 4 条记录的那个 bug 复发：档位说明写着"回环不受影响"，
+        // 而实现里根本没看地址。用户开离线后，本地开发服务器与诊断自检会一起失效，
+        // 而这两件事都不构成"数据离开这台机器"。
+        for mode in [MODE_ALLOW, MODE_ASK, MODE_DENY, "垃圾值"] {
+            for offline in [false, true] {
+                assert_eq!(
+                    decide(mode, offline, true),
+                    Decision::Allow,
+                    "{mode} / offline={offline} 下回环被挡住了"
+                );
+            }
         }
     }
 
     #[test]
     fn default_mode_allows() {
-        assert_eq!(decide(MODE_ALLOW, false), Decision::Allow);
+        assert_eq!(decide(MODE_ALLOW, false, false), Decision::Allow);
     }
 
     #[test]
     fn deny_mode_denies() {
-        assert!(matches!(decide(MODE_DENY, false), Decision::Deny(_)));
+        assert!(matches!(decide(MODE_DENY, false, false), Decision::Deny(_)));
     }
 
     #[test]
     fn ask_mode_allows_but_is_marked() {
         // ask 尚未实现：它不能假装成"已经问过并且用户同意了"，也不能直接拒绝
         // （那会让选了 ask 的用户发现所有网络都坏了）。记成待询问是当前唯一诚实的行为。
-        assert_eq!(decide(MODE_ASK, false), Decision::AllowPendingPrompt);
+        assert_eq!(decide(MODE_ASK, false, false), Decision::AllowPendingPrompt);
     }
 
     #[test]
     fn unknown_mode_falls_back_to_allow() {
         // 见文件头第 3 条：损坏的设置不该让应用失去联网能力
-        assert_eq!(decide("", false), Decision::Allow);
-        assert_eq!(decide("nonsense", false), Decision::Allow);
+        assert_eq!(decide("", false, false), Decision::Allow);
+        assert_eq!(decide("nonsense", false, false), Decision::Allow);
     }
 
     #[test]

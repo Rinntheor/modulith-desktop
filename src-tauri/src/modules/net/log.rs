@@ -31,6 +31,13 @@ pub struct NetLogEntry {
     pub direction: &'static str,
     /// `host` / `plugin:<id>` / `module:<id>` —— 没有它，日志回答不了"是谁发的"
     pub source: String,
+    /// 这次请求是**干什么用的**（"插件市场索引"/"网络诊断"/"插件网络请求"…）。
+    /// 仅有 source 时，用户看到 `module:plugins` 连了 jsdelivr，仍然分不清
+    /// 那是在取索引、取 README 还是在下载插件包。
+    ///
+    /// 是 `&'static str`：这些文案在编译期就定下来了，日志里出现运行时拼出来的
+    /// 用途字符串，意味着那串文案本身成了一份没人维护的第二来源。
+    pub purpose: &'static str,
     pub method: String,
     pub host: String,
     /// 完整地址。**可能含查询串里的敏感参数**，界面上应当允许折叠
@@ -44,11 +51,18 @@ pub struct NetLogEntry {
 }
 
 impl NetLogEntry {
-    pub fn outbound(source: &str, method: &str, url: &str, host: &str) -> Self {
+    pub fn outbound(
+        source: &str,
+        purpose: &'static str,
+        method: &str,
+        url: &str,
+        host: &str,
+    ) -> Self {
         Self {
             at: chrono::Utc::now().to_rfc3339(),
             direction: DIRECTION_OUTBOUND,
             source: source.to_string(),
+            purpose,
             method: method.to_string(),
             host: host.to_string(),
             url: url.to_string(),
@@ -124,7 +138,13 @@ mod tests {
     static SERIAL: Mutex<()> = Mutex::new(());
 
     fn entry(n: usize) -> NetLogEntry {
-        NetLogEntry::outbound(&format!("plugin:p{n}"), "GET", "https://example.com/x", "example.com")
+        NetLogEntry::outbound(
+            &format!("plugin:p{n}"),
+            "测试",
+            "GET",
+            "https://example.com/x",
+            "example.com",
+        )
     }
 
     #[test]
@@ -179,6 +199,23 @@ mod tests {
         let listed = list(1);
         assert!(listed[0].source.starts_with("plugin:"));
         assert_eq!(listed[0].direction, DIRECTION_OUTBOUND);
+        clear();
+    }
+
+    #[test]
+    fn purpose_survives_the_round_trip() {
+        // 用途是"为什么发"：只有来源时，用户看到 module:plugins 连了 jsdelivr，
+        // 仍然分不清那是在取索引还是在下载插件包
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        record(NetLogEntry::outbound(
+            "module:plugins",
+            "插件市场索引",
+            "GET",
+            "https://cdn.jsdelivr.net/gh/a/b@main/index.json",
+            "cdn.jsdelivr.net",
+        ));
+        assert_eq!(list(1)[0].purpose, "插件市场索引");
         clear();
     }
 }
