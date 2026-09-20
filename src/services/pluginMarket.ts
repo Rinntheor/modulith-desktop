@@ -14,6 +14,8 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
+import { shapeFromIndexKinds, type PluginShapeInfo } from './pluginShape';
+
 import {
   PLUGIN_INDEX_REF,
   pluginIndexSources,
@@ -58,6 +60,20 @@ export interface MarketVersion {
   engines: { loopcore: string };
   permissions: string[];
   package: MarketPackage;
+  /**
+   * 这个版本贡献了哪些种类（`modules` / `commands` / `settings` / `contextMenus`）。
+   *
+   * **可选。** 旧索引没有这个字段，宿主据此显示「形态未知」而不是猜一个 ——
+   * 猜错的表现是"标着界面型，装完发现不占侧边栏"，而用户无从分辨。
+   *
+   * 它由插件仓库在**打包时从清单派生**，不是作者手填的。形态决定"这个插件会不会
+   * 占据侧边栏一行"，属于用户判断依据；与权限风险同理，不能由被审查的一方提供。
+   * 因此它也不放在插件级、而放在**版本级** —— 与 `permissions` 同一个位置，
+   * 因为一个插件的形态可以随版本变化（例如从纯命令插件长出了界面）。
+   */
+  kinds?: string[];
+  /** 是否声明了 `onStartup`：应用可用之后它就会开始工作 */
+  background?: boolean;
 }
 
 export interface MarketPlugin {
@@ -78,6 +94,18 @@ export interface MarketPlugin {
 export interface MarketIndex {
   schemaVersion: number;
   plugins: MarketPlugin[];
+}
+
+/**
+ * 某个市场插件（按它的最新版本）的形态。
+ *
+ * 索引里没有形态信息时返回 `unknown`，界面显示「形态未知」——
+ * 这是诚实的结果，也是推动插件仓库补上这个字段的依据。**不要在这里猜**：
+ * 猜成界面型的表现是"标着会占侧边栏，装完发现不占"，而用户无从分辨谁错了。
+ */
+export function marketPluginShape(plugin: MarketPlugin): PluginShapeInfo {
+  const version = latestVersionOf(plugin);
+  return shapeFromIndexKinds(version.kinds, { background: version.background });
 }
 
 // ============================================================
@@ -119,6 +147,13 @@ function parseVersion(raw: unknown, where: string): MarketVersion {
   return {
     version: asString(item.version, `${where}.version`),
     tag: asString(item.tag, `${where}.tag`),
+    // 形态信息是**可选**的：解析它必须比解析 permissions 宽松。
+    // 旧索引缺这两个字段是正常情况，不能让它把整份索引判为非法 ——
+    // 那会让市场对所有人打不开，而原因只是一条展示信息。
+    kinds: Array.isArray(item.kinds)
+      ? item.kinds.filter((entry): entry is string => typeof entry === 'string')
+      : undefined,
+    background: item.background === true ? true : undefined,
     engines: {
       loopcore: asString((engines as Record<string, unknown>).loopcore, `${where}.engines.loopcore`),
     },

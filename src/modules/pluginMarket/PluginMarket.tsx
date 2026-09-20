@@ -40,6 +40,7 @@ import {
   loadIndex,
   loadMarketIcon,
   loadReadme,
+  marketPluginShape,
   planUpdate,
   updateStateFor,
   type MarketIconResult,
@@ -48,7 +49,16 @@ import {
   type UpdatePlan,
   type UpdateState,
 } from '../../services/pluginMarket';
-import { reloadPluginRuntime, subscribePlugins } from '../../services/pluginRuntime';
+import { reloadPluginRuntime, subscribePlugins, getPluginContract } from '../../services/pluginRuntime';
+import { getPluginModuleIds } from '../../services/moduleCatalog';
+import {
+  SHAPE_HINTS,
+  SHAPE_LABELS,
+  shapeBadgeLabels,
+  shapeFromInstalled,
+  type PluginShape,
+  type PluginShapeInfo,
+} from '../../services/pluginShape';
 import { formatBytes } from '../../utils/format';
 
 const RISK_TONE: Record<PermissionRisk, string> = {
@@ -557,6 +567,16 @@ const PluginMarket: React.FC = () => {
   const [error, setError] = useState('');
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<string | null>(null);
+  /**
+   * 形态筛选。
+   *
+   * 与 `category` 是两个**性质不同**的维度，界面上也刻意分开摆：
+   *   * `category` 是作者自填的**浏览分类**（"效率"、"开发"），回答"我想找哪一类工具"；
+   *   * `shape` 是从 `contributes` **派生**的**形态**，回答"它会不会占我的侧边栏"。
+   *
+   * 把两者混成一行按钮，用户就无从分辨哪些标签可信、哪些只是作者的措辞。
+   */
+  const [shape, setShape] = useState<PluginShape | 'all'>('all');
   const [pending, setPending] = useState<{ plugin: MarketPlugin; plan: UpdatePlan | null } | null>(
     null
   );
@@ -592,7 +612,31 @@ const PluginMarket: React.FC = () => {
     return [...found].sort();
   }, [index]);
 
-  const visible = useMemo(() => {
+  /**
+   * 先按「搜索 + 分类」筛一遍，**形态不参与**。
+   *
+   * 分出这一层是为了让形态按钮上的数字有意义：那些数字数的是"在当前搜索与分类下，
+   * 每种形态各有多少"。若把形态也塞进这一层，点一下"界面型"之后"功能型"会立刻变成 0，
+   * 用户就没法用它做判断了（那是筛选器的经典错误）。
+   */
+  /**
+   * 形态：**已安装**的插件用宿主派生的（权威），未安装的才回退到索引。
+   *
+   * 为什么值得分这两种来源：已安装插件的清单就在本机，宿主能从 `contributes`
+   * 直接算出形态 —— 那比索引（打包时算的、可能过期）更准。让已安装的那部分
+   * 立刻正确，也让"索引还没带上形态"这段时间里市场不是一片「形态未知」。
+   *
+   * 旧式插件（清单里没有 `contributes`）在加载之前宿主确实不知道，此时
+   * `shapeFromInstalled` 会如实返回「形态未知」—— 不猜。
+   */
+  const shapeOf = (plugin: MarketPlugin): PluginShapeInfo => {
+    if (updateStateFor(plugin).kind !== 'not-installed') {
+      return shapeFromInstalled(getPluginContract(plugin.id), getPluginModuleIds(plugin.id).length);
+    }
+    return marketPluginShape(plugin);
+  };
+
+  const baseFiltered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return (index?.plugins ?? []).filter((plugin) => {
       if (category && !(plugin.categories ?? []).includes(category)) return false;
@@ -603,6 +647,65 @@ const PluginMarket: React.FC = () => {
         .includes(q);
     });
   }, [index, query, category]);
+
+  const shapeCounts = useMemo(() => {
+    const counts: Record<PluginShape, number> = { ui: 0, headless: 0, unknown: 0 };
+    for (const plugin of baseFiltered) counts[shapeOf(plugin).shape] += 1;
+    return counts;
+    // installedTick 是重算的触发器：已安装状态活在 pluginRuntime 的模块级状态里，
+    // 形态随之变化（装完之后就从「索引推断」变成「宿主派生」）
+  }, [baseFiltered, installedTick]);
+
+  const visible = useMemo(
+    () => (shape === 'all' ? baseFiltered : baseFiltered.filter((plugin) => shapeOf(plugin).shape === shape)),
+    [baseFiltered, shape, installedTick]
+  );
+
+  /**
+   * 列表分组：同类相邻，并带一行小标题。
+   *
+   * 这正是"功能性插件和界面型插件堆在一起，难以分类"要解决的东西 ——
+   * 只加徽章不够，用户仍然要在一堆卡片里自己找。顺序固定为
+   * 界面型 → 功能型 → 形态未知：前两类是用户能直接感知到的差别，
+   * 最后一类是需要被看见（并推动作者补声明）的欠账。
+   */
+  const sections = useMemo(() => {
+    const order: PluginShape[] = ['ui', 'headless', 'unknown'];
+    const buckets = new Map<PluginShape, MarketPlugin[]>();
+    for (const plugin of visible) {
+      const key = shapeOf(plugin).shape;
+      const list = buckets.get(key);
+      if (list) list.push(plugin);
+      else buckets.set(key, [plugin]);
+    }
+    return order
+      .filter((key) => (buckets.get(key)?.length ?? 0) > 0)
+      .map((key) => ({ shape: key, plugins: buckets.get(key) as MarketPlugin[] }));
+    // installedTick 同上：装完之后分组应当立刻从「形态未知」挪到正确的那一组
+  }, [visible, installedTick]);
+
+  /**
+   * 把分组摊平成一串「行」，交给**一次** map 渲染。
+   *
+   * 为什么摊平而不是嵌套两层 map：嵌套要重排整张卡片的缩进，而卡片有近百行 ——
+   * 那样一次纯展示改动会变成一大片 diff，评审时看不出真正变了什么。
+   *
+   * 只有一组时**不打小标题**：那时它不是分类信息，只是噪音。
+   */
+  const rows = useMemo<
+    Array<{ kind: 'header'; shape: PluginShape; count: number } | { kind: 'plugin'; plugin: MarketPlugin }>
+  >(() => {
+    const out: Array<
+      { kind: 'header'; shape: PluginShape; count: number } | { kind: 'plugin'; plugin: MarketPlugin }
+    > = [];
+    for (const section of sections) {
+      if (sections.length > 1) {
+        out.push({ kind: 'header', shape: section.shape, count: section.plugins.length });
+      }
+      for (const plugin of section.plugins) out.push({ kind: 'plugin', plugin });
+    }
+    return out;
+  }, [sections]);
 
   const states = useMemo(() => {
     const map = new Map<string, UpdateState>();
@@ -758,7 +861,45 @@ const PluginMarket: React.FC = () => {
       {/* 筛选 */}
       {status === 'ready' && index && (
         <>
-          <div className="mt-5 flex items-center gap-3">
+          {/*
+            形态：**由清单派生**，因此它是可信的。
+            与下面那行的「分类」刻意分成两块 —— 后者是作者自填的浏览分类，
+            两者混成一行，用户就无从分辨哪些标签能当作判断依据。
+          */}
+          <div className="mt-5 flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] text-gray-400 shrink-0">形态</span>
+            <button
+              type="button"
+              onClick={() => setShape('all')}
+              className={`px-2 py-1 text-[11px] rounded-md border ${
+                shape === 'all'
+                  ? 'border-gray-900 bg-gray-900 text-white'
+                  : 'border-gray-200 text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              全部 · {baseFiltered.length}
+            </button>
+            {(['ui', 'headless', 'unknown'] as PluginShape[])
+              .filter((key) => shapeCounts[key] > 0)
+              .map((key) => (
+                <button
+                  key={key}
+                  type="button"
+                  title={SHAPE_HINTS[key]}
+                  onClick={() => setShape(key)}
+                  className={`px-2 py-1 text-[11px] rounded-md border ${
+                    shape === key
+                      ? 'border-gray-900 bg-gray-900 text-white'
+                      : 'border-gray-200 text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  {SHAPE_LABELS[key]} · {shapeCounts[key]}
+                </button>
+              ))}
+            <span className="text-[11px] text-gray-300">由清单派生，不是作者填写</span>
+          </div>
+
+          <div className="mt-3 flex items-center gap-3">
             <div className="relative flex-1 max-w-xs">
               <Search className="w-3.5 h-3.5 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
               <input
@@ -770,6 +911,7 @@ const PluginMarket: React.FC = () => {
             </div>
             {categories.length > 0 && (
               <div className="flex items-center gap-1 flex-wrap">
+                <span className="text-[11px] text-gray-400 shrink-0">分类</span>
                 <button
                   type="button"
                   onClick={() => setCategory(null)}
@@ -808,7 +950,23 @@ const PluginMarket: React.FC = () => {
             </p>
           ) : (
             <div className="mt-4 space-y-2">
-              {visible.map((plugin) => {
+              {rows.map((row) => {
+                if (row.kind === 'header') {
+                  return (
+                    <div
+                      key={`header-${row.shape}`}
+                      className="flex items-baseline gap-2 pt-3 first:pt-0"
+                    >
+                      <span className="text-[11px] font-medium text-gray-600">
+                        {SHAPE_LABELS[row.shape]}
+                      </span>
+                      <span className="text-[11px] text-gray-400">{row.count}</span>
+                      <span className="text-[11px] text-gray-300">{SHAPE_HINTS[row.shape]}</span>
+                    </div>
+                  );
+                }
+
+                const plugin = row.plugin;
                 const version = latestVersionOf(plugin);
                 const state = states.get(plugin.id) ?? { kind: 'not-installed' as const };
                 const busy = busyId === plugin.id;
@@ -851,6 +1009,25 @@ const PluginMarket: React.FC = () => {
                           需要宿主 {version.engines.loopcore}
                         </span>
                       </div>
+
+                      {/* 贡献种类徽章：分级只分两档，种类靠徽章表达 ——
+                          一旦分级超过两档，用户就要先学一套分类法，那和"不好分类"是同一个病。 */}
+                      {(() => {
+                        const labels = shapeBadgeLabels(shapeOf(plugin));
+                        if (labels.length === 0) return null;
+                        return (
+                          <div className="mt-1 flex items-center gap-1 flex-wrap">
+                            {labels.map((label) => (
+                              <span
+                                key={label}
+                                className="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-500"
+                              >
+                                {label}
+                              </span>
+                            ))}
+                          </div>
+                        );
+                      })()}
 
                       <div className="mt-1.5 text-[11px] text-gray-400">
                         {plugin.author.name || '未知作者'}

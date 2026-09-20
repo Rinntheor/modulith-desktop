@@ -32,6 +32,7 @@ import { getPluginModuleIds, isPluginCatalogLoading, subscribeCatalog } from '..
 import {
   getInstalledPlugins,
   getLoadStates,
+  getPluginContract,
   hasPluginRuntimeLoaded,
   reloadPluginRuntime,
   installPluginFromPackage,
@@ -43,6 +44,13 @@ import {
   type InstalledPlugin,
   type PluginLoadState,
 } from '../../services/pluginRuntime';
+import {
+  SHAPE_HINTS,
+  SHAPE_LABELS,
+  shapeFromInstalled,
+  type PluginShape,
+  type PluginShapeInfo,
+} from '../../services/pluginShape';
 import PluginCard from './PluginCard';
 import PluginDetailDrawer from './PluginDetailDrawer';
 import DevGuide from './DevGuide';
@@ -332,6 +340,15 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const [search, setSearch] = useState('');
   const [tab, setTab] = useState<FilterTab>('all');
   const [category, setCategory] = useState<string | null>(null);
+  /**
+   * 形态筛选。
+   *
+   * 与 `category` 是**性质不同**的两个维度，界面上因此分成两块并各自标注来源：
+   *   * `category` 是作者自填的浏览分类，回答"我想找哪一类工具"；
+   *   * `shape` 由宿主从清单派生，回答"它会不会占我的侧边栏一行" —— 这是判断依据，
+   *     所以不能靠作者填写（与权限风险同理）。
+   */
+  const [shape, setShape] = useState<PluginShape | 'all'>('all');
   const [sortMode, setSortMode] = useState<SortMode>('name');
   const [sortAsc, setSortAsc] = useState(true);
   const [viewMode, setViewMode] = useState<ViewMode>('grid');
@@ -641,6 +658,23 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     [plugins, loadStates]
   );
 
+  /**
+   * 已安装插件的形态 —— 由宿主从清单派生（**权威**），不依赖索引。
+   *
+   * 旧式插件（清单里没有 `contributes`）在加载之前宿主确实不知道它有没有界面：
+   * 它们的目录条目是执行时才注册的。此时 `shapeFromInstalled` 如实返回「形态未知」，
+   * 而不是猜成界面型 —— 猜了会在它加载完之后当场打脸。
+   */
+  const shapeOf = (plugin: InstalledPlugin): PluginShapeInfo =>
+    shapeFromInstalled(getPluginContract(plugin.id), getPluginModuleIds(plugin.id).length);
+
+  const shapeCounts = useMemo(() => {
+    const result: Record<PluginShape, number> = { ui: 0, headless: 0, unknown: 0 };
+    for (const plugin of plugins) result[shapeOf(plugin).shape] += 1;
+    return result;
+    // loadStates 是重算触发器：插件加载完之后「形态未知」会落到准确的那一档
+  }, [plugins, loadStates]);
+
   const visible = useMemo(() => {
     let list = [...plugins];
 
@@ -661,6 +695,8 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
 
     if (category) list = list.filter((p) => (p.manifest.categories ?? []).includes(category));
 
+    if (shape !== 'all') list = list.filter((p) => shapeOf(p).shape === shape);
+
     list.sort((a, b) => {
       let cmp = 0;
       if (sortMode === 'name') {
@@ -676,7 +712,7 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     });
 
     return list;
-  }, [plugins, search, tab, category, sortMode, sortAsc, loadStates]);
+  }, [plugins, search, tab, category, shape, sortMode, sortAsc, loadStates]);
 
   const tabs: { id: FilterTab; label: string; count: number }[] = [
     { id: 'all', label: '全部', count: counts.all },
@@ -830,36 +866,79 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
         </motion.div>
       ) : (
         <div className="flex gap-6 items-start">
-          {/* 左侧筛选栏 */}
-          {categories.length > 0 && (
+          {/* 左侧筛选栏。
+              两块刻意分开并各自标注来源：**形态由清单派生**，是判断依据；
+              **分类是作者填写**，只用于"我想找哪一类工具"。混成一块，
+              用户就无从分辨哪些标签可以当真。 */}
+          {plugins.length > 0 && (
             <aside className="hidden @4xl:block w-48 shrink-0">
-              <div className="bg-white rounded-xl border border-gray-200 p-2 sticky top-4">
-                <p className="px-2.5 py-2 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">
-                  分类
-                </p>
-                <button
-                  onClick={() => setCategory(null)}
-                  className={`w-full text-left px-2.5 py-1.5 text-sm rounded-lg transition-colors ${
-                    category === null
-                      ? 'bg-indigo-50 text-indigo-700 font-medium'
-                      : 'text-gray-600 hover:bg-gray-50'
-                  }`}
-                >
-                  全部分类
-                </button>
-                {categories.map((cat) => (
+              <div className="bg-white rounded-xl border border-gray-200 p-2 sticky top-4 space-y-2">
+                <div>
+                  <p className="px-2.5 pt-2 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">
+                    形态
+                  </p>
+                  <p className="px-2.5 pb-1 text-[10px] text-gray-300">由清单派生</p>
                   <button
-                    key={cat}
-                    onClick={() => setCategory(cat === category ? null : cat)}
-                    className={`w-full text-left px-2.5 py-1.5 text-sm rounded-lg transition-colors truncate ${
-                      category === cat
+                    onClick={() => setShape('all')}
+                    className={`w-full text-left px-2.5 py-1.5 text-sm rounded-lg transition-colors ${
+                      shape === 'all'
                         ? 'bg-indigo-50 text-indigo-700 font-medium'
                         : 'text-gray-600 hover:bg-gray-50'
                     }`}
                   >
-                    {cat}
+                    全部形态
+                    <span className="ml-1.5 text-xs text-gray-400">{plugins.length}</span>
                   </button>
-                ))}
+                  {(['ui', 'headless', 'unknown'] as PluginShape[])
+                    .filter((key) => shapeCounts[key] > 0)
+                    .map((key) => (
+                      <button
+                        key={key}
+                        title={SHAPE_HINTS[key]}
+                        onClick={() => setShape(key === shape ? 'all' : key)}
+                        className={`w-full text-left px-2.5 py-1.5 text-sm rounded-lg transition-colors ${
+                          shape === key
+                            ? 'bg-indigo-50 text-indigo-700 font-medium'
+                            : 'text-gray-600 hover:bg-gray-50'
+                        }`}
+                      >
+                        {SHAPE_LABELS[key]}
+                        <span className="ml-1.5 text-xs text-gray-400">{shapeCounts[key]}</span>
+                      </button>
+                    ))}
+                </div>
+
+                {categories.length > 0 && (
+                  <div className="border-t border-gray-100 pt-1">
+                    <p className="px-2.5 pt-2 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">
+                      分类
+                    </p>
+                    <p className="px-2.5 pb-1 text-[10px] text-gray-300">作者填写</p>
+                    <button
+                      onClick={() => setCategory(null)}
+                      className={`w-full text-left px-2.5 py-1.5 text-sm rounded-lg transition-colors ${
+                        category === null
+                          ? 'bg-indigo-50 text-indigo-700 font-medium'
+                          : 'text-gray-600 hover:bg-gray-50'
+                      }`}
+                    >
+                      全部分类
+                    </button>
+                    {categories.map((cat) => (
+                      <button
+                        key={cat}
+                        onClick={() => setCategory(cat === category ? null : cat)}
+                        className={`w-full text-left px-2.5 py-1.5 text-sm rounded-lg transition-colors truncate ${
+                          category === cat
+                            ? 'bg-indigo-50 text-indigo-700 font-medium'
+                            : 'text-gray-600 hover:bg-gray-50'
+                        }`}
+                      >
+                        {cat}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </aside>
           )}

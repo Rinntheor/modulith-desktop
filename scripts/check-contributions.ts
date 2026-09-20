@@ -36,6 +36,12 @@ import {
   resolveLoadContract,
   settingStorageKey,
 } from '../src/services/pluginContributions.ts';
+import {
+  shapeBadgeLabels,
+  shapeFromContributions,
+  shapeFromIndexKinds,
+  shapeFromInstalled,
+} from '../src/services/pluginShape.ts';
 
 let failed = 0;
 let total = 0;
@@ -526,6 +532,118 @@ console.log('\n真实插件清单：');
       );
     }
   }
+}
+
+// ============================================================
+// 9. 插件形态的派生
+// ============================================================
+//
+// 形态回答的是"这个插件会不会占我的侧边栏一行"，是用户的判断依据。因此它必须
+// **从 contributes 派生**，而不是从作者自填的 categories 读 —— 与风险等级同理，
+// 由被审查的一方提供的信息不可信。这一节把这条判据本身钉下来。
+console.log('\n插件形态的派生：');
+
+{
+  const ui = shapeFromContributions(
+    normalizeContributions({ modules: [{ id: 'm', name: 'M' }] }).contributions,
+    ['onModule:m']
+  );
+  check(ui.shape === 'ui', '有模块 → 界面型');
+  check(ui.kinds.modules === true, '徽章：模块');
+  check(ui.source === 'manifest', '来源标记为清单（权威）');
+
+  const headless = shapeFromContributions(
+    normalizeContributions({ commands: [{ id: 'c', title: 'C' }] }).contributions,
+    ['onCommand:c']
+  );
+  check(headless.shape === 'headless', '无模块但有命令 → 功能型');
+  check(headless.kinds.modules === false, '功能型没有模块徽章');
+
+  const service = shapeFromContributions(emptyContributions(), ['onStartup']);
+  check(service.shape === 'headless', '空贡献 + onStartup → 功能型（后台服务插件）');
+  check(service.background === true, '标记为后台');
+
+  check(
+    shapeFromContributions(emptyContributions(), []).shape === 'unknown',
+    '既无贡献也无激活事件 → 形态未知'
+  );
+}
+
+{
+  const fromIndex = shapeFromIndexKinds(['modules', 'commands']);
+  check(fromIndex.shape === 'ui', '索引里含 modules → 界面型');
+  check(fromIndex.source === 'index', '来源标记为索引');
+
+  check(
+    shapeFromIndexKinds(['settings'], { background: true }).shape === 'headless',
+    '索引里只有设置 + 后台 → 功能型'
+  );
+
+  const missing = shapeFromIndexKinds(undefined);
+  check(missing.shape === 'unknown', '★ 旧索引没有 kinds → 形态未知，而不是猜一个');
+  check(missing.source === 'none', '并标明「来源为空」');
+
+  check(
+    shapeFromIndexKinds([]).shape === 'unknown',
+    'kinds 是空数组 → 同样按未知处理（与"声明了但没有贡献"不同）'
+  );
+}
+
+{
+  const legacyLoaded = shapeFromInstalled(
+    { declarative: false, contributions: emptyContributions(), events: [] },
+    2
+  );
+  check(legacyLoaded.shape === 'ui', '旧式插件加载后注册了模块 → 界面型');
+  check(legacyLoaded.source === 'runtime', '来源标记为运行期实际注册');
+
+  const legacyPending = shapeFromInstalled(
+    { declarative: false, contributions: emptyContributions(), events: [] },
+    0
+  );
+  check(
+    legacyPending.shape === 'unknown',
+    '★ 旧式插件尚未加载 → 形态未知（猜成界面型会在它加载完当场打脸）'
+  );
+}
+
+{
+  const info = shapeFromContributions(
+    normalizeContributions({
+      modules: [{ id: 'm', name: 'M' }],
+      commands: [{ id: 'c', title: 'C' }],
+    }).contributions,
+    ['onStartup']
+  );
+  const labels = shapeBadgeLabels(info).join(',');
+  check(labels === '模块,命令,后台', `徽章按固定顺序输出（实际：${labels}）`);
+}
+
+{
+  const shapeSource = readSource('../src/services/pluginShape.ts');
+  // 判据是**属性访问**，不是那个词本身 —— 这个文件的注释里正当地解释了"为什么不读
+  // categories"，用裸词匹配会把那段解释本身判成违规。这一行的教训值得记下：
+  // 对源码做文本断言时，匹配模式必须收得比"出现的词"更精确。
+  const readsCategories =
+    /\.\s*categories\b/.test(shapeSource) ||
+    shapeSource.includes("'categories'") ||
+    shapeSource.includes('"categories"');
+  check(
+    !readsCategories,
+    '★ 形态派生不读作者自填的 categories（它只用于浏览筛选，不承担形态判断）'
+  );
+  const marketSource = readSource('../src/modules/pluginMarket/PluginMarket.tsx');
+  check(marketSource.includes('marketPluginShape'), '市场页用派生形态做分组与筛选');
+
+  const managementSource = readSource('../src/modules/plugins/Plugins.tsx');
+  check(
+    managementSource.includes('shapeFromInstalled'),
+    '插件管理页的形态来自宿主派生（已安装插件不需要索引）'
+  );
+  check(
+    managementSource.includes('由清单派生') && managementSource.includes('作者填写'),
+    '★ 管理页把「形态（派生）」与「分类（作者填）」分开标注来源'
+  );
 }
 
 if (failed > 0) {
