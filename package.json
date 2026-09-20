@@ -1,7 +1,7 @@
 {
   "name": "modulith-desktop",
   "private": true,
-  "version": "1.1.8",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "dev": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && vite",
@@ -15,6 +15,7 @@
     "check:memory": "node scripts/check-memory.ts",
     "check:performance": "node scripts/check-performance.ts",
     "check:theme": "node scripts/check-theme.ts",
+    "check:contributions": "node scripts/check-contributions.ts",
     "check:sounds": "node scripts/check-sounds.ts",
     "check:backup": "node scripts/check-backup.ts",
     "check:markdown": "node scripts/check-markdown.ts",
