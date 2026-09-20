@@ -1,0 +1,13 @@
+{
+  "name": "fixture.declarative-module",
+  "displayName": "声明式模块插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "index.js",
+  "icon": "Package",
+  "contributes": { "modules": [{ "id": "port-panel", "name": "端口面板" }] },
+  "activationEvents": ["onModule:port-panel"]
+}

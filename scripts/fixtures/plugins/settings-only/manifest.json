@@ -1,0 +1,19 @@
+{
+  "name": "fixture.settings-only",
+  "displayName": "纯设置插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具：只有设置项，没有模块也没有命令",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "loopcore": ">=1.0.0" },
+  "main": "index.js",
+  "icon": "Package",
+  "permissions": ["storage"],
+  "contributes": {
+    "settings": [
+      { "id": "interval", "label": "刷新间隔", "type": "number", "default": 30, "min": 1, "max": 600 },
+      { "id": "notify", "label": "变更时通知", "type": "boolean", "default": true }
+    ]
+  },
+  "activationEvents": ["onStartup"]
+}
