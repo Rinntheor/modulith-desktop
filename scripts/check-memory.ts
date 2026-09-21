@@ -26,6 +26,7 @@ import {
   releaseCachedModuleComponent,
   setCachedModuleComponent,
 } from '../src/services/moduleComponentCache.ts';
+import { resolveDropIndex } from '../src/modules/dashboard/dropIndex.ts';
 import type { ModuleDescriptor } from '../src/types/module.ts';
 
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -167,6 +168,96 @@ check(
 check(
   market.includes('cache.keys().next()'),
   '淘汰按插入顺序取最早的一条'
+);
+
+// ============================================================
+// 侧边栏与模块分类的上限（1.3.2 新增）
+// ============================================================
+//
+// 分类表由前端提交、后端直接落盘，因此"数量上限"必须存在于后端；而前端也有一份
+// 用于即时反馈的校验（`validateCategoryName`）。两份规则里**长度那个数字**是唯一
+// 会漂移的地方 —— 前端说 24 个字符、后端说 32，用户就会遇到"输入框允许、保存被拒"。
+// 这里把两个数字钉在一起。
+console.log('\n侧边栏与分类的上限：');
+
+const sidebarConfig = read('src-tauri/src/modules/sidebar/config.rs');
+const sidebarCommands = read('src-tauri/src/modules/sidebar/commands.rs');
+const validatorsTs = read('src/utils/validators.ts');
+const moduleManagerTs = read('src/services/moduleManager.ts');
+
+const rustNumber = (source: string, name: string): number | null => {
+  const match = new RegExp(`pub const ${name}: usize = (\\d+);`).exec(source);
+  return match ? Number(match[1]) : null;
+};
+
+const rustNameChars = rustNumber(sidebarConfig, 'MAX_CATEGORY_NAME_CHARS');
+const tsNameChars = Number(
+  /export const MAX_CATEGORY_NAME_CHARS = (\d+);/.exec(validatorsTs)?.[1] ?? NaN
+);
+check(
+  rustNameChars !== null && rustNameChars === tsNameChars,
+  `分类名长度上限前后端一致（Rust ${rustNameChars} ／ TS ${Number.isNaN(tsNameChars) ? '缺失' : tsNameChars}）`
+);
+check(
+  (rustNumber(sidebarConfig, 'MAX_CATEGORIES') ?? 0) > 0,
+  '分类数量上限在后端（前端提交的数据必须由后端设上限）'
+);
+check(
+  /config\.categories\.len\(\) >= MAX_CATEGORIES/.test(sidebarCommands),
+  '新建分类时真的检查了数量上限'
+);
+
+// 分类随 `get_module_preferences` 一起返回，因此前端不应有第二个加载入口 ——
+// 有第二个就会出现"这份数据加载了吗"这样的状态，而那个状态迟早有一处是错的。
+check(
+  !/invoke<[^>]*>\(\s*'get_module_categories'/.test(moduleManagerTs),
+  '分类不单独加载（它随 get_module_preferences 一起回来，只有一个来源）'
+);
+check(
+  /categories: ModuleCategory\[\];/.test(moduleManagerTs),
+  'ModulePreferences 里有 categories（否则后端返回的字段会被类型悄悄丢掉）'
+);
+check(
+  /getCategories\(\): ModuleCategory\[\]/.test(moduleManagerTs),
+  '分类的读取入口在 moduleManager 上（模块偏好的唯一归属处）'
+);
+
+// ------------------------------------------------------------
+// 拖动落点的下标换算
+// ------------------------------------------------------------
+//
+// 这一段守的是一个**只在半数方向上错**的缺陷：拖动时算出的下标是按"模块还在
+// 原处"数出来的，而后端先摘掉再插入，因此同一个分类内向下拖要减一。手工试两下
+// 很容易恰好试到对的那一半。规则本身只有一份实现（`dropIndex.ts`），这里直接跑它。
+console.log('\n拖动落点的换算：');
+
+const drop = resolveDropIndex;
+
+// [a,b,c] 把 a 拖到 b 与 c 之间：落点 2 → 摘掉 a 之后应当是 1
+check(
+  drop({ categoryId: 'cat-1', index: 0 }, { categoryId: 'cat-1', index: 2 }) === 1,
+  '同一分类内向下拖：下标减一（不减会得到 [b,c,a] 而不是 [b,a,c]）'
+);
+// 向上拖不需要换算：[a,b,c] 把 c 拖到 a 之前，落点 0，摘掉后插到 0 仍是对的
+check(
+  drop({ categoryId: 'cat-1', index: 2 }, { categoryId: 'cat-1', index: 0 }) === 0,
+  '同一分类内向上拖：下标不变'
+);
+check(
+  drop({ categoryId: 'cat-1', index: 1 }, { categoryId: 'cat-1', index: 1 }) === 1,
+  '原地放手：不变（不是 -1）'
+);
+check(
+  drop({ categoryId: 'cat-1', index: 0 }, { categoryId: 'cat-2', index: 2 }) === 2,
+  '跨分类：不换算（源列表与目标列表是两个数组）'
+);
+check(
+  drop({ categoryId: 'cat-1', index: 0 }, { categoryId: null, index: 0 }) === 0,
+  '移出所有分类：不换算'
+);
+check(
+  drop(undefined, { categoryId: 'cat-1', index: 3 }) === 3,
+  '源位置不可知时原样交给后端（它自己会夹取越界的下标）'
 );
 
 if (failed > 0) {

@@ -53,6 +53,44 @@ export function hasLengthInRange(
 }
 
 /**
+ * 校验分类名。
+ *
+ * **按字符计数，不是字节** —— 与后端 `normalize_category_name` 同一条规则。
+ * 用 `.length` 而不写 UTF-16 长度：JS 的 `length` 对 BMP 之外的字符（emoji）
+ * 会算成 2，而 Rust 的 `chars().count()` 算成 1。差异只在极端输入上出现，
+ * 而方向是安全的：前端更严，后端才是权威。
+ *
+ * **后端仍然会再校验一遍。** 这个函数存在的理由是"在用户还在输入框里的时候
+ * 就给出一句人话的错误"，不是"替代后端校验" —— 前端判定可以绕过（插件能直接
+ * invoke），因此它绝不能是唯一的检查点。
+ */
+export const MAX_CATEGORY_NAME_CHARS = 24;
+
+export function validateCategoryName(name: unknown): ValidationResult {
+  if (typeof name !== 'string') {
+    return createValidationResult(false, ['分类名必须是字符串']);
+  }
+
+  const trimmed = name.trim();
+  if (trimmed.length === 0) {
+    return createValidationResult(false, ['分类名不能为空']);
+  }
+
+  if ([...trimmed].length > MAX_CATEGORY_NAME_CHARS) {
+    return createValidationResult(false, [
+      `分类名最长 ${MAX_CATEGORY_NAME_CHARS} 个字符（当前 ${[...trimmed].length}）`,
+    ]);
+  }
+
+  // 控制字符（含换行与零宽字符）会让界面上的名字与磁盘上的内容看起来不一样
+  if (/[\u0000-\u001f\u007f\u200b-\u200f\u2028\u2029]/.test(trimmed)) {
+    return createValidationResult(false, ['分类名不能包含控制字符']);
+  }
+
+  return createValidationResult(true);
+}
+
+/**
  * 验证模块 ID 格式
  */
 export function isValidModuleId(moduleId: unknown): ValidationResult {
