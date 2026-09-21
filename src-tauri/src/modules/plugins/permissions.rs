@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(
             actual,
             EXPECTED.to_vec(),
-            "权限元数据发生变化。若这是有意的，请同步更新 docs/08-规划/插件生态设计.md 第 3.5 节"
+            "权限元数据发生变化。若这是有意的，请同步更新 docs/02-开发指南/插件开发/清单文件参考.md 第 4 节与 src/services/permissionRegistry.ts"
         );
     }
 
