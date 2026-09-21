@@ -169,10 +169,22 @@
 | `moveModule(id, direction)` | `Promise<void>` | 上移或下移一位 |
 | `toggleFavoriteModule(id, favorite?)` | `Promise<void>` | 切换收藏 |
 | `recordModuleOpen(id)` | `Promise<void>` | 记录一次打开 |
-| `resetAll()` | `Promise<void>` | 恢复默认偏好 |
-| `ModulePreferences` | 接口 | 偏好数据结构 |
+| `resetAll()` | `Promise<void>` | 恢复默认偏好（**不清分类**，见下） |
+| `getCategories()` | `ModuleCategory[]` | 用户自定义的模块分类（同步读缓存） |
+| `getCategoryOf(id)` | `ModuleCategory \| undefined` | 某个模块所属的分类 |
+| `createCategory(name)` | `Promise<void>` | 新建分类（id 由后端生成） |
+| `renameCategory(id, name)` | `Promise<void>` | 重命名（不改 id） |
+| `deleteCategory(id)` | `Promise<void>` | 删除分类，成员回到「未分类」 |
+| `reorderCategories(ids)` | `Promise<void>` | 重排，须提交全部 id 的一个排列 |
+| `setModuleCategory(id, categoryId, index?)` | `Promise<void>` | 移动模块；`null` 表示移出所有分类，`index` 是目标分类内的位置（省略即追加） |
+| `ModulePreferences` | 接口 | 偏好数据结构（含 `categories`） |
+| `ModuleCategory` | 接口 | `{ id, name, modules }` |
 
 方法内部会校验输入（模块存在性、索引范围、方向取值），非法输入被拒绝而不传递给后端。
+
+**分类为什么没有自己的加载步骤。** 它随 `get_module_preferences` 一起返回，因此不存在"这份数据加载了吗"这种状态 —— 而那种状态迟早有一处是错的。**六个写命令统一用后端返回的整张表覆盖本地**，刻意不做乐观更新：`appSettings` 那一套（先改本地、失败再回滚）是为开关准备的，那里等一次 IPC 会有可感知的延迟；分类操作是低频、用户明确发起的，一次往返的几十毫秒看不出来，换来的是"本地那份永远等于磁盘那份"。
+
+**`resetAll()` 不会清掉分类。** 后端 `SidebarPreferences::reset` 刻意保留它们（分类是用户创建的内容，不是显示偏好），因此这个方法的返回结果里分类还在 —— 这里不需要做任何特殊处理。
 
 ## 8. pluginRuntime
 
@@ -328,11 +340,18 @@ interface EngineAdvisory {
 | `loadPolicyModes()` | `Promise<NetPolicyMode[]>` | 三档策略的 label / hint / 是否可用 |
 | `loadNetLog(limit?)` | `Promise<NetLogEntry[]>` | 最近的出站记录，最新的在前 |
 | `clearNetLog()` / `netLogLength()` | `Promise<void>` / `Promise<number>` | 清空 / 取条数 |
-| `OUTCOME_LABELS` | 常量 | 四种结果的显示文案 |
+| `OUTCOME_LABELS` | 常量 | 六种结果的显示文案（含询问相关的两种） |
 | `describeSource(source)` | `string` | `plugin:com.x` → `插件 com.x` |
 | `splitUrl(url)` | `{ host, path, hasQuery }` | **丢掉查询串**（它常带令牌，而日志会被截图） |
+| `NetPrompt` | 接口 | 一次询问的内容：来源、用途、主机、地址（已折查询串）、超时、排队数 |
+| `NET_PROMPT_EVENT` / `NET_PROMPT_CLOSED_EVENT` | 常量 | 后端推来的两个事件名（提出询问 / 询问已结束） |
+| `answerNetPrompt(id, allow, rememberHost)` | `Promise<void>` | 回答一次询问 |
+| `loadSessionGrants()` | `Promise<string[]>` | 本会话已放行的主机 |
+| `clearSessionGrants()` | `Promise<number>` | 清空会话放行表，返回清掉的条数 |
 
 **前端不做策略判定，也不手写档位描述。** 判定在 Rust（请求由它发起），档位与原因由 `net_policy_modes` 给出 —— 前端手写一份的后果是某一档后来实现了、界面还标着"未实现"，或者反过来。这与权限注册表是同一个理由：同一份名单的第二份副本必然漂移。
+
+**「默认询问」的生命周期也不在前端。** 前端只做两件事：把事件里的询问显示出来、把用户的选择送回去。排队、超时与"已被答过"全在后端 —— 因为请求本身在那边挂着，前端无从判断它是否还活着。倒计时用后端给的 `timeoutMs`，前端不写死数字：两处各写一份必然漂移，而漂移的表现是"界面还在倒数，后端已经按超时拒绝了"。
 
 ## 13. globalErrorHandlers
 
