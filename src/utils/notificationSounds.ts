@@ -144,7 +144,17 @@ export interface BuiltinSound {
   id: string;
   label: string;
   description: string;
-  notes: readonly SoundNote[];
+  /**
+   * 合成音色的音符表。
+   *
+   * **打包音效没有这个字段。** 它的声音来自一个随应用发布的音频文件
+   * （`src/assets/notification.mp3`），没有可查的合成参数。因此这个字段是可选
+   * 的，任何遍历它的代码都必须先处理「没有音符」这一支 —— 包括合成函数与
+   * `check-sounds.ts` 的断言。
+   */
+  notes?: readonly SoundNote[];
+  /** 声音来自打包的音频文件，而不是现场合成 */
+  bundled?: true;
 }
 
 /** 指数衰减的终点。不能是 0：`exponentialRampToValueAtTime` 要求目标为正 */
@@ -155,6 +165,20 @@ function note(partial: Omit<SoundNote, 'partials'> & { partials?: readonly Parti
 }
 
 /**
+ * 打包音效的 id。
+ *
+ * 与 `CUSTOM_SOUND_ID` 是两件事，不要合并：
+ *   · 这一项的声音来自**随应用发布**的 `src/assets/notification.mp3`，不占用户
+ *     数据目录、不进备份、也不受「自定义音效文件被删掉」影响；
+ *   · `custom` 是用户导入进 `<app_data>/sounds/` 的那一个，会随备份走，
+ *     文件丢了就要回退到这一项。
+ *
+ * 它必须在使用它的 `BUILTIN_SOUNDS` **之前**声明：`const` 有暂时性死区，
+ * 把声明放到数组下面会让模块求值直接抛 ReferenceError。
+ */
+export const BUNDLED_SOUND_ID = 'default';
+
+/**
  * 内置音色表。
  *
  * 频率说明（十二平均律，A4 = 440 Hz）：
@@ -162,8 +186,18 @@ function note(partial: Omit<SoundNote, 'partials'> & { partials?: readonly Parti
  *   E6 = 1318.51  G#6 = 1661.22  B6 = 1975.53
  *   A5 = 880.00   C#6 = 1108.73
  *   G5 = 783.99   D#5 = 622.25
+ *
+ * **第一项是打包音效，其余是现场合成。** 顺序不是随意的：
+ * `DEFAULT_NOTIFICATION_SOUND_ID` 必须等于 `BUILTIN_SOUNDS[0].id`（三处一致的
+ * 断言见 `scripts/check-sounds.ts`），而默认那一项就是随应用发布的那个文件。
  */
 export const BUILTIN_SOUNDS: readonly BuiltinSound[] = [
+  {
+    id: BUNDLED_SOUND_ID,
+    label: '默认提示音',
+    description: '随应用提供的默认提示音，安装后即可使用',
+    bundled: true,
+  },
   {
     id: 'chime',
     label: '清脆铃声',
@@ -281,8 +315,13 @@ export const BUILTIN_SOUNDS: readonly BuiltinSound[] = [
  * `settings.rs` 的 `DEFAULT_NOTIFICATION_SOUND_ID` 一致。三处不一致会出现
  * 「后端认为默认是 A、前端回退到 B」这种只在缺字段时才暴露的分叉。
  * `scripts/check-sounds.ts` 会把这三者钉在一起。
+ *
+ * 它在 1.3.2 从 `chime`（合成音色）变成了打包音效：一个真实的录音比"几个
+ * 分音堆出来的敲击音"更容易被注意到，而提示音要解决的正是"用户没在看这个
+ * 窗口"。**旧版本已经存进 settings.json 的 `chime` 仍然是合法的**，因此升级
+ * 不会改变老用户听到的声音 —— 我们只改默认值，不改用户已经做出的选择。
  */
-export const DEFAULT_NOTIFICATION_SOUND_ID = 'chime';
+export const DEFAULT_NOTIFICATION_SOUND_ID = BUNDLED_SOUND_ID;
 
 /** 自定义音效的 id */
 export const CUSTOM_SOUND_ID = 'custom';
@@ -292,15 +331,33 @@ export function soundIds(): string[] {
   return [...BUILTIN_SOUNDS.map((s) => s.id), CUSTOM_SOUND_ID];
 }
 
-/** 未知 id 回退到第一个内置音色（与既有的 accent 处理同一取向：不拒绝，只降级） */
+/**
+ * 未知 id 回退到默认音色（与既有的 accent 处理同一取向：不拒绝，只降级）。
+ *
+ * 注意回退目标是 `DEFAULT_NOTIFICATION_SOUND_ID`，而它是**打包音效** ——
+ * 调用方拿到这个返回值之后必须走播放音频文件那条路，不能直接交给
+ * `renderSound`（后者对它无事可做）。`services/sound.ts` 的 `playById` 是
+ * 唯一负责这次分发的地方。
+ */
 export function resolveSoundId(id: unknown, customAvailable: boolean): string {
-  if (id === CUSTOM_SOUND_ID) return customAvailable ? CUSTOM_SOUND_ID : BUILTIN_SOUNDS[0].id;
+  if (id === CUSTOM_SOUND_ID) return customAvailable ? CUSTOM_SOUND_ID : DEFAULT_NOTIFICATION_SOUND_ID;
   if (typeof id === 'string' && BUILTIN_SOUNDS.some((s) => s.id === id)) return id;
-  return BUILTIN_SOUNDS[0].id;
+  return DEFAULT_NOTIFICATION_SOUND_ID;
 }
 
 export function getBuiltinSound(id: string): BuiltinSound | undefined {
   return BUILTIN_SOUNDS.find((s) => s.id === id);
+}
+
+/**
+ * 该音色是否来自打包的音频文件。
+ *
+ * 这是播放端唯一需要的分支判据：打包音效交给 `<audio>`，合成音色交给
+ * `renderSound`。两者不能互相兜底 —— 把打包音效交给 `renderSound` 会静默
+ * 什么都不播（它没有音符），那正是"看起来对、实际不响"这一类缺陷。
+ */
+export function isBundledSound(id: string): boolean {
+  return getBuiltinSound(id)?.bundled === true;
 }
 
 /** 音量区间与默认值（与后端 settings.rs 的校验区间必须一致） */
@@ -383,9 +440,19 @@ export function strike(ctx: AudioContextLike, out: AudioNodeLike, spec: SoundNot
   }
 }
 
-/** 合成一种内置音色。未知 id 直接返回，静默忽略（调用方已经做过回退） */
+/**
+ * 合成一种内置音色。
+ *
+ * 未知 id 与**打包音效**都直接返回，静默忽略：
+ *   · 未知 id 的回退已经由调用方做过（见 `resolveSoundId`）；
+ *   · 打包音效没有音符可合成，它的播放路径是 `<audio>`（见 `services/sound.ts`）。
+ *
+ * 这里刻意不抛错。抛错会把"一个音色选错了分支"升级成"通知推送整个失败"，
+ * 而提示音恰恰是最不该影响通知本身的东西。真正的分发责任收在
+ * `services/sound.ts::playById` 一处，`check-sounds.ts` 断言它在场。
+ */
 export function renderSound(ctx: AudioContextLike, out: AudioNodeLike, soundId: string): void {
   const sound = getBuiltinSound(soundId);
-  if (!sound) return;
+  if (!sound?.notes) return;
   for (const spec of sound.notes) strike(ctx, out, spec);
 }

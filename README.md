@@ -22,7 +22,7 @@ Modulith Desktop 的核心主张是：**需要什么功能，就加什么模块*
 
 模块与插件产生的通知会持久化保存，带未读状态，在标题栏铃铛、侧边栏与标签页徽标上显示未读数，重启后仍在。同一条信息反复发生时按 `dedupeKey` 合并计数，不会刷满通知中心。插件通过 `ctx.notifications` 使用它（需声明 `notification` 权限）。
 
-通知可以带提示音：内置五种音色（清脆铃声、水滴、三连音、警示、柔和木音），可试听后再选，也可以导入自己的音频文件（会被复制进应用数据目录，原文件移动或删除都不影响），音量可调。提示音与浮层同进同出 —— 被合并计数的重复通知不会重复响。
+通知可以带提示音：默认是一段**随应用发布**的音效（来自 Pixabay，作者 Universfield，Pixabay 内容许可 —— 完整标注见[版权与授权](docs/07-法务/版权与授权.md)），另有五种现场合成的音色（清脆铃声、水滴、三连音、警示、柔和木音），都可试听后再选；也可以导入自己的音频文件（会被复制进应用数据目录，原文件移动或删除都不影响），音量可调。提示音与浮层同进同出 —— 被合并计数的重复通知不会重复响。
 
 目前**只有应用内通知，没有系统级通知** —— 那需要新增 Tauri 插件依赖，当前版本刻意不引入。
 
@@ -55,6 +55,16 @@ Modulith Desktop 的核心主张是：**需要什么功能，就加什么模块*
 应用有两件事必须联网：插件市场（索引、说明、图标、包）与软件更新。两者都走 GitHub 地址，而 GitHub 在部分网络下不可直连 —— 因此「设置 → 网络」允许选择**直连**或**经由下载源**（前缀式加速源，例如 `https://gh-proxy.org`），也可以自己填地址。同页的「网络诊断」把两条路各实测一遍，逐条给出状态码、耗时与失败原因。
 
 改写只发生在一处，而且发生在宿主白名单校验**之后**：代理只是把已经通过校验的原始地址整条接在加速源域名后面，因此用户填任意域名都不会扩大应用能访问的范围。内容完整性也不由加速源保证 —— 插件包有索引里的哈希，索引与更新包有发布签名。
+
+**出站管控**
+
+「设置 → 网络」把**所有**经宿主发出的请求收在一处：出站策略（默认放行并记录 / 默认询问 / 禁止出站）与一张流量日志（谁、要干什么、去哪、结果）。判定只有一处实现，裸 HTTP 客户端被私有字段持有、没有交出去的入口，因此"绕过策略发一个请求"是类型问题而不是纪律问题。WebView 里的直接请求由 CSP 的 `connect-src` 兜底 —— 那道边界由浏览器引擎执行，JS 改不掉。
+
+「默认询问」会在放行之前问一次：允许一次 / 本次运行内总是允许该主机 / 拒绝。市场一次操作会连发五条请求，因此那个"总是允许"是必需的而不是便利；它只作用于本次运行，重启即失效 —— 用户选的就是"每次问我"。**不回答按拒绝处理**，因为放行是一次没有发生过的同意。已放行的主机会列在同一页并可一键撤销。
+
+**仪表盘与模块分类**
+
+首页不是模块清单（那是侧边栏的事），而是快速进入与整理：收藏与最近使用提到首屏，其余模块按**用户自己建的分类**分区。分类是划分而不是标签（一个模块只属于一个分类），删除分类不会删模块，成员回到「未分类」；插件被卸载后它的位置仍然留着，重装即回原位。没有分类时只有一个「未分类」区加一句引导 —— 不摆空分区。
 
 **日志与崩溃记录**
 
@@ -159,7 +169,7 @@ modulith-desktop/
 | `pnpm tauri build` | 打包应用 |
 | `pnpm gen:modules` | 重新生成前端模块注册表 |
 | `pnpm gen:backend update` | 重新生成后端声明与命令注册 |
-| `pnpm gen:backend list` | 查看后端模块与命令（当前 8 个模块、86 条命令） |
+| `pnpm gen:backend list` | 查看后端模块与命令（当前 9 个模块、101 条命令） |
 | `pnpm ver check` | 校验版本一致性 |
 | `pnpm ver bump <类型>` | 升级版本并生成变更日志 |
 | `pnpm check:samples` | 示例插件的清单与代码是否一致 |
@@ -168,10 +178,14 @@ modulith-desktop/
 | `pnpm check:network` | 联网方式与下载源（含前后端常量镜像是否漂移） |
 | `pnpm check:memory` | 缓存语义与上限、组件缓存的释放挂钩 |
 | `pnpm check:performance` | 三组动效/毛玻璃开关的真值表与接线 |
+| `pnpm check:scripts` | 脚本直接依赖的模块是否仍可在 Node 里求值（纯逻辑边界），以及两个 tsconfig 的路径别名是否一致 |
 | `pnpm check:theme` | 深色映射覆盖率、遮罩保持半透明、亚层判据与外壳命中区域 |
-| `pnpm check:sounds` | 提示音音色表、包络形状与峰值归一化（用桩音频上下文真跑一遍） |
+| `pnpm check:sounds` | 提示音音色表、包络形状与峰值归一化（用桩音频上下文真跑一遍），以及打包音效的资产与播放分支 |
 | `pnpm check:backup` | 备份的命令接线、恢复门槛与敏感数据两道门 |
 | `pnpm check:markdown` | Markdown 解析的边界（内容不丢、标识符不被当成斜体、危险协议不生成链接），以及两份发布说明的分工 |
+| `pnpm check:contributions` | 贡献模型：清单字段的规范化、激活事件与加载契约 |
+| `pnpm check:plugin-runtime` | 插件运行时：真实跑一遍 `pluginRuntime`，用合成插件撞边界 |
+| `pnpm check:net-guard` | WebView 侧出站门面与后端判定的一致性 |
 
 ## 提交前检查
 
@@ -183,8 +197,10 @@ npx tsc -p tsconfig.node.json          # scripts/ 下的断言脚本
 cd src-tauri && cargo test --offline --lib
 pnpm check:samples                    # 改了 samples/ 才需要
 pnpm check:semver && pnpm check:update && pnpm check:network
-pnpm check:memory && pnpm check:performance && pnpm check:theme
+pnpm check:memory && pnpm check:performance && pnpm check:scripts
+pnpm check:theme                      # 第 7 节需要先 pnpm build，否则会显式跳过
 pnpm check:sounds && pnpm check:backup && pnpm check:markdown
+pnpm check:contributions && pnpm check:plugin-runtime && pnpm check:net-guard
 ```
 
 `cargo test` 里有一条检查**示例包是否与源码一致**：它解压那个 `.lcp` 并逐个文件比对，

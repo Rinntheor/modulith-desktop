@@ -261,10 +261,39 @@
   background-color: rgb(from var(--accent-500) r g b / 0.22);
 }
 
+/*
+ * 上面那两组**只列了它们各自用到的透明度档位**（indigo-50 列了裸类名、
+ * /30、/50，amber-50 列了裸类名、/20、/30）。这张表是按类名精确匹配的，
+ * 因此同一族里没被列出的档位会**原样保留浅色** —— 在深色界面上表现为一块
+ * 发白的板子。设置 → 备份的「已选中」行用的正是 bg-indigo-50/40，
+ * 用户看到的就是这个：一块白底把复选框包在中间。
+ *
+ * 下面这几条是同一族缺失的档位。数值按「档位越大越明显」排序，与上面
+ * 已有的 0.16 / 0.24 同源，但没有改动任何既有取值。
+ */
+:root.dark [class~='bg-indigo-50/20'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.1);
+}
+:root.dark [class~='bg-indigo-50/40'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.14);
+}
+:root.dark [class~='bg-indigo-50/60'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.2);
+}
+:root.dark [class~='bg-indigo-100/40'] {
+  background-color: rgb(from var(--accent-500) r g b / 0.18);
+}
+
 :root.dark [class~='bg-amber-50'],
 :root.dark [class~='bg-amber-50/20'],
 :root.dark [class~='bg-amber-50/30'] {
   background-color: rgba(245, 158, 11, 0.14);
+}
+:root.dark [class~='bg-amber-50/40'] {
+  background-color: rgba(245, 158, 11, 0.16);
+}
+:root.dark [class~='bg-amber-50/70'] {
+  background-color: rgba(245, 158, 11, 0.2);
 }
 :root.dark [class~='bg-amber-100'] {
   background-color: rgba(245, 158, 11, 0.22);
@@ -273,12 +302,18 @@
 :root.dark [class~='bg-emerald-50'] {
   background-color: rgba(16, 185, 129, 0.14);
 }
+:root.dark [class~='bg-emerald-50/50'] {
+  background-color: rgba(16, 185, 129, 0.14);
+}
 :root.dark [class~='bg-emerald-100'] {
   background-color: rgba(16, 185, 129, 0.22);
 }
 
 :root.dark [class~='bg-red-50'] {
   background-color: rgba(239, 68, 68, 0.14);
+}
+:root.dark [class~='bg-red-50/60'] {
+  background-color: rgba(239, 68, 68, 0.16);
 }
 :root.dark [class~='bg-red-100'] {
   background-color: rgba(239, 68, 68, 0.22);
@@ -594,8 +629,16 @@
 }
 
 :root.dark [class~='hover:bg-indigo-50/30']:hover,
+:root.dark [class~='hover:bg-indigo-50/40']:hover,
 :root.dark [class~='hover:bg-indigo-100']:hover {
   background-color: rgb(from var(--accent-500) r g b / 0.22);
+}
+
+/* `hover:bg-gray-50/60` 与它下面那些彩色档位同在 1.3.2 被 `check:theme` 抓出来：
+   它们是仪表盘重写时新用到的类名，而这张表是按类名精确匹配的 —— 漏一档就是
+   深色下悬停时闪出一块浅色。这正是那个脚本存在的理由。 */
+:root.dark [class~='hover:bg-gray-50/60']:hover {
+  background-color: rgba(255, 255, 255, 0.06);
 }
 
 :root.dark [class~='hover:bg-indigo-700']:hover {
@@ -603,6 +646,7 @@
 }
 
 :root.dark [class~='hover:bg-amber-50']:hover,
+:root.dark [class~='hover:bg-amber-50/40']:hover,
 :root.dark [class~='hover:bg-amber-100']:hover,
 :root.dark [class~='hover:bg-amber-200']:hover {
   background-color: rgba(245, 158, 11, 0.22);

@@ -154,6 +154,14 @@ export interface AppSettings {
    */
   glassEffect: boolean;
   /**
+   * 仪表盘是否显示统计面板（模块总数 / 可见 / 收藏 / 隐藏 / 禁用）。
+   *
+   * 默认**开启**：新用户第一次打开仪表盘时，那几个数字回答的是"我装了多少东西、
+   * 整理到哪一步了"。但它可以被关掉 —— 用久之后数字不再提供新信息，而它们占着
+   * 首屏最上面一整行。开关就在仪表盘上，不在设置页里：要收起的是眼前这一块。
+   */
+  dashboardStatsVisible: boolean;
+  /**
    * 是否播放通知提示音。
    *
    * 默认**开启**。通知在这个应用里是低频且有意义的事件（插件加载失败、有可用
@@ -298,6 +306,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   // 与后端 default_glass_effect() 一致：默认开启。
   // 浮层毛玻璃是临时开销（只在浮层打开时），与三个常驻亚层的取舍不同。
   glassEffect: true,
+  // 与后端 default_dashboard_stats_visible() 一致：默认开启。
+  dashboardStatsVisible: true,
   // 与后端 default_notification_sound_* 保持一致：默认开启、默认音色、默认音量。
   // 音量默认 0.8 而不是 1：合成音本身已经按峰值归一化过，留一点余量给多个通知
   // 叠加的情形，避免同时响几声时被压缩器压扁。
@@ -401,6 +411,8 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     // 用 `=== true` 会让一份缺该字段的老 settings.json 静默关掉毛玻璃 ——
     // 那是一次用户从未做过的选择。判据与 tabBarVisible / fileLoggingEnabled 一致。
     glassEffect: raw?.glassEffect !== false,
+    // 同上：默认「开」，只有显式 false 才收起
+    dashboardStatsVisible: raw?.dashboardStatsVisible !== false,
     // 与 glassEffect 同一约定：默认「开」，只有显式 false 才关闭
     notificationSoundEnabled: raw?.notificationSoundEnabled !== false,
     // 音色 id 只做类型清洗，未知取值交给 resolveSoundId 回退（理由见接口注释）

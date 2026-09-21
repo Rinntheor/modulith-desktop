@@ -39,7 +39,13 @@ export interface NetLogEntry {
   method: string;
   host: string;
   url: string;
-  outcome: 'allowed' | 'allowed-pending-prompt' | 'denied' | 'failed';
+  outcome:
+    | 'allowed'
+    | 'allowed-pending-prompt'
+    | 'allowed-by-prompt'
+    | 'allowed-session'
+    | 'denied'
+    | 'failed';
   status: number | null;
   bytes: number | null;
   detail: string | null;
@@ -100,6 +106,8 @@ export const NET_MODE_DENY = 'deny';
 
 export const NET_DENY_OFFLINE = '离线模式已开启';
 export const NET_DENY_POLICY = '出站策略为「禁止出站」';
+export const NET_DENY_PROMPT_REFUSED = '你在询问里拒绝了这次出站';
+export const NET_DENY_PROMPT_TIMEOUT = '等待出站确认超时，已按拒绝处理';
 export const NET_DENY_DIRECT = '插件不能直接联网，请改用 ctx.http（它带权限检查、出站策略与流量日志）';
 
 // ============================================================
@@ -109,9 +117,65 @@ export const NET_DENY_DIRECT = '插件不能直接联网，请改用 ctx.http（
 export const OUTCOME_LABELS: Record<NetLogEntry['outcome'], string> = {
   allowed: '已放行',
   'allowed-pending-prompt': '已放行（本应询问）',
+  'allowed-by-prompt': '已放行（你在询问里同意了）',
+  'allowed-session': '已放行（本会话已允许过该主机）',
   denied: '已拒绝',
   failed: '失败',
 };
+
+// ============================================================
+// 「默认询问」：询问的接收与回答
+// ============================================================
+//
+// 判定权在后端（`net/prompt.rs`）。前端这里只做两件事：把询问显示出来、把用户
+// 的选择送回去。**前端不判断该不该问、也不判断答案是否有效** —— 询问的生命周期
+// （排队、超时、已被答过）全在后端，因为请求本身在那边挂着。
+
+/** 后端 `net/prompt.rs` 的 `NetPrompt` */
+export interface NetPrompt {
+  id: number;
+  /** `host` / `plugin:<id>` / `module:<id>` */
+  source: string;
+  purpose: string;
+  method: string;
+  host: string;
+  /** 已折掉查询串的地址（查询串经常带令牌） */
+  url: string;
+  /** 后端给出的等待上限，界面据此显示倒计时 —— 数字只有一份 */
+  timeoutMs: number;
+  /** 此刻队列里还有多少条在等（含这一条） */
+  queued: number;
+}
+
+/** 后端提出一次询问 */
+export const NET_PROMPT_EVENT = 'net://prompt';
+/** 一次询问已经结束（超时，或已被答过）。界面据此撤掉对话框 */
+export const NET_PROMPT_CLOSED_EVENT = 'net://prompt-closed';
+
+/**
+ * 回答一次询问。
+ *
+ * `rememberHost` 把该主机记进**本会话**的放行表（内存，重启失效）。
+ * 后端对"这一条已经不存在了"（超时、重复点击）返回成功而不是错误 —— 那确实
+ * 不是错误。
+ */
+export function answerNetPrompt(
+  id: number,
+  allow: boolean,
+  rememberHost: boolean
+): Promise<void> {
+  return invoke<void>('net_answer_prompt', { id, allow, rememberHost });
+}
+
+/** 本会话已放行的主机（设置页展示，用户据此撤销） */
+export function loadSessionGrants(): Promise<string[]> {
+  return invoke<string[]>('net_list_session_grants');
+}
+
+/** 清空本会话的放行表，立刻回到"每次都问"。返回清掉的条数 */
+export function clearSessionGrants(): Promise<number> {
+  return invoke<number>('net_clear_session_grants');
+}
 
 /**
  * 来源的可读化：`plugin:com.x.y` → `插件 com.x.y`。

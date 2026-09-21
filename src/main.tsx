@@ -3,6 +3,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import Router from './router/Router';
 import BootGate from './components/boot/BootGate';
+import NetPromptLayer from './components/NetPromptLayer';
 import ThemeProvider from './components/ThemeProvider';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { installGlobalErrorHandlers } from './services/globalErrorHandlers';
@@ -44,6 +45,14 @@ ReactDOM.createRoot(rootElement).render(
     <AppErrorBoundary>
       {/* 主题与动效开关：必须在 BootGate 外层，启动/授权界面也要受它约束 */}
       <ThemeProvider>
+        {/*
+          出站询问（「默认询问」档）。
+          
+          刻意放在 BootGate **外面**：出站请求可能发生在启动阶段（自动检查更新）
+          与解锁界面上，那时 Home 还没挂载 —— 挂在里面会让那些请求无人可问，
+          只能在超时后按拒绝处理。它自己会订阅后端的事件，没有询问时不渲染任何东西。
+        */}
+        <NetPromptLayer />
         {/* 启动门禁：完成真实初始化（设置 → 授权 → 模块 → 插件 → 预热）后才挂载应用 */}
         <BootGate>
           <Router />

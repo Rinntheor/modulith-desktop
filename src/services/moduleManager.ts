@@ -7,6 +7,7 @@ import {
   isValidModuleId,
   isValidIndex,
   isValidDirection,
+  validateCategoryName,
   assertValid,
 } from '../utils/validators';
 
@@ -19,6 +20,27 @@ export interface ModulePreferences {
   pinned_modules: string[];
   favorite_modules: string[];
   recent_modules: string[];
+  /** 用户自定义的模块分类（顺序即显示顺序） */
+  categories: ModuleCategory[];
+}
+
+/**
+ * 用户自定义的模块分类（后端 `sidebar/config.rs` 的 `ModuleCategory`）。
+ *
+ * 两条契约写在这里，因为它们是这个类型被使用时的前提：
+ *
+ *   · **一个模块最多属于一个分类**（划分，不是标签）。后端 `sanitize_categories`
+ *     在读盘时强制它，`set_module_category` 在写入时保证它。因此界面不需要处理
+ *     "同一个模块出现在两个分区里"这种状态 —— 它不存在。
+ *   · **分类成员里可能有当前不存在的模块 ID**（插件被卸载了）。那是有意的：
+ *     重装之后它会回到原来的分类，而清掉成员等于把用户的整理结果扔掉。
+ *     界面只渲染目录里存在的那些，不做清理。见 `sanitize_categories` 的说明。
+ */
+export interface ModuleCategory {
+  id: string;
+  name: string;
+  /** 属于该分类的模块 ID，顺序即显示顺序 */
+  modules: string[];
 }
 
 /** 最近使用列表的最大长度（与后端 MAX_RECENT_MODULES 保持一致） */
@@ -76,6 +98,7 @@ class RuntimeModuleManager {
         pinned_modules: [],
         favorite_modules: [],
         recent_modules: [],
+        categories: [],
       };
     }
 
@@ -385,12 +408,97 @@ class RuntimeModuleManager {
   }
 
   /**
-   * 重置所有偏好
+   * 重置所有偏好。
+   *
+   * **分类不会被清掉** —— 后端 `SidebarPreferences::reset` 刻意保留它们（理由写在
+   * 那里：分类是用户创建的内容，不是显示偏好）。这里不需要做任何特殊处理，
+   * 因为返回的就是后端保留之后的那一份。
    */
   async resetAll(): Promise<void> {
     const defaults = await invoke<ModulePreferences>('reset_module_preferences');
     this.preferences = defaults;
     this.notify();
+  }
+
+  // ========== 用户自定义的模块分类 ==========
+
+  /**
+   * 取分类表（同步读缓存）。
+   *
+   * 分类随 `get_module_preferences` 一起返回，因此没有独立的加载步骤 ——
+   * 少一次 IPC，也少一个"这份数据加载了吗"的状态。
+   */
+  getCategories(): ModuleCategory[] {
+    return this.preferences?.categories ?? [];
+  }
+
+  /** 某个模块所属的分类；未分类时返回 undefined */
+  getCategoryOf(moduleId: string): ModuleCategory | undefined {
+    return this.getCategories().find((category) => category.modules.includes(moduleId));
+  }
+
+  /**
+   * 六个写操作共用的收尾：**用后端返回的整张表覆盖本地**。
+   *
+   * 刻意不做乐观更新。`appSettings` 那一套（先改本地、失败再回滚）是为开关准备的，
+   * 那里等待一次 IPC 往返会有可感知的延迟；而分类操作是**低频、用户明确发起**的，
+   * 一次往返的几十毫秒看不出来，换来的是"本地那份永远等于磁盘那份"。
+   */
+  private async applyCategories(command: string, args: Record<string, unknown>): Promise<void> {
+    const categories = await invoke<ModuleCategory[]>(command, args);
+    if (this.preferences) {
+      this.preferences.categories = categories;
+    }
+    this.notify();
+  }
+
+  async createCategory(name: string): Promise<void> {
+    assertValid(validateCategoryName(name), 'createCategory: name');
+    await this.applyCategories('create_module_category', { name });
+  }
+  async renameCategory(id: string, name: string): Promise<void> {
+    assertValid(validateCategoryName(name), 'renameCategory: name');
+    await this.applyCategories('rename_module_category', { id, name });
+  }
+
+  /**
+   * 删除分类。**成员回到「未分类」，一个模块都不会被删** —— 后端只移除这一条
+   * 分类记录，因此这里不需要任何"先搬走成员"的编排。
+   */
+  async deleteCategory(id: string): Promise<void> {
+    await this.applyCategories('delete_module_category', { id });
+  }
+
+  /** 重排分类。必须提交**全部** id 的一个排列 —— 少一个后端会拒绝 */
+  async reorderCategories(ids: string[]): Promise<void> {
+    await this.applyCategories('reorder_module_categories', { ids });
+  }
+
+  /**
+   * 把一个模块放进某个分类；`categoryId` 为 `null` 表示移出所有分类。
+   *
+   * `index` 是**目标分类内的位置**（省略即追加到末尾），用来支持分类内的拖动重排。
+   * 位置由调用方给出而不是由后端推算：拖动表达的是"放在这两张卡片之间"，
+   * 后端若要去理解"上移一位"就得先知道前端的当前顺序，而那个顺序可能已经过期。
+   *
+   * 后端会先把它从原分类摘掉再放进目标，"一个模块只属于一个分类"因此由后端
+   * 保证，**这里不重复一遍** —— 前端再判一次只会多出一份可能与后端不一致的规则。
+   */
+  async setModuleCategory(
+    moduleId: string,
+    categoryId: string | null,
+    index?: number
+  ): Promise<void> {
+    const moduleIdResult = isValidModuleId(moduleId);
+    assertValid(moduleIdResult, 'setModuleCategory: moduleId');
+
+    await this.applyCategories('set_module_category', {
+      moduleId,
+      categoryId,
+      // 显式传 null 而不是省略：Tauri 的可选参数在两端各有一次"缺省"的语义，
+      // 传 null 只有一个含义
+      index: index ?? null,
+    });
   }
 
   /**

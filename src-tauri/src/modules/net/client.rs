@@ -31,6 +31,7 @@ use crate::modules::settings::settings as settings_store;
 
 use super::log::{self, NetLogEntry};
 use super::policy::{self, Decision};
+use super::prompt::{self, PromptOutcome};
 use super::is_loopback_host;
 
 /// 一次出站的来源与用途。
@@ -183,17 +184,44 @@ impl NetClient {
             return Err(NetError::Denied(reason.to_string()));
         }
 
+        // 「默认询问」档在这里才真正落地。
+        //
+        // `policy::decide` 只回答"要不要问"，问出来的答案由这一段处理 —— 它是
+        // 全项目唯一一处"把请求暂停下来等一个人"的地方，因此拒绝的两种原因
+        // （用户按了拒绝 / 用户没回答）都只在这里写到日志与错误上。
+        let outcome = if decision == Decision::AllowPendingPrompt {
+            if prompt::has_session_grant(&self.app, &host) {
+                // 本会话内已经为这个主机放过行。仍然记一条**可区分**的结果 ——
+                // 混成 `allowed` 之后，用户就再也看不出自己到底同意过什么。
+                policy::OUTCOME_BY_SESSION
+            } else {
+                match prompt::ask(&self.app, &entry, &method, &url, &host).await {
+                    PromptOutcome::Allowed => policy::OUTCOME_BY_PROMPT,
+                    PromptOutcome::Refused => {
+                        log::record(
+                            entry.with_outcome("denied", Some(policy::DENY_PROMPT_REFUSED.to_string())),
+                        );
+                        return Err(NetError::Denied(policy::DENY_PROMPT_REFUSED.to_string()));
+                    }
+                    PromptOutcome::TimedOut => {
+                        log::record(
+                            entry.with_outcome("denied", Some(policy::DENY_PROMPT_TIMEOUT.to_string())),
+                        );
+                        return Err(NetError::Denied(policy::DENY_PROMPT_TIMEOUT.to_string()));
+                    }
+                }
+            }
+        } else {
+            policy::outcome_of(decision)
+        };
+
         // 失败也要留痕：一条"没发出去"的日志，比一条缺失的日志有用得多 ——
         // 后者会让用户以为这个插件根本没尝试过联网
         match self.client.execute(request).await {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let length = response.content_length();
-                log::record(
-                    entry
-                        .with_outcome(policy::outcome_of(decision), None)
-                        .with_response(status, length),
-                );
+                log::record(entry.with_outcome(outcome, None).with_response(status, length));
                 Ok(response)
             }
             Err(error) => {

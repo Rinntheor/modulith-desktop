@@ -17,11 +17,14 @@ import { AlertCircle, Eraser, Loader2, RefreshCw, WifiOff } from 'lucide-react';
 
 import Toggle from './Toggle';
 import {
+  NET_MODE_ASK,
   OUTCOME_LABELS,
   clearNetLog,
+  clearSessionGrants,
   describeSource,
   loadNetLog,
   loadPolicyModes,
+  loadSessionGrants,
   splitUrl,
   type NetLogEntry,
   type NetPolicyMode,
@@ -37,8 +40,86 @@ interface Props {
 const OUTCOME_STYLES: Record<NetLogEntry['outcome'], string> = {
   allowed: 'text-gray-500',
   'allowed-pending-prompt': 'text-amber-600',
+  'allowed-by-prompt': 'text-emerald-600',
+  'allowed-session': 'text-emerald-600',
   denied: 'text-red-600',
   failed: 'text-red-600',
+};
+
+/**
+ * 「默认询问」档下本会话已放行的主机。
+ *
+ * 这一段存在的理由不是"功能完整"，而是**那个放行表必须看得见、也必须能撤销**：
+ * 一个只增不减、又不在界面上的状态，用户既不知道它存在，也无法收回自己给过的
+ * 许可 —— 而"我到底同意过什么"正是这一档存在的全部意义。
+ *
+ * 它只在选中 ask 档时出现：另外两档不会有任何放行记录，摆着只会让人以为
+ * 那里的开关没生效。
+ */
+const SessionGrants: React.FC<{ active: boolean }> = ({ active }) => {
+  const [hosts, setHosts] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    if (!active) {
+      setHosts([]);
+      return;
+    }
+    try {
+      setHosts(await loadSessionGrants());
+    } catch {
+      // 后端不可用时不编造内容
+      setHosts([]);
+    }
+  }, [active]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  if (!active) return null;
+
+  return (
+    <div className="mt-3 rounded-lg border border-gray-100 bg-gray-50 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-[11px] font-medium text-gray-600">
+          本会话已允许的主机（{hosts.length}）
+        </p>
+        {hosts.length > 0 && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              void clearSessionGrants()
+                .catch(() => undefined)
+                .finally(() => {
+                  setBusy(false);
+                  void refresh();
+                });
+            }}
+            className="inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+          >
+            <Eraser className="h-3 w-3" />
+            全部撤销
+          </button>
+        )}
+      </div>
+      {hosts.length === 0 ? (
+        <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+          还没有记住任何主机 —— 每次出站都会问一次。重启应用也会清空这份记录。
+        </p>
+      ) : (
+        <ul className="mt-1.5 space-y-0.5">
+          {hosts.map((host) => (
+            <li key={host} className="break-all font-mono text-[11px] text-gray-700">
+              {host}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 };
 
 const NetPolicySection: React.FC<Props> = ({ settings, onUpdate }) => {
@@ -181,6 +262,8 @@ const NetPolicySection: React.FC<Props> = ({ settings, onUpdate }) => {
             })}
           </div>
         )}
+
+        <SessionGrants active={settings.networkPolicy === NET_MODE_ASK} />
       </div>
 
       {/* ---- 流量日志 ---- */}

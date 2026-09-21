@@ -23,6 +23,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
   Download,
   FileArchive,
@@ -47,6 +48,9 @@ import { formatBytes } from '../../utils/format';
 import { showToast } from '../../services/toast';
 import Toggle from './Toggle';
 
+/** 复选框的可见部分 */
+const CHECKBOX_BOX = 'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors';
+
 const Row: React.FC<{
   checked: boolean;
   disabled?: boolean;
@@ -67,13 +71,35 @@ const Row: React.FC<{
             : 'border-gray-200 bg-white hover:bg-gray-50'
     }`}
   >
+    {/*
+      复选框**不使用原生外观**。
+      
+      原生 `input[type=checkbox]` 在深色下长什么样由渲染引擎决定：它认
+      `color-scheme` 与 `accent-color`，但两者的实际效果依赖 WebView 的实现与
+      版本，而"未选中时是白底"正是这个页面被报告的问题（设置 → 备份在深色
+      模式下选中一项时，那块白底在深色卡片上非常突兀）。
+      
+      这里保留真实的 `input`（键盘可达、屏幕阅读器正确、`<label>` 点击仍然
+      生效），但把它藏起来，由下面这个 span 负责画 —— 于是外观不再取决于任何
+      平台默认值。`peer-focus-visible` 让隐藏掉的原生焦点环回到可见的方框上。
+    */}
     <input
       type="checkbox"
       checked={checked}
       disabled={disabled}
       onChange={onToggle}
-      className="mt-0.5 h-4 w-4 shrink-0 accent-indigo-600"
+      className="peer sr-only"
     />
+    <span
+      aria-hidden="true"
+      className={`${CHECKBOX_BOX} peer-focus-visible:ring-2 peer-focus-visible:ring-indigo-300 ${
+        checked
+          ? 'border-indigo-600 bg-indigo-600 text-white'
+          : 'border-gray-300 bg-white'
+      }`}
+    >
+      {checked && <Check className="h-3 w-3" strokeWidth={3} />}
+    </span>
     <span className="min-w-0 flex-1">
       <span className="flex items-center gap-2">
         <span className="text-sm text-gray-800">{title}</span>

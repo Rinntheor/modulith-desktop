@@ -32,13 +32,24 @@ pub const MODE_DENY: &str = "deny";
 /// 对上 —— 内联字符串没法被那句断言找到。
 pub const DENY_OFFLINE: &str = "离线模式已开启";
 pub const DENY_POLICY: &str = "出站策略为「禁止出站」";
+/// 「默认询问」档下用户按了拒绝
+pub const DENY_PROMPT_REFUSED: &str = "你在询问里拒绝了这次出站";
+/// 「默认询问」档下用户没有在时限内回答
+///
+/// 超时的方向是**拒绝**，与本项目其他不可判定处的取向一致（认证配置损坏时也
+/// 是"需要授权"而不是放行）。这里的代价很具体：用户离开电脑时那批请求会失败，
+/// 而失败是可见、可重试的；反过来放行则是一次没有发生的同意。
+pub const DENY_PROMPT_TIMEOUT: &str = "等待出站确认超时，已按拒绝处理";
 
 /// 一次请求的判定结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     /// 放行
     Allow,
-    /// 放行，但记成「本应询问」。**询问流程尚未实现**，见 `POLICY_MODES` 里 ask 的说明
+    /// 放行到「询问」这一步为止 —— 真正的结果由 `prompt::ask` 决定。
+    ///
+    /// 它刻意**不**表达成 `Deny` 也不表达成 `Allow`：前者会让选了「默认询问」的
+    /// 用户发现所有网络都坏了，后者等于替他点了"允许"。
     AllowPendingPrompt,
     /// 拒绝，附带给用户看的原因
     Deny(&'static str),
@@ -76,10 +87,20 @@ pub fn decide(mode: &str, offline: bool, loopback: bool) -> Decision {
 pub fn outcome_of(decision: Decision) -> &'static str {
     match decision {
         Decision::Allow => "allowed",
+        // 走完询问流程之后由 `client.rs` 换成下面两个具体取值之一；
+        // 这个中间态本身不写进日志（写进去就等于把"问过了"说成"放行了"）。
         Decision::AllowPendingPrompt => "allowed-pending-prompt",
         Decision::Deny(_) => "denied",
     }
 }
+
+/// 日志里「询问」相关的三个取值。
+///
+/// 拆成三个而不是一个 `allowed`，是为了让流量日志能回答"这一条是用户点头放行的、
+/// 还是本会话里早就放行过这个主机"。把两者混在一起，用户就再也看不出自己到底
+/// 同意过什么 —— 而"我到底同意过什么"正是这个档位存在的全部意义。
+pub const OUTCOME_BY_PROMPT: &str = "allowed-by-prompt";
+pub const OUTCOME_BY_SESSION: &str = "allowed-session";
 
 /// WebView 里"直接联网"被拒的原因。
 ///
@@ -135,9 +156,9 @@ pub const POLICY_MODES: &[PolicyMode] = &[
     PolicyMode {
         id: MODE_ASK,
         label: "默认询问",
-        hint: "每次出站前先问一次。**尚未实现** —— 它需要一条请求级的往返（暂停请求、前端弹确认、带回结果、超时兜底），属于独立的一批",
-        available: false,
-        unavailable_reason: "询问流程尚未实现：它需要请求级的前后端往返与超时兜底，会与「只记不拦」的第一版混在一起",
+        hint: "每次出站前先问一次。本会话内已放行过的主机会被记住，不再重复询问 —— 市场一次操作会连发索引、签名、说明与包下载，只给「允许一次」会让这一档没法用",
+        available: true,
+        unavailable_reason: "",
     },
     PolicyMode {
         id: MODE_DENY,
@@ -192,8 +213,11 @@ mod tests {
 
     #[test]
     fn ask_mode_allows_but_is_marked() {
-        // ask 尚未实现：它不能假装成"已经问过并且用户同意了"，也不能直接拒绝
-        // （那会让选了 ask 的用户发现所有网络都坏了）。记成待询问是当前唯一诚实的行为。
+        // ask 在 `decide` 这一层的责任**只是把请求放行到「询问」这一步**。
+        // 真正的放行或拒绝由 `prompt::ask` 决定，结果由 `client.rs` 写回日志。
+        //
+        // 这里不能返回 Deny：那会让选了「默认询问」的用户发现所有网络都坏了，
+        // 而他选的不是"禁止"。也不能返回 Allow：那等于替他点了"允许"。
         assert_eq!(decide(MODE_ASK, false, false), Decision::AllowPendingPrompt);
     }
 
@@ -205,18 +229,41 @@ mod tests {
     }
 
     #[test]
-    fn only_allow_and_deny_are_available() {
-        // 界面必须禁用未实现的档位。这条断言防的是"有人把 ask 的 available 改成 true
-        // 而忘了实现询问流程" —— 那时开关会说谎。
+    fn every_advertised_mode_is_implemented() {
+        // 这条断言的方向在 1.3.2 反了过来。
+        //
+        // 它原本锁的是"只有 allow 与 deny 的 available 为 true"（因为 ask 尚未
+        // 实现），作用是防止有人把 ask 标成可用却忘了实现。现在 ask 落地了，
+        // 于是它改成锁**每一档都必须有事发生** —— 一个对外宣称可用的档位如果
+        // 什么都不做，界面就在说谎，而那比"标着尚未实现"更糟。
         for mode in POLICY_MODES {
-            assert_eq!(
-                mode.available,
-                mode.id == MODE_ALLOW || mode.id == MODE_DENY,
-                "{} 的可用状态与实现不一致",
+            assert!(mode.available, "{} 宣称可用，但没有人验证过它真的生效", mode.id);
+            assert!(
+                mode.unavailable_reason.is_empty(),
+                "{} 可用时不该带不可用原因",
                 mode.id
             );
-            assert_eq!(mode.available, mode.unavailable_reason.is_empty());
+            assert!(is_valid_mode(mode.id), "{} 不是合法取值", mode.id);
         }
+
+        // 档位表与判定函数的取值集合必须一一对应：少一档意味着界面上有选项却
+        // 落进 `_ =>` 那条默认分支（静默变成"放行"）。
+        let ids: Vec<&str> = POLICY_MODES.iter().map(|mode| mode.id).collect();
+        assert_eq!(ids, vec![MODE_ALLOW, MODE_ASK, MODE_DENY]);
+    }
+
+    #[test]
+    fn prompt_outcomes_are_distinguishable_in_the_log() {
+        // 三个取值必须互不相同：把它们混成 `allowed` 之后，用户就再也看不出
+        // "这一条是我点头放行的"还是"本会话里早就放行过这个主机"。
+        let values = [
+            outcome_of(Decision::Allow),
+            OUTCOME_BY_PROMPT,
+            OUTCOME_BY_SESSION,
+            outcome_of(Decision::Deny(DENY_POLICY)),
+        ];
+        let unique: std::collections::HashSet<&&str> = values.iter().collect();
+        assert_eq!(unique.len(), values.len(), "日志里的结果标记必须互不相同");
     }
 
     #[test]

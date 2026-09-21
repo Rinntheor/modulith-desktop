@@ -153,8 +153,9 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> PluginResult<()> {
 ///
 /// - **宿主白名单**见 `ALLOWED_REGISTRY_HOSTS` —— 防止这条命令变成绕过 `network-external`
 ///   权限的任意 GET。
-/// - **https** 是硬性要求。索引**自 1.1.0 起有 minisign 签名**（见
-///   docs/08-规划/插件生态设计.md 第 9.5 节，公钥与应用更新共用），因此中间人改不了
+/// - **https** 是硬性要求。索引**自 1.1.0 起有 minisign 签名**（验签实现在
+///   `modules/plugins/signature.rs`；公钥是 `tauri.conf.json` 的
+///   `plugins.updater.pubkey`，与应用更新共用），因此中间人改不了
 ///   索引内容 —— 但签名挡不住两件事：把**整份旧索引原样重放**给你（回滚，客户端目前
 ///   没有防回滚检测），以及看到你请求了什么。传输层加密是这两件事的基本防护。
 ///   这里不因为「反正有签名」而放行明文 http。
