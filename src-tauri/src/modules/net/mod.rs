@@ -11,6 +11,7 @@ pub mod client;
 pub mod commands;
 pub mod log;
 pub mod policy;
+pub mod prompt;
 
 use crate::core::module::Module;
 
@@ -27,6 +28,18 @@ impl Module for NetModule {
 
     fn description(&self) -> &'static str {
         "出站策略与流量日志（记录为主，拦截逐步接入）"
+    }
+
+    /// 托管询问状态。
+    ///
+    /// 状态必须在 `setup` 里交出去，命令与门面都通过 `app.state::<PromptState>()`
+    /// 取它 —— 换成进程级单例（像 `log` 那样）也能跑，但那样就没法在测试里拿到
+    /// 一个干净的实例，而这个模块里"本会话已放行的主机"恰恰是最需要能独立验证的
+    /// 东西。
+    fn setup(&self, app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+        use tauri::Manager;
+        app.manage(prompt::PromptState::new());
+        Ok(())
     }
 }
 

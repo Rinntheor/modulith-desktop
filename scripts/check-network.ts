@@ -448,6 +448,8 @@ for (const [rustName, tsName] of [
   ['MODE_DENY', 'NET_MODE_DENY'],
   ['DENY_OFFLINE', 'NET_DENY_OFFLINE'],
   ['DENY_POLICY', 'NET_DENY_POLICY'],
+  ['DENY_PROMPT_REFUSED', 'NET_DENY_PROMPT_REFUSED'],
+  ['DENY_PROMPT_TIMEOUT', 'NET_DENY_PROMPT_TIMEOUT'],
   ['DENY_DIRECT', 'NET_DENY_DIRECT'],
 ] as const) {
   const rust = rustConst(rustName);
@@ -459,6 +461,93 @@ for (const [rustName, tsName] of [
       : `${tsName} 与 Rust 的 ${rustName} 不一致。Rust：${JSON.stringify(rust)}／前端：${JSON.stringify(ts)}`
   );
 }
+
+// ============================================================
+// 「默认询问」的接线
+// ============================================================
+//
+// 这一档的正确性**不取决于一个纯函数**，而取决于四处连接是否都在：策略说它可用、
+// 门面在放行之前真的去问、询问模块能暂停与恢复、界面真的挂在看得见的地方。
+// 少任何一处，用户看到的现象都是"我选了默认询问，但它要么不问、要么问了没人管"
+// —— 而这正是 7.33 节记过的那类失败：判定被手写在调用点上，漏一处不会报错。
+console.log('\n「默认询问」的接线：');
+
+const promptRs = read('src-tauri/src/modules/net/prompt.rs');
+const netModRs = read('src-tauri/src/modules/net/mod.rs');
+const clientRs = read('src-tauri/src/modules/net/client.rs');
+const netCommandsRs = read('src-tauri/src/modules/net/commands.rs');
+const libRsForNet = read('src-tauri/src/lib.rs');
+
+check(
+  /id: MODE_ASK[\s\S]{0,240}?available: true/.test(policyRs),
+  'ask 档宣称可用（反方向——宣称可用却没实现——由 Rust 侧的 every_advertised_mode_is_implemented 守）'
+);
+check(
+  /Decision::AllowPendingPrompt[\s\S]{0,700}?prompt::ask\(/.test(clientRs),
+  'client.execute 在 AllowPendingPrompt 分支里**真的去问**，而不是记一条"本应询问"就放行'
+);
+check(
+  /prompt::has_session_grant\(&self\.app, &host\)/.test(clientRs),
+  '本会话已放行过的主机不再重复询问（市场一次操作会连发五条请求）'
+);
+check(
+  /PromptOutcome::Refused[\s\S]{0,400}?PromptOutcome::TimedOut/.test(clientRs),
+  '拒绝与超时两条都折成拒绝 —— 没有哪一条会悄悄变成放行'
+);
+check(
+  /PROMPT_TIMEOUT: Duration = Duration::from_secs\(\d+\)/.test(promptRs),
+  '等待上限是一个具名常量（数字只有一份）'
+);
+check(
+  /tokio::time::timeout\(PROMPT_TIMEOUT/.test(promptRs),
+  '等待有超时兜底（没有兜底的"暂停住"会让请求永久挂着，比拒绝更糟）'
+);
+check(
+  /let _gate = state\.gate\.lock\(\)\.await/.test(promptRs),
+  '一次只弹一个：其余在队列里等（否则五条请求会盖成五个对话框）'
+);
+check(
+  /has_grant\(host\)[\s\S]{0,160}?PromptOutcome::Allowed/.test(promptRs),
+  '拿到队列许可之后要再查一次会话放行 —— 排队期间用户可能刚为同一个主机放过行'
+);
+check(
+  /app\.manage\(prompt::PromptState::new\(\)\)/.test(netModRs),
+  'net 模块在 setup 里托管了询问状态（命令与门面都靠它）'
+);
+for (const command of [
+  'net_answer_prompt',
+  'net_list_session_grants',
+  'net_clear_session_grants',
+]) {
+  check(netCommandsRs.includes(`pub fn ${command}`), `net/commands.rs 定义了 ${command}`);
+  check(libRsForNet.includes(command), `lib.rs 注册了 ${command}（否则前端 invoke 得到"命令不存在"）`);
+}
+
+const mainTsx = read('src/main.tsx');
+check(mainTsx.includes('<NetPromptLayer />'), 'main.tsx 挂载了询问层');
+check(
+  mainTsx.indexOf('<NetPromptLayer />') < mainTsx.indexOf('<BootGate>'),
+  '询问层在 BootGate **外面** —— 启动阶段与解锁界面的出站请求也要能被问到'
+);
+
+const promptLayerTsx = read('src/components/NetPromptLayer.tsx');
+const overlayZ = /fixed inset-0 z-(\d+)/.exec(promptLayerTsx);
+check(
+  overlayZ !== null && Number(overlayZ[1]) > 70,
+  `询问层的层级高于插件弹窗（z-70）与设置面板（z-60），实得 z-${overlayZ?.[1] ?? '无'}`
+);
+check(
+  promptLayerTsx.includes('NET_PROMPT_CLOSED_EVENT'),
+  '界面订阅了"询问已结束" —— 否则它会停在后端已经放弃的那条询问上'
+);
+check(
+  /answerNetPrompt\(current\.id, allow, rememberHost\)/.test(promptLayerTsx),
+  '界面把用户的选择（含是否记住主机）送回后端'
+);
+check(
+  promptLayerTsx.includes('timeoutMs'),
+  '倒计时用后端给的 timeoutMs，而不是前端再写一个数字（两处数字必然漂移）'
+);
 
 // 回环判定同样是两份（后端 `net/mod.rs` 的 `is_loopback_host`、前端
 // `utils/networkSettings.ts` 的 `isLoopbackHost`）。这里用**同一张输入表**：

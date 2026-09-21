@@ -12,7 +12,7 @@
 
 use tauri::AppHandle;
 
-use crate::modules::net::{is_loopback_host, log, policy};
+use crate::modules::net::{is_loopback_host, log, policy, prompt};
 use crate::modules::settings::settings as settings_store;
 
 /// 给界面用的档位描述。
@@ -39,6 +39,37 @@ pub fn net_log_clear() {
 #[tauri::command]
 pub fn net_log_len() -> usize {
     log::len()
+}
+
+/// 「默认询问」档：前端对一次询问的回答。
+///
+/// `remember_host` 为真时把主机记进**本会话**的放行表（内存，重启即失效）。
+/// 之所以要有它：市场一次操作会连发索引、签名、说明与包下载，只给"允许一次"
+/// 会让这一档没法用。之所以不做成"永久允许"：用户选的就是"每次问我"，
+/// 替他永久放行等于静默削弱他自己选的策略。
+#[tauri::command]
+pub fn net_answer_prompt(
+    app: AppHandle,
+    id: u64,
+    allow: bool,
+    remember_host: bool,
+) -> Result<(), String> {
+    prompt::answer(&app, id, allow, remember_host)
+}
+
+/// 本会话已放行的主机（设置页展示用）。
+///
+/// 让用户能看见"我到底同意过什么"，并有一条撤销路径 —— 没有它，那个只增不减的
+/// 表就成了一份看不见的状态。
+#[tauri::command]
+pub fn net_list_session_grants(app: AppHandle) -> Vec<String> {
+    prompt::session_grants(&app)
+}
+
+/// 清空本会话的放行表，立刻回到"每次都问"。返回清掉的条数
+#[tauri::command]
+pub fn net_clear_session_grants(app: AppHandle) -> usize {
+    prompt::clear_session_grants(&app)
 }
 
 /// 一次前端门面拦下的出站尝试：**记一条日志，并返回权威判定**。
