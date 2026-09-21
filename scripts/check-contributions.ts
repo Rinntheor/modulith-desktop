@@ -157,10 +157,25 @@ console.log('贡献点的规范化：');
 }
 
 {
-  const { issues } = normalizeContributions({ themes: [{ id: 't' }] });
+  const { contributions, issues } = normalizeContributions({ themes: [{ id: 't' }] });
+
+  /*
+   * 这一组原先写作 `issues.every((item) => item.kind !== 'themes')` ——
+   * 那是**恒真**的：`ContributionIssue['kind']` 是闭合联合，`'themes'` 根本不在
+   * 其中，所以这条断言永远不可能失败。它之所以一直没被发现，是因为
+   * `tsc -p tsconfig.node.json` 早就坏了（它会在这里报 TS2367），而那条门禁
+   * 从 1.3.0 起就没有真正跑过。修门禁时它自己就冒了出来。
+   *
+   * 改写成能失败的判据：未知贡献点既不能变成贡献，也不能产生除
+   * 「没有认识的贡献点」之外的任何东西。
+   */
   check(
-    issues.every((item) => item.kind !== 'themes'),
-    '未知贡献点（themes）被静默忽略，不产生问题'
+    CONTRIBUTION_KINDS.every((kind) => contributions[kind].length === 0),
+    '未知贡献点（themes）不产生任何贡献'
+  );
+  check(
+    issues.length === 1 && issues[0].kind === 'contributes' && issues[0].level === 'warning',
+    '未知贡献点只产生一条 warning，没有别的副作用'
   );
   check(
     issues.some((item) => item.message.includes('没有任何宿主认识的贡献点')),

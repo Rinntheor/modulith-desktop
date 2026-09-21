@@ -1,28 +1,82 @@
 {
   "compilerOptions": {
-    "composite": true,
+    /*
+     * `incremental` 而不是 `composite`（1.3.2 改）。
+     *
+     * `composite` 有一条附带要求：**program 里的每一个文件都必须出现在
+     * `include` 里**，否则报 TS6307。而脚本会通过 import 拉进一长串 src 模块
+     * （`check-plugin-runtime.ts` 甚至把整条 `pluginRuntime` 依赖图拉进来），
+     * 手工维护那张清单必然漏 —— 实测漏了 24 个文件。
+     *
+     * 增量编译本身不依赖 `composite`：`incremental` 就够了，而它没有那条要求。
+     */
+    "incremental": true,
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
-    "types": ["node"],
+    /*
+     * `vite/client` 是必需的：`src/services/sound.ts` 现在 `import` 一个
+     * `.mp3`（内置默认提示音），而那个模块声明由 Vite 提供。少了它，
+     * 检查会报「Cannot find module '../assets/notification.mp3'」。
+     */
+    "types": ["node", "vite/client"],
+
+    /*
+     * 路径别名必须与 `tsconfig.json` 逐条一致。
+     *
+     * 脚本 project 会沿 import 走进 `src/modules/**`（`check-plugin-runtime.ts`
+     * 加载整条 pluginRuntime 依赖图，而它经生成的注册表指到 `Dashboard.tsx`），
+     * 那些文件里用的是 `@/...` 形式的别名。少一条就是一条 TS2307。
+     *
+     * 两份清单重复本身是漂移风险，因此 `pnpm check:scripts` 会断言两者完全相同。
+     */
+    "paths": {
+      "@/*": ["./src/*"],
+      "@components/*": ["./src/components/*"],
+      "@contexts/*": ["./src/contexts/*"],
+      "@config/*": ["./src/config/*"],
+      "@utils/*": ["./src/utils/*"],
+      "@hooks/*": ["./src/hooks/*"],
+      "@modules/*": ["./src/modules/*"],
+      "@types/*": ["./src/types/*"],
+      "@assets/*": ["./src/assets/*"],
+      "@styles/*": ["./src/styles/*"],
+      "@pages/*": ["./src/pages/*"]
+    },
 
     /*
      * 以下三项目的是让这个 project 能真正检查 scripts/ 下的构建脚本。
      *
      * 原先缺少 target（默认 ES5）与 allowImportingTsExtensions，导致
      * `tsc -p tsconfig.node.json` 对脚本报出大量与本意无关的错误
-     * （Set/Map 迭代、`.ts` 后缀导入），这个 project 实际上从未被当作
-     * 检查入口使用过 —— 脚本因此处于无类型检查的状态。
+     * （Set/Map 迭代、`.ts` 后缀导入）。
      *
      * - target ES2022：脚本运行在 Node 24 上，Set/Map 迭代是语言内置能力；
      * - allowImportingTsExtensions：脚本之间用 `./colors.ts` 显式导入，
-     *   因为 Node 的原生类型擦除模式不支持无后缀/`.js` 后缀（见各脚本头部说明）；
-     * - noEmit + emitDeclarationOnly 的组合：composite 要求产出声明文件，
-     *   但这里只做检查；用 noEmit 保留 composite 的增量能力同时不落盘。
+     *   因为 Node 的原生类型擦除模式不支持无后缀/`.js` 后缀（见各脚本头部说明）。
      */
     "target": "ES2022",
-    "lib": ["ES2022"],
+    /*
+     * **`DOM` 与 `jsx` 是 1.3.2 才加上的，这是一次取舍的结果，不是疏忽。**
+     *
+     * 这个 project 原本只给 `lib: ["ES2022"]`，用意是"引到带 DOM 用法的模块就
+     * 报错"，借此保证脚本只依赖纯逻辑模块。但那个用意**没有配套的守卫**，于是
+     * `check-net-guard.ts` → `appSettings.ts` → `theme.ts`（用 `document`）这条
+     * 链一旦接上，整次检查就变成 **109 个错误、横跨 15 个文件**，真实错误全被
+     * 埋在下面 —— 这个 project 因此从那以后**再也没有被当作检查入口用过**。
+     *
+     * 也就是说：那个用意从来没有生效过，它只是让门禁彻底失效。现在显式声明
+     * DOM 与 jsx（让门禁至少能报告真实错误），改用 `pnpm check:purity` 的文本
+     * 断言守住原本的意图 —— 断言比"靠编译失败"更准确，因为它能指出**是哪一条
+     * 规则**被违反，而不是给出 109 行噪声。
+     *
+     * `jsx` 之所以必需：`check-plugin-runtime.ts` 会真的加载 `pluginRuntime`，
+     * 而它经 `moduleCatalog` → 生成的注册表 → `*.tsx` 模块。没有 `jsx` 就是
+     * 三条 TS6142。
+     */
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
     "allowImportingTsExtensions": true,
     "noEmit": true,
 
@@ -32,31 +86,11 @@
     "noFallthroughCasesInSwitch": true
   },
   /*
-   * `src/types/**` 与 `src/utils/*.ts` 只保留脚本真正引用的类型/实现文件：
-   * generate-modules.ts 会引入 `src/types/module.ts`；check-semver.ts /
-   * check-update-throttle.ts / check-network.ts / check-memory.ts /
-   * check-performance.ts 会分别引入 `src/utils/semver.ts`、`src/utils/updateCheck.ts`、
-   * `src/utils/networkSettings.ts`、`src/utils/motionPreference.ts`、
-   * `src/utils/glassPreference.ts`、`src/utils/notificationSounds.ts`、
-   * `src/services/moduleComponentCache.ts` 与 `src/config/pluginRegistry.ts`。
+   * 只列入口，其余文件由 import 自动进入 program。
    *
-   * **这些文件必须自身不依赖 DOM**（`theme.ts` 这类要操作 `document` 的模块
-   * 因此进不来，它的纯逻辑被抽到 `src/utils/motionPreference.ts`）：本 project
-   * 的 lib 只有 ES2022，引入带 DOM 用法的模块会让整次检查失败 —— 而失败会盖住
-   * 后面所有的真实错误，等于脚本从来没有被检查过。
+   * 曾经这里还逐条列出脚本引用的 src 模块（作为"这些是纯逻辑模块"的白名单）。
+   * 那份名单有两个问题：`composite` 要求它**完备**（它并不完备），而"纯逻辑"
+   * 这件事靠列的清单本身也守不住 —— 现在由 `scripts/check-purity.ts` 负责。
    */
-  "include": [
-    "vite.config.ts",
-    "scripts/**/*.ts",
-    "src/types/module.ts",
-    "src/config/pluginRegistry.ts",
-    "src/services/moduleComponentCache.ts",
-    "src/utils/motionPreference.ts",
-    "src/utils/glassPreference.ts",
-    "src/utils/notificationSounds.ts",
-    "src/utils/markdown.ts",
-    "src/utils/semver.ts",
-    "src/utils/updateCheck.ts",
-    "src/utils/networkSettings.ts"
-  ]
+  "include": ["vite.config.ts", "scripts/**/*.ts"]
 }

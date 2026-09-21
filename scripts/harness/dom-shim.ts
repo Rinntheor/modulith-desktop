@@ -138,7 +138,11 @@ export function installDomShim(): DomShim {
         return child;
       },
       remove() {
-        const parent = element.parentNode as Record<string, unknown> | null;
+        // `parentNode` 是 `Record<string, unknown>`，直接取属性会得到 `unknown`
+        // 而不可调用 —— 这里把它收窄成一个可选方法即可，行为不变。
+        const parent = element.parentNode as
+          | { removeChild?: (child: unknown) => void }
+          | null;
         parent?.removeChild?.(element);
         element.isConnected = false;
       },

@@ -14,6 +14,7 @@
     "check:network": "node scripts/check-network.ts",
     "check:memory": "node scripts/check-memory.ts",
     "check:performance": "node scripts/check-performance.ts",
+    "check:scripts": "node scripts/check-scripts.ts",
     "check:theme": "node scripts/check-theme.ts",
     "check:contributions": "node scripts/check-contributions.ts",
     "check:plugin-runtime": "node --import ./scripts/harness/loader.mjs scripts/check-plugin-runtime.ts",
