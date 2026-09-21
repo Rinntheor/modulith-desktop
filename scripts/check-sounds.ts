@@ -20,7 +20,7 @@
 //   3. 合成事件流的形状（都 start 了、都 stop 了、包络从 0 起、指数衰减目标为正）
 //   4. 峰值归一化的**数学**：分音再多，一个音的峰值也恰好等于它声明的 gain
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -65,6 +65,28 @@ function check(condition: boolean, label: string): void {
 function read(relative: string): string {
   return readFileSync(join(PROJECT_ROOT, relative), 'utf-8');
 }
+
+// ============================================================
+// 音色的两个来源
+//
+// 内置音色自 1.3.2 起有两类，**它们的断言完全不同**：
+//   · 现场合成（`notes` 有值）：可以检查频率、包络、分音与峰值归一化；
+//   · 打包音效（`bundled`）：声音来自一个音频文件，这里能验证的只有
+//     "文件在、被引用、走的是 `<audio>` 那一支"，听感与音量无法自动判断。
+//
+// 混在一起检查会得到两种坏结果之一：对打包音效跑合成断言（必然失败），
+// 或者把它从循环里悄悄跳过（于是 `sound.notes` 的可选性失去意义）。
+// ============================================================
+
+type SynthSound = (typeof BUILTIN_SOUNDS)[number] & { notes: readonly SoundNote[] };
+
+/** 需要现场合成的音色 */
+const synth = BUILTIN_SOUNDS.filter((s): s is SynthSound => s.notes !== undefined);
+/** 声音来自随应用发布的音频文件的音色 */
+const bundled = BUILTIN_SOUNDS.filter((s) => s.bundled === true);
+
+/** 打包音效的资产路径（相对仓库根） */
+const BUNDLED_ASSET = 'src/assets/notification.mp3';
 
 // ============================================================
 // 桩音频上下文
@@ -219,8 +241,21 @@ check(
   `${CUSTOM_SOUND_ID} 是保留 id，不与内置音色冲突`
 );
 check(
-  BUILTIN_SOUNDS.every((s) => s.notes.length > 0),
-  '每种音色至少有一个音'
+  synth.length >= 3 && synth.every((s) => s.notes.length > 0),
+  `每种合成音色至少有一个音（合成音色 ${synth.length} 种、打包音效 ${bundled.length} 种）`
+);
+check(
+  BUILTIN_SOUNDS.every((s) => (s.bundled === true) !== (s.notes !== undefined)),
+  '每个内置音色恰好属于一种来源：打包的音效文件，或现场合成'
+);
+check(bundled.length === 1, `打包音效恰好一个（实得 ${bundled.length}）`);
+check(
+  bundled.length === 1 && bundled[0].id === DEFAULT_NOTIFICATION_SOUND_ID,
+  '默认音色就是那个打包音效'
+);
+check(
+  bundled.every((s) => s.notes === undefined),
+  '打包音效不声明音符（写了也不会被合成，只会让人以为它在合成）'
 );
 
 console.log('\n回退规则：');
@@ -269,7 +304,7 @@ function durationOf(note: SoundNote): number {
   return note.at + note.attack + longest;
 }
 
-for (const sound of BUILTIN_SOUNDS) {
+for (const sound of synth) {
   for (const [index, note] of sound.notes.entries()) {
     const where = `${sound.id}[${index}]`;
 
@@ -352,7 +387,7 @@ function envelopeBound(note: SoundNote, t: number): number {
 }
 
 /** 一个音色在整段时长里的瞬时振幅峰值（按 1ms 采样） */
-function peakOf(sound: (typeof BUILTIN_SOUNDS)[number]): number {
+function peakOf(sound: SynthSound): number {
   const end = Math.max(...sound.notes.map(durationOf)) + 0.05;
   let max = 0;
   for (let t = 0; t <= end; t += 0.001) {
@@ -363,7 +398,7 @@ function peakOf(sound: (typeof BUILTIN_SOUNDS)[number]): number {
   return max;
 }
 
-for (const sound of BUILTIN_SOUNDS) {
+for (const sound of synth) {
   const peak = peakOf(sound);
   const loudest = Math.max(...sound.notes.map((n) => n.gain));
 
@@ -392,7 +427,7 @@ if (problems.length > 0) {
 
 console.log('\n合成事件流：');
 
-for (const sound of BUILTIN_SOUNDS) {
+for (const sound of synth) {
   const ctx = new FakeContext();
   let threw = '';
   try {
@@ -610,6 +645,52 @@ check(
 check(
   read('src/components/Settings/NotificationSettings.tsx').includes('previewSound'),
   '通知分页提供试听'
+);
+
+// ============================================================
+// 8. 打包音效：文件、引用与播放分支
+//
+// 这一类断言针对的失败方式与合成音色**完全不同**：合成音色写错参数会静默不响，
+// 而打包音效写错的表现是"资源没被打进产物"或"播放走进了合成那一支"——
+// 两者都不会让构建或类型检查变红。
+// ============================================================
+
+console.log('\n打包音效：');
+
+const assetPath = join(PROJECT_ROOT, BUNDLED_ASSET);
+check(existsSync(assetPath), `资产文件存在：${BUNDLED_ASSET}`);
+
+if (existsSync(assetPath)) {
+  const bytes = statSync(assetPath).size;
+  check(bytes > 1024, `资产不是空文件（${bytes} 字节）`);
+  // 它会随每一个安装包分发，因此体积本身是一条约束
+  check(bytes < 2 * 1024 * 1024, `资产体积可接受（${bytes} 字节，上限 2 MB）`);
+}
+
+const soundService = read('src/services/sound.ts');
+check(
+  soundService.includes("from '../assets/notification.mp3'"),
+  'sound.ts 用 import 引用资产（而不是运行期拼路径 —— 拼错的路径只会在运行时静默无声）'
+);
+check(
+  /function playById\(/.test(soundService),
+  'sound.ts 有唯一的分发函数 playById（三支：打包文件 / 自定义文件 / 现场合成）'
+);
+check(
+  /isBundledSound\(resolved\)[\s\S]{0,200}playClip\(bundledSoundUrl/.test(soundService),
+  '打包音效走 <audio> 那一支（交给 renderSound 会静默什么都不播）'
+);
+// 走 fetch 会被 netGuard 当成一次出站尝试记进流量日志 —— 而它读的是随应用
+// 发布的本地文件，既不是出站，也不该受出站策略约束。CSP 的 media-src 覆盖它。
+check(
+  !/fetch\([^)]*notification\.mp3/.test(soundService),
+  '打包音效用 <audio> 读取，而不是 fetch（后者会被 netGuard 记成出站）'
+);
+check(
+  !/notificationSoundId:\s*BUILTIN_SOUNDS\[0\]\.id/.test(
+    read('src/components/Settings/NotificationSettings.tsx')
+  ),
+  '设置页用常量而不是数组下标表达默认音色（下标会在有人调整顺序时静默改变语义）'
 );
 
 if (failed > 0) {

@@ -35,6 +35,7 @@ import type { AppSettings } from '../../services/appSettings';
 import {
   BUILTIN_SOUNDS,
   CUSTOM_SOUND_ID,
+  DEFAULT_NOTIFICATION_SOUND_ID,
   MAX_SOUND_VOLUME,
   MIN_SOUND_VOLUME,
   type BuiltinSound,
@@ -147,8 +148,10 @@ const NotificationSettings: React.FC<Props> = ({ settings, onUpdate }) => {
     invalidateCustomSound();
     await onUpdate({
       notificationSoundCustomFile: null,
-      // 同时把音色切回内置，否则设置会停在一个不可用的 `custom` 上
-      notificationSoundId: BUILTIN_SOUNDS[0].id,
+      // 同时把音色切回默认，否则设置会停在一个不可用的 `custom` 上。
+      // 用常量而不是 `BUILTIN_SOUNDS[0].id`：默认音色是打包音效，它的位置
+      // 由常量表达；靠数组下标表达会在有人调整顺序时静默改变语义。
+      notificationSoundId: DEFAULT_NOTIFICATION_SOUND_ID,
     });
   }, [onUpdate]);
 

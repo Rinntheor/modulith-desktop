@@ -205,6 +205,14 @@ pub struct AppSettings {
     /// `accent` 同理，视觉细节不该在后端复制一份（复制一份必然漂移）。
     #[serde(default = "default_glass_effect")]
     pub glass_effect: bool,
+    /// 仪表盘是否显示统计面板
+    ///
+    /// 默认 `true`：那几个数字（模块总数 / 可见 / 收藏 / 隐藏 / 禁用）回答的是
+    /// "我现在装了多少东西、整理到哪一步了"，新用户第一次打开仪表盘时正需要它。
+    /// 但它是**可关的** —— 用久之后那几个数字不再提供任何新信息，而它们占着首屏
+    /// 最上面的一整行。判断该由用户做，不该由默认值替他做。
+    #[serde(default = "default_dashboard_stats_visible")]
+    pub dashboard_stats_visible: bool,
     /// 是否播放通知提示音
     ///
     /// 默认 `true`。通知在这个应用里是**低频且有意义**的事件（插件加载失败、
@@ -339,6 +347,11 @@ fn default_glass_effect() -> bool {
     true
 }
 
+/// 仪表盘统计面板默认显示。理由见 `dashboard_stats_visible` 字段上的说明。
+fn default_dashboard_stats_visible() -> bool {
+    true
+}
+
 /// 提示音默认开启。理由见 `notification_sound_enabled` 字段上的说明。
 fn default_notification_sound_enabled() -> bool {
     true
@@ -349,8 +362,17 @@ fn default_notification_sound_id() -> String {
     DEFAULT_NOTIFICATION_SOUND_ID.to_string()
 }
 
-/// 默认音色。取第一个内置音色 —— 前端回退到未知 id 时用的也是它。
-pub const DEFAULT_NOTIFICATION_SOUND_ID: &str = "chime";
+/// 默认音色。取 `BUILTIN_SOUNDS` 的第一项，也就是随应用发布的那个音效文件
+/// （`src/assets/notification.mp3`）—— 前端在遇到未知 id 时回退到的也是它。
+///
+/// **它的声音不在这里，也不在前端常量里**：后端只存 id，播放由前端负责。因此
+/// 这个常量的唯一职责是"与前后端的默认值保持一致"，两侧不一致会出现"后端认为
+/// 默认是 A、前端回退到 B"这种只在缺字段时才暴露的分叉。
+///
+/// 1.3.2 之前它是 `"chime"`（一个现场合成的音色）。**老设置文件里已经存下的
+/// `"chime"` 仍然合法**，因此升级不会改变老用户听到的声音 —— 只改默认值，
+/// 不改用户已经做出的选择。
+pub const DEFAULT_NOTIFICATION_SOUND_ID: &str = "default";
 
 /// 音效 id 的最大长度（与前端 `utils/notificationSounds.ts` 的校验一致）
 pub const MAX_SOUND_ID_LEN: usize = 32;
@@ -486,6 +508,7 @@ impl Default for AppSettings {
             crash_logging_enabled: default_crash_logging_enabled(),
             performance_mode: default_performance_mode(),
             glass_effect: default_glass_effect(),
+            dashboard_stats_visible: default_dashboard_stats_visible(),
             notification_sound_enabled: default_notification_sound_enabled(),
             notification_sound_id: default_notification_sound_id(),
             notification_sound_custom_file: None,
