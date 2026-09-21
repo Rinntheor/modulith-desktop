@@ -896,7 +896,6 @@ const PluginMarket: React.FC = () => {
                   {SHAPE_LABELS[key]} · {shapeCounts[key]}
                 </button>
               ))}
-            <span className="text-[11px] text-gray-300">由清单派生，不是作者填写</span>
           </div>
 
           <div className="mt-3 flex items-center gap-3">
