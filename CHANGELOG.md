@@ -3,6 +3,35 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.3.2] - 2026-09-21
+
+### Added
+
+- 重写仪表盘，并加入用户自定义的模块分类
+- 实现出站策略的「默认询问」
+- 默认提示音改为随应用发布的音效（Pixabay / Universfield）
+
+### Changed
+
+- 版本 1.3.2
+- Merge branch 'feat/plugin-api-types-guard'（插件 API 类型包与能力表的一致性门禁，及文档同步）
+
+### Fixed
+
+- 市场页去掉一处面向开发者的来源标注
+- 救活脚本类型检查，新增 check:scripts，并修掉一条恒真断言
+- 补齐彩色半透明档位的深色映射，并把 check:theme 扩到全颜色族
+
+### Documentation
+
+- 同步 v1.3.2 的参考文档与两处门禁盲区的记录
+- 移除《插件生态设计》并同步它引出的全部引用
+- 同步插件多文件源码链路，并记录 7.36 技术债
+
+### Tests
+
+- 插件 API 类型包与能力表的一致性门禁
+
 ## [1.3.1] - 2026-09-20
 
 ### Changed
