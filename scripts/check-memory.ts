@@ -3,17 +3,22 @@
 //
 //   node scripts/check-memory.ts
 //
-// 这个脚本守的是三条**容易被无声改掉**的约定：
+// 这个脚本守的是四条**容易被无声改掉**的约定：
 //
 // 1. 模块组件缓存能在模块不再挂载时被逐条释放（否则它会随「曾经打开过的模块」
 //    一直长大）。
-// 2. 那条释放必须挂在 `tabStore` 的唯一写入点上 —— 六条关闭/对账路径都经过它，
+// 2. **挂载集合会随关闭而收缩** —— 直接跑 `pruneMountedTabs` 断言行为。
+//    这一条曾经缺失：集合只增不减，关闭标签不卸载面板，而当时的文本核对
+//    （"setState 里出现了 releaseCachedModuleComponent"）**三项全过**。
+//    这是本脚本里唯一必须用行为断言而不是文本核对的理由。
+// 3. 那条释放必须挂在 `tabStore` 的唯一写入点上 —— 六条关闭/对账路径都经过它，
 //    逐条去调必然漏一个。
-// 3. 市场正文与图标缓存必须有上限（它们存的是几十 KB 级的字符串与 base64 文本，
+// 4. 市场正文与图标缓存必须有上限（它们存的是几十 KB 级的字符串与 base64 文本，
 //    而此前一条上限都没有）。
 //
-// 第 2、3 条只能用文本核对：`tabStore` / `pluginMarket` 会 import Tauri 的 IPC，
+// 第 3、4 条只能用文本核对：`tabStore` / `pluginMarket` 会 import Tauri 的 IPC，
 // 进不了 `tsconfig.node.json` 这个纯脚本 project（见该文件里的说明）。
+// 第 2 条是这条限制的**出口**：把规则放进不依赖 IPC 的纯模块，就能真跑它。
 
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -26,6 +31,7 @@ import {
   releaseCachedModuleComponent,
   setCachedModuleComponent,
 } from '../src/services/moduleComponentCache.ts';
+import { pruneMountedTabs } from '../src/services/tabMountedPolicy.ts';
 import { resolveDropIndex } from '../src/modules/dashboard/dropIndex.ts';
 import type { ModuleDescriptor } from '../src/types/module.ts';
 
@@ -107,8 +113,85 @@ clearModuleComponentCache();
 check(cachedModuleCount() === 0, '再次清空后计数归零');
 
 // ============================================================
-// 2. 释放必须挂在 tabStore 的唯一写入点
+// 2. 挂载集合的收缩规则（直接跑纯函数，不做文本核对）
 // ============================================================
+//
+// 这一段的存在理由本身就是一条教训：本规则此前只增不减，导致关闭标签不卸载面板、
+// 组件缓存的逐条释放变成死代码。而当时的脚本只做文本核对
+// （"setState 里出现了 releaseCachedModuleComponent"），**缺陷代码三项全过**。
+// 规则抽进 `tabMountedPolicy.ts`（不 import 任何 Tauri/浏览器 API）之后，
+// 这里可以直接调用它断言行为 —— 文本核对查不出的东西，行为断言能查。
+console.log('\n标签挂载集合的收缩规则：');
+
+// 场景 A：三个标签都挂载着，关掉其中一个。
+// 这是核心缺陷的回归锁：修复前结果里仍有 'b'。
+check(
+  JSON.stringify(pruneMountedTabs(['a', 'b', 'c'], ['a', 'c'], [], 'a', null)) ===
+    JSON.stringify(['a', 'c']),
+  '关闭标签会把它从挂载集合里移除'
+);
+
+// 场景 B：仍然打开、只是当前未被激活的标签**必须保留** —— 保活是核心体验承诺，
+// 与本规则是两件事（后者只管"已经从标签栏消失"的模块）。
+check(
+  JSON.stringify(pruneMountedTabs(['a', 'b', 'c'], ['a', 'b', 'c'], [], 'a', null)) ===
+    JSON.stringify(['a', 'b', 'c']),
+  '未被激活但仍然打开着的标签保持挂载（保活不被误伤）'
+);
+
+// 场景 C：激活标签必定在结果里，否则 Home 渲染不出面板 → 内容区白屏。
+check(
+  pruneMountedTabs([], ['a', 'b'], [], 'b', null).includes('b'),
+  '激活标签即使不在上一轮的挂载集合里也会被补上'
+);
+
+// 场景 D：分屏两组的激活标签都要被补上。
+const splitPruned = pruneMountedTabs([], ['a'], ['z'], 'a', 'z');
+check(
+  splitPruned.includes('a') && splitPruned.includes('z'),
+  '分屏时两组的激活标签都被补上'
+);
+
+// 场景 E：顺序必须稳定（它决定面板的渲染顺序，跨组拖动时不能抖）。
+check(
+  JSON.stringify(pruneMountedTabs(['c', 'a', 'b'], ['a', 'b', 'c'], [], 'a', null)) ===
+    JSON.stringify(['c', 'a', 'b']),
+  '裁剪保持原有的相对顺序'
+);
+
+// 场景 F：**先裁剪再补齐**的顺序不能反。反过来的话，被关闭的标签会因为
+// "它还是上一个激活项"而把自己救回来 —— 这正是原缺陷的成因之一。
+check(
+  JSON.stringify(pruneMountedTabs(['a', 'b'], ['a'], [], 'b', null)) ===
+    JSON.stringify(['a']),
+  '已关闭的标签不会因为仍是激活项而被保留'
+);
+
+// 场景 G：不复用传入数组（返回值是新数组，调用方拿不到可变的旧引用）。
+const frozenInput = Object.freeze(['a', 'b']);
+const frozenOut = pruneMountedTabs(frozenInput, ['a'], [], 'a', null);
+check(
+  frozenOut !== (frozenInput as unknown) && JSON.stringify(frozenOut) === JSON.stringify(['a']),
+  '不修改传入数组，返回新数组'
+);
+
+// 场景 H：重复 ID 不重复挂载；空集合与空标签都不炸。
+check(
+  JSON.stringify(pruneMountedTabs(['a', 'a'], ['a'], [], 'a', null)) ===
+    JSON.stringify(['a']),
+  '挂载集合去重'
+);
+check(
+  JSON.stringify(pruneMountedTabs([], [], [], null, null)) === JSON.stringify([]),
+  '零标签时挂载集合为空（不是残留旧值）'
+);
+
+// ============================================================
+// 3. 释放必须挂在 tabStore 的唯一写入点
+// ============================================================
+//
+// 上面那组行为断言保证**规则本身**是对的；这一段保证**规则真的被用上**，
+// 而且只在一个地方用 —— 六条关闭/对账路径都经过 setState，散落到各转移函数里迟早会漏。
 
 console.log('\ntabStore 的释放挂钩：');
 
@@ -125,10 +208,20 @@ check(
   '释放依据是比较前后的 mountedTabs，而不是别处传来的列表'
 );
 check(
+  setStateBody !== null && setStateBody.includes('pruneMountedTabs'),
+  'setState 用 pruneMountedTabs 收缩挂载集合（只补齐不收缩就是原缺陷）'
+);
+check(
   /import\s*\{[^}]*releaseCachedModuleComponent[^}]*\}\s*from\s*'\.\/moduleComponentCache'/.test(
     tabStore
   ),
   'moduleComponentCache 的导入存在'
+);
+// 收缩不能在别处另写一份：两份实现必然漂移，而漏掉的那一份不报错。
+const pruneCalls = [...tabStore.matchAll(/pruneMountedTabs\(/g)].length;
+check(
+  pruneCalls === 1,
+  `pruneMountedTabs 在 tabStore 里只被调用一次（实际 ${pruneCalls} 处）`
 );
 
 // 释放只应出现在这一处；散落到各转移函数里迟早会漏
@@ -136,7 +229,7 @@ const releaseCalls = [...tabStore.matchAll(/releaseCachedModuleComponent\(/g)].l
 check(releaseCalls === 1, `整个 tabStore 里只有一处释放调用（实际 ${releaseCalls} 处）`);
 
 // ============================================================
-// 3. 市场缓存的条目上限
+// 4. 市场缓存的条目上限
 // ============================================================
 
 console.log('\n市场缓存的条目上限：');

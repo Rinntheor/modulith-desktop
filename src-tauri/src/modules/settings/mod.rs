@@ -3,8 +3,11 @@
 
 pub mod autostart;
 pub mod commands;
+pub mod memory_level;
+pub mod memory_trim;
 pub mod network;
 pub mod probe;
+pub mod process_memory;
 pub mod settings;
 pub mod sound;
 
