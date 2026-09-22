@@ -293,7 +293,7 @@ const BackupSettings: React.FC = () => {
   );
 
   return (
-    <div className="px-6 py-5">
+    <div className="px-4 lg:px-6 py-5">
       {/* ---------------- 导出 ---------------- */}
       <section className="bg-white rounded-xl border border-gray-200 px-5 py-4 mb-5">
         <div className="flex items-center justify-between gap-4">

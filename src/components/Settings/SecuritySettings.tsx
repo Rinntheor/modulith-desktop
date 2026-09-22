@@ -309,7 +309,7 @@ const SecuritySettings: React.FC = () => {
   }
 
   return (
-    <div className="px-6 py-5">
+    <div className="px-4 lg:px-6 py-5">
       {/* 反馈 */}
       <AnimatePresence>
         {feedback && (

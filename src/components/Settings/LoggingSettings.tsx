@@ -84,7 +84,7 @@ const LoggingSettings: React.FC<Props> = ({ settings, onUpdate }) => {
   }, [refresh]);
 
   return (
-    <div className="px-6 py-5">
+    <div className="px-4 lg:px-6 py-5">
       <section className="bg-white rounded-xl border border-gray-200 px-5 py-2 mb-5">
         <h3 className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider pt-3">
           记录内容

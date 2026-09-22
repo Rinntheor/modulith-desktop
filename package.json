@@ -19,6 +19,8 @@
     "check:contributions": "node scripts/check-contributions.ts",
     "check:plugin-runtime": "node --import ./scripts/harness/loader.mjs scripts/check-plugin-runtime.ts",
     "check:net-guard": "node --import ./scripts/harness/loader.mjs scripts/check-net-guard.ts",
+    "check:tray": "node scripts/check-tray.ts",
+    "check:quota": "node scripts/check-quota.ts",
     "check:sounds": "node scripts/check-sounds.ts",
     "check:backup": "node scripts/check-backup.ts",
     "check:markdown": "node scripts/check-markdown.ts",
@@ -27,7 +29,13 @@
     "ver": "node scripts/version-manager.ts",
     "ver:fix": "node scripts/version-manager.ts sync",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "check:eviction": "node scripts/check-eviction.ts",
+    "check:modules": "node scripts/check-modules.ts",
+    "check:background": "node scripts/check-background.ts",
+    "check:background-scheduler": "node scripts/check-background-scheduler.mjs",
+    "check:notifications": "node scripts/check-notifications.ts",
+    "check:settings-layout": "node scripts/check-settings-layout.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
