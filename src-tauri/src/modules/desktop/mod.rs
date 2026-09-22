@@ -14,6 +14,7 @@ pub mod close_behavior;
 pub mod commands;
 pub mod events;
 pub mod tray;
+pub mod tray_menu;
 
 use crate::prelude::*;
 
@@ -105,6 +106,14 @@ impl Module for DesktopModule {
         // 顺序上它不依赖托盘，但**必须先于托盘**的语义定下来 ——
         // 没有托盘时"隐藏到托盘"会让窗口消失且无法找回，因此下面会兜底。
         close_behavior::install(app);
+
+        // 自绘托盘菜单窗口的"失去焦点就收起来"行为。
+        //
+        // 必须**早于**托盘安装：托盘一装好，用户就可能右键，而那时如果这个
+        // 行为还没装上，菜单弹出来之后就再也不会自己关闭 —— 它会一直挂在屏幕上
+        // 挡住别的东西，用户唯一的办法是再点一次托盘图标（而那时它又会重新
+        // 显示在同一个地方，看起来像是"点了没反应"）。
+        tray_menu::install(app);
 
         // 托盘装不上不能拖垮启动：它在部分环境里会失败（例如没有桌面会话、
         // 或被系统策略禁用）。失败只记警告，应用照常可用 ——

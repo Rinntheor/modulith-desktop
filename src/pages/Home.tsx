@@ -53,6 +53,7 @@ import {
   X,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { SidebarProvider, useSidebar } from '@/contexts/SidebarContext';
 import { ModuleRuntimeProvider } from '@/contexts/ModuleRuntimeContext';
@@ -123,6 +124,19 @@ interface HomeContentProps {
  * 是为了让"让位"这件事只有一个数字来源。
  */
 const SIDEBAR_WIDTH = 256;
+
+/**
+ * 自绘托盘菜单请求界面配合时广播的事件名。
+ *
+ * **必须与后端 `desktop::commands::TRAY_ACTION_EVENT` 一致。** 它是跨语言契约：
+ * 两边字符串对不上时不会有任何编译错误，表现只是"托盘里点了设置，界面没反应"。
+ * `check:tray` 会核对两侧的字符串。
+ *
+ * 事件载荷是一个动作名的字符串（`settings` / `update`）。后端只发这两个 ——
+ * 其余动作（显示窗口、释放资源、切换关闭行为、退出）后端自己就能做完，
+ * 不需要界面知道。
+ */
+const TRAY_ACTION_EVENT = 'modulith://tray-action';
 
 /**
  * 把一条插件右键菜单贡献转成外壳菜单的条目。
@@ -373,6 +387,71 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
      */
     void loadNotifications().then(() => autoCheckForAppUpdate());
   }, [handleRefresh, handleOpenSettings]);
+
+  /**
+   * 响应自绘托盘菜单里的动作。
+   *
+   * ============================================================
+   * 为什么这里只处理"要打开哪个界面"，不处理后端已经做完的事
+   * ============================================================
+   *
+   * 托盘菜单里的六项被分成两类：
+   *
+   *   · **后端能独立完成的**：显示主窗口、切换关闭行为、释放资源、退出。
+   *     它们在后端就结束了，前端什么也不用做（回收结果由后端写日志，
+   *     而用户能立刻在设置→性能里看到数字变化）。
+   *   · **需要界面配合的**：打开设置、检查更新。后端只知道"用户要设置"，
+   *     它不知道设置是哪一个分页、更不知道要往哪个按钮上点。因此这两项由
+   *     后端把窗口显示出来、广播一个动作名，由这里决定打开什么。
+   *
+   * 这个分工让后端不必知道界面的形状 —— 界面改版时后端不用动。
+   *
+   * ============================================================
+   * 为什么"检查更新"要连分页一起打开
+   * ============================================================
+   *
+   * 检查结果是**异步**的（要联网），而且失败时只写日志、不打扰用户。
+   * 如果只默默检查，用户在托盘里点了"检查更新"之后什么都看不到 ——
+   * 那与"点了没用"无法区分。因此这里把「关于」分页打开，
+   * 那里有更新卡片，成功与失败都会显示在上面。
+   */
+  useEffect(() => {
+    let dispose: (() => void) | null = null;
+    let cancelled = false;
+
+    void listen<string>(TRAY_ACTION_EVENT, (event) => {
+      const action = event.payload;
+      if (action === 'settings') {
+        openSettings('general');
+        return;
+      }
+      if (action === 'update') {
+        openSettings('about');
+        return;
+      }
+      // 其余动作（show / free / toggle_close_to_tray / exit）后端已经处理完，
+      // 这里**刻意什么都不做**，而不是"顺手也做一遍" —— 两处各实现一次
+      // 必然漂移，而漂移的表现是"回收执行了两次"这类看不见的浪费。
+      console.info(`[Home] 托盘动作「${action}」由后端处理，界面无需介入`);
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        dispose = unlisten;
+      })
+      .catch((error) => {
+        // 监听装不上不该影响主界面：托盘菜单里那两项会表现为"点了没反应"，
+        // 而其余四项照常工作。
+        console.warn('[Home] 订阅托盘动作失败：', error);
+      });
+
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
+  }, [openSettings]);
 
   useGlobalShortcuts();
 

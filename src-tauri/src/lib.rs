@@ -119,6 +119,8 @@ pub fn run() -> Result<(), tauri::Error> {
         get_close_to_tray,
         set_close_to_tray,
         is_tray_available,
+        tray_menu_state,
+        tray_menu_action,
         list_reminders,
         save_reminder,
         delete_reminder,

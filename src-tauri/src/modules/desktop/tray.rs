@@ -31,6 +31,7 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 
+use crate::modules::desktop::tray_menu;
 use crate::modules::settings::settings;
 use crate::prelude::*;
 
@@ -113,6 +114,17 @@ pub fn install(app: &AppHandle) -> Result<(), String> {
         .map_err(error_text)?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        // 原生菜单**保留但不主动弹出**。
+        //
+        // 它曾经是这个托盘的主菜单。现在右键走的是自绘菜单（`tray_menu.rs`），
+        // 而这条 `.menu(&menu)` 留着有两个理由：
+        //
+        //   1. `TrayIcon` 在这种配置下仍然把菜单挂在自己身上；右键事件里我们
+        //      接管了显示，因此用户看不到它。
+        //   2. 自绘窗口存在"起不来"的极端情况（创建失败、系统策略禁用）。
+        //      那时这些菜单项仍然是可用的退路 —— 一个丑菜单好过一个没有菜单。
+        //
+        // 这些项的勾选状态仍然要同步（见 `sync_menu_check`），因为退路也要是对的。
         .menu(&menu)
         // 左键点击**不**弹菜单，而是直接显示窗口 —— 这是托盘图标最常见的心智模型：
         // 点一下把窗口叫回来。菜单留给右键。
@@ -132,16 +144,39 @@ pub fn install(app: &AppHandle) -> Result<(), String> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            // 左键单击（按下并抬起）→ 显示窗口。
-            // 只认 `Up` 是因为 `Down` 在按下瞬间就会触发，用户按住拖动图标时
-            // 也会命中 —— 那会让"按住图标"意外地把窗口弹出来。
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
+            match event {
+                // 左键单击（按下并抬起）→ 显示窗口。
+                // 只认 `Up` 是因为 `Down` 在按下瞬间就会触发，用户按住拖动图标时
+                // 也会命中 —— 那会让"按住图标"意外地把窗口弹出来。
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => {
+                    show_main_window(tray.app_handle());
+                }
+
+                // 右键 → 弹出**自绘**菜单（见 `tray_menu.rs`）。
+                //
+                // 原生菜单仍然挂着（构造时的 `.menu(&menu)`），但它不再被显示：
+                // `show_menu_on_left_click(false)` 只管左键，右键本来会弹原生菜单。
+                // 因此右键这一条分支必须**在这里被接管**，否则用户右键时会看到
+                // 一个系统菜单盖在自绘菜单上面。
+                //
+                // 保留原生菜单的理由：自绘窗口在极端情况下可能起不来
+                // （创建失败、被系统策略禁用）。那时右键仍然能用 —— 一个丑菜单
+                // 好过一个没有菜单。
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => {
+                    if let Err(error) = tray_menu::show(tray.app_handle()) {
+                        log::warn!("托盘菜单：弹出失败：{error}");
+                    }
+                }
+
+                _ => {}
             }
         });
 

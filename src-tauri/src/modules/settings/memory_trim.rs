@@ -195,9 +195,6 @@ mod tests {
 #[cfg(windows)]
 mod windows_impl {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, SetProcessWorkingSetSize, PROCESS_QUERY_LIMITED_INFORMATION,
         PROCESS_SET_QUOTA,
@@ -288,6 +285,12 @@ mod windows_impl {
     /// 给测试用：读一个进程的工作集，验证回收真的改变了它。
     #[cfg(test)]
     pub(super) fn working_set_of(pid: u32) -> Option<u64> {
+        // 这两个只在这条测试里用到，因此 import 放在函数内：
+        // 放在文件头会让**非测试**构建报"未使用的导入"。
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return None;

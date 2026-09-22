@@ -222,6 +222,147 @@ check(
   '设置页那个开关走的是「保存设置 + 同步菜单勾选」两处'
 );
 
+// ============================================================
+// 7. 自绘托盘菜单
+// ============================================================
+//
+// 自绘菜单是一个**独立的 WebView 窗口**，而这一点带来了三类"只有跨文件才看得出"
+// 的问题，全部没有编译期保护：
+//
+//   1. 窗口标签（`tauri.conf.json` 的 label）与 Rust 里的常量对不上 ——
+//      表现是右键托盘没有任何反应；
+//   2. **Vite 的多入口漏了它** —— 开发模式完全正常（Vite 按 URL 提供任意 HTML），
+//      而发布版里那个窗口是空白的。这正是"只在发布版里坏掉"的典型；
+//   3. 后端与前端对同一个事件名的字符串对不上 —— 表现是"点了设置，界面没反应"。
+console.log('\n自绘托盘菜单：');
+
+const tauriConf = read('src-tauri/tauri.conf.json');
+const trayMenuRs = read('src-tauri/src/modules/desktop/tray_menu.rs');
+const trayMenuTsx = read('src/tray-menu/TrayMenu.tsx');
+const trayMenuMainTsx = read('src/tray-menu/main.tsx');
+const viteConfig = read('vite.config.ts');
+const homeTsx = read('src/pages/Home.tsx');
+
+check(
+  /"label":\s*"tray-menu"/.test(tauriConf),
+  'tauri.conf.json 里有 tray-menu 窗口（label 是 Rust 侧按名字找它的依据）'
+);
+check(
+  /url":\s*"tray-menu\.html"/.test(tauriConf),
+  'tray-menu 窗口指向 tray-menu.html'
+);
+check(
+  /"visible":\s*false/.test(tauriConf),
+  'tray-menu 窗口启动时不可见（否则应用一开就有一个浮层挂在屏幕上）'
+);
+check(
+  /"transparent":\s*true/.test(tauriConf),
+  'tray-menu 窗口是透明的（不透明窗口会在圆角外带出一圈底色）'
+);
+check(
+  /"skipTaskbar":\s*true/.test(tauriConf),
+  'tray-menu 窗口不在任务栏出现（它不是一个"窗口"）'
+);
+
+check(
+  /input:\s*\{[\s\S]{0,300}?tray-menu[\s\S]{0,200}?tray-menu\.html/.test(viteConfig),
+  'vite.config.ts 声明了 tray-menu 入口 —— **漏掉它时开发模式正常、发布版空白**'
+);
+check(
+  !/index\.html[\s\S]{0,80}tray-menu/.test(viteConfig) ||
+    /main:\s*path\.resolve/.test(viteConfig),
+  '主入口也仍在多入口列表里（改成多入口时漏掉主入口会让整个应用打不开）'
+);
+
+check(
+  /TRAY_MENU_LABEL:\s*&str\s*=\s*"tray-menu"/.test(trayMenuRs),
+  'Rust 侧的窗口标签常量与配置一致'
+);
+check(
+  /tauri\.conf\.json[\s\S]{0,200}label/.test(trayMenuRs) ||
+    /include_str!\("\.\.\/\.\.\/\.\.\/tauri\.conf\.json"\)/.test(trayMenuRs),
+  'Rust 侧有一条测试把窗口标签钉在配置上（改名时会被拦住）'
+);
+
+check(
+  /TRAY_ACTION_EVENT:\s*&str\s*=\s*"modulith:\/\/tray-action"/.test(desktopCommandsRs),
+  '后端声明了托盘动作的事件名'
+);
+check(
+  homeTsx.includes(`'modulith://tray-action'`),
+  '前端监听的是**同一个**事件名（字符串不一致时不会有任何编译错误）'
+);
+
+// 「关闭时最小化到托盘」这个开关在两个入口（设置页 / 自绘菜单）必须都经过
+// 同一条命令 —— 各写一份必然漂移，而漂移的表现是"菜单里勾了、设置页没勾"。
+check(
+  /tray_menu_state[\s\S]{0,400}?settings::load/.test(desktopCommandsRs),
+  '自绘菜单的开关状态从**持久设置**读回来（而不是自己存一份）'
+);
+check(
+  /toggle_close_to_tray[\s\S]{0,600}?set_close_to_tray/.test(desktopCommandsRs),
+  '自绘菜单切换开关时走的是与设置页同一条命令'
+);
+
+// 未知动作必须报错而不是静默成功：静默成功会让"菜单项接错了"变成
+// 一件没有线索的事（用户点了，界面没反应，也没有报错）。
+check(
+  /未知动作/.test(desktopCommandsRs),
+  '未知的托盘动作会明确报错，而不是静默成功'
+);
+
+// 菜单窗口必须能自己关掉。少了这条行为，菜单会一直挂在屏幕上。
+check(
+  /WindowEvent::Focused\(false\)[\s\S]{0,120}?hide\(/.test(trayMenuRs),
+  '菜单失去焦点会自己收起来（少了它菜单会一直挡在屏幕上）'
+);
+check(
+  /tray_menu::install\(app\)/.test(desktopModRs),
+  '这个行为在模块 setup 里被装上'
+);
+
+// 右键必须被接管：原生菜单仍然挂着（作为退路），若不接管右键，
+// 用户会看到一个系统菜单盖在自绘菜单上面。
+check(
+  /MouseButton::Right[\s\S]{0,200}?tray_menu::show/.test(trayRs),
+  '右键事件转给了自绘菜单（不接管的话系统菜单会同时弹出来）'
+);
+
+// 前端菜单不做业务：它只 invoke 一个动作，由后端分派。
+check(
+  /invoke<string \| null>\('tray_menu_action'/.test(trayMenuTsx),
+  '菜单把点击转成一次 tray_menu_action 调用'
+);
+check(
+  !/getCurrentWindow\(\)[\s\S]{0,200}?hide\(\)/.test(trayMenuTsx),
+  '菜单**不自己隐藏窗口**（由后端在处理动作时决定，否则"点了没反应"会无法区分）'
+);
+check(
+  trayMenuMainTsx.includes('#tray-menu-root'),
+  '独立入口挂载到 tray-menu.html 里的容器上'
+);
+
+// ============================================================
+// 8. 释放资源：菜单里的那一项必须真的做事
+// ============================================================
+//
+// 「释放资源」是个很容易变成安慰剂的功能 —— 它必须同时回收工作集与停掉后台宿主，
+// 而且**不显示主窗口**（把一个大窗口弹到屏幕上是反着的）。
+console.log('\n释放资源：');
+
+check(
+  /"free"[\s\S]{0,400}?trim_self_tree\(\)/.test(desktopCommandsRs),
+  '「释放资源」会回收工作集'
+);
+check(
+  /"free"[\s\S]{0,500}?shutdown\(\)\.await/.test(desktopCommandsRs),
+  '「释放资源」会停掉后台宿主'
+);
+check(
+  !/"free"[\s\S]{0,300}?show_main_window/.test(desktopCommandsRs),
+  '「释放资源」不会显示主窗口（那与这个动作的语义相反）'
+);
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

@@ -208,7 +208,7 @@ check(
 console.log('\n前端的诚实性：');
 
 check(
-  /插件代码的加载与执行尚未实现/.test(serviceTs),
+  /插件代码的加载与执行\*\*仍未实现\*\*|插件执行尚未实现/.test(serviceTs),
   '服务模块的注释如实说明"插件执行尚未实现"'
 );
 check(

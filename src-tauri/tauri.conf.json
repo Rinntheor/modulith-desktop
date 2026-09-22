@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Modulith Desktop",
         "decorations": false,
         "width": 1100,
@@ -21,6 +22,24 @@
         "transparent": false,
         "minWidth": 960,
         "minHeight": 560
+      },
+      {
+        "label": "tray-menu",
+        "url": "tray-menu.html",
+        "title": "Modulith Desktop 菜单",
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "focus": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "width": 268,
+        "height": 316
       }
     ],
     "security": {
