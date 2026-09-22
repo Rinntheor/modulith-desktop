@@ -710,6 +710,32 @@ export function getLoadState(pluginId: string): PluginLoadState | undefined {
 // 插件上下文（暴露给插件作者的 API）
 // ============================================================
 
+/**
+ * `ctx.storage.all()` 一次最多读出多少个键。
+ *
+ * 它是一条"把所有数据拉进内存"的接口。后端对单个插件的键数上限是 2000、
+ * 总量 8 MB，无条件全读等于把那个上限直接搬进内存 —— 而配额本来的目的
+ * 就是别让单个插件决定我们吃多少内存。
+ *
+ * 取 500 而不是 2000：真正需要用 `all()` 的插件管理的是几十到几百条配置，
+ * 而需要遍历几千条记录的插件本来就该用 `list()` 分页。
+ */
+const MAX_STORAGE_ALL_KEYS = 500;
+
+/** 一页存储键（与后端 `StoragePage` 的序列化形式一致） */
+export interface PluginStoragePage {
+  keys: string[];
+  /** 为空表示已经到底 */
+  nextCursor: string | null;
+  usage: PluginStorageUsage;
+}
+
+/** 插件存储的用量（与后端 `StorageUsage` 一致） */
+export interface PluginStorageUsage {
+  totalBytes: number;
+  keyCount: number;
+}
+
 function pluginStorage(pluginId: string) {
   return {
     async get<T>(key: string, defaultValue?: T): Promise<T | undefined> {
@@ -722,6 +748,10 @@ function pluginStorage(pluginId: string) {
       }
     },
     async set<T>(key: string, value: T): Promise<void> {
+      // 配额拒绝会以字符串错误的形式回到这里（后端 `PluginError::QuotaExceeded`
+      // 的消息里带着"哪一档、上限多少、已用多少、本次多少"四个数字）。
+      // 这里**不**改写它：那条消息是给插件作者看的可行动提示，
+      // 包一层自己的话只会把数字弄丢。
       await invoke('plugin_storage_set', { id: pluginId, key, value: JSON.stringify(value) });
     },
     async delete(key: string): Promise<void> {
@@ -733,8 +763,61 @@ function pluginStorage(pluginId: string) {
     async keys(): Promise<string[]> {
       return invoke<string[]>('plugin_storage_keys', { id: pluginId });
     },
+    /**
+     * 分页枚举键 —— 数据量大时**应当用这个**而不是 `keys()`。
+     *
+     * 起因为什么要加它：`keys()` 一次返回全部键，而插件的典型模式是"一条记录一个键"，
+     * 键数随使用时间线性增长。后端对单个插件的键数设了上限（2000），
+     * 因此最坏情况是可控的；但**每次列表都走一次全量枚举**仍然不必要 ——
+     * 2000 个键在每次打开界面时都要过一遍 IPC 与 JSON 解析。
+     *
+     * 游标是不透明的：原样回传 `nextCursor` 即可，不要自己解析它。
+     * `nextCursor` 为 `null` 表示已经到底。
+     *
+     * ```js
+     * let cursor = null;
+     * do {
+     *   const page = await ctx.storage.list({ prefix: 'record.', cursor, pageSize: 200 });
+     *   for (const key of page.keys) { ... }
+     *   cursor = page.nextCursor;
+     * } while (cursor);
+     * ```
+     */
+    async list(options?: {
+      prefix?: string;
+      cursor?: string | null;
+      pageSize?: number;
+    }): Promise<PluginStoragePage> {
+      return invoke<PluginStoragePage>('plugin_storage_list', {
+        id: pluginId,
+        prefix: options?.prefix ?? '',
+        cursor: options?.cursor ?? null,
+        pageSize: options?.pageSize ?? null,
+      });
+    },
+    /** 当前用量（字节数与键数）。用于插件自己做配额提示，或插件页展示。 */
+    async usage(): Promise<PluginStorageUsage> {
+      return invoke<PluginStorageUsage>('plugin_storage_usage', { id: pluginId });
+    },
+    /**
+     * 读出全部键值。
+     *
+     * **上限 500 个键**：它是"一次性把所有数据拉进内存"的接口，
+     * 而插件的存储上限是 2000 个键、8 MB —— 无条件全读等于把那个上限
+     * 直接搬到内存里。超过上限时抛错而不是静默截断：
+     * 静默截断会让插件拿到一份"看起来正常但缺了很多条"的数据，
+     * 而缺数据是最难被发现的错误。
+     */
     async all(): Promise<Record<string, unknown>> {
       const keys = await invoke<string[]>('plugin_storage_keys', { id: pluginId });
+
+      if (keys.length > MAX_STORAGE_ALL_KEYS) {
+        throw new Error(
+          `ctx.storage.all() 最多支持 ${MAX_STORAGE_ALL_KEYS} 个键，当前有 ${keys.length} 个。` +
+            `请改用 ctx.storage.list() 分页读取，或先清理不再需要的数据。`
+        );
+      }
+
       const result: Record<string, unknown> = {};
       for (const key of keys) {
         result[key] = await this.get(key);
