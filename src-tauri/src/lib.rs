@@ -13,6 +13,7 @@ use tauri::Manager;
 
 use modules::auth::commands::*;
 use modules::backup::commands::*;
+use modules::desktop::commands::*;
 use modules::logging::commands::*;
 use modules::net::commands::*;
 use modules::notifications::commands::*;
@@ -70,11 +71,18 @@ pub fn run() -> Result<(), tauri::Error> {
             )));
         }
 
-        // 启动所有模块
-        for module in registry.all() {
-            if let Err(e) = module.start(&handle) {
-                eprintln!("[WARN] Module {} start failed: {}", module.id(), e);
-            }
+        // 启动所有模块。
+        //
+        // **按拓扑序**（start_all 内部推出执行计划），而不是遍历 registry.all()
+        // —— 后者是 HashMap::values()，也就是哈希顺序。此前 setup_all 按拓扑序
+        // 而 start 不按，两者不一致会让一个模块的 start 早于它依赖的模块的
+        // start，于是它在启动阶段读到对方半初始化的状态。
+        //
+        // 单个模块启动失败**不中止其余模块**：一个模块起不来不该让整个应用打不开。
+        // 失败记进日志并把第一个失败者报到 stderr（release 版没有控制台，
+        // 因此日志文件才是主要出口）。
+        if let Some((id, reason)) = registry.start_all(&handle) {
+            eprintln!("[WARN] Module start failed: {} - {}", id, reason);
         }
 
         app.manage(registry);
@@ -105,6 +113,18 @@ pub fn run() -> Result<(), tauri::Error> {
         export_backup,
         open_backup,
         restore_backup,
+        background_host_status,
+        background_host_probe,
+        background_host_shutdown,
+        get_close_to_tray,
+        set_close_to_tray,
+        is_tray_available,
+        list_reminders,
+        save_reminder,
+        delete_reminder,
+        set_reminder_enabled,
+        reminder_runtime,
+        run_reminder_now,
         get_log_dir,
         read_log_tail,
         clear_logs,
@@ -146,6 +166,8 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_storage_set,
         plugin_storage_delete,
         plugin_storage_keys,
+        plugin_storage_list,
+        plugin_storage_usage,
         plugin_storage_clear,
         plugin_http_request,
         plugin_launch_program,
@@ -156,6 +178,10 @@ pub fn run() -> Result<(), tauri::Error> {
         get_app_info,
         update_app_settings,
         reload_app_settings,
+        memory_snapshot,
+        apply_memory_level_for_visibility,
+        set_webview_memory_level,
+        webview_memory_level_supported,
         reset_app_settings,
         probe_network,
         get_app_data_dir,
@@ -164,6 +190,8 @@ pub fn run() -> Result<(), tauri::Error> {
         get_autostart_status,
         set_autostart_enabled,
         was_started_by_autostart,
+        trim_memory_now,
+        trim_memory_supported,
         get_sidebar_preferences,
         get_module_preferences,
         update_module_order,
@@ -186,5 +214,29 @@ pub fn run() -> Result<(), tauri::Error> {
         install_app_update,
     ]);
 
-    builder.run(tauri::generate_context!())
+    // 用 run_return 而不是 run，唯一的理由是**拿到退出事件**。
+    //
+    // 此前应用退出时没有任何收尾动作：模块的 stop 从来没有被调用过
+    // （registry.stop_all 甚至不存在）。而 logging 模块确实有需要落盘的东西，
+    // 于是"关掉应用之后最后几条日志不见了"成了一个没人解释得清的现象。
+    //
+    // 代价是必须**自己把 Tauri 内部那个回调补全**：run_return 会替换掉默认实现，
+    // 而默认实现除了跑事件循环还做了 cleanup_before_exit。漏掉它不会立刻报错，
+    // 但托盘图标、窗口资源表都不会被清理 —— 因此下面显式调用它，
+    // 并把退出码原样传出去。
+    let app = builder.build(tauri::generate_context!())?;
+    let exit_code = app.run_return(|app, event| {
+        if let tauri::RunEvent::Exit = event {
+            // 停止模块：**逆序**（依赖方先停），见 ModuleRegistry::stop_all。
+            // 放在 cleanup_before_exit **之前** —— 后者会清掉窗口与资源表，
+            // 之后模块再想用 Tauri 的 API 收尾就拿不到东西了。
+            let registry = app.state::<ModuleRegistry>();
+            registry.stop_all(app);
+
+            log::info!("应用即将退出，模块收尾已完成");
+            app.cleanup_before_exit();
+        }
+    });
+
+    std::process::exit(exit_code);
 }
