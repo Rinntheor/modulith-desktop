@@ -33,6 +33,16 @@ impl Module for LoggingModule {
         "运行日志与崩溃记录：写文件、可开关、可查看"
     }
 
+    /// 依赖 `settings`
+    ///
+    /// **这条依赖一直存在于代码里，只是一直没有声明。** `setup` 直接调用
+    /// `settings::settings::load(app)`，而 `dependencies()` 返回空 ——
+    /// 于是拓扑排序无从得知这件事，顺序靠"注册表恰好按字母序注册"碰巧正确
+    /// （`logging` 在 `settings` 之后）。碰巧正确的顺序不是顺序，是运气。
+    fn dependencies(&self) -> Vec<&'static str> {
+        vec!["settings"]
+    }
+
     /// 把启动早期排队的记录落盘，并按用户设置决定两个开关
     ///
     /// 这个模块在字母序上排在 `auth` 之后，因此 `auth` setup 里的那几行
@@ -61,6 +71,21 @@ impl Module for LoggingModule {
             }
         }
 
+        Ok(())
+    }
+
+    /// 退出前把日志冲到磁盘
+    ///
+    /// **这是 `FileLogger::flush()` 此前唯一合理的调用点，而它一直没有被调用过**
+    /// —— 因为应用退出时根本没有任何收尾动作（模块的 `stop` 从未被调用）。
+    ///
+    /// 平时每次写入都会 flush，因此这里针对的不是"平时丢日志"，而是退出那一刻：
+    /// 进程结束之前最后几条记录可能还在缓冲区里，而"关掉应用之后最后几条不见了"
+    /// 恰恰是最需要有日志的那一段。
+    fn stop(&self, _app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(logger) = logger::global() {
+            logger.flush();
+        }
         Ok(())
     }
 }
