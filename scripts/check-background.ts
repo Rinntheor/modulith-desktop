@@ -54,6 +54,7 @@ const desktopModRs = read('src-tauri/src/modules/desktop/mod.rs');
 const serviceTs = read('src/services/backgroundHost.ts');
 const tauriConf = read('src-tauri/tauri.conf.json');
 const backgroundModRs = read('src-tauri/src/modules/desktop/background/mod.rs');
+const desktopCommandsRs = read('src-tauri/src/modules/desktop/commands.rs');
 const schedulesRs = read('src-tauri/src/modules/desktop/background/schedules.rs');
 const eventsRs = read('src-tauri/src/modules/desktop/events.rs');
 const remindersTs = read('src/services/reminders.ts');
@@ -219,6 +220,100 @@ check(
   /getBackgroundStatus[\s\S]{0,400}?不启动子进程/.test(serviceTs) ||
     /不启动子进程/.test(serviceTs),
   '状态查询注明不启动子进程（打开设置页不该拉起一个 Node）'
+);
+
+// ============================================================
+// 6. Node 运行时的发现路径
+// ============================================================
+//
+// 这一段守的是**用户报告过的一个真实缺陷**：在 cmd 里 `node --version` 有版本，
+// 应用里却说"未找到 Node 运行时"。原因是 cmd 会走 PATH，而当时的实现没有查 PATH。
+//
+// 这里守住的是"查找顺序被写下来了、PATH 与常见安装位置真的在计划里"。
+// "真的能从 PATH 找到"由 `live_tests::a_node_on_the_path_is_found` 守着 ——
+// 它把常见安装位置清空，因此找到只可能来自 PATH。
+console.log('\nNode 运行时的发现路径：');
+
+check(
+  /fn resolve_node\(configured: Option<&str>\)/.test(backgroundModRs),
+  'resolve_node 接受"用户在设置里指定的路径"（界面里能选，不必改环境变量）'
+);
+check(
+  /fn plan_node_search\(/.test(backgroundModRs) && /NodeSearchPlan/.test(backgroundModRs),
+  '查找顺序被抽成纯函数计划（顺序错了会像"没找到"一样无声，因此必须可单测）'
+);
+check(
+  /path_dirs: Vec<PathBuf>/.test(backgroundModRs) && /split_paths/.test(backgroundModRs),
+  '**系统 PATH 会被查找** —— 这正是"cmd 里有、软件里没有"那个缺陷的修复'
+);
+check(
+  /ProgramFiles/.test(backgroundModRs) && /nodejs/.test(backgroundModRs),
+  '常见安装位置也在查找范围内（多数机器不必手工指定）'
+);
+check(
+  /MODULITH_NODE_SEARCH_BASES/.test(backgroundModRs),
+  '常见安装位置可以用环境变量替换（测试要能造出"哪里都没有"的前提）'
+);
+check(
+  /fn platform_base_dirs\(\)/.test(backgroundModRs),
+  '平台目录是**参数传进**纯函数的，不是在它内部偷偷读环境变量'
+);
+check(
+  /指定的 Node 路径不存在/.test(backgroundModRs),
+  '显式指定过路径但不存在时，错误里要指出那个路径（而不是笼统的"未找到"）'
+);
+check(
+  /逐目录检查存在性|Command::new` 不能直接执行/.test(backgroundModRs) ||
+    /candidate\.is_file\(\)/.test(backgroundModRs),
+  'PATH 查找逐目录确认是真实文件（Windows 上 PATH 里的 `node` 可能是 .cmd 包装）'
+);
+
+// 命令接线：设置页要能查、能设
+for (const command of ['detect_node_runtime', 'set_node_runtime_path']) {
+  check(libRs.includes(`${command},`), `命令 ${command} 已注册进 lib.rs`);
+  check(serviceTs.includes(`'${command}'`), `前端 backgroundHost.ts 调用了 ${command}`);
+}
+
+// 保存路径时必须**真的验证**：只检查文件存在不够（用户可能选到别的同名文件，
+// 或一个缺 DLL 的残包）。验证失败还要回滚，否则留下的是"看着配好了、实际跑不起来"。
+check(
+  /set_node_runtime_path[\s\S]{0,2500}?ping\(\)\.await/.test(desktopCommandsRs),
+  '保存 Node 路径时会真的拉起一次后台宿主来验证'
+);
+check(
+  /set_node_runtime_path[\s\S]{0,3000}?rolled\.node_runtime_path = previous/.test(
+    desktopCommandsRs
+  ),
+  '验证失败会**回滚**设置（留下跑不起来的路径比明确失败更糟）'
+);
+check(
+  /\*self\.node\.lock\(\)\.unwrap\(\) = None/.test(backgroundModRs),
+  '改路径时会清掉解析缓存（否则"改完设置没生效，非要重启"）'
+);
+
+// 随包分发：资源声明必须容得下"没有放 Node"
+check(
+  /"runtime\/\*"/.test(tauriConf),
+  'bundle.resources 里有 runtime/* —— 通配让"目录为空"时构建照常成功'
+);
+check(
+  /resources\/runtime\//.test(tauriConf),
+  '它被放进安装目录的 resources/runtime/'
+);
+check(
+  /dir\.join\("resources"\)\.join\("runtime"\)/.test(backgroundModRs),
+  '解析器同时试 resources/runtime/（开发与安装两种布局的资源位置不同）'
+);
+
+// 用户不该被迫改环境变量：界面里必须有一条手工指定的路
+const perfSettingsTsx = read('src/components/Settings/PerformanceSettings.tsx');
+check(
+  /setNodeRuntimePath/.test(perfSettingsTsx),
+  '设置 → 性能 里有手工指定 Node 路径的入口'
+);
+check(
+  /detectNodeRuntime/.test(perfSettingsTsx),
+  '那一节会把探测结果显示出来（找到没有、用的是哪个路径、失败原因）'
 );
 
 // ============================================================

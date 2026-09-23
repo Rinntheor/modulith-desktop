@@ -50,6 +50,138 @@ pub fn background_host_status(state: State<'_, BackgroundState>) -> BackgroundSt
     state.inner().0.describe()
 }
 
+/// 自动查找 Node 运行时，返回找到的路径与**查找过程**。
+///
+/// 存在的理由是用户的实际困难：在 cmd 里敲 `node --version` 有版本，应用里却
+/// 说找不到。那条路径上真正需要的是"你到底找了哪些地方"，而不是一句"未找到"。
+///
+/// 它**不写设置** —— 查出结果由用户决定要不要采用。一个"点一下就悄悄改掉配置"
+/// 的按钮会让用户不知道自己的设置被动过。
+#[tauri::command]
+pub fn detect_node_runtime(app: AppHandle, state: State<'_, BackgroundState>) -> NodeDetection {
+    use crate::modules::settings::settings;
+
+    let configured = settings::load(&app).node_runtime_path;
+    let host = &state.inner().0;
+
+    // 让宿主按**当前设置**重新解析一次（而不是用上一次的缓存）：
+    // 用户可能刚手工改过 settings.json，而缓存里还是旧结果。
+    host.set_configured_node(&configured);
+
+    let configured_path = if configured.trim().is_empty() {
+        None
+    } else {
+        Some(configured)
+    };
+
+    match host.probe_node() {
+        Ok(path) => NodeDetection {
+            found: true,
+            path: Some(path.display().to_string()),
+            reason: None,
+            configured_path,
+        },
+        Err(reason) => NodeDetection {
+            found: false,
+            path: None,
+            reason: Some(reason),
+            configured_path,
+        },
+    }
+}
+
+/// 手工指定 Node 可执行文件的路径（设置 → 性能）
+///
+/// ============================================================
+/// 为什么要有它（而不是只提供环境变量）
+/// ============================================================
+///
+/// 环境变量对普通用户不友好：要打开系统设置、找到"环境变量"、新建一条、再重启
+/// 应用。而"把文件放进安装目录"要求用户先知道安装目录在哪。
+///
+/// 结果是后台功能明明可用（用户的 PATH 上就有 node），界面上却只说"未找到"。
+/// 因此提供一条**在界面里选一次就记住**的路径。
+///
+/// ============================================================
+/// 会校验，不是照单全收
+/// ============================================================
+///
+/// 传进来的路径必须真的**能跑起来**：存在、是文件、而且能应答一次握手。
+/// 只检查 `is_file()` 不够 —— 用户完全可能选到别的同名文件，或者一个缺 DLL 的
+/// 残包。那种情况下"保存成功"是谎话，而失败要等到几个小时后的定时提醒才被发现。
+#[tauri::command]
+pub async fn set_node_runtime_path(
+    app: AppHandle,
+    state: State<'_, BackgroundState>,
+    path: String,
+) -> Result<CallOutcome, String> {
+    use crate::modules::settings::settings;
+
+    let trimmed = path.trim().to_string();
+
+    // 空字符串 = 清掉手工指定，恢复自动探测。这是一条正当操作，不是错误。
+    if trimmed.is_empty() {
+        let mut current = settings::load(&app);
+        current.node_runtime_path = String::new();
+        settings::save(&app, &current)?;
+        state.inner().0.set_configured_node("");
+        log::info!("Node 运行时路径已清空，恢复自动探测");
+        return Ok(CallOutcome {
+            ok: true,
+            result: None,
+            error: None,
+        });
+    }
+
+    if !std::path::Path::new(&trimmed).is_file() {
+        return Err(format!("这个路径不是一个文件：{trimmed}"));
+    }
+
+    // 先落盘再验证：验证要拉起子进程，而它读的是**设置里的值**。
+    // 顺序反了的话验证用的是旧配置，于是"验证通过"可能验证的是另一个 Node。
+    let mut current = settings::load(&app);
+    let previous = current.node_runtime_path.clone();
+    current.node_runtime_path = trimmed.clone();
+    settings::save(&app, &current)?;
+    state.inner().0.set_configured_node(&trimmed);
+
+    // 真的拉起一次。它走完整的启动握手，因此验证的是"这个 Node 能跑我们的脚本"。
+    let outcome = state.inner().0.ping().await;
+
+    if !outcome.ok {
+        // **验证失败就回滚**：留下一个跑不起来的路径，表现是"设置里看着配好了、
+        // 后台功能却不可用" —— 那比一次明确的失败糟得多。
+        let mut rolled = settings::load(&app);
+        rolled.node_runtime_path = previous.clone();
+        if let Err(error) = settings::save(&app, &rolled) {
+            log::warn!("回滚 Node 路径失败，设置里可能留下一个不可用的路径：{error}");
+        }
+        state.inner().0.set_configured_node(&previous);
+
+        return Err(format!(
+            "这个 Node 运行时无法启动后台宿主：{}",
+            outcome.error.unwrap_or_else(|| "原因未知".to_string())
+        ));
+    }
+
+    log::info!("Node 运行时路径已设为 {trimmed}，并验证通过");
+    Ok(outcome)
+}
+
+/// Node 运行时的探测结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeDetection {
+    /// 是否找到了一个可用的 Node
+    pub found: bool,
+    /// 找到时的可执行文件路径
+    pub path: Option<String>,
+    /// 没找到时的**具体原因**
+    pub reason: Option<String>,
+    /// 当前设置里手工指定的路径（没有则为 `null`）
+    pub configured_path: Option<String>,
+}
+
 /// 探测后台宿主：真的拉起子进程跑一次握手与存活探测。
 ///
 /// 这是唯一一个会启动子进程的命令，也是"设置里点一下试试"的入口。

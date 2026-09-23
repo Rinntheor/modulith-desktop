@@ -306,6 +306,28 @@ pub struct AppSettings {
     /// `false` 并写回设置 —— 这里不重复那条判断，因为"托盘是否可用"只有那一处知道。
     #[serde(default = "default_close_to_tray")]
     pub close_to_tray: bool,
+
+    /// 用户手工指定的 Node 运行时路径（可执行文件）。
+    ///
+    /// ============================================================
+    /// 为什么需要这个字段（而不是只靠环境变量）
+    /// ============================================================
+    ///
+    /// 后台宿主要跑在一个 Node 进程里，而 Node **不是**应用的依赖 —— 它是用户
+    /// 机器上可能有、也可能没有的东西。此前只有两条发现路径：环境变量
+    /// `MODULITH_NODE`，以及 exe 旁边的 `runtime/node.exe`。
+    ///
+    /// 这两条对普通用户都不友好：改环境变量要懂系统设置、要重启应用，而
+    /// "把文件放到安装目录"要先知道安装目录在哪。结果是后台功能明明可用
+    /// （用户的 PATH 上就有 node），界面上却只说"未找到 Node 运行时"。
+    ///
+    /// 因此加一条**在界面里选一次就记住**的路径。它的优先级最高 —— 用户显式
+    /// 指过的东西不该被任何自动探测覆盖。
+    ///
+    /// 空字符串表示"没有手工指定"（用 `Option` 会让 JSON 里多一种形态，
+    /// 而这里"没有"与"空"是同一件事）。
+    #[serde(default)]
+    pub node_runtime_path: String,
 }
 
 /// 同时打开的标签页数量上限
@@ -546,6 +568,10 @@ impl Default for AppSettings {
             // 「全新安装」与「字段缺失的老文件」会得到相反的默认行为。
             // `impl_default_matches_serde_defaults` 测试把两处钉在一起。
             close_to_tray: default_close_to_tray(),
+            // 空 = 没有手工指定 Node 路径，走自动探测。
+            // 与 serde 的 `#[serde(default)]` 保持一致（空字符串），
+            // `impl_default_matches_serde_defaults` 测试把两处钉在一起。
+            node_runtime_path: String::new(),
         }
     }
 }

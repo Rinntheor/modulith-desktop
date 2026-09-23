@@ -75,7 +75,8 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "resources": {
-      "resources/background-host.mjs": "background-host.mjs"
+      "resources/background-host.mjs": "background-host.mjs",
+      "runtime/*": "resources/runtime/"
     },
     "icon": [
       "icons/32x32.png",

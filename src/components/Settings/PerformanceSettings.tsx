@@ -52,8 +52,21 @@ import {
   trimMemoryNow,
   type TrimOutcome,
 } from '../../services/memoryTrim';
+import {
+  detectNodeRuntime,
+  setNodeRuntimePath,
+  type NodeDetection,
+} from '../../services/backgroundHost';
 import { cachedModuleCount } from '../../services/moduleComponentCache';
 import { getEvictionCount, getTabState } from '../../services/tabStore';
+
+/**
+ * Node 可执行文件在两个平台上的名字。
+ *
+ * 界面上把名字显示出来（"手动指定 node.exe"）是有用的：用户需要在文件选择器里
+ * 认出该选哪个文件，而只说"指定 Node 运行时"会让人不确定是选文件夹还是选文件。
+ */
+const NODE_FILE_NAME = navigator.userAgent.includes('Windows') ? 'node.exe' : 'node';
 /** 采样间隔。3 秒足以看出趋势，又不会让面板自己成为负载。 */
 const SAMPLE_INTERVAL_MS = 3000;
 
@@ -157,13 +170,130 @@ const PerformanceSettings: React.FC = () => {
   const [trimBusy, setTrimBusy] = useState(false);
   const [autoTrim, setAutoTrim] = useState(isAutoTrimEnabled());
 
+  /** Node 运行时：探测结果与操作中的状态 */
+  const [detection, setDetection] = useState<NodeDetection | null>(null);
+  const [nodeBusy, setNodeBusy] = useState(false);
+  /** 粘贴路径的输入框：系统文件选择器不可用时的退路 */
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualValue, setManualValue] = useState('');
+
   /** 防止采样重叠：后端那次调用比一次 tick 慢时，不能让请求堆起来 */
   const inFlight = useRef(false);
+
+  const refreshDetection = useCallback(async () => {
+    setNodeBusy(true);
+    try {
+      setDetection(await detectNodeRuntime());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setNodeBusy(false);
+    }
+  }, []);
+
+  /**
+   * 把一条路径交给后端验证并保存。
+   *
+   * **定义在 `chooseNode` 之前**：后者依赖它，而 `const` 有暂时性死区 ——
+   * 顺序反了会在编译期报"used before its declaration"。
+   */
+  const applyNodePath = useCallback(
+    async (path: string) => {
+      setNodeBusy(true);
+      setError('');
+      try {
+        // 后端会真的拉起一次来验证；失败时它已经回滚了设置，这里只显示原因。
+        await setNodeRuntimePath(path);
+        setManualOpen(false);
+        setManualValue('');
+      } catch (err) {
+        // Tauri 的 Err 是裸字符串：取 .message 会得到 undefined
+        setError(typeof err === 'string' ? err : String(err));
+      } finally {
+        setNodeBusy(false);
+        await refreshDetection();
+      }
+    },
+    [refreshDetection]
+  );
+
+  /**
+   * 让用户选一个 Node 可执行文件。
+   *
+   * ============================================================
+   * 文件选择器是**可选的**，不是必需的
+   * ============================================================
+   *
+   * 走 `@tauri-apps/plugin-dialog` 能弹出系统文件选择器，那是最省事的一条路。
+   * 但那个前端包**不在本项目的依赖里**（后端 `tauri-plugin-dialog` 在，
+   * 前端包没装），而我不想为了一个可选的输入方式去动依赖树与 lockfile。
+   *
+   * 因此这里用动态 import 并**兜住失败**：插件在就用系统选择器，不在就退化成
+   * 一条可以粘贴路径的输入框。两条路都能完成同一件事，而且后端那条验证
+   * （真的拉起一次握手）对两者一视同仁 —— 粘贴一条错路径同样会被拒绝。
+   *
+   * 这比"依赖一个可能不存在的模块"好：少一个包不会让这一整页打不开。
+   */
+  const chooseNode = useCallback(async () => {
+    let picked: string | null = null;
+
+    try {
+      /*
+       * 模块名用**变量**拼出来，而不是写成一个字符串字面量。
+       *
+       * 这不是为了绕开什么，而是因为 TypeScript 会对字面量形式的动态 import 做
+       * 静态解析：包没装时报 TS2307（"找不到模块"），于是**这一整页编译不过**。
+       * 而这个文件选择器是纯粹的可选输入方式，它不可用不该阻止整个设置页构建。
+       *
+       * 用变量之后 TS 不再解析它，代价是这条 import 没有类型 —— 因此结果在这里
+       * 立刻被收窄成 `string | null`，类型安全从那一点之后照旧。
+       */
+      const moduleName = '@tauri-apps/plugin-dialog';
+      const dialog = (await import(/* @vite-ignore */ moduleName)) as {
+        open: (options: {
+          multiple: boolean;
+          directory: boolean;
+          title: string;
+        }) => Promise<unknown>;
+      };
+      const result = await dialog.open({
+        multiple: false,
+        directory: false,
+        title: `选择 ${NODE_FILE_NAME}`,
+      });
+      if (typeof result === 'string') picked = result;
+    } catch {
+      // 插件不在：露出粘贴框，而不是把这一页搞崩
+      setManualOpen(true);
+      return;
+    }
+
+    if (picked === null) return;
+    await applyNodePath(picked);
+  }, [applyNodePath]);
+
+  const clearNode = useCallback(async () => {
+    setNodeBusy(true);
+    setError('');
+    try {
+      await setNodeRuntimePath('');
+      setManualOpen(false);
+      setManualValue('');
+    } catch (err) {
+      setError(typeof err === 'string' ? err : String(err));
+    } finally {
+      setNodeBusy(false);
+      await refreshDetection();
+    }
+  }, [refreshDetection]);
 
   useEffect(() => {
     void isMemoryLevelSupported().then(setLevelSupported);
     void isTrimSupported().then(setTrimSupported);
-  }, []);
+    // 只查一次，不轮询：Node 的位置不会在使用过程中变化，而每次都去
+    // 访问文件系统是白花开销。
+    void refreshDetection();
+  }, [refreshDetection]);
 
   /**
    * 手动回收一次，并把"回收前 → 回收后"的数字显示出来。
@@ -500,6 +630,132 @@ const PerformanceSettings: React.FC = () => {
 
         {levelResult && (
           <p className="pb-3 text-[11px] text-gray-500 leading-relaxed">{levelResult}</p>
+        )}
+      </section>
+
+      {/* ── Node 运行时 ────────────────────────────────────── */}
+      {/*
+        这一节存在的原因是用户的一个具体困难：在 cmd 里敲 `node --version`
+        有版本，应用里却说"未找到 Node 运行时"。
+
+        原因是应用**当时没有查 PATH**（cmd 会查，而它不会）。修好之后绝大多数
+        机器都能自动找到，但仍会有找不到的情况（便携部署、非常规安装前缀、
+        PATH 里只有一个 `.cmd` 包装）。那时用户唯一的出路是改环境变量 ——
+        而这对普通用户并不友好。
+
+        因此这里给一条"选一次就记住"的路，并且把**自动查找的结果**显示出来：
+        用户需要知道我们到底找了哪里，而不是一句"未找到"。
+      */}
+      <section className="bg-white rounded-xl border border-gray-200 px-5 py-2 mb-5">
+        <h3 className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider pt-3 pb-2">
+          Node 运行时
+        </h3>
+
+        <div className="py-2">
+          <p className="text-sm font-medium text-gray-800">
+            {detection === null
+              ? '正在查找…'
+              : detection.found
+                ? '已找到，后台功能可用'
+                : '未找到，后台功能不可用'}
+          </p>
+          <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">
+            定时提醒这类「窗口关掉之后仍要继续工作」的能力需要一个 Node 进程。
+            <br />
+            <span className="text-gray-400">
+              查找顺序：设置里指定的路径 → 环境变量 MODULITH_NODE → 应用目录下的
+              runtime/node.exe → 常见安装位置 → 系统 PATH。
+            </span>
+          </p>
+        </div>
+
+        {detection && (
+          <div className="pb-1">
+            {detection.path && (
+              <p className="text-[11px] text-gray-600 break-all">
+                <span className="text-gray-400">正在使用：</span>
+                <code className="font-mono">{detection.path}</code>
+              </p>
+            )}
+            {detection.configuredPath && (
+              <p className="mt-0.5 text-[11px] text-gray-400 break-all">
+                手工指定：<code className="font-mono">{detection.configuredPath}</code>
+              </p>
+            )}
+            {!detection.found && detection.reason && (
+              <p className="mt-1 flex items-start gap-1.5 text-[11px] text-amber-700 leading-relaxed">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span className="break-all">{detection.reason}</span>
+              </p>
+            )}
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center gap-2 pb-3">
+          <button
+            type="button"
+            onClick={() => void refreshDetection()}
+            disabled={nodeBusy}
+            className="px-2.5 py-1.5 text-xs rounded-lg border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 transition-colors"
+          >
+            {nodeBusy ? '查找中…' : '重新查找'}
+          </button>
+          <button
+            type="button"
+            onClick={() => void chooseNode()}
+            disabled={nodeBusy}
+            className="px-2.5 py-1.5 text-xs rounded-lg border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 transition-colors"
+          >
+            手动指定 {NODE_FILE_NAME}
+          </button>
+          {detection?.configuredPath && (
+            <button
+              type="button"
+              onClick={() => void clearNode()}
+              disabled={nodeBusy}
+              className="px-2.5 py-1.5 text-xs rounded-lg border border-gray-200 bg-white text-gray-500 hover:bg-gray-50 disabled:opacity-50 transition-colors"
+            >
+              清空手工指定
+            </button>
+          )}
+        </div>
+
+        {/* 粘贴路径的退路：系统文件选择器不可用时露出来。
+            没有它，用户就只剩"改环境变量"这一条路 —— 而那正是这一节要避免的事。 */}
+        {manualOpen && (
+          <div className="pb-3">
+            <label className="block">
+              <span className="text-[11px] text-gray-500">
+                把 {NODE_FILE_NAME} 的完整路径粘贴到这里
+              </span>
+              <div className="mt-1 flex items-center gap-2">
+                <input
+                  type="text"
+                  value={manualValue}
+                  onChange={(e) => setManualValue(e.target.value)}
+                  placeholder="C:\Program Files\nodejs\node.exe"
+                  spellCheck={false}
+                  className="min-w-0 flex-1 px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-xs font-mono text-gray-800 focus:outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+                />
+                <button
+                  type="button"
+                  onClick={() => void applyNodePath(manualValue)}
+                  disabled={nodeBusy || manualValue.trim() === ''}
+                  className="shrink-0 px-2.5 py-1.5 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+                >
+                  验证并保存
+                </button>
+              </div>
+            </label>
+            <p className="mt-1 text-[11px] text-gray-400 leading-relaxed">
+              保存时会真的用这个 Node 启动一次后台进程来验证 —— 路径写错会被直接拒绝，
+              而不是留下一个"看着配好了、实际跑不起来"的设置。
+              <br />
+              不知道路径？在 cmd 里执行 <code className="font-mono">where node</code>，
+              取其中以 <code className="font-mono">.exe</code> 结尾的那一行（不要用
+              <code className="mx-1 font-mono">.cmd</code> 那一行）。
+            </p>
+          </div>
         )}
       </section>
 

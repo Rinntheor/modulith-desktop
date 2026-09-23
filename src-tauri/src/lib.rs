@@ -114,6 +114,8 @@ pub fn run() -> Result<(), tauri::Error> {
         open_backup,
         restore_backup,
         background_host_status,
+        detect_node_runtime,
+        set_node_runtime_path,
         background_host_probe,
         background_host_shutdown,
         get_close_to_tray,

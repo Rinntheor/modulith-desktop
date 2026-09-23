@@ -127,6 +127,12 @@ pub struct BackgroundHost {
     next_id: AtomicU64,
     /// Node 可执行文件的解析结果。`None` 表示"还没找过"，`Some(Err)` 表示找过但失败
     node: Mutex<Option<Result<PathBuf, String>>>,
+    /// 用户在设置里指定的 Node 路径（空 = 自动探测）
+    ///
+    /// 它与 `node`（解析结果）分开：那个是**缓存**，改了配置必须清掉重算，
+    /// 否则用户在设置里换了一个路径之后，我们仍然拿旧路径去启动子进程 ——
+    /// 表现为"改完设置没生效，重启才好"。
+    configured_node: Mutex<String>,
     /// 出站事件的去向。由应用侧用 `set_event_handler` 装上。
     ///
     /// 装之前收到的事件只记日志 —— 不静默丢弃，但也不假装处理过。
@@ -152,6 +158,7 @@ impl BackgroundHost {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             node: Mutex::new(None),
+            configured_node: Mutex::new(String::new()),
             event_handler: Mutex::new(None),
             schedules: Mutex::new(Vec::new()),
         }
@@ -248,9 +255,30 @@ impl BackgroundHost {
             return result.clone();
         }
 
-        let result = resolve_node();
+        let configured = self.configured_node.lock().unwrap().clone();
+        let result = resolve_node(Some(configured.as_str()));
         *cached = Some(result.clone());
         result
+    }
+
+    /// 记下用户在设置里指定的 Node 路径，并**清掉解析缓存**。
+    ///
+    /// 清缓存这一步是必须的：否则用户在设置里换一个路径之后，我们仍然按上一次
+    /// 的解析结果去启动子进程 —— 表现为"改完设置没生效，非要重启应用"。
+    ///
+    /// 传空字符串表示恢复自动探测。
+    pub fn set_configured_node(&self, path: &str) {
+        let mut configured = self.configured_node.lock().unwrap();
+        if *configured == path {
+            return;
+        }
+        *configured = path.to_string();
+        *self.node.lock().unwrap() = None;
+    }
+
+    /// 当前记下的 Node 路径（空 = 自动探测）
+    pub fn configured_node(&self) -> String {
+        self.configured_node.lock().unwrap().clone()
     }
 
     /// 让状态查询也能填上 Node 路径（不启动子进程）
@@ -719,38 +747,199 @@ impl Default for BackgroundHost {
 
 /// 解析 Node 可执行文件。
 ///
-/// 查找顺序刻意是"**明确的配置优先，猜测最后**"：
-///   1. 环境变量 `MODULITH_NODE`（开发与排障用，也能让用户手工指定）；
-///   2. 可执行文件旁边的 `runtime/node.exe`（打包分发时随包带上）；
-///   3. 系统 PATH 上的 `node`。
+/// ============================================================
+/// 查找顺序：**用户显式指的 > 随包分发的 > 系统里的**
+/// ============================================================
 ///
-/// 第 3 条放最后：系统上的 Node 版本不受我们控制，而协议版本是按我们分发的那份
-/// 定的。能用它跑起来是运气，不能当成设计。
-fn resolve_node() -> Result<PathBuf, String> {
-    if let Ok(explicit) = std::env::var("MODULITH_NODE") {
-        let path = PathBuf::from(&explicit);
-        if path.is_file() {
-            return Ok(path);
+///   1. 设置里的 `nodeRuntimePath`（**界面上选一次就记住**，不需要改环境变量）；
+///   2. 环境变量 `MODULITH_NODE`（开发与排障用）；
+///   3. 可执行文件旁边的 `runtime/node.exe`（打包分发时随包带上）；
+///   4. 几个常见的安装位置（`C:\Program Files\nodejs\node.exe` 等）；
+///   5. 系统 PATH。
+///
+/// **第 4、5 条是后补的，而它们的缺失是一个真实的缺陷。** 原来的实现只有 2、3
+/// 两条，于是出现了一个很难自查的现象：用户在 cmd 里敲 `node --version` 有版本，
+/// 应用里却说"未找到 Node 运行时" —— 因为 cmd 会走 PATH，而我们**没有查 PATH**。
+/// 用户会以为是自己环境变量没配好，而我们其实少找了一个地方。
+///
+/// 把"系统里的 node"放在最后一条，是因为它的版本不受我们控制，而协议是按我们
+/// 分发的那份定的 —— 能用它跑起来是意外之喜，不该当成设计。但它比"直接失败"
+/// 好：绝大多数用户的机器上就装着 Node。
+///
+/// 排序逻辑抽在 `plan_node_search` 里（纯函数，可单测），这里只负责按顺序找文件。
+fn resolve_node(configured: Option<&str>) -> Result<PathBuf, String> {
+    let env_value = std::env::var("MODULITH_NODE").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()));
+    let path_env = std::env::var("PATH").ok();
+
+    let plan = plan_node_search(
+        configured,
+        env_value.as_deref(),
+        exe_dir.as_deref(),
+        path_env.as_deref(),
+        platform_base_dirs(),
+    );
+
+    // 1~4 类是候选文件路径：存在即用。
+    for candidate in &plan.files {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
         }
+    }
+
+    // 5 类是要在 PATH 目录里拼的**文件名**。这里逐目录检查存在性，
+    // 而不是把裸 "node" 交给 `Command::new` 让它自己去 PATH 里找 ——
+    // 两个理由：
+    //   · 我们要在**报错时给出具体路径**，而交给系统去找就无从知道；
+    //   · Windows 上 PATH 里的 `node` 可能是一个 `.cmd` 包装脚本，
+    //     而 `Command::new` 不能直接执行 `.cmd`（它需要一个真实的可执行文件）。
+    for dir in &plan.path_dirs {
+        let candidate = dir.join(plan.executable_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    // 显式指过路径、但它不存在时，**要把那件事说出来**。
+    //
+    // 两个来源都要报：设置里的路径（界面选的）与环境变量（手工设的）。
+    // 笼统的"未找到 Node"会让用户以为是自己没配，而其实是配错了路径 ——
+    // 尤其环境变量那条：用户改了环境变量、应用里还是说找不到，他会去反复
+    // 检查自己改对没有，而真正的原因（那个文件不在那里）从没被说出来。
+    let explicit: Vec<&str> = [configured, env_value.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    if !explicit.is_empty() {
         return Err(format!(
-            "环境变量 MODULITH_NODE 指向的文件不存在：{explicit}"
+            "指定的 Node 路径不存在：{}。请在设置 → 性能 里重新指定，或把它清空以恢复自动探测。",
+            explicit.join("、")
         ));
     }
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let bundled = dir.join("runtime").join(node_file_name());
-            if bundled.is_file() {
-                return Ok(bundled);
-            }
+    Err(format!(
+        "未找到 Node 运行时。{}后台功能需要它 —— 请在设置 → 性能 里指定 {} 的位置，\
+         或把 Node 放在应用目录的 runtime/ 下。",
+        if path_env.is_none() {
+            "（当前进程读不到 PATH 环境变量，因此无法自动查找）"
+        } else {
+            ""
+        },
+        node_file_name()
+    ))
+}
+
+/// 一次 Node 查找的**计划**（纯数据，不含任何文件系统访问）。
+///
+/// 抽成纯函数是为了让"查找顺序"这件事可以被单元测试直接覆盖 —— 顺序错了
+/// 表现得就像"没找到"（前面的候选不存在时会顺延到下一个，因此顺序错往往
+/// 无声无息），而它恰好不需要真实文件就能验证。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeSearchPlan {
+    /// 按优先级排列的**候选文件路径**（存在即用）
+    files: Vec<PathBuf>,
+    /// 要逐个进去找 `executable_name` 的目录
+    path_dirs: Vec<PathBuf>,
+    /// 可执行文件名（Windows 上是 `node.exe`）
+    executable_name: &'static str,
+}
+
+fn plan_node_search(
+    configured: Option<&str>,
+    env_value: Option<&str>,
+    exe_dir: Option<&std::path::Path>,
+    path_env: Option<&str>,
+    platform_bases: Vec<PathBuf>,
+) -> NodeSearchPlan {
+    let name = node_file_name();
+    let mut files = Vec::new();
+
+    // 1. 用户在界面里指定的路径（最高优先级：显式指过的不该被覆盖）
+    if let Some(value) = configured {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            files.push(PathBuf::from(trimmed));
         }
     }
 
-    Err(
-        "未找到 Node 运行时。后台功能需要它：请把 Node 放在应用目录的 runtime/ 下，\
-         或设置环境变量 MODULITH_NODE 指向它。"
-            .to_string(),
-    )
+    // 2. 环境变量
+    if let Some(value) = env_value {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            files.push(PathBuf::from(trimmed));
+        }
+    }
+
+    // 3. 随包分发的那一份：exe 旁边的 runtime/
+    //
+    // 同时试两种相对位置：打包后资源会被放到 exe 同级的 `runtime/`，
+    // 而 Tauri 的资源解析在开发/安装两种布局下并不一致。
+    if let Some(dir) = exe_dir {
+        files.push(dir.join("runtime").join(name));
+        files.push(dir.join("resources").join("runtime").join(name));
+    }
+
+    // 4. 常见安装位置（Windows）。
+    //
+    // 这些目录是**参数传进来的**，不是在这里读环境变量 —— 见 `plan_node_search`
+    // 上的说明：在函数里偷偷读环境变量，测试就无法造出"哪里都没有"这个前提，
+    // 而那种失败会伪装成"实现坏了"。
+    for base in &platform_bases {
+        files.push(base.join("nodejs").join(name));
+        files.push(base.join("Programs").join("nodejs").join(name));
+    }
+
+    // 5. PATH 上的每一个目录
+    let path_dirs = path_env
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    NodeSearchPlan {
+        files,
+        path_dirs,
+        executable_name: name,
+    }
+}
+
+/// Windows 上 Node 的常见安装位置所基于的目录。
+///
+/// 单独抽出来是为了让 `plan_node_search` 完全纯粹：环境变量在 `resolve_node`
+/// 里读一次，然后作为参数传进去。在纯函数内部读环境变量会让它无法被确定地
+/// 测试 —— 而那种失败会伪装成"实现坏了"（本项目刚踩过一次：`a_missing_runtime`
+/// 因为 `ProgramFiles` 里真有 node 而失败）。
+///
+/// `MODULITH_NODE_SEARCH_BASES` 可以**替换**这份列表（用 `;` 分隔）。两种情况
+/// 都真实存在：
+///
+///   · **测试**：要造出"哪里都没有 Node"这个前提，就不能让这台机器上真实存在的
+///     安装位置参与查找；
+///   · **排障**：用户把 Node 装在非常规前缀下（企业环境、便携部署），自动查找
+///     注定找不到，而给一个"这些目录也找一遍"的入口比让他手工选文件省事。
+///
+/// 它**替换**而不是追加：追加会让测试无法把列表清空，而那正是这里最需要的语义。
+fn platform_base_dirs() -> Vec<PathBuf> {
+    if let Ok(override_value) = std::env::var("MODULITH_NODE_SEARCH_BASES") {
+        return std::env::split_paths(&override_value).collect();
+    }
+
+    #[cfg(windows)]
+    {
+        return ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA"]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
 }
 
 fn node_file_name() -> &'static str {
@@ -796,11 +985,24 @@ fn host_script_path() -> Result<PathBuf, String> {
 mod live_tests {
     use super::*;
 
-    /// 改动进程级环境变量（`MODULITH_NODE` / `MODULITH_BACKGROUND_HOST`）会与
-    /// 其它测试互相影响，因此这一组测试串行执行。
+    /// 改动进程级环境变量（`MODULITH_NODE` / `MODULITH_BACKGROUND_HOST` / `PATH`）
+    /// 会与其它测试互相影响，因此这一组测试串行执行。
     ///
     /// 用一把测试专用的锁而不是假设 `--test-threads=1`：那个参数是**调用方**的
     /// 选择，而一条依赖调用方参数的测试会在别人机器上随机失败。
+    ///
+    /// 取锁用 `unwrap_or_else(PoisonError::into_inner)` 而不是 `unwrap()`：
+    /// 一个测试 panic 之后这把锁会被标记为"中毒"，而 `unwrap()` 会让**所有**
+    /// 后续测试都以 `PoisonError` 失败 —— 那会把一次真实的失败放大成一片虚假的
+    /// 失败，真正的原因被埋起来。本项目刚经历过一次：一条断言失败导致另外四条
+    /// 报 `PoisonError`，看起来像四处都坏了。
+    ///
+    /// 中毒对这里的测试是安全的：它们之间没有靠这把锁保护的**数据**，
+    /// 只是需要互斥。
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// 找一个可用的 Node。找不到就跳过整组测试。
@@ -851,6 +1053,146 @@ mod live_tests {
             .join("background-host.mjs")
     }
 
+    /// 环境变量的**原值快照**，用于测试结束后还原。
+    ///
+    /// 这批测试会改动 `MODULITH_NODE` 与 `PATH`，而它们对同进程里的其它测试是
+    /// 可见的。用一个守卫而不是在每个测试末尾手写还原：漏掉一次就会污染后面
+    /// 任意一条测试，而那种失败与被测代码毫无关系。
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var(key).ok()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // 查找计划（纯函数，不需要真实文件）
+    // ============================================================
+
+    /// **用户在设置里指的路径优先级最高。**
+    ///
+    /// 这条最重要：用户显式指过的东西不该被任何自动探测覆盖。若顺序反了，
+    /// 用户会在设置里选好一个 Node、保存、然后发现我们仍然在用另一个 ——
+    /// 而那看起来就是"设置没生效"。
+    #[test]
+    fn a_user_configured_path_outranks_everything() {
+        let plan = plan_node_search(
+            Some(r"C:\my\node.exe"),
+            Some(r"C:\env\node.exe"),
+            Some(std::path::Path::new(r"C:\app")),
+            Some(r"C:\path\dir"),
+            // 空的平台目录列表：测试要能**确定**候选里没有别的来源，
+            // 否则一条"优先级"断言会被机器上真实存在的 node 干扰。
+            Vec::new(),
+        );
+
+        assert_eq!(plan.files[0], PathBuf::from(r"C:\my\node.exe"));
+        assert_eq!(plan.files[1], PathBuf::from(r"C:\env\node.exe"));
+    }
+
+    /// 空白配置等于"没有配置"，不能变成一条指向空路径的候选。
+    ///
+    /// 一个 `PathBuf::from("")` 会让 `is_file()` 去查当前目录，而那是**当前
+    /// 工作目录** —— 取决于用户从哪里启动应用。这种依赖是不可接受的。
+    #[test]
+    fn blank_configuration_is_treated_as_absent() {
+        let plan = plan_node_search(
+            Some("   "),
+            Some(""),
+            Some(std::path::Path::new(r"C:\app")),
+            None,
+            Vec::new(),
+        );
+
+        assert!(
+            !plan.files.iter().any(|path| path.as_os_str().is_empty()),
+            "空配置不该产生一条空路径候选：{:?}",
+            plan.files
+        );
+        assert_eq!(
+            plan.files[0],
+            PathBuf::from(r"C:\app").join("runtime").join(node_file_name()),
+            "去掉空配置之后，第一条应当是随包分发的那一份"
+        );
+    }
+
+    /// 随包分发的那一份要在"常见安装位置"之前。
+    ///
+    /// 理由不只是优先级：我们分发的那份版本与协议是自己定的，而用户机器上那份
+    /// 不受我们控制。能用随包的那份，就不该用系统的。
+    #[test]
+    fn the_bundled_runtime_outranks_a_system_install() {
+        let plan = plan_node_search(
+            None,
+            None,
+            Some(std::path::Path::new(r"C:\app")),
+            Some(r"C:\somewhere"),
+            Vec::new(),
+        );
+
+        let bundled = PathBuf::from(r"C:\app").join("runtime").join(node_file_name());
+        let bundled_index = plan
+            .files
+            .iter()
+            .position(|path| *path == bundled)
+            .expect("随包分发的那一份应当在候选里");
+
+        // 后面那些是常见安装位置。它们都该排在 bundled 之后。
+        for later in &plan.files[bundled_index + 1..] {
+            assert_ne!(*later, bundled);
+        }
+        assert_eq!(bundled_index, 0, "没有其它配置时它应当排第一");
+    }
+
+    /// PATH 目录被单独收集，而不是混进候选文件列表。
+    ///
+    /// 分开的理由是两者的判据不同：前者是"某个目录下有没有这个文件"，
+    /// 后者是"这个文件存不存在"。混在一起会让 PATH 的每一项都被当成一个文件路径。
+    #[test]
+    fn path_directories_are_collected_separately() {
+        let plan = plan_node_search(
+            None,
+            None,
+            None,
+            Some(r"C:\a;C:\b"),
+            Vec::new(),
+        );
+
+        assert_eq!(plan.path_dirs.len(), 2);
+        assert_eq!(plan.executable_name, node_file_name());
+        assert!(
+            !plan.files.iter().any(|path| path.parent() == Some(std::path::Path::new(r"C:\a"))),
+            "PATH 目录不该出现在候选文件列表里"
+        );
+    }
+
+    /// 没有任何输入时计划仍然是一个合法的空计划，而不是 panic。
+    #[test]
+    fn an_empty_environment_yields_an_empty_plan() {
+        let plan = plan_node_search(None, None, None, None, Vec::new());
+        assert!(plan.path_dirs.is_empty());
+        assert_eq!(plan.executable_name, node_file_name());
+    }
+
     /// **正向证据：真的拉起 Node、真的走完一次请求-响应。**
     ///
     /// 协议本身（编码、校验、畸形响应拒绝）由 `protocol` 的单元测试守着，
@@ -862,7 +1204,7 @@ mod live_tests {
     /// 只有真的有一个子进程在对面时才会被执行。
     #[test]
     fn a_real_node_host_answers_a_ping() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
 
         let Some(node) = find_node() else {
             // 环境里没有 Node：跳过而不是失败。理由见 `find_node` 的说明。
@@ -917,30 +1259,31 @@ mod live_tests {
     ///
     /// 这条路径在真实用户机器上会发生（打包遗漏、杀毒软件隔离）。
     /// 界面上要显示的是"为什么不可用"，而不是一个异常。
+    ///
+    /// **这条测试必须显式清掉 PATH。** 加了"PATH 自动查找"之后，一个只是
+    /// `MODULITH_NODE` 指向坏路径的环境仍然会在 PATH 上找到真的 node ——
+    /// 于是这条测试会以"居然成功了"失败。那不是实现坏了，是测试没有把
+    /// "什么都不存在"这个前提造出来。**环境类测试要显式造出它的前提**，
+    /// 不能依赖跑测试的那台机器恰好没有 Node。
     #[test]
     fn a_missing_runtime_yields_a_readable_reason() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
+        let _env = EnvGuard::capture(&[
+            "MODULITH_NODE",
+            "MODULITH_BACKGROUND_HOST",
+            "PATH",
+            "MODULITH_NODE_SEARCH_BASES",
+        ]);
 
-        let saved_node = std::env::var("MODULITH_NODE").ok();
-        let saved_host = std::env::var("MODULITH_BACKGROUND_HOST").ok();
-
-        // 指向一个不存在的文件：这条路径必须给出具体路径，
-        // 而不是一句笼统的"找不到运行时"。
+        // 把"哪里都没有"这件事造出来：一个坏路径 + 没有 PATH + 没有常见安装位置。
         std::env::set_var("MODULITH_NODE", r"C:\definitely\not\here\node.exe");
+        std::env::remove_var("PATH");
+        // 空值会让 `split_paths` 得到一个空列表 —— 也就是"这几个常见位置也不查"。
+        std::env::set_var("MODULITH_NODE_SEARCH_BASES", "");
 
         let host = BackgroundHost::new();
         let reason = host.probe_node().expect_err("不存在的路径必须失败");
         let status = host.describe();
-
-        // 还原环境，别影响其它测试
-        match saved_node {
-            Some(value) => std::env::set_var("MODULITH_NODE", value),
-            None => std::env::remove_var("MODULITH_NODE"),
-        }
-        match saved_host {
-            Some(value) => std::env::set_var("MODULITH_BACKGROUND_HOST", value),
-            None => std::env::remove_var("MODULITH_BACKGROUND_HOST"),
-        }
 
         assert!(
             reason.contains(r"C:\definitely\not\here\node.exe"),
@@ -954,23 +1297,91 @@ mod live_tests {
         );
     }
 
+    /// 设置里指定的路径**优先级最高**，即使环境变量指向别处。
+    ///
+    /// 这条防的是"用户设了路径、但环境变量把它的效果盖掉" —— 那看起来就是
+    /// 设置没生效，而用户已经明确指过他要哪一个。
+    #[test]
+    fn a_configured_path_wins_over_the_environment_variable() {
+        let _guard = lock_env();
+        let _env = EnvGuard::capture(&["MODULITH_NODE"]);
+
+        let Some(node) = find_node() else {
+            eprintln!("跳过：环境里没有可用的 Node 运行时");
+            return;
+        };
+
+        // 环境变量指向一个坏路径，设置指向真的那个
+        std::env::set_var("MODULITH_NODE", r"C:\definitely\not\here\node.exe");
+
+        let host = BackgroundHost::new();
+        host.set_configured_node(&node.display().to_string());
+
+        let resolved = host.probe_node().expect("设置里的路径应当被采用");
+        assert_eq!(
+            resolved, node,
+            "设置里指定的路径必须优先于环境变量"
+        );
+    }
+
+    /// **`PATH` 也确实会被查找**（这是用户报告的那个缺陷的直接回归测试）。
+    ///
+    /// 现象：在 cmd 里 `node --version` 有版本，应用里却说"未找到 Node 运行时"。
+    /// 原因是 cmd 会走 PATH 而当时的实现没有查 PATH。
+    ///
+    /// 造前提的方式：把 `MODULITH_NODE` 指向坏路径、**没有**随包分发的 runtime、
+    /// 然后把 PATH 设成"只含真实 Node 所在的那个目录"。若实现不查 PATH，
+    /// 这条会以"找不到"失败。
+    #[test]
+    fn a_node_on_the_path_is_found() {
+        let _guard = lock_env();
+        let _env = EnvGuard::capture(&[
+            "MODULITH_NODE",
+            "PATH",
+            "MODULITH_NODE_SEARCH_BASES",
+        ]);
+
+        let Some(node) = find_node() else {
+            eprintln!("跳过：环境里没有可用的 Node 运行时");
+            return;
+        };
+
+        let dir = node.parent().expect("Node 应当在一个目录里");
+
+        std::env::set_var("MODULITH_NODE", r"C:\definitely\not\here\node.exe");
+        // **把"常见安装位置"清空**，这样"找到"只可能来自 PATH 查找。
+        //
+        // 少了这一步，这台机器上 `C:\Program Files\nodejs\node.exe` 会先被
+        // 第 4 类命中，于是这条测试**即使 PATH 查找整个被删掉也照样通过** ——
+        // 那就成了一条对着坏代码也通过的测试（本项目已经有过两例）。
+        std::env::set_var("MODULITH_NODE_SEARCH_BASES", "");
+        // PATH 里只有那一个目录。
+        std::env::set_var("PATH", dir.to_string_lossy().to_string());
+
+        let host = BackgroundHost::new();
+        let resolved = host
+            .probe_node()
+            .expect("PATH 上的 Node 应当被找到（这正是用户报告的那个缺陷）");
+
+        assert_eq!(
+            resolved, node,
+            "解析结果应当就是 PATH 上那一个 —— 若它落在了别处，说明查找没有真的走 PATH"
+        );
+    }
+
     /// 没启动子进程时，状态查询不能有副作用。
     ///
     /// 用户打开设置页看一眼，不该因此拉起一个 Node 进程。
     #[test]
     fn describing_status_does_not_start_the_process() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
+        let _env = EnvGuard::capture(&["MODULITH_NODE", "PATH"]);
 
-        let saved = std::env::var("MODULITH_NODE").ok();
         std::env::set_var("MODULITH_NODE", r"C:\definitely\not\here\node.exe");
+        std::env::remove_var("PATH");
 
         let host = BackgroundHost::new();
         let status = host.describe();
-
-        match saved {
-            Some(value) => std::env::set_var("MODULITH_NODE", value),
-            None => std::env::remove_var("MODULITH_NODE"),
-        }
 
         assert!(!status.running, "状态查询不该启动子进程");
         assert_eq!(status.requests, 0, "没有发过请求就不该有请求计数");
@@ -991,7 +1402,7 @@ mod live_tests {
     /// 那一段完全不经过 Rust 的读循环，而读循环正是最容易把事件丢掉的地方。
     #[test]
     fn a_scheduled_reminder_really_fires_back_into_the_host() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
 
         let Some(node) = find_node() else {
             eprintln!("跳过：环境里没有可用的 Node 运行时");

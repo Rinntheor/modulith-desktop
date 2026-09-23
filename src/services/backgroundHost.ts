@@ -72,3 +72,39 @@ export async function probeBackgroundHost(): Promise<BackgroundCallOutcome> {
 export async function shutdownBackgroundHost(): Promise<BackgroundStatus> {
   return invoke<BackgroundStatus>('background_host_shutdown');
 }
+
+/** Node 运行时探测的结果 */
+export interface NodeDetection {
+  /** 是否找到了一个可用的 Node */
+  found: boolean;
+  /** 找到时的可执行文件路径 */
+  path: string | null;
+  /** 没找到时的具体原因 */
+  reason: string | null;
+  /** 当前设置里手工指定的路径（没有则为 null） */
+  configuredPath: string | null;
+}
+
+/**
+ * 自动查找 Node 运行时。
+ *
+ * **不写设置** —— 查出结果由用户决定要不要采用。一个"点一下就悄悄改掉配置"的
+ * 按钮会让用户不知道自己的设置被动过。
+ *
+ * 它会按这条顺序找：设置里手工指定的路径 → 环境变量 `MODULITH_NODE` →
+ * 应用目录下的 `runtime/node.exe` → 常见安装位置 → 系统 PATH。
+ */
+export async function detectNodeRuntime(): Promise<NodeDetection> {
+  return invoke<NodeDetection>('detect_node_runtime');
+}
+
+/**
+ * 手工指定 Node 可执行文件的路径；传空字符串表示恢复自动探测。
+ *
+ * **后端会真的拉起一次后台宿主来验证**：只检查文件存在是不够的（用户可能选到
+ * 别的同名文件，或一个缺 DLL 的残包）。验证失败时后端会回滚设置并把原因带回来
+ * —— 界面因此可以直接显示"这个 Node 跑不起来，为什么"。
+ */
+export async function setNodeRuntimePath(path: string): Promise<BackgroundCallOutcome> {
+  return invoke<BackgroundCallOutcome>('set_node_runtime_path', { path });
+}

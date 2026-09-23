@@ -72,6 +72,14 @@ impl Module for DesktopModule {
             state.0.set_event_handler(std::sync::Arc::new(move |event| {
                 events::handle(&handle, &event);
             }));
+
+            // 把用户在设置里指定的 Node 路径交给后台宿主。
+            //
+            // 必须在**第一次拉起子进程之前**做（也就是这里），否则首次探测会用
+            // 自动查找的结果 —— 而用户明明已经指过一个路径。表现是"我设了路径，
+            // 第一次还是说找不到，重启之后才好"。
+            let configured = crate::modules::settings::settings::load(app).node_runtime_path;
+            state.0.set_configured_node(&configured);
         }
 
         // 定时提醒的定义存在应用侧，启动时读进内存。
