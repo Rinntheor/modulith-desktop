@@ -23,6 +23,8 @@ import { fileURLToPath } from 'node:url';
 
 import { isMotionReduced } from '../src/utils/motionPreference.ts';
 import { isGlassEnabled, NO_GLASS_CLASS } from '../src/utils/glassPreference.ts';
+import { levelForVisibility } from '../src/utils/memoryLevelPolicy.ts';
+import { shouldAutoTrim } from '../src/utils/memoryTrimPolicy.ts';
 
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -303,6 +305,186 @@ check(
   '后端默认值为 false（默认打开等于替所有用户做了这个取舍）'
 );
 check(rustSettings.includes('\\"performanceMode\\"'), '后端序列化用的键名是 camelCase');
+
+// ============================================================
+// 4. 内存目标等级的降级策略（前后端真值表必须一致）
+// ============================================================
+//
+// 这条策略有一条**刻意的镜像实现**：前端 `services/memoryLevel.ts` 与后端
+// `settings/memory_level.rs` 各有一份。允许重复的理由是前端需要在本地就知道
+// "目标等级是不是已经设过了"（避免每次 visible 事件都发一次 IPC），
+// 而那件事没法靠每次问后端来做。
+//
+// 但两份实现必须给出**同一个真值表**，否则会出现"前端以为设成 Low 了、
+// 后端按另一条规则设成 Normal"这类只表现为"省内存没生效"的分叉。
+// 这里把规则本身钉住，而不是钉住某一行代码的写法。
+console.log('\n内存目标等级的降级策略：');
+
+const memoryLevelTs = read('src/utils/memoryLevelPolicy.ts');
+const memoryLevelServiceTs = read('src/services/memoryLevel.ts');
+const memoryLevelRs = read('src-tauri/src/modules/settings/memory_level.rs');
+
+// 前端：直接跑那份镜像实现。
+check(
+  levelForVisibility(true) === 'low',
+  '前端：不可见 → low'
+);
+check(
+  levelForVisibility(false) === 'normal',
+  '前端：可见 → normal'
+);
+
+// 策略必须真的被服务用上：放进了纯模块却没人调用，等于没写。
+check(
+  /from '\.\.\/utils\/memoryLevelPolicy'/.test(memoryLevelServiceTs),
+  '前端服务用的是纯策略模块（而不是自己另写一份判断）'
+);
+
+// 后端：规则是一段极小的纯函数，用正则取出它的分支 —— 比"检查某文件包含某字符串"
+// 更接近"检查规则本身"，因为它同时要求两个分支都在。
+check(
+  /if hidden \{[\s\S]{0,80}?MemoryLevel::Low[\s\S]{0,80}?else[\s\S]{0,80}?MemoryLevel::Normal/.test(
+    memoryLevelRs
+  ) || /if hidden \{\s*MemoryLevel::Low\s*\} else \{\s*MemoryLevel::Normal\s*\}/.test(memoryLevelRs),
+  '后端：不可见 → Low，可见 → Normal（与前端同一真值表）'
+);
+
+// 「失焦不降级」是这条策略最重要的一条，也是最容易被顺手优化掉的一条。
+// 前端：策略函数的输入里不能出现焦点概念。
+check(
+  /export function levelForVisibility\(hidden: boolean\)/.test(memoryLevelTs),
+  '前端策略只接受「是否隐藏」一个输入（失焦不参与判定）'
+);
+// 后端：同样只接受一个布尔量。
+check(
+  /pub fn level_for_visibility\(hidden: bool\)/.test(memoryLevelRs),
+  '后端策略只接受「是否隐藏」一个输入（失焦不参与判定）'
+);
+// 事件策略里不允许出现降级：Rust 侧的窗口事件回调跑在事件循环上，
+// 在那里既不能 with_webview（会死锁）也不能查窗口状态（也会死锁）。
+check(
+  !/WindowEvent::Focused/.test(memoryLevelRs),
+  '后端没有基于窗口焦点事件做判定（那会在事件循环上死锁）'
+);
+
+// 三条命令必须都注册进生成的 lib.rs —— 生成器只扫 commands.rs，
+// 属性写在子模块里会被静默忽略（这条坑本文件已经踩过一次）。
+const libRs = read('src-tauri/src/lib.rs');
+for (const command of [
+  'memory_snapshot',
+  'apply_memory_level_for_visibility',
+  'set_webview_memory_level',
+  'webview_memory_level_supported',
+]) {
+  check(libRs.includes(`${command},`), `命令 ${command} 已注册进 lib.rs`);
+}
+
+// 策略必须挂在根上而不是某个组件里：解锁界面上也要生效，
+// 而且必须早于窗口第一次显示（否则启动期那次隐藏会被漏掉）。
+const mainTsx = read('src/main.tsx');
+check(
+  mainTsx.includes('installMemoryLevelPolicy()'),
+  '策略在 main.tsx 里安装（整个生命周期生效，且早于窗口首次显示）'
+);
+
+// ============================================================
+// 回收工作集
+// ============================================================
+//
+// 这一段与上面那段是**两件不同的事**，而它们最容易被混为一谈：
+//
+//   · 内存目标等级：让引擎自己丢缓存/换出内容，降低的是将来的分配；
+//   · 回收工作集：把本进程树当前驻留的页交还系统，降低的是**工作集**这个数字。
+//
+// 后者**完全不会**降低私有内存（Private Bytes），而任务管理器默认那一列正是它。
+// 因此这里要守住的最重要一条是：界面上必须把两个口径都显示出来 ——
+// 只显示私有内存会让这个功能看起来完全无效。
+console.log('\n回收工作集：');
+
+const memoryTrimServiceTs = read('src/services/memoryTrim.ts');
+const memoryTrimPolicyTs = read('src/utils/memoryTrimPolicy.ts');
+const memoryTrimRs = read('src-tauri/src/modules/settings/memory_trim.rs');
+const performanceSettingsTsx = read('src/components/Settings/PerformanceSettings.tsx');
+
+// 前端：直接跑那份镜像实现。
+check(shouldAutoTrim(true) === true, '前端：不可见 → 允许自动回收');
+check(
+  shouldAutoTrim(false) === false,
+  '前端：可见 → **绝不**自动回收（代价是恢复时缺页，会表现为卡顿）'
+);
+
+// 策略必须真的被服务用上：放进了纯模块却没人调用，等于没写。
+check(
+  /from '\.\.\/utils\/memoryTrimPolicy'/.test(memoryTrimServiceTs),
+  '前端服务用的是纯策略模块（而不是自己另写一份判断）'
+);
+
+// 后端策略：只接受一个布尔量，且两个分支都在
+check(
+  /pub fn should_trim_for_visibility\(hidden: bool\) -> bool/.test(memoryTrimRs) &&
+    /pub fn should_trim_for_visibility\(hidden: bool\) -> bool \{\s*hidden\s*\}/.test(memoryTrimRs),
+  '后端策略只接受「是否隐藏」一个输入，且可见时不回收'
+);
+
+// 策略文件里不能出现 IPC 或浏览器 API（它要能被门禁直接跑）
+check(
+  !/from '@tauri-apps|invoke\(|document\./.test(memoryTrimPolicyTs),
+  '纯策略模块不含 IPC 与浏览器 API（否则门禁跑不起来）'
+);
+
+// 关键取舍：回收降低的是工作集，不是私有内存。这条事实必须写在代码里，
+// 因为它是一个会被反复重新发现的惊讶点。
+check(
+  /完全不会[\s\S]{0,40}降低|不会\*\*降低/.test(memoryTrimRs) ||
+    /SetProcessWorkingSetSize[\s\S]{0,400}?不会/.test(memoryTrimRs),
+  '后端注明回收不影响私有内存（否则会被当成"没用"）'
+);
+
+// 返回值必须同时带前后两个口径，否则"到底降了没有"无法被验证
+check(
+  /before_working_set/.test(memoryTrimRs) &&
+    /after_working_set/.test(memoryTrimRs) &&
+    /before_private_bytes/.test(memoryTrimRs) &&
+    /after_private_bytes/.test(memoryTrimRs),
+  '回收结果同时给出回收前后的工作集与私有内存'
+);
+
+// 界面必须真的把两个口径都渲染出来
+check(
+  /trimOutcome\.beforeWorkingSet/.test(performanceSettingsTsx) &&
+    /trimOutcome\.afterWorkingSet/.test(performanceSettingsTsx),
+  '界面显示工作集的"回收前 → 回收后"'
+);
+check(
+  /trimOutcome\.beforePrivateBytes/.test(performanceSettingsTsx) &&
+    /trimOutcome\.afterPrivateBytes/.test(performanceSettingsTsx),
+  '界面也显示私有内存（并说明它不会下降）'
+);
+
+// 降幅可为负：不降反升是可能的，不能钳到 0（那会让"没有效果"看起来像"效果为零"）
+check(
+  /working_set_freed\(&self\) -> i64/.test(memoryTrimRs),
+  '降幅是**有符号**的（不降反升时如实返回负数，不钳到 0）'
+);
+
+// 自动回收必须是"一次状态迁移"，不是"一个状态"：
+// visibilitychange 在窗口拖动时会连续触发，每次都回收会反复触发缺页。
+check(
+  /enteredHidden/.test(memoryLevelServiceTs),
+  '自动回收只在「可见 → 不可见」的那一次做（不是每次 hidden 事件都做）'
+);
+
+// 回收必须有代价说明：没有它，用户会以为这是个没有代价的按钮
+check(
+  /缺页|页面文件读回来/.test(memoryTrimServiceTs) ||
+    /页面文件读回来/.test(performanceSettingsTsx),
+  '界面或服务说明了回收的代价（被换出的页要在下次访问时读回来）'
+);
+
+// 两条命令必须注册进生成的 lib.rs
+for (const command of ['trim_memory_now', 'trim_memory_supported']) {
+  check(libRs.includes(`${command},`), `命令 ${command} 已注册进 lib.rs`);
+}
 
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);

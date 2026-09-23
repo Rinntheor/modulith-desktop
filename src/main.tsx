@@ -7,6 +7,8 @@ import NetPromptLayer from './components/NetPromptLayer';
 import ThemeProvider from './components/ThemeProvider';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { installGlobalErrorHandlers } from './services/globalErrorHandlers';
+import { installMemoryLevelPolicy } from './services/memoryLevel';
+import { subscribeBackendNotificationEvents } from './services/notifications';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
@@ -36,6 +38,35 @@ installGlobalErrorHandlers();
  * 会让它一直占着音频设备，而绝大多数启动根本不会产生通知。
  */
 primeSound();
+
+/*
+ * 内存目标等级的策略要尽早装。
+ *
+ * 窗口被最小化、隐藏到托盘、切到后台时，WebView2 并不知道"现在没人看你"，
+ * 于是那几百 MB 一直挂着。这个监听把这些时刻翻译成"请降到 Low"。
+ *
+ * 挂在**这里**而不是某个组件里，有两个理由：
+ *   1. 它不是界面的行为，而是整个应用生命周期的一部分 —— 解锁界面上就该生效；
+ *   2. 它必须早于窗口第一次显示，否则启动期那一次隐藏会被漏掉。
+ *
+ * 策略本身（为什么只认可见性、为什么不认失焦）见该模块的文件头。
+ */
+installMemoryLevelPolicy();
+
+/*
+ * 订阅后端的"通知列表变了"事件。
+ *
+ * 在它之前，**后端产生一条通知时前端完全不知道** —— 前端只在自己调用通知命令
+ * 之后才刷新缓存。于是任何不是由界面发起的通知（后台宿主的定时提醒、启动阶段
+ * 的插件加载失败）都不会出现在通知中心里：它已经落盘、未读数也算上了，
+ * 但铃铛徽标不变、列表里也看不到。
+ *
+ * 装在最外层而不是某个组件里：通知中心可能还没挂载（启动阶段、解锁界面），
+ * 而徽标与浮层都要能看到新通知。
+ *
+ * 它是异步的，因此这里不 await —— 订阅失败只记一条警告，不该挡住启动。
+ */
+void subscribeBackendNotificationEvents();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

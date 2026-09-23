@@ -110,6 +110,60 @@ pub async fn reload_app_settings(
     Ok(loaded)
 }
 
+/// 本应用的进程内存快照（设置 → 性能）
+///
+/// 命令外壳放在这里而不是 `process_memory/mod.rs`，原因是**命令注册由脚本生成，
+/// 而生成器只扫描 `<模块>/commands.rs`** —— 写在子模块里的命令属性会被静默忽略，
+/// 直到运行期 `invoke` 报 "command not found" 才暴露。
+/// 实现与它的大量单元测试留在 `process_memory`，这里只做一个转发。
+///
+/// 注意：这段注释里**不能出现那个属性的字面写法**。生成器按文本统计属性出现次数
+/// 并与解析出的函数名对账（`extractCommandFunctions`），注释里的字面量会被计入，
+/// 于是它报"14 处属性但只有 13 个函数"。那条对账本身是对的 —— 它抓的就是
+/// "有属性没解析出函数"，只是它还分不清代码与注释。这里配合它，不写那个字面量。
+///
+/// 不返回 `Result`：采集失败（例如权限不足读不到某个进程）是**部分失败**，
+/// 由返回值里的 `unreadable` 字段如实回报。把它变成 `Err` 只会让整个面板
+/// 什么都不显示，而那正好是最需要看到数字的时候。
+#[tauri::command]
+pub fn memory_snapshot() -> crate::modules::settings::process_memory::MemorySnapshot {
+    crate::modules::settings::process_memory::snapshot()
+}
+
+/// 按文档可见性套用 WebView2 的内存目标等级（设置 → 性能的策略入口）
+///
+/// **由前端调用**：`with_webview` 会阻塞等待事件循环，因此它只能在事件循环之外的
+/// 线程上调用 —— 前端的一次 `invoke` 正好落在这里。Rust 侧的窗口事件回调与托盘
+/// 回调都跑在事件循环上，在那里调用会死锁（详见 `memory_level.rs` 文件头）。
+///
+/// 前端只报"我现在是不是看不见"，等级由后端推导；这样"隐藏到托盘"这个由 Rust
+/// 发起的动作也会因为 webview 同样收到 `visibilitychange` 而生效，不必两处各写一遍。
+#[tauri::command]
+pub fn apply_memory_level_for_visibility(
+    app: AppHandle,
+    hidden: bool,
+) -> Result<bool, String> {
+    crate::modules::settings::memory_level::apply_memory_level_for_visibility(app, hidden)
+}
+
+/// 手动设置内存目标等级（设置 → 性能的验证入口）
+#[tauri::command]
+pub fn set_webview_memory_level(
+    app: AppHandle,
+    level: crate::modules::settings::memory_level::MemoryLevel,
+) -> Result<bool, String> {
+    crate::modules::settings::memory_level::set_webview_memory_level(app, level)
+}
+
+/// 当前环境的 WebView2 是否支持内存目标等级
+///
+/// 不支持时必须如实告诉用户（界面显示"当前运行时不支持"），
+/// 而不是显示一个从未生效的开关。
+#[tauri::command]
+pub fn webview_memory_level_supported(app: AppHandle) -> bool {
+    crate::modules::settings::memory_level::webview_memory_level_supported(app)
+}
+
 /// 恢复默认设置并返回
 #[tauri::command]
 pub async fn reset_app_settings(
@@ -246,6 +300,33 @@ pub fn set_autostart_enabled(enabled: bool) -> Result<AutostartStatus, String> {
 #[tauri::command]
 pub fn was_started_by_autostart() -> bool {
     autostart::launched_by_autostart()
+}
+
+/// 回收本应用进程树的工作集，返回回收前后的两个内存口径。
+///
+/// ============================================================
+/// 为什么返回的是"前"与"后"两组数字，而不是一句"已完成"
+/// ============================================================
+///
+/// 因为"回收到底有没有用"必须是一个**可以被验证**的问题。只回报一句"已完成"
+/// 的按钮，用户按下之后无从判断它是真做了事还是只是弹了个提示。
+///
+/// 而这里必须把两个口径都给出来，理由见 `memory_trim.rs` 的文件头：
+/// **回收降低的是工作集，不是私有内存**。只显示私有内存会让这个功能看起来
+/// 完全无效；只显示工作集又会与任务管理器对不上。两个都给，用户才能自己确认。
+#[tauri::command]
+pub fn trim_memory_now() -> crate::modules::settings::memory_trim::TrimOutcome {
+    crate::modules::settings::memory_trim::trim_self_tree()
+}
+
+/// 当前平台是否支持回收工作集
+///
+/// 判据是"能不能真的回收一次"。它**只回收宿主进程自己那一个**
+/// （不会顺带把所有子进程换出去）—— 这条命令的调用方是界面首次展示时的能力探测，
+/// 在那里对整棵树动手是越权的副作用。
+#[tauri::command]
+pub fn trim_memory_supported() -> bool {
+    crate::modules::settings::memory_trim::is_supported()
 }
 
 #[cfg(test)]

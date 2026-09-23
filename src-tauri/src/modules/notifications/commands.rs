@@ -21,7 +21,30 @@ use super::store::{
     self, Notification, NotificationCategory, NotificationLevel, MAX_STORED_NOTIFICATIONS,
 };
 use std::sync::Mutex;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
+
+/// 通知列表发生变化时广播的事件名。
+///
+/// ============================================================
+/// 为什么需要它（这是"通知存在但界面不知道"的缺口）
+/// ============================================================
+///
+/// 在加入它之前，**后端产生一条通知时前端完全不知道**：前端只在
+/// "自己调用了某个通知命令"之后才刷新缓存。而那意味着任何**不是由界面发起**
+/// 的通知都不会出现在通知中心里 —— 后台宿主的定时提醒、启动阶段的插件加载失败
+/// 都属于这一类。
+///
+/// 具体表现（在它之前）：一条通知已经落盘、`get_notification_summary` 也会把它
+/// 算进未读数，但铃铛徽标不变、列表里也看不到 —— 直到用户碰巧触发了某次刷新。
+/// 这是"看起来接通了、实际从未通电"的又一例。
+///
+/// 之所以选择**广播事件**而不是让前端轮询：轮询要为一件大多数时候什么都不发生
+/// 的事情持续付出代价（IPC + 序列化整份列表），而事件只在真的变化时发一次。
+/// 这也与项目里其它跨进程通知（网络询问）的做法一致。
+///
+/// 事件名带 `modulith://` 前缀：它与模块名空间隔开，不会和插件或 Tauri 内置的
+/// 事件名撞上。
+pub const NOTIFICATIONS_CHANGED_EVENT: &str = "modulith://notifications-changed";
 
 /// 通知的全局状态（由 Tauri 托管）
 pub struct NotificationsState(pub Mutex<Vec<Notification>>);
@@ -117,6 +140,23 @@ pub fn summarize(list: &[Notification]) -> NotificationSummary {
 // 命令
 // ============================================================
 
+/// 广播"通知列表变了"。
+///
+/// 抽成一个函数而不是在每个命令里各写一遍 `emit`：漏掉任意一处都会让那一条路径
+/// 上的变化对界面不可见，而那种缺陷**只在特定操作之后**才显形（例如"标记已读
+/// 之后徽标不更新"），很难被联想到根因。
+///
+/// 广播失败只记日志、**不影响命令的返回值**：命令的职责是改数据并回报结果，
+/// 而"界面没收到通知"不该让它变成一个失败。界面下次自己调用时仍会拿到最新值。
+///
+/// `pub` 是给 `desktop::events` 用的：后台提醒到点时会直接改动这份状态，
+/// 而它必须走**同一条**广播路径 —— 各写一份 emit 迟早会漏掉一处。
+pub fn broadcast_changed(app: &AppHandle) {
+    if let Err(error) = app.emit(NOTIFICATIONS_CHANGED_EVENT, ()) {
+        log::debug!("广播通知变化事件失败（不影响数据本身）：{error}");
+    }
+}
+
 /// 列出全部通知（新的在前）
 #[tauri::command]
 pub fn list_notifications(state: State<'_, NotificationsState>) -> Result<Vec<Notification>, String> {
@@ -127,6 +167,9 @@ pub fn list_notifications(state: State<'_, NotificationsState>) -> Result<Vec<No
 /// 推送一条通知
 ///
 /// `source` 用于按模块显示未读徽标；`dedupeKey` 相同且未读时合并为一条。
+///
+/// 写完广播事件 —— 这是**调用方不是界面**时（后台宿主、模块的后台任务）
+/// 界面能知道有新通知的唯一途径。
 #[tauri::command]
 pub fn push_notification(
     app: AppHandle,
@@ -142,10 +185,15 @@ pub fn push_notification(
         input.dedupe_key.as_deref(),
     )?;
 
-    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
-    store::insert(&mut list, incoming);
-    store::save(&app, &list)?;
-    Ok(list.clone())
+    let snapshot = {
+        let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
+        store::insert(&mut list, incoming);
+        store::save(&app, &list)?;
+        list.clone()
+    };
+
+    broadcast_changed(&app);
+    Ok(snapshot)
 }
 
 /// 标记单条已读
@@ -155,12 +203,17 @@ pub fn mark_notification_read(
     state: State<'_, NotificationsState>,
     id: String,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
-    mark_read(&mut list, &id);
-    // 未命中不报错：通知可能刚被「清空全部」删掉，这属于正常的竞态，
-    // 界面拿到最新列表即可。
-    store::save(&app, &list)?;
-    Ok(list.clone())
+    let snapshot = {
+        let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
+        mark_read(&mut list, &id);
+        // 未命中不报错：通知可能刚被「清空全部」删掉，这属于正常的竞态，
+        // 界面拿到最新列表即可。
+        store::save(&app, &list)?;
+        list.clone()
+    };
+
+    broadcast_changed(&app);
+    Ok(snapshot)
 }
 
 /// 标记全部已读
@@ -169,10 +222,15 @@ pub fn mark_all_notifications_read(
     app: AppHandle,
     state: State<'_, NotificationsState>,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
-    mark_all_read(&mut list);
-    store::save(&app, &list)?;
-    Ok(list.clone())
+    let snapshot = {
+        let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
+        mark_all_read(&mut list);
+        store::save(&app, &list)?;
+        list.clone()
+    };
+
+    broadcast_changed(&app);
+    Ok(snapshot)
 }
 
 /// 移除一条通知
@@ -182,10 +240,15 @@ pub fn dismiss_notification(
     state: State<'_, NotificationsState>,
     id: String,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
-    dismiss(&mut list, &id);
-    store::save(&app, &list)?;
-    Ok(list.clone())
+    let snapshot = {
+        let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
+        dismiss(&mut list, &id);
+        store::save(&app, &list)?;
+        list.clone()
+    };
+
+    broadcast_changed(&app);
+    Ok(snapshot)
 }
 
 /// 清空全部通知
@@ -194,9 +257,13 @@ pub fn clear_notifications(
     app: AppHandle,
     state: State<'_, NotificationsState>,
 ) -> Result<Vec<Notification>, String> {
-    let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
-    list.clear();
-    store::save(&app, &list)?;
+    {
+        let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
+        list.clear();
+        store::save(&app, &list)?;
+    }
+
+    broadcast_changed(&app);
     Ok(Vec::new())
 }
 

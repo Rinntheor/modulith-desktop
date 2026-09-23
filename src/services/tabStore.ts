@@ -34,6 +34,9 @@ import {
   saveAppSettings,
 } from './appSettings';
 import { releaseCachedModuleComponent } from './moduleComponentCache';
+import { moduleManager } from './moduleManager';
+import { selectEvictions } from './tabEvictionPolicy';
+import { pruneMountedTabs } from './tabMountedPolicy';
 import { showToast } from './toast';
 
 /**
@@ -101,6 +104,32 @@ let lastPersistedTabs: string[] = [];
 let lastPersistedActive: string | null = null;
 let lastPersistedSplitTabs: string[] = [];
 let lastPersistedSplitActive: string | null = null;
+
+/**
+ * 每个标签**最后一次被显示**的时刻。
+ *
+ * 用一个单调递增的计数而不是数组位置，理由见 `tabEvictionPolicy.ts`：
+ * "没有记录"必须是一个**显式的最低优先级**，而不是靠排序稳定性碰巧得到的结果。
+ *
+ * 只在内存里，不持久化 —— 它是"这次运行里用户看过什么"，重启后重新观察即可。
+ * 持久化反而有害：一份几天前的使用顺序会让下一次启动的淘汰选中错误的标签。
+ *
+ * 由 `setState` 在激活项变化时维护（见那里的说明），因此不需要每个切换路径
+ * 各自记得更新它。
+ */
+let lastSeen: Record<string, number> = {};
+
+/** `lastSeen` 的单调计数（每次有标签被显示就 +1） */
+let lastSeenClock = 0;
+
+/**
+ * 已经淘汰过多少次（本次运行内）。
+ *
+ * 存在的理由是**可观测性**：淘汰是静默的（用户只会发现某个标签不见了），
+ * 因此需要有一个数字能回答"到底淘不淘汰、淘了几次"。
+ * 设置 → 性能那一页会读它。
+ */
+let evictionCount = 0;
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -175,12 +204,14 @@ function dedupe(ids: readonly string[]): string[] {
  * `reconcile` / `resyncTabsFromSettings` / 以及分屏的移动）。逐条去维护必然漏，
  * 而漏掉的表现都是"界面与状态不一致"这类不报错的故障。
  *
- * 这里强制四件事：
+ * 这里强制五件事：
  *   1. 两组的标签各自去重；
  *   2. **同一个标签不能同时在两组**（分屏组优先，它代表用户更近的一次意图）；
  *   3. 每组的激活标签必须属于该组，否则回落到该组第一个（或 null）；
  *   4. 两组的激活标签都必须已挂载 —— `Home` 只渲染 `mountedTabs` 里的面板，
  *      「激活了但没挂载」表现为标签栏高亮着、内容区却空白（白屏）。
+ *   5. **挂载集合必须随关闭收缩** —— 关闭标签要真的卸载面板并释放它的组件缓存。
+ *      这一条曾经缺失，表现是"关掉的标签还在占内存"，而四类不变量看上去都成立。
  */
 function setState(next: TabState): void {
   let splitTabs = dedupe(next.splitTabs);
@@ -209,12 +240,20 @@ function setState(next: TabState): void {
     splitActive = splitTabs[0] ?? null;
   }
 
-  let mountedTabs = next.mountedTabs;
-  for (const id of [activeTab, splitActive]) {
-    if (id && !mountedTabs.includes(id)) {
-      mountedTabs = [...mountedTabs, id];
-    }
-  }
+  // 挂载集合先**收缩**再用激活标签补齐。
+  //
+  // 这里曾经只有「补齐」的一半：集合只增不减，于是**关闭标签不会卸载面板**
+  // （`Home` 继续渲染它，DOM 子树、React 树、模块内部的定时器与订阅全都活着），
+  // 而且下面那段缓存释放循环的判据 `!resolved.mountedTabs.includes(id)` 恒为 false，
+  // 让 `releaseCachedModuleComponent` 变成死代码。规则与它的完整论证见
+  // `tabMountedPolicy.ts` —— 抽出去是为了它能被脚本直接跑（这里进不了纯脚本 project）。
+  const mountedTabs = pruneMountedTabs(
+    next.mountedTabs,
+    openTabs,
+    splitTabs,
+    activeTab,
+    splitActive
+  );
 
   // 焦点组必须是一个**有内容的**组：指向空组会让"当前模块"变成 null，
   // 侧边栏高亮随之消失，而用户看到的是右边明明有内容。
@@ -240,14 +279,57 @@ function setState(next: TabState): void {
   // 不再挂载就没有对象了；不释放则缓存会随「曾经打开过的模块」一直长大。
   // 这里同步释放是安全的：释放之后 `resolved.mountedTabs` 已不含它，
   // React 随后那次渲染不会再渲染它的面板。
+  //
+  // 【这段曾经是死代码】判据成立的前提是 `mountedTabs` 会收缩，而它当时不会
+  // （见上面第 5 条不变量）。现在收缩规则在 `tabMountedPolicy.ts`，并由
+  // `pnpm check:memory` 直接跑它断言 —— 光看这里"有没有调用"是查不出问题的，
+  // 这正是它当初藏住的原因。
   for (const moduleId of state.mountedTabs) {
     if (!resolved.mountedTabs.includes(moduleId)) {
       releaseCachedModuleComponent(moduleId);
     }
   }
 
+  // 最近使用记录：把这一轮的激活项打上"现在"的时刻，并清掉已经关掉的标签。
+  //
+  // 同样收在唯一写入点：激活项变化的路径有六七条（点标签、快捷键、分屏切组、
+  // 目录对账……），逐条维护必然漏，而漏掉的表现是"某个刚看过的标签被优先淘汰"。
+  lastSeen = updateRecency(lastSeen, resolved);
+
   state = resolved;
   notify();
+}
+
+/**
+ * 更新"最后一次被显示"的记录。
+ *
+ * 语义是"最近一次被**显示**"，不是"最近一次被打开"：用户开着 A 打字、切到 B
+ * 查资料、再切回 A 继续打 —— A 才是用户更在意的那一个，而它按"打开时间"会被
+ * 当成最旧的。只有"最近被显示"能表达"用户现在在看什么"。
+ *
+ * 已关闭的标签一并清掉：留着它们会让这份记录随"曾经打开过的标签"一直长大，
+ * 而它只在淘汰判定里用得到 —— 一个已关闭的标签永远不会是淘汰对象。
+ */
+function updateRecency(previous: Record<string, number>, resolved: TabState): Record<string, number> {
+  const live = new Set<string>([...resolved.openTabs, ...resolved.splitTabs]);
+
+  const next: Record<string, number> = {};
+  for (const [id, stamp] of Object.entries(previous)) {
+    if (live.has(id)) next[id] = stamp;
+  }
+
+  for (const id of [resolved.activeTab, resolved.splitActive]) {
+    if (!id || !live.has(id)) continue;
+    lastSeenClock += 1;
+    next[id] = lastSeenClock;
+  }
+
+  return next;
+}
+
+/** 本次运行内已经淘汰过多少个标签（供设置 → 性能展示） */
+export function getEvictionCount(): number {
+  return evictionCount;
 }
 
 /** 订阅标签变化 */
@@ -448,11 +530,20 @@ function canOpen(moduleId: string): boolean {
   return getCatalogFlatMap().has(moduleId);
 }
 
-/** 打开上限的统一提示（两组共用一个上限：每个标签都是一个常驻的模块实例） */
+/**
+ * 达到上限、且**没有可淘汰对象**时的提示。
+ *
+ * 这条提示的措辞在加入淘汰之后必须改：它此前写"不会自动帮你关掉"，
+ * 而那句话现在只在下述这一种情况下才成立 —— 其余情况下我们**会**淘汰。
+ * 让提示与真实行为相反，比没有提示更糟：用户会照着它去推断。
+ */
 function warnLimit(): void {
   showToast({
     title: '标签页已达上限',
-    body: `最多同时打开 ${MAX_OPEN_TABS} 个标签（含分屏那一组）。请先关闭一个再继续 —— 每个标签都会保留它的界面状态，因此不会自动帮你关掉。`,
+    body:
+      `最多同时打开 ${MAX_OPEN_TABS} 个标签（含分屏那一组）。` +
+      `当前打开的全部标签都受保护（正在显示、置顶或收藏），因此没有可以回收的。` +
+      `请先关闭一个，或取消某个标签的置顶/收藏。`,
     level: 'warning',
     durationMs: 6000,
   });
@@ -529,9 +620,22 @@ export function openTab(moduleId: string): OpenTabResult {
     return { ok: false, reason: 'missing' };
   }
 
+  // 达到上限时**先尝试淘汰**，而不是直接拒绝。
+  //
+  // 这条策略是在"保活"与"内存上限"之间的取舍：保活承诺"切走不卸载"，
+  // 但一个开了很久、早已没人看的标签，它的现场值不值那份内存？
+  // 用户已明确同意这个方向：**只淘汰最久未显示且非用户固定的标签**。
+  //
+  // 三条不可退让的界线（都收在 `tabEvictionPolicy.ts` 里）：
+  //   1. 正在显示的两个标签永不淘汰 —— 那是当着用户的面关界面；
+  //   2. 置顶与收藏的标签受保护 —— 它们表达的是"我常用的"；
+  //   3. 没有任何可淘汰对象时**如实拒绝**并说明原因，而不是硬挤一个进去。
   if (totalTabs(state) >= MAX_OPEN_TABS) {
-    warnLimit();
-    return { ok: false, reason: 'limit' };
+    const evicted = evictToMakeRoom(1);
+    if (evicted === 0) {
+      warnLimit();
+      return { ok: false, reason: 'limit' };
+    }
   }
 
   const target: TabGroupId =
@@ -539,6 +643,64 @@ export function openTab(moduleId: string): OpenTabResult {
 
   addTabToGroup(target, moduleId);
   return { ok: true };
+}
+
+/**
+ * 腾出 `needed` 个标签位置，返回**实际腾出的数量**。
+ *
+ * 返回 0 表示没有可淘汰的对象（全部受保护，或除了正在显示的之外都还没挂载过）。
+ * 调用方据此决定"如实拒绝"还是"继续"。
+ *
+ * 为什么在这里一次性算出全部淘汰对象、再一次性关闭，而不是循环调用 `closeTab`：
+ * `closeTab` 有自己的兜底逻辑（"第一组不能空着"会从第二组搬一个过来），
+ * 在循环里连续触发会让淘汰的落点变得难以预测。一次性构造出最终状态则明确得多。
+ */
+function evictToMakeRoom(needed: number): number {
+  const victims = selectEvictions({
+    openTabs: state.openTabs,
+    splitTabs: state.splitTabs,
+    activeTab: state.activeTab,
+    splitActive: state.splitActive,
+    mountedTabs: state.mountedTabs,
+    lastSeen,
+    pinnedIds: moduleManager.getPinnedModules(),
+    favoriteIds: moduleManager.getFavoriteIds(),
+    needed,
+  });
+
+  if (victims.length === 0) return 0;
+
+  const doomed = new Set(victims);
+  const openTabs = state.openTabs.filter((id) => !doomed.has(id));
+  const splitTabs = state.splitTabs.filter((id) => !doomed.has(id));
+
+  // 淘汰之后的激活项一律回落到该组第一个 —— 淘汰永远不会选中激活项
+  // （见 `selectEvictions`），因此这里只是把类型收窄，不会真的发生切换。
+  setState({
+    ...state,
+    openTabs,
+    splitTabs,
+    activeTab: openTabs.includes(state.activeTab ?? '') ? state.activeTab : openTabs[0] ?? null,
+    splitActive: splitTabs.includes(state.splitActive ?? '')
+      ? state.splitActive
+      : splitTabs[0] ?? null,
+  });
+
+  evictionCount += victims.length;
+
+  // **如实告知**：淘汰是静默的，用户只会发现某个标签不见了。
+  // 不提示的话，这看起来像是"标签自己消失了"——那是故障的观感，而不是策略。
+  showToast({
+    title: `已回收 ${victims.length} 个长时间未使用的标签`,
+    body:
+      `同时打开的标签上限是 ${MAX_OPEN_TABS} 个，每个都会保留它的界面状态，` +
+      `因此长时间没看过的标签会被回收。置顶与收藏的模块不会被回收；` +
+      `被回收的标签重新打开时会是一个新的界面。`,
+    level: 'info',
+    durationMs: 6000,
+  });
+
+  return victims.length;
 }
 
 // ============================================================
@@ -819,6 +981,9 @@ export function closeTabsToTheRight(moduleId: string): void {
  */
 export function closeAllTabs(): void {
   if (totalTabs(state) === 0) return;
+  // 全部关掉时最近使用记录也归零：留着它只会积一堆已经不存在的标签，
+  // 而那些数据在淘汰判定里只会被清掉 —— 不如现在就清。
+  lastSeen = {};
   setState({ ...EMPTY_STATE });
   schedulePersist();
 }

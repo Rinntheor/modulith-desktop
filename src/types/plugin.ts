@@ -493,7 +493,36 @@ export interface PluginStorage {
   set<T>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<void>;
   clear(): Promise<void>;
+  /**
+   * 全部键，一次返回。
+   *
+   * **数据量大时请用 `list()`。** 单个插件的键数上限是 2000（后端配额），
+   * 因此这条调用最坏会返回 2000 个键 —— 每次界面打开都走一遍是不必要的。
+   */
   keys(): Promise<string[]>;
+  /**
+   * 分页枚举键（带前缀过滤与游标）。
+   *
+   * `nextCursor` 为空表示已经到底；游标不透明，原样回传即可。
+   * 游标与 `prefix` 不一致时后端会报错，而不是给一份缺数据的结果。
+   */
+  list(options?: {
+    prefix?: string;
+    cursor?: string | null;
+    pageSize?: number;
+  }): Promise<{
+    keys: string[];
+    nextCursor: string | null;
+    usage: { totalBytes: number; keyCount: number };
+  }>;
+  /** 当前存储用量（字节数与键数） */
+  usage(): Promise<{ totalBytes: number; keyCount: number }>;
+  /**
+   * 读出全部键值。
+   *
+   * **上限 500 个键**，超过时抛错而不是静默截断 ——
+   * 静默截断会让插件拿到一份"看起来正常但缺了很多条"的数据。
+   */
   all(): Promise<Record<string, any>>;
 }
 

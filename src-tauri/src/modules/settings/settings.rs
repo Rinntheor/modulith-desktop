@@ -289,6 +289,45 @@ pub struct AppSettings {
     /// 最小宽度是多少）是渲染层的事，在这里复制一份布局判断只会漂移。
     #[serde(default = "default_split_ratio")]
     pub split_ratio: f32,
+    /// 点击窗口关闭按钮时的行为
+    ///
+    /// `true`（默认）= 隐藏到托盘，应用继续在后台运行；`false` = 直接退出。
+    ///
+    /// **默认 `true`，与"关闭即退出"的朴素预期相反。** 理由是应用接下来要有
+    /// 在窗口之外继续工作的能力（后台插件、桌面通知）：若关闭等于退出，
+    /// 那些能力会在用户点一下关闭时被静默取消，而用户不会意识到自己关掉了什么。
+    ///
+    /// 反过来，默认隐藏到一个**用户看得见、点得开**的托盘图标上，代价是多一个图标，
+    /// 收益是"我以为它还在跑，它真的还在跑"。而这一项用户随时可以改回直接退出
+    /// （设置页与托盘右键菜单改的是同一个字段）。
+    ///
+    /// 唯一会让默认值变得危险的情况是**托盘装不上**：那时隐藏到一个不存在的托盘
+    /// 会让窗口永久消失。因此 `DesktopModule::setup` 在托盘安装失败时会把它回落成
+    /// `false` 并写回设置 —— 这里不重复那条判断，因为"托盘是否可用"只有那一处知道。
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
+
+    /// 用户手工指定的 Node 运行时路径（可执行文件）。
+    ///
+    /// ============================================================
+    /// 为什么需要这个字段（而不是只靠环境变量）
+    /// ============================================================
+    ///
+    /// 后台宿主要跑在一个 Node 进程里，而 Node **不是**应用的依赖 —— 它是用户
+    /// 机器上可能有、也可能没有的东西。此前只有两条发现路径：环境变量
+    /// `MODULITH_NODE`，以及 exe 旁边的 `runtime/node.exe`。
+    ///
+    /// 这两条对普通用户都不友好：改环境变量要懂系统设置、要重启应用，而
+    /// "把文件放到安装目录"要先知道安装目录在哪。结果是后台功能明明可用
+    /// （用户的 PATH 上就有 node），界面上却只说"未找到 Node 运行时"。
+    ///
+    /// 因此加一条**在界面里选一次就记住**的路径。它的优先级最高 —— 用户显式
+    /// 指过的东西不该被任何自动探测覆盖。
+    ///
+    /// 空字符串表示"没有手工指定"（用 `Option` 会让 JSON 里多一种形态，
+    /// 而这里"没有"与"空"是同一件事）。
+    #[serde(default)]
+    pub node_runtime_path: String,
 }
 
 /// 同时打开的标签页数量上限
@@ -321,6 +360,11 @@ fn default_defer_plugin_loading() -> bool {
 
 /// 标签栏默认可见。理由见 `tab_bar_visible` 字段上的说明。
 fn default_tab_bar_visible() -> bool {
+    true
+}
+
+/// 关闭窗口时默认隐藏到托盘。理由见 `close_to_tray` 字段上的说明。
+fn default_close_to_tray() -> bool {
     true
 }
 
@@ -519,6 +563,15 @@ impl Default for AppSettings {
             split_tabs: Vec::new(),
             split_active: None,
             split_ratio: default_split_ratio(),
+            // 与 `default_close_to_tray()` 保持一致 —— 理由同上面
+            // `restore_last_module` 那段：`impl Default` 与 serde 缺省值不一致时，
+            // 「全新安装」与「字段缺失的老文件」会得到相反的默认行为。
+            // `impl_default_matches_serde_defaults` 测试把两处钉在一起。
+            close_to_tray: default_close_to_tray(),
+            // 空 = 没有手工指定 Node 路径，走自动探测。
+            // 与 serde 的 `#[serde(default)]` 保持一致（空字符串），
+            // `impl_default_matches_serde_defaults` 测试把两处钉在一起。
+            node_runtime_path: String::new(),
         }
     }
 }
@@ -893,6 +946,10 @@ mod tests {
             DEFAULT_NOTIFICATION_SOUND_VOLUME
         );
         assert_eq!(defaults.notification_sound_custom_file, None);
+        // 关闭窗口默认隐藏到托盘：一旦应用有在窗口之外继续工作的能力，
+        // 「关闭即退出」会在用户点一下关闭时静默取消那些能力。
+        // 托盘装不上时由 `DesktopModule::setup` 强制回落成直接退出。
+        assert!(defaults.close_to_tray);
     }
 
     /// `impl Default` 与 serde 的缺省值必须逐字段一致。

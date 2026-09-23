@@ -13,6 +13,29 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss(),vitePluginGenerateModules()],
 
+  /*
+   * 多入口：主窗口 + 托盘菜单。
+   *
+   * 托盘菜单必须是**独立的 HTML 入口**，因为它显示在主窗口之外
+   * （主窗口可能已被隐藏到托盘），而且无边框、透明、始终置顶。
+   * 把它做成主窗口里的一段界面行不通：那要求主窗口一直在屏幕上，
+   * 而那与"关掉窗口就省内存"是矛盾的。
+   *
+   * 不写这一段时的表现很典型：开发模式下一切正常（Vite 按 URL 提供任意 HTML），
+   * 而**发布版**里托盘菜单窗口是空白的 —— 构建产物里只有 index.html。
+   * 那正是"只在发布版里坏掉"这一类问题。
+   *
+   * key 决定产物的路径（`tray-menu.html`），Tauri 的窗口 URL 按它去找。
+   */
+  build: {
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, 'index.html'),
+        'tray-menu': path.resolve(__dirname, 'tray-menu.html'),
+      },
+    },
+  },
+
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

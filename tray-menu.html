@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Modulith Desktop</title>
+
+    <!--
+      托盘菜单是一个**独立的 HTML 入口**，而不是主窗口里的一段界面。
+
+      原因：它要显示在主窗口**之外**（主窗口可能被隐藏到托盘，那时它根本不在
+      屏幕上），而且要无边框、透明、始终置顶。把这几件事做在一个独立窗口上，
+      比让主窗口去模拟一个"看起来在托盘旁边的浮层"要简单得多 ——
+      后者需要主窗口一直存在，而那与"关掉窗口省内存"是矛盾的。
+
+      这里同样做了首帧防跳色：托盘菜单每次弹出都是一个**新建/重新显示**的窗口，
+      如果等 React 挂载后再套主题，用户会看到"先白底再变深色"的一闪。
+      逻辑与 index.html 里的那份一致（只做底色 + accent 变量，不渲染界面）。
+    -->
+    <script>
+      (function () {
+        var root = document.documentElement;
+        var prefersDark = true;
+        try {
+          var theme = localStorage.getItem('modulith.theme');
+          prefersDark =
+            theme === 'dark' ||
+            (theme !== 'light' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          root.dataset.theme = theme || 'system';
+          root.dataset.resolvedTheme = prefersDark ? 'dark' : 'light';
+          if (prefersDark) root.classList.add('dark');
+        } catch (error) {
+          // localStorage 不可用时按深色处理（与 index.html 同样的取舍）
+          root.classList.add('dark');
+        }
+
+        /*
+         * accent 变量的预置。**必须与 src/services/accent.ts 的算法一致** ——
+         * 两处只依赖「主色 + HSL 明度表」，保持同步不难，但改一处要改两处。
+         * 这份是 index.html 里那段的最小副本：托盘菜单只用到 300/400/500/600
+         * 这几档，其余档位不写也不会被引用。
+         */
+        var ACCENT_BASES = {
+          indigo: ['#4f46e5', 0], violet: ['#7c3aed', 0], blue: ['#2563eb', 0],
+          cyan: ['#0891b2', 0], teal: ['#0d9488', 0], emerald: ['#059669', 0],
+          amber: ['#d97706', 0], orange: ['#ea580c', 0], rose: ['#e11d48', 0],
+          gray: ['#4b5563', 1]
+        };
+        var LIGHT_LEVELS = { '300': 0.76, '400': 0.64, '500': 0.55, '600': 0.45 };
+        var DARK_LEVELS = { '300': 0.82, '400': 0.72, '500': 0.62, '600': 0.52 };
+
+        try {
+          var accentId = localStorage.getItem('modulith.accent') || 'indigo';
+          var entry = ACCENT_BASES[accentId];
+          if (!entry) { return; }
+          var hex = entry[0], neutral = entry[1] === 1;
+          var r = parseInt(hex.slice(1, 3), 16) / 255;
+          var g = parseInt(hex.slice(3, 5), 16) / 255;
+          var b = parseInt(hex.slice(5, 7), 16) / 255;
+          var max = Math.max(r, g, b), min = Math.min(r, g, b);
+          var l = (max + min) / 2, d = max - min, h = 0, s = 0;
+          if (d !== 0) {
+            s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+            if (max === r) { h = ((g - b) / d + (g < b ? 6 : 0)) / 6; }
+            else if (max === g) { h = ((b - r) / d + 2) / 6; }
+            else { h = ((r - g) / d + 4) / 6; }
+            h *= 360;
+          }
+          if (neutral) { s = 0; }
+          var hsl = function (hh, ss, ll) {
+            return 'hsl(' + Math.round(hh * 100) / 100 + ' ' + Math.round(ss * 10000) / 100 + '% ' + Math.round(ll * 10000) / 100 + '%)';
+          };
+          var lv, dk;
+          for (lv in LIGHT_LEVELS) {
+            root.style.setProperty('--accent-' + lv, hsl(h, s, LIGHT_LEVELS[lv]));
+          }
+          for (dk in DARK_LEVELS) {
+            root.style.setProperty('--accent-' + dk, hsl(h, Math.min(1, s * 1.02), DARK_LEVELS[dk]));
+          }
+          root.dataset.accent = accentId;
+        } catch (error) {
+          // 配色预置失败由 CSS 的 :root 默认值兜住
+        }
+      })();
+    </script>
+
+    <style>
+      /*
+       * 透明底：圆角与投影由弹出面板自己画。
+       *
+       * 窗口如果是不透明的，圆角外面会带出一圈窗口底色 —— 那正是"自绘菜单"
+       * 最容易露馅的地方。因此背景必须是透明的，并且不要给 body 任何底色。
+       */
+      :root {
+        background: transparent;
+        color-scheme: dark light;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      /* 关掉拖拽选中与文本光标：这是一个菜单，不是文档 */
+      body {
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: default;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="tray-menu-root"></div>
+    <script type="module" src="/src/tray-menu/main.tsx"></script>
+  </body>
+</html>

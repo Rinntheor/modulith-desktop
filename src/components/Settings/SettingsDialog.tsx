@@ -29,6 +29,7 @@ import {
   Bell,
   Archive,
   Settings2,
+  Activity,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
@@ -36,12 +37,14 @@ import ModuleEmbed from '../ModuleEmbed';
 import LoggingSettings from './LoggingSettings';
 import NetworkSettings from './NetworkSettings';
 import NotificationSettings from './NotificationSettings';
+import PerformanceSettings from './PerformanceSettings';
 import BackupSettings from './BackupSettings';
 import SecuritySettings from './SecuritySettings';
 import PluginSettingsSection from './PluginSettingsSection';
 import Toggle from './Toggle';
 import UpdateChecker from './UpdateChecker';
 import { getCatalogModules } from '../../services/moduleCatalog';
+import { isTrayAvailable, setCloseToTray } from '../../services/desktopShell';
 import { getHostVersion, getInstalledPlugins } from '../../services/pluginRuntime';
 import { APP_INFO, APP_LINKS } from '../../config/appInfo';
 import { ACCENT_THEMES, getAccentTheme } from '../../config/accentTheme';
@@ -59,11 +62,43 @@ import {
 } from '../../services/appSettings';
 import { persistWindowStateNow, resyncTabsFromSettings } from '../../services/tabStore';
 
+/**
+ * 设置面板容器的类名。
+ *
+ * **抽成常量是为了它能被门禁检查**：这段类名决定了"面板是否会超出窗口"，
+ * 而那是一个真实发生过的问题。写成内联字符串时，检查脚本只能靠正则去猜
+ * 那一行长什么样；写成常量后，`check:settings-layout` 可以直接对它做几何断言。
+ *
+ * 约束（三条缺一不可）：
+ *   1. `w-full` —— 占满遮罩内容盒（= 视口宽 − 48px，见遮罩上的 `p-6`）；
+ *   2. 宽度上限是 `min(64rem, 100vw - 6rem)`。**两项都是必需的**：
+ *      · `64rem` 给出"大屏上不要无限宽"的舒适上限；
+ *      · `100vw - 6rem` 保证在任何窗口宽度下，面板两侧**至少各有 24px 空隙**
+ *        （遮罩内边距 24px + 上限再收 24px）。
+ *      只写 `max-w-5xl` 时，1024~1056 宽的窗口下那个上限不生效、`w-full` 顶满
+ *      内容盒，两侧只剩遮罩内边距 —— 用户看到的正是那个"贴边"。
+ *   3. `h-full max-h-[82vh]` —— 高度相对内容盒，且不超过视口的 82%。
+ *      此前写的是 `h-[82vh]`，那是**视口**高度而不是内容盒高度，
+ *      再叠加遮罩内边距就会顶到边界。
+ */
+export const SETTINGS_PANEL_CLASS =
+  'w-full max-w-[min(64rem,calc(100vw-6rem))] h-full max-h-[82vh] bg-gray-50 rounded-2xl shadow-2xl flex overflow-hidden';
+
+/**
+ * 左侧导航栏的类名。同样抽成常量，供门禁断言"它在窄窗口下会收窄"。
+ *
+ * 侧栏此前是固定的 `w-52`（208px）。窗口一窄，它就把内容区挤到放不下表单，
+ * 而侧栏自己并不需要那么宽。
+ */
+export const SETTINGS_NAV_CLASS =
+  'w-14 md:w-44 xl:w-52 shrink-0 bg-white border-r border-gray-200 flex flex-col';
+
 export type SettingsSectionId =
   | 'general'
   | 'notifications'
   | 'network'
   | 'logs'
+  | 'performance'
   | 'backup'
   | 'security'
   | 'plugins'
@@ -82,6 +117,7 @@ const SECTIONS: SectionDef[] = [
   { id: 'notifications', label: '通知', icon: Bell },
   { id: 'network', label: '网络', icon: Globe },
   { id: 'logs', label: '日志', icon: FileText },
+  { id: 'performance', label: '性能', icon: Activity },
   { id: 'backup', label: '备份', icon: Archive },
   { id: 'security', label: '安全', icon: ShieldCheck },
   { id: 'plugins', label: '插件', icon: Puzzle },
@@ -270,6 +306,20 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
    */
   const autostartEnabled = autostart?.enabled ?? false;
 
+  /**
+   * 系统托盘是否可用。
+   *
+   * 与 `autostart` 同理，**刻意不放进 `settings`**：它描述的是"这个环境有没有
+   * 托盘"，而那不是一份可以被保存的偏好。托盘装不上时后端会把「隐藏到托盘」
+   * 强制回落成「直接退出」，因此界面必须知道这件事 ——
+   * 否则它会显示一个"已开启"、但实际永远不会隐藏到任何地方的开关。
+   */
+  const [trayAvailable, setTrayAvailable] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    void isTrayAvailable().then(setTrayAvailable);
+  }, []);
+
   const refreshAutostart = useCallback(async () => {
     try {
       setAutostart(await invoke<AutostartStatus>('get_autostart_status'));
@@ -370,6 +420,33 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
   }, [dataDir]);
 
   /**
+   * 切换「关闭窗口时最小化到托盘」。
+   *
+   * 走两处是必要的，不是重复：
+   *   1. `update()` 把设置写进 settings.json —— 那是唯一的持久化路径；
+   *   2. `setCloseToTray()` 让**后端同步托盘右键菜单的勾选状态**。
+   *
+   * 少了第 2 步，用户会在设置页关掉它、再右键托盘发现它还勾着，而那个勾是错的
+   * （行为已经跟着设置变了）。两处改的是同一个字段，因此不存在"两份状态"。
+   *
+   * 必须定义在 `update` 之后：`const` 声明有暂时性死区，提前引用会在运行期抛错。
+   */
+  const toggleCloseToTray = useCallback(
+    async (next: boolean) => {
+      await update({ closeToTray: next });
+      try {
+        await setCloseToTray(next);
+      } catch (error) {
+        // 设置已经存下去了，失败的只是菜单勾选同步。
+        // 记一条警告即可 —— 真实行为已经跟着设置变了，用户看到的现象是
+        // "托盘菜单里的勾没跟上"，而不是"这个开关没用"。
+        console.warn('[Settings] 同步托盘菜单勾选状态失败:', error);
+      }
+    },
+    [update]
+  );
+
+  /**
    * 打开外部链接。
    *
    * 用系统浏览器而不是在 WebView 内导航：WebView 内导航会直接把应用本体
@@ -407,11 +484,20 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
       {open && (
         <>
           {/* 遮罩同时充当居中容器：面板用 flex 居中，宽高都相对遮罩「内容盒」
-              （= 视口宽 − 32px）计算，所以永远不会等于整窗宽度。
-              原来面板是 `w-full max-w-5xl`，max-w-5xl = 1024px 大于默认窗口宽度
-              1000px（见 tauri.conf.json），于是 w-full 生效、面板被撑满整窗——
-              非全屏时贴着两边，看起来就是横向拉伸；最大化后 1024px 上限才生效，
-              所以全屏反而正常。
+              （= 视口宽 − 32px）计算。
+
+              尺寸的写法经过一次修正，值得说明：
+
+              · 宽度：`w-full`（占满遮罩内容盒 = 视口宽 − 32px），上限取
+                `min(64rem, 100vw - 2rem)`。只写 `max-w-5xl`（1024px）时，
+                默认窗口宽度（1100px）下上限不生效，面板会占满 1068px ——
+                那不是「超出窗口」，但确实几乎贴满整窗。上限同时受视口约束，
+                两侧才会始终留出边距。
+              · 高度：`h-full max-h-[82vh]`。此前是 `h-[82vh]`，而 `82vh` 是
+                **视口高度**、不是遮罩内容盒的高度，再加上 `p-4` 的 32px，
+                矮窗口下面板会顶到遮罩边界。`h-full` 让高度相对内容盒、
+                `max-h-[82vh]` 给出舒适上限，两者取小 —— 面板永远不会超出。
+
               面板必须留在 AnimatePresence 的「直接子节点」位置上，否则退出动画会失效，
               因此不要在这里再套一层普通 div 做居中。 */}
           <motion.div
@@ -420,7 +506,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
             exit={{ opacity: 0 }}
             transition={{ duration: 0.15 }}
             onClick={onClose}
-            className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-[2px]"
+            className="fixed inset-0 z-60 flex items-center justify-center p-6 bg-gray-900/40 backdrop-blur-[2px]"
           >
           <motion.div
             onClick={(e) => e.stopPropagation()}
@@ -428,28 +514,42 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.98, y: 8 }}
             transition={{ type: 'spring', stiffness: 400, damping: 36 }}
-            className="w-full max-w-5xl max-h-full h-[82vh] bg-gray-50 rounded-2xl shadow-2xl flex overflow-hidden"
+            className={SETTINGS_PANEL_CLASS}
           >
-            {/* 左侧导航 */}
-            <aside className="w-52 shrink-0 bg-white border-r border-gray-200 flex flex-col">
-              <div className="px-5 py-4 border-b border-gray-100">
-                <h2 className="font-semibold text-gray-900">设置</h2>
-                <p className="text-[11px] text-gray-500 mt-0.5">Modulith Desktop v{getHostVersion()}</p>
+            {/* 左侧导航。
+
+                宽度在小窗口下收窄（`w-44 xl:w-52`），而在更窄时进一步压到 3.5rem
+                并只留图标 —— 侧栏是**固定的 208px**，窗口一窄它就把内容区挤到
+                放不下表单（12 个分页里最长的一行是「已挂载标签」那一组说明文字），
+                而侧栏自己并不需要那么宽。
+
+                导航本身可滚动（`overflow-y-auto`）：分页有 12 个，矮窗口下
+                它比内容区更早放不下。 */}
+            <aside className={SETTINGS_NAV_CLASS}>
+              <div className="px-3 md:px-5 py-4 border-b border-gray-100">
+                <h2 className="font-semibold text-gray-900 hidden md:block">设置</h2>
+                <p className="text-[11px] text-gray-500 mt-0.5 hidden md:block">
+                  Modulith Desktop v{getHostVersion()}
+                </p>
+                {/* 窄侧栏时用图标占位，避免那一栏空成一条竖线 */}
+                <Settings2 className="w-4 h-4 mx-auto text-gray-400 md:hidden" />
               </div>
 
-              <nav className="flex-1 p-2 space-y-0.5">
+              <nav className="flex-1 min-h-0 overflow-y-auto custom-scrollbar p-2 space-y-0.5">
                 {SECTIONS.map((s) => (
                   <button
                     key={s.id}
                     onClick={() => setSection(s.id)}
-                    className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm rounded-lg transition-colors ${
+                    title={s.label}
+                    aria-label={s.label}
+                    className={`w-full flex items-center justify-center md:justify-start gap-2.5 px-3 py-2 text-sm rounded-lg transition-colors ${
                       section === s.id
                         ? 'bg-indigo-50 text-indigo-700 font-medium'
                         : 'text-gray-600 hover:bg-gray-50'
                     }`}
                   >
                     <s.icon className="w-4 h-4 shrink-0" />
-                    {s.label}
+                    <span className="hidden md:inline truncate">{s.label}</span>
                   </button>
                 ))}
               </nav>
@@ -457,18 +557,19 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
               <div className="p-3 border-t border-gray-100">
                 <button
                   onClick={handleReset}
+                  title="恢复默认设置"
                   className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs text-gray-500 rounded-lg hover:bg-gray-50 hover:text-gray-700 transition-colors"
                 >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  恢复默认设置
+                  <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                  <span className="hidden md:inline">恢复默认设置</span>
                 </button>
               </div>
             </aside>
 
             {/* 右侧内容 */}
             <div className="flex-1 min-w-0 flex flex-col">
-              <div className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-gray-200 bg-white">
-                <h3 className="font-semibold text-gray-900">
+              <div className="shrink-0 flex items-center justify-between gap-3 px-4 lg:px-6 py-4 border-b border-gray-200 bg-white">
+                <h3 className="font-semibold text-gray-900 truncate">
                   {SECTIONS.find((s) => s.id === section)?.label}
                 </h3>
                 <button
@@ -486,7 +587,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: 'auto' }}
                     exit={{ opacity: 0, height: 0 }}
-                    className={`shrink-0 mx-6 mt-4 px-3 py-2 rounded-lg flex items-center gap-2 text-xs border ${
+                    className={`shrink-0 mx-4 lg:mx-6 mt-4 px-3 py-2 rounded-lg flex items-center gap-2 text-xs border ${
                       feedback.kind === 'error'
                         ? 'bg-red-50 border-red-200 text-red-700'
                         : 'bg-emerald-50 border-emerald-200 text-emerald-700'
@@ -502,9 +603,12 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 )}
               </AnimatePresence>
 
-              <div className="flex-1 overflow-y-auto custom-scrollbar">
+              {/* `overflow-x-hidden` 是刻意的：内容宽了应当**换行或收起**，
+                  而不是横向滚动条。设置页里横向滚动几乎不可用 ——
+                  用户看不到右边那一半，也不会想到去拖它。 */}
+              <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar">
                 {section === 'general' && (
-                  <div className="px-6 py-5">
+                  <div className="px-4 lg:px-6 py-5">
                     <Card title="外观">
                       <ThemePicker
                         value={settings.theme}
@@ -556,6 +660,38 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                         <p className="pb-4 -mt-1 text-[11px] text-gray-500 leading-relaxed">
                           性能模式已包含「关闭界面动画」与「毛玻璃效果」的效果，三者不需要同时打开。
                           代价是界面不再有毛玻璃层次与粒子背景 —— 看起来会更朴素。
+                        </p>
+                      )}
+                    </Card>
+
+                    <Card title="窗口与托盘">
+                      {/*
+                        托盘不可用时这一段必须**如实说明**，而不是显示一个假开关。
+                        后端在那条路径上已经把「隐藏到托盘」回落成「直接退出」，
+                        因此界面读到的值本来就是回落后的 —— 这里只负责解释原因。
+                      */}
+                      {trayAvailable === false ? (
+                        <p className="py-3 text-xs text-gray-500 leading-relaxed">
+                          当前环境没有可用的系统托盘，因此关闭窗口会直接退出应用。
+                          托盘在部分环境下装不上（例如没有桌面会话，或被系统策略禁用）——
+                          隐藏到一个不存在的托盘会让窗口再也叫不回来，所以这里不做那个选择。
+                        </p>
+                      ) : (
+                        <SettingRow
+                          title="关闭窗口时最小化到托盘"
+                          description="关闭后应用继续在后台运行，托盘图标可以随时把窗口叫回来。关掉它则关闭窗口即退出应用。托盘图标的右键菜单里也能改这一项"
+                        >
+                          <Toggle
+                            checked={settings.closeToTray}
+                            onChange={(next) => void toggleCloseToTray(next)}
+                          />
+                        </SettingRow>
+                      )}
+
+                      {trayAvailable !== false && (
+                        <p className="pb-4 text-[11px] text-gray-500 leading-relaxed">
+                          隐藏到托盘之后，退出应用要从托盘图标的右键菜单里选「退出」——
+                          单击托盘图标只是把窗口叫回来。
                         </p>
                       )}
                     </Card>
@@ -724,6 +860,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   <NotificationSettings settings={settings} onUpdate={update} />
                 )}
                 {section === 'logs' && <LoggingSettings settings={settings} onUpdate={update} />}
+                {section === 'performance' && <PerformanceSettings />}
                 {section === 'backup' && <BackupSettings />}
 
                 {section === 'security' && <SecuritySettings />}
@@ -737,7 +874,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 )}
 
                 {section === 'plugin-settings' && (
-                  <div className="px-6 py-5">
+                  <div className="px-4 lg:px-6 py-5">
                     {/* 内容是**清单声明**驱动渲染的，不执行任何插件代码 ——
                         这与上面那一格（插件管理页要读运行时状态）是两回事，
                         因此它是普通组件而不是 ModuleEmbed。 */}
@@ -754,7 +891,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 )}
 
                 {section === 'about' && (
-                  <div className="px-6 py-5">
+                  <div className="px-4 lg:px-6 py-5">
                     {/* 软件更新。放在身份卡之前：它是这一页唯一"可以操作"的东西，
                         其余部分都是只读信息。 */}
                     <UpdateChecker onOpenNetwork={() => setSection('network')} onOpenLogs={() => setSection('logs')} />

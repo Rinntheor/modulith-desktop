@@ -6,11 +6,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 
 use super::icon;
+use super::quota;
 use super::types::{
     ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio, PluginError, PluginManifest,
     PluginPermission, PluginResult, PluginStatus, RegistryEntry, RegistryFile,
@@ -19,6 +21,27 @@ use super::validator;
 use crate::modules::net::client::{NetClient, NetError, NetOrigin};
 use crate::modules::net::is_loopback_host;
 use crate::modules::settings::{network, settings as settings_store};
+
+/// 插件存储的用量。传回前端用于展示与调试 ——
+/// 一个"存了多少 / 上限多少"的数字，比一句"超出配额"有用得多。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageUsage {
+    pub total_bytes: u64,
+    pub key_count: usize,
+}
+
+/// 一页存储键。
+///
+/// `nextCursor` 为空表示**已经到底**。给一个"下一页是空的"游标会让调用方
+/// 多走一次没有结果的请求，而那看起来像卡住了。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePage {
+    pub keys: Vec<String>,
+    pub next_cursor: Option<String>,
+    pub usage: StorageUsage,
+}
 
 /// 单个插件包解压后的最大体积（64 MB）
 const MAX_PLUGIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -1234,12 +1257,41 @@ impl PluginManager {
 
     pub fn storage_set(&self, id: &str, key: &str, value: &str) -> PluginResult<()> {
         let path = self.storage_path(id, key)?;
+
         // 必须先是合法 JSON
         let parsed: serde_json::Value = serde_json::from_str(value)?;
+        // 保持与写盘时同一种序列化形式，配额才算得准 ——
+        // 用原始 `value` 的长度会与磁盘上的实际字节数不一致（pretty 会加缩进与换行），
+        // 于是"上限 1 MB"到底指哪一种就成了一个没人说得清的问题。
+        let serialized = serde_json::to_string_pretty(&parsed)?;
+
+        // 配额判定：**在写入之前**，因为它的目的就是不让那次写入发生。
+        let usage = self.storage_usage(id)?;
+        let existing = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+
+        if let Some(error) = quota::check_write(
+            usage.total_bytes,
+            usage.key_count,
+            existing,
+            serialized.len() as u64,
+            existing == 0,
+        ) {
+            // 记一条日志：配额拒绝是"插件在长"，而增长趋势往往比单次拒绝更有用。
+            log::warn!(
+                "插件 {} 的写入被配额拒绝（键 {}，已用 {} 字节 / {} 个键）：{:?}",
+                id,
+                key,
+                usage.total_bytes,
+                usage.key_count,
+                error.kind
+            );
+            return Err(error.into_error());
+        }
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(&parsed)?)?;
+        std::fs::write(path, serialized)?;
         Ok(())
     }
 
@@ -1269,6 +1321,113 @@ impl PluginManager {
             .collect();
         keys.sort();
         Ok(keys)
+    }
+
+    /// 列出该插件的全部键，**按前缀过滤**，返回一页。
+    ///
+    /// ============================================================
+    /// 为什么要有它 —— 这是一个规模问题，不是接口洁癖
+    /// ============================================================
+    ///
+    /// `storage_keys` 一次返回全部键，而它此前**没有任何上限**。插件的典型模式是
+    /// "一条记录一个键"，因此键数随使用时间线性增长：一个练了两年的插件会拿出
+    /// 几万个键，而每一次列表都是一次全量枚举 —— 前端调一次就吃掉几 MB。
+    ///
+    /// 配额（2000 个键）把最坏情况关进了笼子，但**枚举本身仍该是可分页的**：
+    /// 2000 个键的全量列表在每次打开界面时都要走一遍 IPC，那仍然不必要。
+    ///
+    /// ============================================================
+    /// 为什么用游标而不是页码
+    /// ============================================================
+    ///
+    /// 页码在下标会变的列表上是错的：插件在翻页过程中删掉一个键，
+    /// 第二页就会漏掉一条记录。而"从某个键之后继续"对增删都稳 ——
+    /// 键的排序是确定的（`sort`），所以"之后"是一个有定义的位置。
+    ///
+    /// 游标是不透明的（base64），因此将来改编码不会破坏调用方。
+    pub fn storage_list_paged(
+        &self,
+        id: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        requested_page_size: Option<usize>,
+    ) -> PluginResult<StoragePage> {
+        // 游标与本次前缀不一致时**报错**而不是静默给一份缺数据的结果。
+        let after = quota::resolve_cursor(cursor, prefix)?;
+        let page_size = quota::clamp_page_size(requested_page_size);
+
+        let dir = self.checked_storage_dir(id)?;
+        let usage = self.storage_usage(id)?;
+
+        if !dir.is_dir() {
+            return Ok(StoragePage {
+                keys: Vec::new(),
+                next_cursor: None,
+                usage,
+            });
+        }
+
+        // 枚举**只读文件名**（不读内容、不读元数据），再按前缀过滤。
+        let mut keys: Vec<String> = std::fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+            })
+            .filter(|key| key.starts_with(prefix))
+            .collect();
+        keys.sort();
+
+        // 切页的规则是纯函数（`quota::slice_page`），因此边界情况能被穷举测试。
+        // 这里只负责"把目录读成一组排好序的键"。
+        let slice = quota::slice_page(&keys, prefix, after.as_deref(), page_size);
+
+        Ok(StoragePage {
+            keys: slice.keys,
+            next_cursor: slice.next_cursor,
+            usage,
+        })
+    }
+
+    /// 该插件存储的当前用量（字节数与键数）。
+    ///
+    /// 每次都从文件系统统计，**不缓存**。理由与这整个模块的存在理由一致：
+    /// 缓存一份用量意味着它与磁盘上的事实之间有一个窗口，而插件正好可以在那个
+    /// 窗口里写满磁盘 —— 于是配额就变成了一个"有时候生效"的东西。
+    /// 统计的代价是每个键一次 `metadata`（不读内容），在 2000 个键的上限下是毫秒级。
+    pub fn storage_usage(&self, id: &str) -> PluginResult<StorageUsage> {
+        let dir = self.checked_storage_dir(id)?;
+        if !dir.is_dir() {
+            return Ok(StorageUsage {
+                total_bytes: 0,
+                key_count: 0,
+            });
+        }
+
+        // 只读元数据（不读内容），并把"算不算"的判定交给纯函数 ——
+        // 那样"目录里混进子目录 / 非 .json 文件 / 读不到元数据的条目"这些情况
+        // 都能在 `quota` 的单元测试里直接构造，而不必真的造出那些文件。
+        let entries: Vec<quota::StorageEntry> = std::fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let meta = entry.metadata().ok()?;
+                let path = entry.path();
+                Some(quota::StorageEntry {
+                    is_file: meta.is_file(),
+                    is_json: path.extension().is_some_and(|ext| ext == "json"),
+                    len: meta.len(),
+                })
+            })
+            .collect();
+
+        let (total_bytes, key_count) = quota::sum_storage(&entries);
+
+        Ok(StorageUsage {
+            total_bytes,
+            key_count,
+        })
     }
 
     /// 清空插件数据目录。

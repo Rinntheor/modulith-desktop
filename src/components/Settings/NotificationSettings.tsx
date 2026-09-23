@@ -159,7 +159,7 @@ const NotificationSettings: React.FC<Props> = ({ settings, onUpdate }) => {
   const hasCustom = Boolean(settings.notificationSoundCustomFile);
 
   return (
-    <div className="px-6 py-5">
+    <div className="px-4 lg:px-6 py-5">
       <section className="bg-white rounded-xl border border-gray-200 px-5 py-2 mb-5">
         <div className="flex items-start justify-between gap-6 py-3.5">
           <div className="min-w-0">

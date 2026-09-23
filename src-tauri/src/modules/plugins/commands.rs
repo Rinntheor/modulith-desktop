@@ -255,6 +255,46 @@ pub async fn plugin_storage_keys(
     manager.storage_keys(&id).map_err(to_msg)
 }
 
+/// 分页列出该插件的存储键（设置 → 插件 与插件自己的列表都走它）
+///
+/// 与 `plugin_storage_keys` 的区别是**规模**：那一条一次返回全部键，而插件存储
+/// 的典型模式是"一条记录一个键"，键数随使用时间线性增长 —— 一个用久了的插件
+/// 能拿出几万个键，前端调一次就吃掉几 MB。
+///
+/// `cursor` 为空表示从头开始；返回值里的 `nextCursor` 为空表示已经到底。
+/// 游标是不透明的（base64），调用方只需原样回传。
+#[tauri::command]
+pub async fn plugin_storage_list(
+    state: State<'_, PluginState>,
+    id: String,
+    prefix: Option<String>,
+    cursor: Option<String>,
+    page_size: Option<usize>,
+) -> Result<super::manager::StoragePage, String> {
+    let manager = state.inner().0.read().await;
+    manager
+        .storage_list_paged(
+            &id,
+            prefix.as_deref().unwrap_or(""),
+            cursor.as_deref(),
+            page_size,
+        )
+        .map_err(to_msg)
+}
+
+/// 该插件存储的当前用量（字节数与键数），用于展示与排查
+///
+/// 数字由后端从文件系统现算，因此界面显示的一定是磁盘上的事实，
+/// 而不是某个可能过期的缓存。
+#[tauri::command]
+pub async fn plugin_storage_usage(
+    state: State<'_, PluginState>,
+    id: String,
+) -> Result<super::manager::StorageUsage, String> {
+    let manager = state.inner().0.read().await;
+    manager.storage_usage(&id).map_err(to_msg)
+}
+
 #[tauri::command]
 pub async fn plugin_storage_clear(
     state: State<'_, PluginState>,

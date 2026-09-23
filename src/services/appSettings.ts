@@ -231,6 +231,19 @@ export interface AppSettings {
    * 没保存。区间限制在两端：太窄的一半等于不可用。
    */
   splitRatio: number;
+  /**
+   * 点击窗口关闭按钮时的行为。
+   *
+   * `true` = 隐藏到托盘，应用继续在后台运行；`false` = 直接退出。
+   *
+   * **默认 `true`，与"关闭即退出"的朴素预期相反。** 理由是应用接下来要有在窗口
+   * 之外继续工作的能力（后台插件、桌面通知）：若关闭等于退出，那些能力会在用户
+   * 点一下关闭时被静默取消，而用户不会意识到自己关掉了什么。
+   *
+   * 托盘**右键菜单里也能改**这一项（改的是同一个字段），因此界面不能只依赖自己
+   * 这份缓存 —— 从托盘改过之后要重新读回来，否则开关显示的值与真实行为相反。
+   */
+  closeToTray: boolean;
 }
 
 export const MIN_SPLIT_RATIO = 0.2;
@@ -325,6 +338,9 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   splitActive: null,
   // 与后端 default_split_ratio() 一致：对半分
   splitRatio: DEFAULT_SPLIT_RATIO,
+  // 与后端 default_close_to_tray() 一致：默认隐藏到托盘（它是由
+  // 「后台保活需要窗口之外的存活能力」推出的默认值，理由见类型上的说明）。
+  closeToTray: true,
 };
 
 let cache: AppSettings = { ...DEFAULT_APP_SETTINGS };
@@ -441,6 +457,11 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
       typeof raw?.splitActive === 'string' && raw.splitActive ? raw.splitActive : null,
     // 夹取而不是拒绝：一个被手工改歪的比例不值得让整份设置回落到默认
     splitRatio: clampSplitRatio(raw?.splitRatio),
+    // 与 autoStartSilent 那几项同理，用 `!== false`：缺字段时取后端默认的
+    // 「隐藏到托盘」，而不是因为 `undefined` 落到 `false`。
+    // 用裸 `raw?.closeToTray` 会让一份缺字段的老 settings.json 变成"关闭即退出"，
+    // 而那正是这一项的默认值想避免的行为。
+    closeToTray: raw?.closeToTray !== false,
   };
 }
 

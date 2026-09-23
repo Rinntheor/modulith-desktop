@@ -93,6 +93,50 @@ export function subscribeNotifications(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/**
+ * 后端通知列表变化时广播的事件名。
+ *
+ * 必须与 `src-tauri/src/modules/notifications/commands.rs` 的
+ * `NOTIFICATIONS_CHANGED_EVENT` 一致 —— 两者是**同一份契约的两侧**，
+ * 而没有任何编译器把它们联系在一起。`pnpm check:notifications` 把它钉住。
+ */
+export const NOTIFICATIONS_CHANGED_EVENT = 'modulith://notifications-changed';
+
+/**
+ * 订阅后端的"通知列表变了"事件。
+ *
+ * ============================================================
+ * 为什么需要它（这是"通知存在但界面不知道"的缺口）
+ * ============================================================
+ *
+ * 在它之前，**后端产生一条通知时前端完全不知道**：前端只在"自己调用了某个
+ * 通知命令"之后才刷新缓存。于是任何**不是由界面发起**的通知都不会出现在
+ * 通知中心里 —— 后台宿主的定时提醒、启动阶段的插件加载失败都属于这一类。
+ *
+ * 具体表现：一条通知已经落盘、`get_notification_summary` 也会把它算进未读数，
+ * 但铃铛徽标不变、列表里也看不到，直到用户碰巧触发了某次刷新。
+ *
+ * 之所以用事件而不是轮询：轮询要为一件大多数时候什么都不发生的事情持续付出
+ * 代价（IPC + 序列化整份列表），而事件只在真的变化时发一次。
+ */
+export async function subscribeBackendNotificationEvents(): Promise<() => void> {
+  try {
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen(NOTIFICATIONS_CHANGED_EVENT, () => {
+      // 事件不带负载：**列表本身仍然从后端读**。
+      // 把列表放进事件负载会让"哪一份是权威"变成两个可能不一致的来源，
+      // 而通知列表本来就有一条明确的读取路径。
+      void loadNotifications();
+    });
+    return unlisten;
+  } catch (error) {
+    // 取不到事件 API（纯前端预览 / 旧版运行时）不该让界面报错。
+    // 退化成"只有自己调用时才会看到新通知"，与这个订阅存在之前的行为一致。
+    console.warn('[notifications] 无法订阅后端通知事件:', error);
+    return () => {};
+  }
+}
+
 /** 当前通知列表（新的在前，不可变快照） */
 export function getNotifications(): AppNotification[] {
   return notifications;
