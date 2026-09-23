@@ -12,7 +12,6 @@
 pub mod background;
 pub mod close_behavior;
 pub mod commands;
-pub mod events;
 pub mod tray;
 pub mod tray_menu;
 
@@ -38,21 +37,22 @@ impl Module for DesktopModule {
         "系统托盘图标、托盘菜单，以及窗口关闭时的行为"
     }
 
-    /// 依赖 `settings`、`logging` 与 `notifications`
+    /// 依赖 `settings` 与 `logging`
     ///
-    /// · `settings`：托盘与关闭行为都要读写设置（`close_to_tray`）；
+    /// · `settings`：托盘与关闭行为都要读写设置（`close_to_tray`），
+    ///   后台宿主还要读用户指定的 Node 路径（`node_runtime_path`）；
     /// · `logging`：托盘安装失败是一条**必须在日志里留下痕迹**的警告 ——
-    ///   "托盘不可用"这条路径出问题时，日志是唯一的线索；
-    /// · `notifications`：后台提醒到点时要往通知中心里放一条。这条依赖是**硬的**：
-    ///   后台事件处理函数会直接取通知模块的托管状态，而模块的启动顺序由
-    ///   `registry` 按依赖拓扑排序 —— 没有这条声明，处理函数可能在一个还没
-    ///   初始化的通知模块上运行，表现是"提醒触发了但通知中心里什么都没有"。
+    ///   "托盘不可用"这条路径出问题时，日志是唯一的线索。
     ///
-    /// 声明它同时还有实际效果：这条依赖让 `desktop` 在其它模块之后启动，
+    /// 这里曾经还依赖 `notifications` —— 那是"定时提醒到点要往通知中心里放一条"
+    /// 带来的。定时提醒整条移除之后这条依赖也随之消失，而这是好的：
+    /// `desktop` 现在不再需要知道通知模块长什么样。
+    ///
+    /// 声明依赖还有实际效果：这条依赖让 `desktop` 在 settings 之后启动，
     /// 而 `logging` 自己的 `stop` 会因为逆序停止而**晚于** `desktop` 停止 ——
     /// 也就是"写日志的那个模块最后收尾"。这正是日志类模块该有的位置。
     fn dependencies(&self) -> Vec<&'static str> {
-        vec!["settings", "logging", "notifications"]
+        vec!["settings", "logging"]
     }
 
     fn setup(&self, app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -64,15 +64,7 @@ impl Module for DesktopModule {
         // 而我们正在做的整件事就是降低内存占用。
         app.manage(commands::BackgroundState::new());
 
-        // 出站事件的去向要在任何子进程被拉起**之前**装好。
-        // 顺序反了的话，第一条事件会因为"没有处理函数"而被丢掉 ——
-        // 而它恰好是最容易先到的那条（定时任务在同步之后马上到点）。
         if let Some(state) = app.try_state::<commands::BackgroundState>() {
-            let handle = app.clone();
-            state.0.set_event_handler(std::sync::Arc::new(move |event| {
-                events::handle(&handle, &event);
-            }));
-
             // 把用户在设置里指定的 Node 路径交给后台宿主。
             //
             // 必须在**第一次拉起子进程之前**做（也就是这里），否则首次探测会用
@@ -80,34 +72,6 @@ impl Module for DesktopModule {
             // 第一次还是说找不到，重启之后才好"。
             let configured = crate::modules::settings::settings::load(app).node_runtime_path;
             state.0.set_configured_node(&configured);
-        }
-
-        // 定时提醒的定义存在应用侧，启动时读进内存。
-        // 读失败（文件损坏）不阻止启动 —— 退化为空列表并告警。
-        background::schedules::load(app);
-
-        // 把**已有的**提醒推给后台宿主。
-        //
-        // 这里刻意**不**同步等待：`set_schedules` 在没有子进程时只记下定义，
-        // 真正推送发生在子进程第一次被拉起的时候（`ensure_started` 里）。
-        // 因此启动阶段不会有任何进程被拉起来，也不会阻塞启动。
-        if app.try_state::<commands::BackgroundState>().is_some() {
-            let specs = background::schedules::specs_for_host();
-            if !specs.is_empty() {
-                // 刻意**不**把 `State` 搬进那个任务：`State<'_, _>` 借用的是
-                // `setup` 的参数，活不到 `'static`。任务里用 `AppHandle` 重新取一次
-                // 托管状态 —— 那也是托管状态存在的意义。
-                let handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    use tauri::Manager;
-                    let Some(state) = handle.try_state::<commands::BackgroundState>() else {
-                        return;
-                    };
-                    // 返回值在"子进程未运行"时是 `None`，那是正常情况而不是错误 ——
-                    // 定义已经记在 `BackgroundHost` 里，子进程起来时会自动收到。
-                    let _ = state.0.set_schedules(specs).await;
-                });
-            }
         }
 
         // 关闭行为的判定先装：它决定窗口关闭时是退出还是隐藏。

@@ -30,7 +30,6 @@
 // 而不是让用户看到一串 invoke 失败。
 
 pub mod protocol;
-pub mod schedules;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,12 +98,6 @@ pub struct CallOutcome {
 /// 而调用方正在等读任务递来的响应，直接死锁。
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<protocol::Response>>>>;
 
-/// 出站事件的处理函数。
-///
-/// 读任务在解析到一条事件时调用它。**它跑在读任务里**，因此必须是"发完就走"的
-/// 性质：阻塞读循环会让所有请求的响应都跟着被推迟。
-type EventHandler = Arc<dyn Fn(protocol::Event) + Send + Sync>;
-
 /// 子进程的运行时状态
 struct State {
     child: Option<Child>,
@@ -133,16 +126,6 @@ pub struct BackgroundHost {
     /// 否则用户在设置里换了一个路径之后，我们仍然拿旧路径去启动子进程 ——
     /// 表现为"改完设置没生效，重启才好"。
     configured_node: Mutex<String>,
-    /// 出站事件的去向。由应用侧用 `set_event_handler` 装上。
-    ///
-    /// 装之前收到的事件只记日志 —— 不静默丢弃，但也不假装处理过。
-    event_handler: Mutex<Option<EventHandler>>,
-    /// 每次**新**拉起子进程之后要推送的定时任务定义。
-    ///
-    /// 放在这里而不是"启动后由调用方记得推送"：后者要求每一个会拉起子进程的
-    /// 调用点都记得这件事，而漏掉任意一处的表现都是"定时提醒在子进程重启之后
-    /// 再也不响了"—— 一个既难复现、又难联想到根因的故障。
-    schedules: Mutex<Vec<serde_json::Value>>,
 }
 
 impl BackgroundHost {
@@ -159,68 +142,8 @@ impl BackgroundHost {
             next_id: AtomicU64::new(1),
             node: Mutex::new(None),
             configured_node: Mutex::new(String::new()),
-            event_handler: Mutex::new(None),
-            schedules: Mutex::new(Vec::new()),
         }
     }
-
-    /// 装上出站事件的处理函数（通常由模块的 setup 调用一次）。
-    ///
-    /// 覆盖式安装：重复调用以后一次为准。测试与将来的"换一个分发目标"都需要它。
-    pub fn set_event_handler(&self, handler: EventHandler) {
-        *self.event_handler.lock().unwrap() = Some(handler);
-    }
-
-    /// 记下定时任务定义，并在子进程正在运行时立刻推送过去。
-    ///
-    /// 返回推送结果：`None` 表示"当前没有子进程，等它下次被拉起时自动推送"。
-    /// 这不是失败 —— 定时任务在进程重启后由 `ensure_started` 自动补上。
-    pub async fn set_schedules(&self, schedules: Vec<serde_json::Value>) -> Option<CallOutcome> {
-        *self.schedules.lock().unwrap() = schedules.clone();
-
-        let running = self.state.lock().unwrap().child.is_some();
-        if !running {
-            return None;
-        }
-
-        Some(
-            self.call(
-                BackgroundMethod::ScheduleSync,
-                Some(serde_json::json!({ "schedules": schedules })),
-            )
-            .await,
-        )
-    }
-
-    /// 当前记下的定时任务定义条数（不含子进程侧的运行状态）
-    pub fn schedule_count(&self) -> usize {
-        self.schedules.lock().unwrap().len()
-    }
-
-    /// 读回子进程侧当前的定时任务运行状态（下一次什么时候响、响过几次）。
-    ///
-    /// **不启动子进程**：查一眼列表不该拉起一个 Node 进程。没在跑就返回
-    /// 一个带 `reason` 的结果，由界面如实显示"后台未运行"。
-    pub async fn list_schedules(&self) -> CallOutcome {
-        if !self.status().running {
-            return CallOutcome {
-                ok: false,
-                result: None,
-                error: Some("后台宿主当前未运行，没有正在计时的定时任务".to_string()),
-            };
-        }
-        self.call(BackgroundMethod::ScheduleList, None).await
-    }
-
-    /// 立刻触发一次某个定时任务（"现在试一下"）
-    pub async fn run_schedule_now(&self, id: &str) -> CallOutcome {
-        self.call(
-            BackgroundMethod::ScheduleRunNow,
-            Some(serde_json::json!({ "id": id })),
-        )
-        .await
-    }
-
 
     /// 当前状态（不启动任何东西）
     pub fn status(&self) -> BackgroundStatus {
@@ -307,11 +230,7 @@ impl BackgroundHost {
             }
         };
 
-        // 先记下"这次调用之前子进程是否已经在跑"，因为 `ensure_started` 会改变它，
-        // 而"是不是这一次启动的"决定了要不要推送定时任务。
-        let was_running = self.state.lock().unwrap().child.is_some();
-
-        if let Err(error) = self.ensure_started(&node, !was_running).await {
+        if let Err(error) = self.ensure_started(&node).await {
             return CallOutcome {
                 ok: false,
                 result: None,
@@ -324,12 +243,8 @@ impl BackgroundHost {
 
     /// 把一条请求写到子进程并等它的响应。**不负责拉起子进程。**
     ///
-    /// 与 `call` 分开的理由是**再入**：`ensure_started` 在新拉起子进程之后要同步
-    /// 定时任务，而同步本身就是一次请求。若它调 `call`，`call` 又会走到
-    /// `ensure_started` —— 编译器看到的是一条无限递归的 async 函数，
-    /// 而它即使被削掉，语义上也仍然是错的分层：启动流程不该重入启动流程。
-    ///
-    /// 子进程没在跑时立刻失败，而不是这里再启动一次 —— 那正是 `call` 的职责。
+    /// 与 `call` 分开是因为分层：启动流程不该重入"启动 + 发送"那条路径。
+    /// 子进程没在跑时这里立刻失败，而不是再启动一次 —— 那正是 `call` 的职责。
     async fn send(
         &self,
         method: BackgroundMethod,
@@ -444,13 +359,8 @@ impl BackgroundHost {
         }
     }
 
-    /// 确保子进程在运行。
-    ///
-    /// `push_schedules` 只在**这一次真的启动了子进程**时为真。这个参数存在的
-    /// 理由是一个再入问题：同步定时任务本身就是一次 `call`，而 `call` 又会走到
-    /// 这里；若这里无条件同步，就会变成"同步 → 同步 → …"的无限递归。
-    /// 由调用方判断"是不是我启动的"，比在这里再取一次锁要清楚得多。
-    async fn ensure_started(&self, node: &PathBuf, push_schedules: bool) -> Result<(), String> {
+    /// 确保子进程在运行（已运行则直接返回）
+    async fn ensure_started(&self, node: &PathBuf) -> Result<(), String> {
         {
             let state = self.state.lock().unwrap();
             if state.child.is_some() {
@@ -533,42 +443,15 @@ impl BackgroundHost {
 
         self.spawn_reader(reader);
         log::info!("后台宿主已启动：pid={:?}", self.status().pid);
-
-        // 子进程是**无状态**的：定时任务的定义存在应用侧，每次新拉起之后都要
-        // 重新推送一遍。放在 `ensure_started` 内部（唯一会拉起子进程的地方）
-        // 而不是让调用方记得做：漏掉的表现是"子进程重启之后提醒再也不响了"。
-        //
-        // 失败只记警告：定时任务推不过去不该让"拉起子进程"这件事被判定为失败，
-        // 否则一次同步故障会连带把其它后台能力一起关掉。
-        if push_schedules {
-            let schedules = self.schedules.lock().unwrap().clone();
-            if !schedules.is_empty() {
-                // 用 `send` 而不是 `call`：见 `send` 上的说明（再入）。
-                let outcome = self
-                    .send(
-                        BackgroundMethod::ScheduleSync,
-                        Some(serde_json::json!({ "schedules": schedules })),
-                    )
-                    .await;
-                if !outcome.ok {
-                    log::warn!(
-                        "向后台宿主推送定时任务失败（子进程照常可用）：{:?}",
-                        outcome.error
-                    );
-                }
-            }
-        }
-
         Ok(())
     }
 
-    /// 起一个读任务，把子进程的每一行分派给对应的等待者或事件处理器
+    /// 起一个读任务，把子进程的每一行分派给对应的等待者
     ///
     /// 这是一个 **async 任务**而不是"读线程"：它只做 `read_line` 与一次查表，
     /// 全程没有阻塞式系统调用，因此不需要独占一个线程。
     fn spawn_reader(&self, mut reader: BufReader<ChildStdout>) {
         let pending = Arc::clone(&self.pending);
-        let handler = self.event_handler.lock().unwrap().clone();
 
         tokio::spawn(async move {
             let mut line = String::new();
@@ -589,58 +472,30 @@ impl BackgroundHost {
                     }
                 }
 
-                let frame = match protocol::decode_frame(&line) {
-                    Ok(frame) => frame,
+                let response = match protocol::decode_response(&line) {
+                    Ok(response) => response,
                     Err(error) => {
                         // 一行解析不了**不终止**读循环：对面可能只是写了一条垃圾，
                         // 而它之后的消息仍然是好的。终止会让一次格式错误变成
                         // "整个后台功能永久失效"。
+                        //
+                        // 但要把待处理的请求放掉 —— 否则调用方会一直等到超时。
                         log::warn!("后台宿主返回了无法解析的一行：{error}");
                         continue;
                     }
                 };
 
-                match frame {
-                    protocol::Frame::Response(response) => {
-                        let waiter = pending.lock().unwrap().remove(&response.id);
-                        match waiter {
-                            Some(sender) => {
-                                // 接收方可能已经因为超时走掉了；那不是错误。
-                                let _ = sender.send(response);
-                            }
-                            None => {
-                                // 没有等待者：要么是超时之后的迟到响应，要么是对面
-                                // 自己发了一条我们没有请求过的响应。如实记下来。
-                                log::debug!("收到没有等待者的后台响应（id {}）", response.id);
-                            }
-                        }
+                let waiter = pending.lock().unwrap().remove(&response.id);
+                match waiter {
+                    Some(sender) => {
+                        // 接收方可能已经因为超时走掉了；那不是错误。
+                        let _ = sender.send(response);
                     }
-
-                    protocol::Frame::Event(event) => {
-                        // 版本错配的事件**不处理**：字段语义可能已经变了，
-                        // 按旧语义解释它可能得出错误结论（例如把"已取消"读成"已触发"）。
-                        if let Err(error) = event.validate() {
-                            log::warn!("后台宿主发来一条不可用的事件：{error}");
-                            continue;
-                        }
-
-                        match handler.as_ref() {
-                            Some(handler) => {
-                                let name = event.event.clone();
-                                // 记一行日志再交给处理函数：事件处理函数自己出错时，
-                                // 这行日志是唯一能证明"事件确实到过这里"的证据。
-                                log::debug!("后台事件：{name}（主体 {}）", event.subject);
-                                handler(event);
-                            }
-                            None => {
-                                // 没装处理器时只记日志。**不静默丢弃** ——
-                                // "事件发了但没人接"是需要被发现的一件事。
-                                log::warn!(
-                                    "收到后台事件「{}」但没有任何处理函数，已忽略",
-                                    event.event
-                                );
-                            }
-                        }
+                    None => {
+                        // 没有等待者：要么是超时之后的迟到响应，要么是对面自己
+                        // 发了一条我们没有请求过的消息。如实记下来 ——
+                        // 后者说明协议实现有问题。
+                        log::debug!("收到没有等待者的后台响应（id {}）", response.id);
                     }
                 }
             }
@@ -1387,129 +1242,4 @@ mod live_tests {
         assert_eq!(status.requests, 0, "没有发过请求就不该有请求计数");
     }
 
-    /// **端到端：定时任务真的会在到点后把事件送回宿主。**
-    ///
-    /// 这是第 6b-2 步唯一有说服力的证据。它一次串起了全部四段：
-    ///
-    ///   1. Rust 侧把一条定时任务推给子进程（`set_schedules`）；
-    ///   2. Node 侧真的计时，1 秒后到点；
-    ///   3. Node 主动发出一条 `schedule.fired`（**没有任何请求在等它**）；
-    ///   4. Rust 侧的读任务把它认成事件（而不是一条 id 对不上的响应），
-    ///      并交给装上的处理函数。
-    ///
-    /// 少了任何一段，表现都是"提醒永远不响"，而日志里没有任何线索。
-    /// 只用 `check-background-scheduler.mjs` 验证第 2、3 段是不够的 ——
-    /// 那一段完全不经过 Rust 的读循环，而读循环正是最容易把事件丢掉的地方。
-    #[test]
-    fn a_scheduled_reminder_really_fires_back_into_the_host() {
-        let _guard = lock_env();
-
-        let Some(node) = find_node() else {
-            eprintln!("跳过：环境里没有可用的 Node 运行时");
-            return;
-        };
-
-        let script = host_script();
-        assert!(script.is_file(), "宿主脚本不存在：{}", script.display());
-
-        std::env::set_var("MODULITH_NODE", &node);
-        std::env::set_var("MODULITH_BACKGROUND_HOST", &script);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("测试用的运行时应当能建立");
-
-        let received = std::sync::Arc::new(Mutex::new(Vec::<protocol::Event>::new()));
-
-        let result = runtime.block_on(async {
-            let host = BackgroundHost::new();
-
-            let sink = std::sync::Arc::clone(&received);
-            host.set_event_handler(std::sync::Arc::new(move |event| {
-                sink.lock().unwrap().push(event);
-            }));
-
-            // 1 秒是宿主脚本允许的最小间隔，因此这条测试至少要跑 1 秒。
-            let outcome = host
-                .set_schedules(vec![serde_json::json!({
-                    "id": "live.test",
-                    "kind": "interval",
-                    "name": "端到端验证",
-                    "intervalMs": 1000,
-                    "payload": { "title": "端到端验证", "body": "来自后台宿主" },
-                })])
-                .await;
-
-            // 同步的那一刻子进程还不存在，因此 `None` 是**预期**结果：
-            // 定义被记下来了，真正的推送发生在下面这次 `call` 拉起子进程之后。
-            let synced_lazily = outcome.is_none();
-
-            // 这一句会真的拉起子进程，并在启动之后自动把定义推过去。
-            let ping = host.ping().await;
-
-            // 等事件回来。上限 5 秒：1 秒的间隔加上进程启动时间，余量充足；
-            // 真出问题时我们等的是"它永远不来"，因此这个上限不能太长。
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                if !received.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-
-            let events = received.lock().unwrap().clone();
-            let status = host.describe();
-            host.shutdown().await;
-
-            (synced_lazily, ping, events, status)
-        });
-
-        std::env::remove_var("MODULITH_NODE");
-        std::env::remove_var("MODULITH_BACKGROUND_HOST");
-
-        let (synced_lazily, ping, events, status) = result;
-
-        assert!(
-            synced_lazily,
-            "子进程未运行时同步应当只记下定义（`None`），而不是报一个假失败"
-        );
-        assert!(
-            ping.ok,
-            "存活探测应当成功，实际失败：{:?}。状态：{:?}",
-            ping.error,
-            status
-        );
-
-        assert!(
-            !events.is_empty(),
-            "定时任务到点后应当有一条事件回到宿主。状态：{:?}",
-            status
-        );
-
-        let fired = events
-            .iter()
-            .find(|event| event.event == "schedule.fired")
-            .expect("事件名必须是 schedule.fired");
-
-        assert_eq!(fired.subject, "live.test", "事件主体应当是那条任务的 id");
-        assert_eq!(fired.validate(), Ok(()), "回到宿主的事件必须是合法的");
-        assert_eq!(
-            fired.data.as_ref().and_then(|d| d.get("fireCount")).and_then(|v| v.as_u64()),
-            Some(1),
-            "第一次触发应当报告 fireCount=1：{:?}",
-            fired.data
-        );
-        assert_eq!(
-            fired
-                .data
-                .as_ref()
-                .and_then(|d| d.get("payload"))
-                .and_then(|p| p.get("title"))
-                .and_then(|v| v.as_str()),
-            Some("端到端验证"),
-            "定义里的标题应当随事件一起回来（应用侧显示时不必回查）：{:?}",
-            fired.data
-        );
-    }
 }

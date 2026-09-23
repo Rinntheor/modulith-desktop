@@ -30,7 +30,6 @@ import {
   Archive,
   Settings2,
   Activity,
-  AlarmClock,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
@@ -42,7 +41,6 @@ import PerformanceSettings from './PerformanceSettings';
 import BackupSettings from './BackupSettings';
 import SecuritySettings from './SecuritySettings';
 import PluginSettingsSection from './PluginSettingsSection';
-import ReminderSettings from './ReminderSettings';
 import Toggle from './Toggle';
 import UpdateChecker from './UpdateChecker';
 import { getCatalogModules } from '../../services/moduleCatalog';
@@ -98,7 +96,6 @@ export const SETTINGS_NAV_CLASS =
 export type SettingsSectionId =
   | 'general'
   | 'notifications'
-  | 'reminders'
   | 'network'
   | 'logs'
   | 'performance'
@@ -118,9 +115,6 @@ interface SectionDef {
 const SECTIONS: SectionDef[] = [
   { id: 'general', label: '通用', icon: SlidersHorizontal },
   { id: 'notifications', label: '通知', icon: Bell },
-  // 「提醒」与「通知」分开：通知页管"长什么样"，提醒页管"什么时候产生一条"，
-  // 而后者的技术前提完全不同（它由后台进程计时，窗口关掉照样响）。
-  { id: 'reminders', label: '提醒', icon: AlarmClock },
   { id: 'network', label: '网络', icon: Globe },
   { id: 'logs', label: '日志', icon: FileText },
   { id: 'performance', label: '性能', icon: Activity },
@@ -865,7 +859,6 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 {section === 'notifications' && (
                   <NotificationSettings settings={settings} onUpdate={update} />
                 )}
-                {section === 'reminders' && <ReminderSettings />}
                 {section === 'logs' && <LoggingSettings settings={settings} onUpdate={update} />}
                 {section === 'performance' && <PerformanceSettings />}
                 {section === 'backup' && <BackupSettings />}

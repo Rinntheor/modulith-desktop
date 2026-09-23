@@ -33,7 +33,6 @@
     "check:eviction": "node scripts/check-eviction.ts",
     "check:modules": "node scripts/check-modules.ts",
     "check:background": "node scripts/check-background.ts",
-    "check:background-scheduler": "node scripts/check-background-scheduler.mjs",
     "check:notifications": "node scripts/check-notifications.ts",
     "check:settings-layout": "node scripts/check-settings-layout.ts"
   },

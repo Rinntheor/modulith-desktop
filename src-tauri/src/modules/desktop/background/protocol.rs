@@ -50,7 +50,7 @@ use serde_json::Value;
 /// **改任何一方的字段语义时都必须同时改它**，否则旧脚本会以"少一个字段"
 /// 的形式静默降级。整数而不是语义化版本：这里没有"向后兼容的小改动"这种
 /// 东西 —— 协议是双方的内部约定，任何不匹配都应当直接拒绝。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// 一次请求的最大长度（字节）。
 ///
@@ -75,14 +75,8 @@ pub enum BackgroundMethod {
     Hello,
     /// 存活探测
     Ping,
-    /// 当前后台侧的状态（已加载的插件、活跃的定时任务等）
+    /// 当前后台侧的状态
     Status,
-    /// 用一份完整列表替换后台侧的定时任务集合
-    ScheduleSync,
-    /// 读回后台侧当前的定时任务集合
-    ScheduleList,
-    /// 立刻触发一次某个定时任务（用于"现在试一下"，也用于验证整条链路）
-    ScheduleRunNow,
     /// 优雅停止
     Shutdown,
 }
@@ -95,9 +89,6 @@ impl BackgroundMethod {
             BackgroundMethod::Hello => "hello",
             BackgroundMethod::Ping => "ping",
             BackgroundMethod::Status => "status",
-            BackgroundMethod::ScheduleSync => "scheduleSync",
-            BackgroundMethod::ScheduleList => "scheduleList",
-            BackgroundMethod::ScheduleRunNow => "scheduleRunNow",
             BackgroundMethod::Shutdown => "shutdown",
         }
     }
@@ -168,13 +159,6 @@ pub enum ProtocolError {
 
     #[error("无法解析后台宿主的响应：{0}")]
     Malformed(String),
-
-    /// 调用方在等一条响应，对面发来的却是一条事件。
-    ///
-    /// 这不是"畸形"——事件本身是合法的，只是不该出现在这个位置。
-    /// 分开报是为了让日志能指出"事件分派这条路没接上"。
-    #[error("后台宿主发来了事件「{0}」，但调用方在等一条响应")]
-    UnexpectedEvent(String),
 }
 
 /// 把一条请求编码成一行（含结尾换行）
@@ -192,71 +176,8 @@ pub fn encode_request(request: &Request) -> Result<String, ProtocolError> {
     Ok(line)
 }
 
-/// 子进程**主动**发来的一行。
-///
-/// ============================================================
-/// 为什么协议需要"出站消息"这一半
-/// ============================================================
-///
-/// 前面的请求/响应只能表达"你问我答"。而后台宿主存在的意义恰恰是**在没有人问的
-/// 时候做事** —— 定时提醒到点了。如果没有一条子进程主动发消息的路径，
-/// 那个"到点了"就只能靠宿主轮询：要么轮询频率高到浪费 CPU，要么低到提醒不准。
-///
-/// 因此事件与响应共用同一条 stdout 通道、同一种行格式，靠**有没有 `id`** 区分：
-/// 有 `id` 的是对某条请求的回答，没有的是主动事件。这个判据是结构性的，
-/// 不存在"猜错类型"的可能。
-///
-/// ============================================================
-/// 为什么事件也带 `v`
-/// ============================================================
-///
-/// 与请求同理：一条事件可能在升级过程的两端之间流动，版本错配要在**收到它的
-/// 那一刻**暴露，而不是等某个字段缺失。事件里的字段是插件可见的契约，
-/// 版本不变就意味着字段语义不变 —— 所以版本号必须能独立变化。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Event {
-    pub v: u32,
-    /// 事件名。命名风格是 `域.动作`（例如 `schedule.fired`），
-    /// 这样将来加域不会与既有名字冲突。
-    pub event: String,
-    /// 事件主体（哪个定时任务），没有主体时为空串
-    #[serde(default)]
-    pub subject: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-}
-
-impl Event {
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.v != PROTOCOL_VERSION {
-            return Err(ProtocolError::VersionMismatch {
-                expected: PROTOCOL_VERSION,
-                got: self.v,
-            });
-        }
-        if self.event.is_empty() {
-            return Err(ProtocolError::Malformed("事件名为空".to_string()));
-        }
-        Ok(())
-    }
-}
-
-/// 从子进程读到的**一行**：要么是对某条请求的回答，要么是一条主动事件。
-///
-/// 用一个枚举把这两种东西在类型上分开，而不是"都塞进 `Response`、看 `id` 是不是
-/// 0"：后者会让"id 恰好是 0 的响应"变成一条被误解的事件，而 0 是一个完全
-/// 合法的 id。`Option<u64>` 表达"有没有 id"这件事本身就是语义。
-#[derive(Debug, Clone, PartialEq)]
-pub enum Frame {
-    Response(Response),
-    Event(Event),
-}
-
-/// 解析子进程返回的一行，自动区分响应与事件。
-///
-/// 判定顺序是**先响应后事件**：`Response` 的 `id` 是必填字段，因此一条事件
-/// （没有 id）在解析响应时必然失败，不会出现"两边都能解析"的歧义。
-pub fn decode_frame(line: &str) -> Result<Frame, ProtocolError> {
+/// 解析子进程返回的一行
+pub fn decode_response(line: &str) -> Result<Response, ProtocolError> {
     if line.len() > MAX_LINE_BYTES {
         return Err(ProtocolError::LineTooLong);
     }
@@ -264,26 +185,7 @@ pub fn decode_frame(line: &str) -> Result<Frame, ProtocolError> {
     if trimmed.is_empty() {
         return Err(ProtocolError::Malformed("空行".to_string()));
     }
-
-    // 先按最有可能的形态解析：绝大多数行是对请求的回答。
-    if let Ok(response) = serde_json::from_str::<Response>(trimmed) {
-        return Ok(Frame::Response(response));
-    }
-
-    let event: Event = serde_json::from_str(trimmed)
-        .map_err(|error| ProtocolError::Malformed(error.to_string()))?;
-    Ok(Frame::Event(event))
-}
-
-/// 解析子进程返回的一行
-pub fn decode_response(line: &str) -> Result<Response, ProtocolError> {
-    match decode_frame(line)? {
-        Frame::Response(response) => Ok(response),
-        // 事件不是响应。调用方要的是"某条请求的答案"，收到事件时如实报告，
-        // 而不是把它硬当成一个 id 不匹配的响应 —— 那样会静默丢掉一条
-        // 本该被处理的事件。
-        Frame::Event(event) => Err(ProtocolError::UnexpectedEvent(event.event)),
-    }
+    serde_json::from_str(trimmed).map_err(|error| ProtocolError::Malformed(error.to_string()))
 }
 
 #[cfg(test)]
@@ -308,96 +210,7 @@ mod tests {
         assert_eq!(BackgroundMethod::Hello.as_wire(), "hello");
         assert_eq!(BackgroundMethod::Ping.as_wire(), "ping");
         assert_eq!(BackgroundMethod::Status.as_wire(), "status");
-        assert_eq!(BackgroundMethod::ScheduleSync.as_wire(), "scheduleSync");
-        assert_eq!(BackgroundMethod::ScheduleList.as_wire(), "scheduleList");
-        assert_eq!(BackgroundMethod::ScheduleRunNow.as_wire(), "scheduleRunNow");
         assert_eq!(BackgroundMethod::Shutdown.as_wire(), "shutdown");
-    }
-
-    /// 出站事件必须与响应在同一行格式下**可以被区分开**。
-    ///
-    /// 这条测试查的是那个判据（有没有 `id`）真的成立：一条事件经过
-    /// `decode_frame` 必须落到 `Frame::Event`，而不是被当成一条 id 缺失的响应。
-    #[test]
-    fn an_event_line_decodes_as_an_event_not_a_response() {
-        let line = r#"{"v":2,"event":"schedule.fired","subject":"s1","data":{"at":1}}"#;
-        match decode_frame(line).unwrap() {
-            Frame::Event(event) => {
-                assert_eq!(event.event, "schedule.fired");
-                assert_eq!(event.subject, "s1");
-                assert_eq!(event.validate(), Ok(()));
-            }
-            Frame::Response(other) => panic!("事件被误判成了响应：{other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_response_line_decodes_as_a_response_not_an_event() {
-        let line = r#"{"v":2,"id":3,"result":{"pong":true}}"#;
-        match decode_frame(line).unwrap() {
-            Frame::Response(response) => {
-                assert_eq!(response.id, 3);
-                assert_eq!(response.validate(), Ok(()));
-            }
-            Frame::Event(other) => panic!("响应被误判成了事件：{other:?}"),
-        }
-    }
-
-    /// **id 为 0 的响应不能被误判成事件。**
-    ///
-    /// 这正是"看 id 是不是 0"那种判据会错的地方：0 是完全合法的 id。
-    /// 类型上的 `Option` 才不会把"id 是 0"与"没有 id"混为一谈。
-    #[test]
-    fn a_response_with_id_zero_is_still_a_response() {
-        let line = r#"{"v":2,"id":0,"result":{}}"#;
-        assert!(matches!(decode_frame(line).unwrap(), Frame::Response(r) if r.id == 0));
-    }
-
-    /// 事件缺省 `subject` 与 `data` 时仍然合法。
-    #[test]
-    fn an_event_without_subject_or_data_is_valid() {
-        let event: Event = serde_json::from_str(r#"{"v":2,"event":"host.ready"}"#).unwrap();
-        assert_eq!(event.subject, "");
-        assert!(event.data.is_none());
-        assert_eq!(event.validate(), Ok(()));
-    }
-
-    #[test]
-    fn an_event_with_an_empty_name_is_rejected() {
-        let event = Event {
-            v: PROTOCOL_VERSION,
-            event: String::new(),
-            subject: "s1".to_string(),
-            data: None,
-        };
-        assert!(matches!(event.validate(), Err(ProtocolError::Malformed(_))));
-    }
-
-    #[test]
-    fn an_event_with_a_mismatched_version_is_rejected() {
-        let event = Event {
-            v: PROTOCOL_VERSION + 1,
-            event: "schedule.fired".to_string(),
-            subject: String::new(),
-            data: None,
-        };
-        assert!(matches!(
-            event.validate(),
-            Err(ProtocolError::VersionMismatch { .. })
-        ));
-    }
-
-    /// `decode_response` 遇到事件时的失败必须是**有名字的那种**。
-    ///
-    /// 它防的是"读循环把一条事件悄悄当成超时/畸形丢掉"：那样定时提醒会
-    /// 永远不响，而日志里没有任何线索。
-    #[test]
-    fn decode_response_names_an_event_rather_than_swallowing_it() {
-        let line = r#"{"v":2,"event":"schedule.fired","subject":"s9"}"#;
-        assert_eq!(
-            decode_response(line),
-            Err(ProtocolError::UnexpectedEvent("schedule.fired".to_string()))
-        );
     }
 
     #[test]
@@ -541,7 +354,7 @@ mod tests {
 
         // 这条断言本身就是"当前版本是 2"的显式记录：升到 3 时它必须一起改，
         // 那时也会顺带看到上面那份 `ALLOWED`。
-        assert_eq!(PROTOCOL_VERSION, 2, "协议版本变了就更新这条测试");
+        assert_eq!(PROTOCOL_VERSION, 1, "协议版本变了就更新这条测试");
         assert!(ALLOWED.contains(&PROTOCOL_VERSION));
     }
 

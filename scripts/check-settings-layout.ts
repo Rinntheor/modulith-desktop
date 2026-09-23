@@ -287,7 +287,6 @@ const sectionFiles = [
   'BackupSettings.tsx',
   'PerformanceSettings.tsx',
   'NotificationSettings.tsx',
-  'ReminderSettings.tsx',
   'SecuritySettings.tsx',
 ];
 

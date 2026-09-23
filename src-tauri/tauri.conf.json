@@ -38,6 +38,7 @@
         "focus": true,
         "skipTaskbar": true,
         "visible": false,
+        "dataDirectory": "webview-tray-menu",
         "width": 268,
         "height": 316
       }
