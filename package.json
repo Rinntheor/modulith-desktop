@@ -19,6 +19,7 @@
     "check:contributions": "node scripts/check-contributions.ts",
     "check:plugin-boundary": "node scripts/check-plugin-boundary.ts",
     "check:acl": "node scripts/check-acl.ts",
+    "check:sandbox": "node scripts/check-sandbox.ts",
     "check:source-ast": "node scripts/check-source-ast.ts",
     "check:plugin-runtime": "node --import ./scripts/harness/loader.mjs scripts/check-plugin-runtime.ts",
     "check:net-guard": "node --import ./scripts/harness/loader.mjs scripts/check-net-guard.ts",
