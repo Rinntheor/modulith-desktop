@@ -146,6 +146,7 @@ pub fn run() -> Result<(), tauri::Error> {
         list_plugins,
         get_plugin,
         list_plugin_permissions,
+        dev_plugin_fingerprints,
         install_plugin_package,
         install_plugin_folder,
         install_plugin_url,

@@ -42,9 +42,38 @@
   var React = Modulith.React;
   var h = React.createElement;
 
-  // createContext() 依赖「当前正在加载哪个插件」这一全局状态，因此只能在 IIFE 顶层
-  // 取一次并长期持有 —— 放进组件的渲染函数里调用会抛错。
-  var ctx = Modulith.createContext();
+  /**
+   * 上下文（`ctx`）与引导数据（`bootstrap`）在**显式引导**里取得。
+   *
+   * 与 `Modulith.createContext()` 的区别只在**插件身份怎么获得**：后者靠
+   * 「当前正在加载哪个插件」这一全局状态，因此只能在 IIFE 顶层调用；前者由宿主把身份
+   * 与数据作为**参数**交进来。两者返回同一个 `ctx` 对象，用哪个都不会拿到不同的东西。
+   *
+   * 本示例采用 `run`，因为它是**往后要用的那一条**：插件将来挪进独立进程之后，
+   * 「当前正在加载哪个插件」这个全局状态不复存在，而显式传参跨得过去。
+   *
+   * ⚠️ 回调是**同步执行**的，它不是什么"延迟到激活时才跑"的钩子 —— 什么时候执行
+   * 整段 bundle 仍然由清单里的 `activationEvents` 决定。`registerModule()` 这类调用
+   * 必须落在同步路径上，宿主在 bundle 执行结束后立即检查注册结果。
+   */
+  var ctx = null;
+  var bootstrap = null;
+  Modulith.run(function (data) {
+    bootstrap = data;
+    ctx = data.ctx;
+  });
+
+  // 引导数据里的每一项都是**值**（字符串、数字、纯对象），这正是它能跨进程的原因。
+  ctx.logger.info(
+    '[reference] 引导数据：pluginId=' +
+      bootstrap.pluginId +
+      ' pluginVersion=' +
+      bootstrap.pluginVersion +
+      ' hostVersion=' +
+      bootstrap.hostVersion +
+      ' activationEvent=' +
+      String(bootstrap.activationEvent)
+  );
 
   /** 存储键。只允许字母数字与 . _ -，最长 128 字符 */
   var KEY_COUNT = 'count';

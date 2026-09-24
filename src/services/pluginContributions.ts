@@ -33,6 +33,11 @@ import type {
   SettingOption,
   SettingType,
 } from '../types/plugin';
+// **带 `.ts` 扩展名是有意的**：`scripts/check-plugin-boundary.ts` 直接用 Node 执行
+// TypeScript（类型擦除），而 Node 的 ESM 解析不会替你补扩展名 —— 被 import 的模块
+// 内部若再有省略扩展名的导入，那个链路就会在运行期才炸。这是本仓库 check 脚本
+// 已经在用的写法（见 scripts/check-*.ts 的导入）。
+import { boundaryNames } from './pluginBoundary.ts';
 
 // ============================================================
 // 常量
@@ -93,42 +98,16 @@ const LOCAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
  * **刻意不列权限名。** 权限的权威是后端 `PluginPermission` 枚举，前端已经有一条
  * 取回它的路径（`list_plugin_permissions` / `permissionRegistry`）；在这里再放一份
  * 就是同一份名单的第二个副本，而副本必然漂移 —— 这正是 1.1.x 反复记录过的教训。
+ *
+ * `host` 与 `context` 两份成员名单**不再写在这里**，而是从 `pluginBoundary.ts` 派生。
+ * 过去它们是本文件里的两个字面量数组，同时另有一份分类表躺在
+ * `scripts/check-contributions.ts` 里 —— 同一份边界信息有两个副本，只有其中一份
+ * 会被新增成员的人想起来更新。现在清单是唯一的真源，门禁对着实际接线断言它。
  */
 export const HOST_CAPABILITIES: ModulithCapabilities = {
   api: 1,
-  host: [
-    'version',
-    'platform',
-    'React',
-    'jsx',
-    'jsxs',
-    'Fragment',
-    'registerModule',
-    'createContext',
-    'registerCommand',
-    'onDeactivate',
-    'useModuleActive',
-    'capabilities',
-  ],
-  context: [
-    'pluginId',
-    'pluginVersion',
-    'manifest',
-    'version',
-    'activationEvent',
-    'storage',
-    'http',
-    'logger',
-    'notifications',
-    'events',
-    'launcher',
-    'icons',
-    'shell',
-    'fileDrop',
-    'audio',
-    'settings',
-    'disposables',
-  ],
+  host: boundaryNames('host'),
+  context: boundaryNames('context'),
   contributions: [...CONTRIBUTION_KINDS],
   activationEvents: [...ACTIVATION_EVENT_NAMES],
 };

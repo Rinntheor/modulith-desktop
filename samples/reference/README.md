@@ -21,7 +21,8 @@
 
 | 约定 | 接口 | 需要哪项权限 |
 | --- | --- | --- |
-| 加载期取上下文 | `createContext()` | 无 |
+| 加载期取上下文（**推荐写法**） | `run(bootstrap)` | 无 |
+| 加载期取上下文（旧写法，靠隐式全局） | `createContext()` | 无 |
 | 注册一个模块（必须同步调用） | `registerModule()` | 无 |
 | 注册一条全局搜索命令 | `registerCommand()` | 无 |
 | 私有持久化存储 | `storage` | `storage` |
@@ -37,7 +38,41 @@
 「权限列表是给用户看风险用的」这条原则的反面示范。想看那几项怎么写，读插件仓库里的
 `quick-launch`（原生能力）与 `pomodoro`（后台计时 + 通知 + 自定义提示音）。
 
-## 四处值得注意的写法
+## 六处值得注意的写法
+
+### 用 `Modulith.run()` 取上下文，而不是 `createContext()`
+
+```js
+var ctx = null;
+Modulith.run(function (bootstrap) {
+  ctx = bootstrap.ctx;     // 与 Modulith.createContext() 返回的是同一个对象
+});
+```
+
+两者返回**同一个** `ctx`，区别只在**插件身份怎么获得**：
+
+| | 身份来源 | 跨进程可用 |
+| --- | --- | --- |
+| `createContext()` | 「当前正在加载哪个插件」这一全局状态 | ✗ |
+| `run(bootstrap)` | 宿主作为**参数**传进来 | ✓ |
+
+插件将来挪进独立进程（沙箱化）之后，那个全局状态不复存在，而显式传参跨得过去。
+因此**新插件应当用 `run`**；已有的 `createContext()` 写法不会被移除。
+
+⚠️ **回调是同步执行的**，它不是什么"延迟到激活时才跑"的钩子 —— 什么时候执行整段 bundle
+仍然由清单里的 `activationEvents` 决定。所以下面的注册规则对它同样适用。
+
+`bootstrap` 里全是**值**（字符串、数字、纯对象），这正是它能跨进程的原因：
+
+| 字段 | 是什么 |
+| --- | --- |
+| `pluginId` / `pluginVersion` | 本插件的 ID 与版本 |
+| `hostVersion` | 宿主版本 |
+| `manifest` | 本插件的清单 |
+| `activationEvent` | 本次由什么触发（`onStartup` / `onModule:xxx` / …） |
+| `capabilities` | 宿主能力表。**特性探测用它**，不要比较版本号 |
+| `settings` | 本插件声明的设置项的**当前值快照**（只读，不跟随变化） |
+| `ctx` | 上下文，与 `createContext()` 的返回值相同 |
 
 ### 注册必须在加载期同步完成
 
@@ -45,8 +80,9 @@
 Modulith.registerModule({ id: 'reference', name: '…', component: Reference });
 ```
 
-放在 IIFE 顶层，不能包进 Promise、`setTimeout` 或任何回调。宿主在一次加载结束后**立即**
-检查注册结果，晚一步就会被判定为「没有注册任何模块」，插件被标记为异常。
+不能包进 Promise、`setTimeout` 或任何回调。宿主在一次加载结束后**立即**检查注册结果，
+晚一步就会被判定为「没有注册任何模块」，插件被标记为异常。
+放进 `Modulith.run()` 的回调里是可以的 —— 那个回调本身是同步的。
 
 ### 窗口级监听必须判断模块是否可见
 

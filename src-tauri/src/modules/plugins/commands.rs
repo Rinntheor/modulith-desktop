@@ -51,6 +51,69 @@ pub fn list_plugin_permissions() -> Vec<PermissionDescriptor> {
     PluginPermission::all_descriptors()
 }
 
+/// 「开发链接」插件当前**磁盘指纹**，供开发模式的自动重载判断"要不要刷新"。
+///
+/// 返回 `插件 ID → 指纹`，只含开发链接（`devSource` 非空）的插件。没有开发链接的
+/// 插件不在结果里 —— 它们的代码来自安装目录的副本，改源目录对它们没有意义。
+///
+/// ============================================================
+/// 为什么由后端算指纹，而不是前端读文件比内容
+/// ============================================================
+///
+/// 前端要判断"变了没有"，最直接的写法是定时把 `index.js` 读回来比内容。但一个
+/// 多文件构建出来的插件产物是**几百 KB**（kanban 现在是 367 KB），读回来越过一次
+/// IPC 就是一次完整反序列化。按秒轮询时这是纯粹的浪费。
+///
+/// 指纹用 `(长度, 修改时间)`，一次读 `metadata` 就够 —— 不读文件内容。
+/// 它挡得住"重新构建了产物"这一种变化，而那正是开发模式唯一关心的变化。
+///
+/// **指纹不参与任何信任决策。** 它不是校验和，不用于判断内容是否被篡改 ——
+/// 那件事由安装时的签名与哈希负责，与这里无关。
+#[tauri::command]
+pub async fn dev_plugin_fingerprints(
+    state: State<'_, PluginState>,
+) -> Result<HashMap<String, String>, String> {
+    let manager = state.inner().0.read().await;
+
+    let mut fingerprints = HashMap::new();
+    for plugin in manager.list() {
+        let Some(source) = plugin.dev_source.as_deref() else {
+            continue;
+        };
+
+        // 入口文件名与 `resolve_asset_root` / 前端加载路径保持一致：
+        // 清单里没写 `main` 时默认 `dist/index.js`。
+        let entry = {
+            let declared = plugin.manifest.main.trim();
+            if declared.is_empty() {
+                "dist/index.js".to_string()
+            } else {
+                declared.to_string()
+            }
+        };
+
+        let path = PathBuf::from(source).join(&entry);
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            // 文件暂时不在（构建中、或刚被删）—— 报一个可区分标记，让前端把它当成
+            // "有变化"，从而触发一次重载并把错误显示出来。静默跳过会让作者对着
+            // 一个不再更新的界面等下去。
+            fingerprints.insert(plugin.id.clone(), "missing".to_string());
+            continue;
+        };
+
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+
+        fingerprints.insert(plugin.id.clone(), format!("{}:{}", metadata.len(), modified));
+    }
+
+    Ok(fingerprints)
+}
+
 #[tauri::command]
 pub async fn install_plugin_package(
     state: State<'_, PluginState>,

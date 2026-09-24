@@ -253,7 +253,7 @@ const InstallConfirm: React.FC<{
                       </div>
                       {info.enforcement === 'none' && (
                         <div className="mt-0.5 text-[11px] text-amber-600">
-                          宿主尚未强制这一项：声明它不会带来额外限制
+                          宿主当前不强制这一项 —— 其原因见上面的说明
                         </div>
                       )}
                     </div>
@@ -502,7 +502,7 @@ const MarketDetailDrawer: React.FC<{
                         </div>
                         {info.enforcement === 'none' && (
                           <div className="mt-0.5 text-[11px] text-amber-600">
-                            宿主尚未强制这一项：声明它不会带来额外限制
+                            宿主当前不强制这一项 —— 其原因见上面的说明
                           </div>
                         )}
                       </div>
