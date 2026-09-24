@@ -79,7 +79,26 @@ pub enum PermissionEnforcement {
     Host,
     /// 前端接口检查；未声明时降级为空实现并记录警告
     Frontend,
-    /// 已解析并保留，但当前不改变任何行为
+    /// 当前不改变任何行为。
+    ///
+    /// ⚠️ **这一项的"为什么"不是一个值能表达的。** 标为 `None` 的权限有四种互不相同的
+    /// 原因，而插件作者与用户对它们的判断完全不同：
+    ///
+    ///   * `filesystem-write` —— 有语义、**缺检查点**（"以后可能会强制"）
+    ///   * `filesystem-scoped` —— **缺授权模型**（同上，但要先设计授权）
+    ///   * `native-module` —— **这一能力不存在**（永远不会有东西可强制）
+    ///   * `dev-tools` —— **这一项是冗余的**（插件本来就具备，不需要授权）
+    ///
+    /// 后两项的读法**恰好相反**：一个真的拿不到，一个不拿也有。因此：
+    ///
+    ///   1. 各自的理由写在 **`description`** 里，界面把它显示给用户；
+    ///   2. 界面上那句通用文案**不许承诺**"以后会强制"（曾经写作"尚未强制"，
+    ///      对后两项是假的）；
+    ///   3. `scripts/check-plugin-boundary.ts` 第 10 节断言这些说明还在，
+    ///      且没有退化回一句中性的话。
+    ///
+    /// 把"为什么不强制"做成结构化字段（例如 `unenforced_reason`）是更好的形态，
+    /// 但那要同时改 Rust 类型、前端类型与界面 —— 当前不值得，记为已知的债。
     None,
 }
 
@@ -211,11 +230,21 @@ impl PluginPermission {
             },
             Self::Clipboard => Spec {
                 label: "剪贴板",
-                description: "读取与写入系统剪贴板",
+                description: "读取与写入系统剪贴板。**写入尤其需要注意**：它会静默替换用户剪贴板里的内容，而用户可能正打算粘贴别的东西",
                 effect: E::Write,
                 scope: S::Device,
                 reversible: true,
-                enforcement: F::None,
+                // 前端强制：`ctx.clipboard` 在未声明权限时降级为空实现并记录警告。
+                //
+                // **为什么不放到 Rust 侧。** 剪贴板是浏览器 API（`navigator.clipboard`），
+                // 页面脚本本来就能直接调它 —— 因此后端加一道门**不会让强制变强**，
+                // 只会多出一个"看起来更难绕过"的假象。真实的边界是前端这一层，
+                // 与 `notification` / `plugin-communicate` 同类。
+                //
+                // 与 `updater` 那处刻意的处理不同：那里禁用的是**宿主自己的命令**
+                // （`tauri-plugin-updater` 的 `updater:default`），前端不授权就能让它
+                // 真正不可达；剪贴板没有这样的开关。
+                enforcement: F::Frontend,
                 risk_override: None,
             },
             Self::FilesystemRead => Spec {
@@ -262,7 +291,7 @@ impl PluginPermission {
             },
             Self::NativeModule => Spec {
                 label: "原生模块",
-                description: "调用原生代码，可绕过沙箱限制",
+                description: "加载原生代码。**当前宿主不提供这项能力**：Tauri 插件必须随应用一起编译，插件包在运行期无法引入原生模块。声明它不改变任何行为 —— 插件拿不到它，宿主也没有可强制的东西",
                 effect: E::Execute,
                 scope: S::System,
                 reversible: false,
@@ -271,7 +300,7 @@ impl PluginPermission {
             },
             Self::DevTools => Spec {
                 label: "开发者工具",
-                description: "访问开发者工具与调试接口",
+                description: "访问开发者工具与调试接口。**插件本来就具备这一能力**（它与宿主共享同一个页面环境，谁都能打开控制台），因此这一项是**冗余**的：声明它不会多得到什么，不声明也不会被阻止。与「原生模块」不同，那项是真的拿不到",
                 effect: E::Execute,
                 scope: S::System,
                 reversible: false,
@@ -345,7 +374,7 @@ mod tests {
             F::Host,
         ),
         ("notification", E::Write, S::App, true, R::Low, F::Frontend),
-        ("clipboard", E::Write, S::Device, true, R::Medium, F::None),
+        ("clipboard", E::Write, S::Device, true, R::Medium, F::Frontend),
         (
             "filesystem-read",
             E::Read,
@@ -524,7 +553,7 @@ mod tests {
         };
 
         assert_eq!(count(F::Host), 5, "后端强制的权限数量变化");
-        assert_eq!(count(F::Frontend), 2, "前端强制的权限数量变化");
-        assert_eq!(count(F::None), 5, "未强制的权限数量变化");
+        assert_eq!(count(F::Frontend), 3, "前端强制的权限数量变化");
+        assert_eq!(count(F::None), 4, "未强制的权限数量变化");
     }
 }

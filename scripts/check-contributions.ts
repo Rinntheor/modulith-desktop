@@ -42,6 +42,12 @@ import {
   shapeFromIndexKinds,
   shapeFromInstalled,
 } from '../src/services/pluginShape.ts';
+import { boundaryNames, findMember } from '../src/services/pluginBoundary.ts';
+import {
+  collectObjectLiterals,
+  interfaceMemberNames,
+  objectKeysAt,
+} from './source-ast.ts';
 
 let failed = 0;
 let total = 0;
@@ -60,31 +66,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const readSource = (relative: string): string =>
   readFileSync(resolve(here, relative), 'utf8');
 
-/**
- * 取一段从 `marker` 开始、到下一行行首 `}` 为止的源码块。
- *
- * 用于在接口 / 函数体上做成员核对。这些块的闭合花括号都在第 0 列，因此
- * `\n}` 是可靠的终止标记 —— 这个前提写在这里，因为一旦格式变了它就会失效。
- */
-function blockFrom(source: string, marker: string): string {
-  const start = source.indexOf(marker);
-  if (start === -1) return '';
-  const end = source.indexOf('\n}', start);
-  return end === -1 ? '' : source.slice(start, end);
-}
-
-/** 取某段代码里指定缩进层级上的属性名（同时接受 `a: x` 与 `a,` 两种写法） */
-function keysAtIndent(block: string, indent: number): string[] {
-  const pad = ' '.repeat(indent);
-  const keys: string[] = [];
-  for (const line of block.split('\n')) {
-    if (!line.startsWith(pad)) continue;
-    if (line.startsWith(`${pad} `)) continue; // 更深层缩进，不属于这一级
-    const match = /^([A-Za-z_$][\w$]*)\s*[,:]/.exec(line.slice(indent));
-    if (match) keys.push(match[1]);
-  }
-  return keys;
-}
+// 成员核对已改用 `scripts/source-ast.ts` 的 AST 查询。原先这里的 `blockFrom` /
+// `keysAtIndent` 是"找标记到下一个行首 `}`、再按缩进猜属性名" —— 它们不会说
+// "我解析错了"，只会说"你没接线"，因此上下文工厂一改名就报出 17 条假失败。
 
 // ============================================================
 // 1. 贡献点的规范化
@@ -411,17 +395,22 @@ console.log('\n能力表：');
   const runtime = readSource('../src/services/pluginRuntime.ts');
   const types = readSource('../src/types/plugin.ts');
 
-  const hostInterface = blockFrom(runtime, 'export interface ModulithHost {');
-  const hostObject = blockFrom(runtime, 'const host: ModulithHost = {');
-  const contextObject = blockFrom(runtime, 'function createContext() {');
+  // 源码解析统一走 `scripts/source-ast.ts`（TypeScript parser），不再按缩进匹配。
+  // 这里曾经用 `keysAtIndent` 猜属性名 —— 上下文工厂改名之后它读到的是过期数据，
+  // 报出 17 条"createContext 没有返回它们"。手写解析器的失败方式就是这样：
+  // 它不会说"我解析错了"，只会说"你没接线"。
+  const literals = collectObjectLiterals(runtime);
+  const interfaceKeys = interfaceMemberNames(runtime, 'ModulithHost');
+  const objectKeys = objectKeysAt(literals, 'installHostGlobals', ['host']);
+  const contextKeys = objectKeysAt(literals, 'createContextFor', ['return']);
 
-  check(hostInterface.length > 0, '找到 ModulithHost 接口');
-  check(hostObject.length > 0, '找到 installHostGlobals 里的 host 对象');
-  check(contextObject.length > 0, '找到 createContext 函数体');
-
-  const interfaceKeys = keysAtIndent(hostInterface, 2);
-  const objectKeys = keysAtIndent(hostObject, 4);
-  const contextKeys = keysAtIndent(contextObject, 4);
+  check(interfaceKeys !== null, '找到 ModulithHost 接口');
+  check(objectKeys !== null, '找到 installHostGlobals 里的 host 对象');
+  check(contextKeys !== null, '找到上下文工厂返回的对象');
+  if (interfaceKeys === null || objectKeys === null || contextKeys === null) {
+    // 解析失败时不再往下走：下面每条断言都会因为空数组而"通过"或"失败"得毫无意义
+    console.error('  源码解析未命中，跳过本节的成员核对');
+  }
 
   // ----------------------------------------------------------
   // 执行模型：**过渡**，成本由一条接口纪律压住
@@ -437,41 +426,21 @@ console.log('\n能力表：');
   // 1.2.0 的声明式贡献正是为此而做：registerModule / registerCommand 从「交出组件、
   // 交出函数」变成了「交出可寻址的行为」。
   //
-  // 下面这个分类把**哪些成员是传引用的**钉死。新增成员会让断言失败 ——
-  // 这不是禁止你加，而是要求你先回答"它将来怎么跨 realm"，并在这里显式登记。
-  //
-  // 读这份分类时请注意一件容易被低估的事：**共享 React 实例本身就是最深的一处耦合。**
-  // React / jsx / jsxs / Fragment 全都过不去 realm 边界，而它们不是"两个函数"那么小 ——
-  // 沙箱化之后插件不能再用宿主的 React，界面必须改成"插件交出可序列化的界面描述、
-  // 宿主负责渲染"。这才是迁移里最大的一块。
+  // **分类表已经搬走了。** 此前这里是两份局部数组（`REFERENCE_PASSING` /
+  // `VALUE_PASSING`），而 ctx 的 17 个成员一个都没被回答过。现在唯一的真源是
+  // `src/services/pluginBoundary.ts`：每个跨边界成员登记 kind（值 / 句柄 / 可调用）
+  // 与 migration（v2 的去处），由 `scripts/check-plugin-boundary.ts` 对着实际接线断言。
+  // 这里只保留一条与它联动的断言，免得两处各自漂移。
   // ----------------------------------------------------------
-  const REFERENCE_PASSING = [
-    'React',
-    'jsx',
-    'jsxs',
-    'Fragment',
-    'createContext',
-    'registerModule',
-    'registerCommand',
-    'onDeactivate',
-    'useModuleActive',
-  ];
-  /** 传值的：跨 realm 只要序列化，天然安全 */
-  const VALUE_PASSING = ['version', 'platform', 'capabilities'];
+  const referencePassing = boundaryNames('host').filter(
+    (name) => findMember('host', name)?.kind !== 'value'
+  );
+  const valuePassing = boundaryNames('host').filter(
+    (name) => findMember('host', name)?.kind === 'value'
+  );
 
-  /** 取出接口里每个成员的**名字**（成员声明的续行会被折叠掉） */
-  const memberNames = (block: string, indent: number): string[] => {
-    const pad = ' '.repeat(indent);
-    return block
-      .split('\n')
-      .slice(1)
-      .filter((line) => line.startsWith(pad) && !line.startsWith(`${pad} `))
-      .map((line) => /^([A-Za-z_$][\w$]*)\s*[?:]/.exec(line.slice(indent))?.[1] ?? '')
-      .filter(Boolean);
-  };
-
-  const actualHostMembers = memberNames(hostInterface, 2).sort();
-  const expectedHostMembers = [...REFERENCE_PASSING, ...VALUE_PASSING].sort();
+  const actualHostMembers = interfaceKeys.slice().sort();
+  const expectedHostMembers = [...referencePassing, ...valuePassing].sort();
   const added = actualHostMembers.filter((name) => !expectedHostMembers.includes(name));
   const gone = expectedHostMembers.filter((name) => !actualHostMembers.includes(name));
 
@@ -482,12 +451,12 @@ console.log('\n能力表：');
   check(
     added.length === 0 && gone.length === 0,
     `★ 宿主 API 表面未变（新增：${added.join('、') || '无'}；移除：${gone.join('、') || '无'}）` +
-      ` —— 新增成员必须在本文件里分类：它传的是值还是引用？传引用的跨不过 realm`
+      ` —— 新增成员必须在 src/services/pluginBoundary.ts 里登记：它传的是值、句柄，还是函数？`
   );
   check(
-    REFERENCE_PASSING.every((name) => HOST_CAPABILITIES.host.includes(name)) &&
-      VALUE_PASSING.every((name) => HOST_CAPABILITIES.host.includes(name)),
-    '分类里的每个成员都在能力表里（否则分类本身已经过期）'
+    referencePassing.every((name) => HOST_CAPABILITIES.host.includes(name)) &&
+      valuePassing.every((name) => HOST_CAPABILITIES.host.includes(name)),
+    '边界清单里的每个宿主成员都在能力表里（否则清单本身已经过期）'
   );
 
   const missingFromInterface = HOST_CAPABILITIES.host.filter(
@@ -509,13 +478,13 @@ console.log('\n能力表：');
   );
   check(
     missingFromContext.length === 0,
-    `能力表里的每个上下文成员都由 createContext 返回：${missingFromContext.join('、') || '无缺失'}`
+    `能力表里的每个上下文成员都由上下文工厂返回：${missingFromContext.join('、') || '无缺失'}`
   );
 
   const unusedContext = contextKeys.filter((name) => !HOST_CAPABILITIES.context.includes(name));
   check(
     unusedContext.length === 0,
-    `createContext 返回的每一项都在能力表里（否则插件探测不到它）：${unusedContext.join('、') || '无遗漏'}`
+    `上下文工厂返回的每一项都在能力表里（否则插件探测不到它）：${unusedContext.join('、') || '无遗漏'}`
   );
 
   // 关键接线点：把「插件现在可以不是一个模块」这件事钉住。
@@ -540,8 +509,19 @@ console.log('\n能力表：');
     '卸载路径会执行插件登记的清理函数'
   );
   check(
-    contextObject.includes('activationEvent:'),
+    contextKeys.includes('activationEvent'),
     'ctx.activationEvent 已接线（插件能知道自己为什么被激活）'
+  );
+  // `Modulith.run` 是显式引导入口：它去掉"当前正在加载哪个插件"这个隐式全局，
+  // 改成把身份作为参数交给插件。这条断言把接线点本身钉住 —— 一个只在注释里
+  // 描述过的 API，与一个真的挂在 host 对象上的 API，看起来是一样的。
+  check(
+    objectKeys.includes('run'),
+    'Modulith.run 已挂到注入的 host 对象上（api: 2 的显式引导入口）'
+  );
+  check(
+    runtime.includes('currentBootstrap'),
+    '加载路径为每个插件准备了引导数据（run 的回调才有东西可拿）'
   );
   check(
     types.includes('PluginDisposablesAPI') && types.includes('PluginSettingsAPI'),

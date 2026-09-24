@@ -27,6 +27,7 @@ import {
   reloadPluginRuntime,
 } from './pluginRuntime';
 import { computeBootProgress, type BootPhase, type BootStepStatus } from './bootProgress';
+import { startPluginDevWatch } from './pluginDevWatch';
 import { tryAutoLogin } from './auth';
 
 export type { BootPhase, BootStepStatus };
@@ -220,7 +221,12 @@ const STEPS: BootStepDefinition[] = [
 
         // 真正的加载：不 await，启动流程立即继续。
         // 每完成一个插件都会通过 moduleCatalog 的通知实时出现在侧边栏。
-        void loadPluginsInBackground({ timeoutMs: settings.pluginLoadTimeoutMs });
+        //
+        // 开发模式自动重载在它**跑完之后**再启动 —— 那时 `installed` 才填好，
+        // `devPluginIds()` 才有东西可答。放早了会看到空列表，于是监听根本没起来。
+        void loadPluginsInBackground({ timeoutMs: settings.pluginLoadTimeoutMs }).finally(() => {
+          startPluginDevWatch();
+        });
         return;
       }
 
@@ -235,6 +241,10 @@ const STEPS: BootStepDefinition[] = [
         ctx.warn(`插件加载失败：${error instanceof Error ? error.message : String(error)}`);
         report(0, 0, '插件加载失败，已跳过');
       }
+
+      // 开发模式自动重载：清单已在手，可以判断有没有开发链接的插件了。
+      // 没有的话它什么都不做（连定时器都不建）—— 见 `startPluginDevWatch`。
+      startPluginDevWatch();
     },
   },
   {

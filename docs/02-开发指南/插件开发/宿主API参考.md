@@ -19,9 +19,14 @@
 | `jsxs` | function | 同 `jsx`，用于多子元素场景 |
 | `Fragment` | symbol | React Fragment |
 | `registerModule` | function | 注册一个模块 |
-| `createContext` | function | 取得当前插件的服务集合 |
+| `createContext` | function | 取得当前插件的服务集合（靠隐式全局定位插件） |
+| `run` | function | **推荐**：显式引导 —— 宿主把身份与数据作为参数交进来，见 [1.5](#15-run推荐) |
 | `registerCommand` | function | 把一个动作注册进全局搜索框 |
 | `useModuleActive` | function | 判断当前模块是否真的对用户可见（Hook） |
+| `capabilities` | object | 宿主能力表。**特性探测用它**，不要比较版本号 |
+
+`Modulith.capabilities` 的 `api` 字段是**接口表自身的版本**，当前为 `1`。它描述的是"宿主认识哪些成员"，
+不是"你这个插件用第几版接口" —— 插件不需要在清单里声明 api 版本，用哪个入口由插件自己决定。
 
 `registerCommand` 与 `createContext` 一样**只能在插件加载期间调用**（即 IIFE 顶层），因为命令需要归属到具体插件，而「当前正在加载哪个插件」只有加载期才有确定值。宿主会给 ID 加上 `plugin:<插件ID>:` 前缀，插件卸载时据此一次性摘除它注册的全部命令。
 
@@ -159,6 +164,66 @@ var ctx = Modulith.createContext();
   Modulith.registerModule({ id: 'myView', name: '我的视图', component: MyView });
 })();
 ```
+
+### 1.5 run（推荐）
+
+```js
+var ctx = null;
+Modulith.run(function (bootstrap) {
+  ctx = bootstrap.ctx;      // 与 Modulith.createContext() 返回的是**同一个**对象
+});
+```
+
+`run` 与 `createContext` 返回同一个 `ctx`，**区别只在插件身份怎么获得**：
+
+| | 身份来源 | 跨进程可用 |
+| --- | --- | --- |
+| `createContext()` | 「当前正在加载哪个插件」这一全局状态 | ✗ |
+| `run(bootstrap)` | 宿主作为**参数**传进来 | ✓ |
+
+插件将来挪进独立进程（沙箱化）之后，那个全局状态不复存在，而显式传参跨得过去。
+因此**新插件应当用 `run`**；已有的 `createContext()` 写法不会被移除。
+
+`bootstrap` 里全是**值**（字符串、数字、纯对象），这正是它能跨进程的原因：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `pluginId` | string | 本插件 ID |
+| `pluginVersion` | string | 本插件版本 |
+| `hostVersion` | string | 宿主版本 |
+| `manifest` | object \| undefined | 本插件的清单 |
+| `activationEvent` | string \| null | 本次由什么触发；旧式插件为 `'legacy'` |
+| `capabilities` | object | 宿主能力表。**特性探测用它**，不要比较版本号 |
+| `settings` | object | 本插件声明的设置项的**当前值快照**（只读，不跟随变化） |
+| `ctx` | object | 上下文，与 `createContext()` 的返回值相同 |
+
+⚠️ **回调是同步执行的。** 它**不是**"延迟到激活事件再执行"的生命周期钩子 ——
+什么时候执行整段 bundle 仍然由清单里的 `activationEvents` 决定。因此 `registerModule()`
+这类"必须在加载期同步完成"的调用，放进这个回调里同样有效：
+
+```js
+(function () {
+  var Modulith = window.Modulith;
+  if (!Modulith) return;
+
+  var React = Modulith.React;
+  var ctx = null;
+
+  Modulith.run(function (bootstrap) {
+    ctx = bootstrap.ctx;
+    // bootstrap.activationEvent 让我们只为"被用到的那部分"做准备
+    if (bootstrap.activationEvent === 'onStartup') { /* 后台预热 */ }
+  });
+
+  function MyView() { /* ... */ }
+
+  Modulith.registerModule({ id: 'myView', name: '我的视图', component: MyView });
+})();
+```
+
+`settings` 是快照而不是读取器：它在 bundle 执行**之前**取好，之后不会跟着变化。
+需要跟进用户改动就用 `ctx.settings.onChange`。它需要清单声明 `storage` 权限，
+未声明时是空对象（与 `ctx.settings.get` 的降级一致）。
 
 ## 2. storage
 
@@ -481,6 +546,53 @@ if (picked) {
 > 计时结束时触发、而用户当时并没有点击任何东西，第一次播放可能被拒绝。稳妥做法是在
 > 用户点「开始」这类按钮时先建好并 `resume()` 一个 `AudioContext`，
 > 之后到点播放就不会被拦（插件仓库的 `plugins/pomodoro` 就是这么做的）。
+
+## 11.1 clipboard —— 需要 `clipboard`
+
+```js
+await ctx.clipboard.writeText('要复制的内容');
+const text = await ctx.clipboard.readText();
+if (!ctx.clipboard.isAvailable()) { /* 未声明权限或环境不支持，走降级 */ }
+```
+
+| 方法 | 返回 | 说明 |
+| --- | --- | --- |
+| `isAvailable()` | boolean | 权限已声明**且**环境提供剪贴板接口 |
+| `readText()` | `Promise<string>` | 未声明权限时返回空串并记录一次警告 |
+| `writeText(text)` | `Promise<void>` | 未声明权限时静默返回；真的失败时抛错 |
+
+### ⚠️ 这一项的强制程度比其它权限弱
+
+**剪贴板是浏览器 API，插件绕过 `ctx.clipboard` 直接调 `navigator.clipboard` 仍然可行。**
+因此这一项管住的是「插件按约定走宿主通道」，而**不是**「插件拿不到剪贴板」。
+
+这与 `updater` 的处理不同：那里是宿主自己的命令（`updater:default`），前端不授权就真的
+不可达；剪贴板没有这样的开关，在 Rust 侧加门只会制造一种「更难绕过」的假象。
+
+**那为什么还要有它**：调用会被记录、行为统一，而且**忘记声明权限的插件会被降级** ——
+权限列表里这一项因此不是空的。需要真正的强隔离，只能等插件挪进独立进程。
+
+### 两条会咬人的行为
+
+**一、`writeText` 会静默替换用户剪贴板里的内容。** 用户可能正打算粘贴别的东西。
+它不像通知那样显眼，因此**别在用户没主动触发的时候调用它** ——
+一个后台定时器每 5 秒覆盖一次剪贴板，用户只会觉得"电脑坏了"。
+
+**二、读取可能被拒绝，而且那不是缺陷。** 浏览器通常要求页面处于聚焦状态，剪贴板也可能
+被别的程序独占。因此：
+
+```js
+let text = '';
+try {
+  text = await ctx.clipboard.readText();
+} catch (err) {
+  // 别把拒绝当成致命错误 —— 准备好回退路径（让用户手动粘贴、读插件自己的存储）
+}
+```
+
+写入路径有一个 `document.execCommand('copy')` 的回退，它**必须由用户手势触发**：
+在按钮点击里有效，在定时器或后台回调里无效。失败时会抛出说明原因的错误，
+而不是无声失败 —— 无声失败会让作者以为是自己传的值不对。
 
 ## 12. 完整示例
 

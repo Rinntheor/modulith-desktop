@@ -619,9 +619,24 @@ export async function activatePlugin(
   }
 }
 
+/**
+ * 「开发链接」插件的 ID。
+ *
+ * 开发模式的自动重载（`pluginDevWatch`）用它决定**要不要**开始轮询 ——
+ * 没有任何开发链接插件时，宿主不该常驻一个定时器。
+ *
+ * 判据取自运行时自己持有的 `installed`，而不是让调用方自己再查一次后端：
+ * 那样会出现"运行时说这个插件从目录读取、而调用方拿到的列表里没有它"的不一致，
+ * 而那种不一致的表现是**自动重载静默不工作**。
+ */
+export function devPluginIds(): string[] {
+  return installed
+    .filter((plugin) => plugin.enabled && plugin.status !== 'error' && !!plugin.devSource)
+    .map((plugin) => plugin.id);
+}
+
 /** 右键菜单里的一条插件贡献 */
-export interface PluginContextMenuEntry {
-  pluginId: string;
+export interface PluginContextMenuEntry {  pluginId: string;
   pluginDisplayName: string;
   id: string;
   label: string;
@@ -953,6 +968,156 @@ function pluginFileDrop(pluginId: string, manifest: PluginManifest | undefined) 
 }
 
 /**
+ * 插件读写系统剪贴板（`ctx.clipboard`）。**需要 `clipboard` 权限。**
+ *
+ * ============================================================
+ * 为什么这一项是**前端**强制，而不是后端
+ * ============================================================
+ *
+ * 剪贴板是浏览器 API（`navigator.clipboard`），页面脚本本来就能直接调它。
+ * 因此"在 Rust 侧再加一道门"**不会让强制变强** —— 插件绕过 `ctx.clipboard`
+ * 直接调 `navigator.clipboard` 仍然可行，那道门只会制造一种"更难绕过"的假象。
+ *
+ * 真实的边界就是这一层，所以 `permissions.rs` 里把它标成 `frontend`，
+ * 与 `notification` / `plugin-communicate` 同类。这条理由写在这里而不只是写在
+ * 权限表里，因为**下一个人很容易顺手把它"补"到 Rust 侧**，以为那是在加固。
+ *
+ * 与 `capabilities/default.json` 里刻意不授权 `updater:default` 的那处不同：
+ * 那里禁用的是**宿主自己的命令**，前端不授权就真的不可达；剪贴板没有这样的开关。
+ *
+ * ============================================================
+ * 它仍然值得存在
+ * ============================================================
+ *
+ * 即便绕过是可能的，这一层仍有三个真实作用：
+ *   1. 插件不必自己发明一套剪贴板访问方式（否则各写各的、行为不一）；
+ *   2. 调用会被记录，出问题时有迹可循；
+ *   3. **权限列表里这一项不再是空的** —— 声明了它的插件会被如实标注为"前端强制"，
+ *      而不是"声明了但宿主暂不强制"。这是 v1.5「让权限列表说真话」的一部分。
+ */
+function pluginClipboard(pluginId: string, manifest: PluginManifest | undefined) {
+  const allowed = pluginHasPermission(manifest, 'clipboard');
+
+  let warned = false;
+  const warnOnce = () => {
+    if (warned) return;
+    warned = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 使用了剪贴板，但清单里没有声明 "clipboard" 权限，调用会被忽略（后续同类调用不再重复提示）`
+    );
+  };
+
+  /**
+   * 浏览器是否提供剪贴板接口。
+   *
+   * 在 Tauri 的 WebView 里它是有的（安全上下文），但这个判断仍然保留：
+   * 纯前端预览、以及未来可能出现的受限渲染环境都拿不到它，而那时应当**如实返回
+   * 不可用**，而不是让插件在 `await` 一个 undefined 时收到一句看不懂的报错。
+   */
+  const api = typeof navigator !== 'undefined' ? navigator.clipboard : undefined;
+  const available = allowed && !!api;
+
+  return {
+    isAvailable: () => available,
+
+    /**
+     * 读取剪贴板文本。
+     *
+     * **可能失败，而且失败不是缺陷**：浏览器要求页面处于聚焦状态、且可能要求
+     * 用户手势；剪贴板也可能被别的程序独占。调用方应当准备好回退路径，
+     * 而不是把拒绝当成致命错误。
+     */
+    readText: (): Promise<string> => {
+      if (!allowed) {
+        warnOnce();
+        return Promise.resolve('');
+      }
+      if (!api) {
+        console.warn(
+          `[pluginRuntime] 插件 "${pluginId}" 读取剪贴板失败：当前环境不提供 navigator.clipboard`
+        );
+        return Promise.resolve('');
+      }
+      return api.readText();
+    },
+
+    /**
+     * 写入剪贴板文本。
+     *
+     * ⚠️ **这会静默替换用户剪贴板里的内容** —— 用户可能正打算粘贴别的东西。
+     * 权限描述里专门写了这一点，因为它不像通知那样显眼。
+     *
+     * 优先用异步接口；不可用时回退到 `document.execCommand('copy')`。
+     * 回退路径**必须**由用户手势触发（浏览器限制），因此它在按钮点击里有效、
+     * 在定时器里无效 —— 失败时会返回一条说清原因的错误，而不是无声失败。
+     */
+    writeText: async (text: string): Promise<void> => {
+      if (!allowed) {
+        warnOnce();
+        return;
+      }
+      if (typeof text !== 'string') {
+        throw new Error('ctx.clipboard.writeText() 需要字符串');
+      }
+
+      if (api) {
+        try {
+          await api.writeText(text);
+          return;
+        } catch (error) {
+          // 落到回退路径，而不是直接把错误抛出去 —— 异步接口在"页面未聚焦"时
+          // 会拒绝，而回退路径在那种情况下往往仍然可用。
+          console.warn(
+            `[pluginRuntime] 插件 "${pluginId}" 的 navigator.clipboard.writeText 被拒绝，尝试回退路径：`,
+            error
+          );
+        }
+      }
+
+      if (!copyViaSelection(text)) {
+        throw new Error(
+          'ctx.clipboard.writeText() 失败：浏览器拒绝了剪贴板写入。' +
+            '该接口通常要求页面处于聚焦状态、且由用户手势触发 —— ' +
+            '请把写入放在点击等交互里，而不是定时器或后台回调里。'
+        );
+      }
+    },
+  };
+}
+
+/**
+ * `document.execCommand('copy')` 回退：临时建一个文本框、选中、复制、再撤掉。
+ *
+ * **必须有用户手势**（浏览器限制），因此它是回退而不是首选。
+ * 返回是否成功 —— 调用方据此给出可行动的报错，而不是无声失败。
+ */
+function copyViaSelection(text: string): boolean {
+  if (typeof document === 'undefined' || !document.body) return false;
+
+  const holder = document.createElement('textarea');
+  holder.value = text;
+  // 不要让它可见或改变布局：固定定位 + 透明，且避开可能的滚动锚定
+  holder.setAttribute('readonly', '');
+  holder.style.position = 'fixed';
+  holder.style.top = '0';
+  holder.style.left = '0';
+  holder.style.opacity = '0';
+  holder.style.pointerEvents = 'none';
+
+  document.body.appendChild(holder);
+  try {
+    holder.select();
+    holder.setSelectionRange(0, text.length);
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    // 无论成功与否都要摘掉：失败时留下一个游离节点，会在下一次复制时被再次选中
+    holder.remove();
+  }
+}
+
+/**
  * 插件导入音频文件（`ctx.audio`）。
  *
  * 权限检查在后端（`plugin_pick_audio` → `filesystem-read`）。
@@ -1202,7 +1367,14 @@ function pluginSettingsAPI(
   };
 }
 
-/** 为「正在加载的插件」创建上下文；在插件代码之外调用会抛错 */
+/**
+ * 为「正在加载的插件」创建上下文；在插件代码之外调用会抛错。
+ *
+ * 实现委托给 `createContextFor`：`api: 1` 走这条（靠隐式全局定位插件），
+ * `api: 2` 的 `Modulith.run()` 走 `createContextFor`（插件身份是显式参数）。
+ * **两条路返回同一个形状、同一个对象** —— `bootstrap.ctx` 与 `Modulith.createContext()`
+ * 是同一件东西，因此一个插件可以只用其中一条，也可以按需混用。
+ */
 function createContext() {
   if (!loadingPluginId) {
     throw new Error(
@@ -1211,6 +1383,15 @@ function createContext() {
   }
   const pluginId = loadingPluginId;
   const manifest = installed.find((p) => p.id === pluginId)?.manifest;
+  return createContextFor(pluginId, manifest, activationReasons.get(pluginId) ?? 'legacy');
+}
+
+/** 上下文工厂。插件身份是**显式参数** —— 这是 `api: 2` 能成立的原因 */
+function createContextFor(
+  pluginId: string,
+  manifest: PluginManifest | undefined,
+  event: ActivationEvent | 'legacy'
+) {
   return {
     pluginId,
     pluginVersion: manifest?.version ?? '0.0.0',
@@ -1224,7 +1405,7 @@ function createContext() {
      * 做准备（例如被 `onCommand:export` 唤醒时不必先去建界面）。没有它，插件只能
      * 全部初始化一遍，那等于把按需激活省下的钱又花回去。
      */
-    activationEvent: activationReasons.get(pluginId) ?? null,
+    activationEvent: event,
     storage: pluginStorage(pluginId),
     http: pluginHttp(pluginId),
     logger: pluginLogger(pluginId),
@@ -1235,6 +1416,7 @@ function createContext() {
     shell: pluginShell(pluginId),
     fileDrop: pluginFileDrop(pluginId, manifest),
     audio: pluginAudio(pluginId),
+    clipboard: pluginClipboard(pluginId, manifest),
     settings: pluginSettingsAPI(pluginId, manifest),
     /**
      * 收尾登记的入口。**这是功能型插件的前提**：一个后台服务会创建定时器、
@@ -1391,7 +1573,7 @@ export interface ModulithHost {
   jsxs: typeof jsxs;
   Fragment: typeof Fragment;
   registerModule: (registration: PluginModuleRegistration) => void;
-  createContext: () => ReturnType<typeof createContext>;
+  createContext: () => PluginContextValue;
   /**
    * 把一个动作注册进全局搜索框。
    *
@@ -1426,6 +1608,31 @@ export interface ModulithHost {
    * 真正决定一段代码能不能跑的，是这里列出的东西。
    */
   capabilities: ModulithCapabilities;
+  /**
+   * **显式引导入口**（`api: 2`）：宿主把插件身份与数据作为**参数**交进去，
+   * 而不是让插件去读"当前正在加载哪个插件"这个隐式全局。
+   *
+   * 沙箱化之后插件与宿主不再共享 realm，那个全局不复存在 —— 显式传参是唯一
+   * 能跨过去的形态。`bootstrap.ctx` 与 `createContext()` 返回的是**同一个**对象，
+   * 因此两条路可以混用。
+   *
+   * ```js
+   * Modulith.run(function (bootstrap) {
+   *   var ctx = bootstrap.ctx;            // 与 Modulith.createContext() 等价
+   *   var saved = bootstrap.settings;     // 本插件设置的当前值快照（只读）
+   *   Modulith.registerModule({ ... });   // 行为与在顶层调用完全一致
+   * });
+   * ```
+   *
+   * **回调在 bundle 执行期同步跑完。** 它不是"延迟到激活事件再执行"的生命周期钩子 ——
+   * 什么时候执行整段 bundle，仍然由清单的 `activationEvents` 决定。
+   *
+   * 回调的返回值**被忽略**：贡献仍然通过 `registerModule()` 等入口登记。
+   * "返回值即贡献"要求插件把组件作为值交出来，而组件是函数、跨不过 realm ——
+   * 那是界面层的重新设计（见 `docs/08-规划/插件架构与API-v1.5范围.md` 分叉 A），
+   * 不属于这一步。
+   */
+  run: (entry: (bootstrap: PluginBootstrap) => void) => void;
   /**
    * 登记一个「插件被卸载/禁用/重载时执行」的清理函数。
    *
@@ -1486,6 +1693,158 @@ function registerPluginCommand(command: PluginCommandRegistration): void {
 
 let hostInstalled = false;
 
+// ============================================================
+// 显式引导（`api: 2`）
+// ============================================================
+//
+// 当前插件代码依赖一个**隐式全局**："当前正在加载哪个插件"（`loadingPluginId`）。
+// `Modulith.createContext()` 与 `Modulith.registerModule()` 都靠它决定归属，
+// 因此它们必须在 IIFE 顶层、且只能在加载期调用。
+//
+// 这条约束的代价有两层：
+//
+//   1. **写起来别扭**：中大型插件无法把激活逻辑拆成模块再调用，注册代码只能堆在顶层；
+//   2. **与沙箱天然冲突**：插件挪进独立 realm 之后，没有那个全局可读 ——
+//      归属必须**由宿主显式告诉插件**，而不是让插件去读一个环境变量。
+//
+// 因此这一层给出一条显式路径：宿主把身份与数据作为**参数**交给插件，插件在回调里
+// 干活。`api: 1` 的行为一个字都没变，两条路并存。
+//
+// ⚠️ **这一层改的是"身份怎么传"，不是"什么时候执行"。** 回调仍然在 bundle 执行期
+// 同步跑完 —— 它不是"延迟到激活事件再执行"的钩子。真正的按需激活仍然是
+// 清单里的 `activationEvents` 决定的（宿主决定何时执行整段 bundle）。
+// 把这件事说清楚很重要：一个名字叫 `activate` 的东西很容易被误解成生命周期钩子。
+
+/**
+ * 插件上下文（`ctx`）的**实际类型**。
+ *
+ * 由工厂的返回类型反推，而不是再手写一份接口：插件拿到的东西就是 `createContextFor`
+ * 返回的东西，手写一份等于把"类型声明"与"真实形状"分成两份，而这两份必然会漂移 ——
+ * 类型说错了比没有类型更糟，因为作者会相信补全。
+ */
+export type PluginContextValue = ReturnType<typeof createContextFor>;
+
+/** 宿主交给插件的一份**只读快照** */
+export interface PluginBootstrap {
+  readonly pluginId: string;
+  readonly pluginVersion: string;
+  readonly hostVersion: string;
+  readonly manifest: PluginManifest | undefined;
+  /** 本次执行由什么触发；旧式插件为 `'legacy'` */
+  readonly activationEvent: ActivationEvent | 'legacy' | null;
+  /** 宿主能力表。**特性探测用它**，不要比较版本号 */
+  readonly capabilities: ModulithCapabilities;
+
+  /**
+   * 本插件自己声明的设置项的**当前值快照**。
+   *
+   * 是快照，不是读取器：它在 bundle 执行之前取好，之后**不会**跟着变化。
+   * 需要跟进变更就用 `ctx.settings.onChange`。
+   *
+   * 需要清单声明 `storage` 权限；未声明时是空对象（与 `ctx.settings.get` 的降级一致）。
+   */
+  readonly settings: Readonly<Record<string, unknown>>;
+
+  /** 本插件的上下文。与 `Modulith.createContext()` 返回的是同一个对象 */
+  readonly ctx: PluginContextValue;
+}
+
+/**
+ * 插件在 `run()` 回调里能拿到的宿主入口。
+ *
+ * 刻意**不含** `createContext` / `registerModule` / `registerCommand` / `onDeactivate`
+ * 的副本：那四个走 `Modulith.*` 的现有入口，行为不变。等它们有了明确的
+ * "只传数据"形态（见边界清单里那 7 条 `callable`），再作为方法挂到这里来 ——
+ * 现在挂上去只会多一份与 `Modulith.*` 行为可能分叉的实现。
+ */
+export interface PluginRunContext {
+  readonly pluginId: string;
+  /** 宿主版本 */
+  readonly version: string;
+  /** 本次激活事件 */
+  readonly activationEvent: string | null;
+}
+
+/**
+ * 一次 plugin bundle 执行期内的显式引导状态。
+ *
+ * 每个 API 版本一份、每个插件一份：`settings` 是**可变对象**，跨插件共用会让
+ * 某个插件的写入串到别人身上 —— 那类缺陷只在恰好两个插件同时存在时才复现。
+ */
+interface BootstrapState {
+  readonly bootstrap: PluginBootstrap;
+  readonly runContext: PluginRunContext;
+}
+
+let currentBootstrap: BootstrapState | null = null;
+
+/**
+ * 组装一份引导快照。**必须在 bundle 执行之前**调用。
+ *
+ * 同步的：改 40 个插件的加载路径去 `await` 一份设置，收益为零。
+ * 设置值本来就随贡献目录在激活前读好（`loadPluginSettingValues` 在加载流程里已跑过）。
+ */
+function createBootstrap(
+  pluginId: string,
+  manifest: PluginManifest | undefined,
+  event: ActivationEvent | 'legacy'
+): BootstrapState {
+  const ctx = createContextFor(pluginId, manifest, event);
+
+  const allowed = pluginHasPermission(manifest, 'storage');
+  const settings: Record<string, unknown> = allowed ? { ...getAllPluginSettings(pluginId) } : {};
+
+  return {
+    bootstrap: {
+      pluginId,
+      pluginVersion: manifest?.version ?? '0.0.0',
+      hostVersion: resolvedVersion,
+      manifest,
+      activationEvent: event,
+      capabilities: HOST_CAPABILITIES,
+      settings,
+      ctx,
+    },
+    runContext: {
+      pluginId,
+      version: resolvedVersion,
+      activationEvent: event,
+    },
+  };
+}
+
+/**
+ * 插件入口：`Modulith.run(fn)`。
+ *
+ * `fn` 在**加载期同步**执行；它抛出的错误会被原样向上抛给加载流程，
+ * 于是插件的加载状态会如实变成 `error` —— 与 bundle 顶层抛错完全一致。
+ *
+ * 为什么不把返回值当作贡献：那要求插件把组件、命令行为都**作为值**交出来，
+ * 而组件是函数。跨 realm 之后函数过不去，那是一次界面层的重新设计（见
+ * `docs/08-规划/插件架构与API-v1.5范围.md` 的分叉 A），不属于这一步。
+ * 因此 `fn` 的返回值**被忽略**，贡献仍然通过 `Modulith.registerModule()` 等入口登记。
+ */
+function runPlugin(entry: (bootstrap: PluginBootstrap) => void): void {
+  if (!loadingPluginId) {
+    throw new Error(
+      'Modulith.run() 只能在插件 bundle 执行期间调用 —— 它需要知道自己在为哪个插件收取贡献'
+    );
+  }
+  if (typeof entry !== 'function') {
+    throw new Error('Modulith.run() 需要一个函数参数');
+  }
+  if (!currentBootstrap) {
+    throw new Error(
+      `插件 "${loadingPluginId}" 调用了 Modulith.run()，但宿主没有为它准备引导数据` +
+        '（这通常是宿主的缺陷，请连同插件 ID 一起报告）'
+    );
+  }
+
+  // 回调期间 `loadingPluginId` 保持设置：`registerModule()` / `registerCommand()` /
+  // `onDeactivate()` 仍然靠它决定归属，因此它们在回调里的行为与在顶层完全一致。
+  entry(currentBootstrap.bootstrap);
+}
+
 function installHostGlobals(): void {
   if (hostInstalled) return;
 
@@ -1503,6 +1862,7 @@ function installHostGlobals(): void {
     registerCommand: registerPluginCommand,
     useModuleActive,
     capabilities: HOST_CAPABILITIES,
+    run: runPlugin,
     /**
      * 登记一个「插件被卸载/禁用/重载时执行」的清理函数。
      *
@@ -1706,11 +2066,16 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
     // 门面要知道"现在是谁在跑"：来源标记是日志里唯一能回答"是谁发的"的东西，
     // 而它只能在插件脚本执行的**这个窗口**里拿到。
     setGuardSource(pluginId);
+
+    // 引导数据必须**在脚本执行之前**备好：`Modulith.run()` 的回调在 bundle 执行期
+    // 同步跑，那时再去读设置就来不及了。
+    currentBootstrap = createBootstrap(pluginId, manifest, activationReasons.get(pluginId) ?? 'legacy');
     try {
       document.head.appendChild(scriptEl);
       assets.scripts.push(scriptEl);
     } finally {
       loadingPluginId = null;
+      currentBootstrap = null;
       setGuardSource(null);
       window.removeEventListener('error', onError);
     }
@@ -1887,6 +2252,26 @@ export async function reloadPluginRuntime(
     cleanupInjected(pluginId);
     cleanupPluginResources(pluginId);
     loadStates.delete(pluginId);
+  }
+
+  // 仍然启用、但已经加载过的插件，必须**忘掉它们的激活状态**。
+  //
+  // 这是一个真实缺陷的修复，不只是为开发模式做的准备。重载意味着"目录、组件缓存
+  // 与注入的资源都已经重建"，而 `activationStates` 里的 `active` 会让
+  // `activatePlugin()` 在开头直接早退：
+  //
+  //     const current = activationStates.get(pluginId);
+  //     if (current?.status === 'active') return current;
+  //
+  // 于是重载之后，**懒激活插件**的 bundle 永远不会再执行 —— 而它的 DOM、组件缓存与
+  // 模块描述符都已经在重载里被清掉了。表现是"重载之后点开那个模块是空白"，
+  // 只有重启应用才恢复。eager 插件看不出来，因为它们紧接着就被重新执行了一遍。
+  //
+  // 因此这里对**所有**仍启用的插件清空激活状态。重载的语义就是"接下来谁被用到，
+  // 谁就重新执行一次" —— 而这一条也正是开发模式自动重载能生效的前提。
+  for (const plugin of enabledPlugins) {
+    activationStates.delete(plugin.id);
+    activationReasons.delete(plugin.id);
   }
 
   // 原先这里还有一个遍历 `contracts.keys()` 的清理循环。它是**死代码**：
