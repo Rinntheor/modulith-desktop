@@ -22,7 +22,7 @@
 //
 // 前三条在本地跑一次就会暴露，但它们不该靠"记得跑一次"。
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -392,6 +392,60 @@ section('运行位置字段');
   check(
     /runtime/.test(manifestDoc),
     '清单文件参考里写了 runtime 字段'
+  );
+}
+
+// ============================================================
+// 8. 窗口查找不许走 `get_webview_window`
+// ============================================================
+//
+// `get_webview_window(label)` 在返回前会再判一次 `is_webview_window()`，而那个判据是
+// "这个窗口下的**所有** webview 的标签都等于窗口标签"。**只要窗口里多出一个 webview**
+// —— 沙箱插件的界面就是 —— 它就变成 false，于是返回 `None`。
+//
+// 症状完全不像"取不到窗口"：关闭按钮点了没反应（关闭行为那条路径找不到窗口）、
+// 隐藏到托盘之后托盘再也叫不回窗口、内存等级设不上，而日志里只有一句
+// "找不到主窗口"。第一次真人使用正是这样：装上第一个沙箱插件之后，点关闭就再也
+// 回不来了。
+//
+// 因此宿主代码一律走 `core::window`。这条断言盯的就是"别再有人图省事写回去"。
+
+section('窗口查找');
+
+{
+  const rustFiles: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.rs')) rustFiles.push(full);
+    }
+  };
+  walk(resolve(here, '../src-tauri/src'));
+
+  // 注释里会出现这个词（`core/window.rs` 就在解释它为什么不能用），
+  // 因此先把行注释与块注释剥掉再找。
+  const stripComments = (source: string): string =>
+    source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  const offenders = rustFiles
+    .filter((file) => stripComments(readFileSync(file, 'utf8')).includes('get_webview_window'))
+    .map((file) => file.replace(resolve(here, '../src-tauri/src'), 'src').replace(/\\/g, '/'));
+
+  check(
+    offenders.length === 0,
+    offenders.length === 0
+      ? '宿主源码里没有 get_webview_window（都走 core::window）'
+      : `这些文件仍在用 get_webview_window —— 窗口里多一个 webview 就会失效：${offenders.join('、')}`
+  );
+
+  check(
+    /pub fn main<R: Runtime>/.test(read('../src-tauri/src/core/window.rs')),
+    'core::window 提供了 main()'
+  );
+  check(
+    /pub fn main_webview<R: Runtime>/.test(read('../src-tauri/src/core/window.rs')),
+    'core::window 提供了 main_webview()'
   );
 }
 

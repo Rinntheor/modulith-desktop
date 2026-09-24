@@ -362,7 +362,7 @@ pub fn run() -> Result<(), tauri::Error> {
         // 这里再显式居中一次作为兜底：失败只记警告，绝不影响启动。
         #[cfg(desktop)]
         {
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = crate::core::window::main(app.handle()) {
                 if let Err(e) = window.center() {
                     eprintln!("[WARN] Failed to center main window: {e}");
                 }

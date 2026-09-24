@@ -2,3 +2,4 @@
 pub mod lifecycle;
 pub mod module;
 pub mod registry;
+pub mod window;

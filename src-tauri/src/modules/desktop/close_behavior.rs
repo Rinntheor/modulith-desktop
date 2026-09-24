@@ -47,20 +47,17 @@
 // 把它**捕获进来**（`AppHandle` 是 `Arc` 内部的廉价克隆，且闭包要求 `'static`，
 // 捕获自己拥有的句柄正好合适）。这样既避开了生成文件，也不需要任何全局状态。
 
-use tauri::{Manager, WindowEvent};
+use tauri::WindowEvent;
 
 use crate::modules::settings::settings;
 use crate::prelude::*;
-
-/// 主窗口标签
-const MAIN_WINDOW: &str = "main";
 
 /// 给主窗口装上关闭行为的判定
 ///
 /// 在模块 `setup` 里调用一次。注册监听本身只是加一份回调，不做任何跨线程调用，
 /// 因此在 setup 阶段（事件循环启动之前）执行是安全的。
 pub fn install(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+    let Some(window) = crate::core::window::main(&app) else {
         log::warn!("关闭行为：找不到主窗口，关闭时不会隐藏到托盘");
         return;
     };
@@ -86,7 +83,7 @@ pub fn install(app: &AppHandle) {
         // 这个决定的地方，之后再做的任何事都只是善后。
         api.prevent_close();
 
-        let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        let Some(window) = crate::core::window::main(&app) else {
             return;
         };
 
