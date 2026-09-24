@@ -121,23 +121,58 @@ function extractBlock(
   return values;
 }
 
-const handlerCommands = extractBlock(
-  libRs,
-  'src-tauri/src/lib.rs',
-  'generate_handler![',
-  /^\s*\]\);/m,
-  /^([a-z][a-z0-9_]*),$/,
-  'generate_handler!'
-);
+const handlerCommands = (() => {
+  try {
+    return extractBlock(
+      libRs,
+      'src-tauri/src/lib.rs',
+      'generate_handler![',
+      /^\s*\]\);/m,
+      /^([a-z][a-z0-9_]*),$/,
+      'generate_handler!'
+    );
+  } catch (error) {
+    // 解析失败**不能**退化成"集合偏小"的正常结果 —— 那正好会让下面每一条
+    // "没有漏掉"的断言全部通过。宁可整体失败。
+    console.error(`\n解析 lib.rs 的 generate_handler! 失败：${(error as Error).message}\n`);
+    process.exit(1);
+  }
+})();
 
-const manifestCommands = extractBlock(
-  buildRs,
-  'src-tauri/build.rs',
-  'AppManifest::new().commands(&[',
-  /^\s*\]\),?/m,
-  /^"([a-z][a-z0-9_]*)",$/,
-  'AppManifest::commands'
-);
+const manifestCommands = (() => {
+  try {
+    return extractBlock(
+      buildRs,
+      'src-tauri/build.rs',
+      'AppManifest::new().commands(&[',
+      /^\s*\]\),?/m,
+      /^"([a-z][a-z0-9_]*)",$/,
+      'AppManifest::commands'
+    );
+  } catch (error) {
+    // 这一条是**插件沙箱的主屏障**，而它不成立时的症状是"一切都正常"。
+    //
+    // 实测过一次，插件 webview 调宿主命令时日志里有**两条**独立记录：
+    //   1. `connect-src 拦下了 http://ipc.localhost/get_app_info`（CSP，引擎执行）
+    //   2. `get_app_info not allowed on window "main", webview "plugin-selftest"`
+    //      （ACL，Rust 的 IPC 入口）
+    //
+    // 第 1 条**不承重**：Tauri 的 IPC 在 fetch 失败后会回退到
+    // `window.ipc.postMessage`（见 tauri 的 `scripts/ipc-protocol.js`），
+    // 那是一条原生桥，不受 CSP 管辖。真正挡住它的是 ACL —— 而 ACL 只在应用
+    // 声明过 app manifest 时才对**应用自己的**命令生效。
+    //
+    // 也就是说：删掉 build.rs 里这一句，插件会重新拿到全部 120 条命令，
+    // 而构建、类型检查与其余门禁都不会变红。所以这里不是"报个错"，
+    // 是把那句话写出来。
+    console.error(
+      `\n在 build.rs 里找不到 AppManifest::commands：${(error as Error).message}\n\n` +
+        '这是插件沙箱的主屏障。没有它，插件 webview 能调全部应用命令 ——\n' +
+        'CSP 挡不住它（Tauri 的 IPC 有 postMessage 回退路径），其余门禁也不会报错。\n'
+    );
+    process.exit(1);
+  }
+})();
 
 const slug = (command: string): string => command.replace(/_/g, '-');
 
@@ -265,6 +300,78 @@ for (const capability of capabilityFiles) {
     capability.windows === undefined
       ? `${capability.name} 未使用 windows 键`
       : `${capability.name} 使用了 windows 键 —— 它会把授权发给该窗口下的所有 webview（包括将来的插件 webview）`
+  );
+}
+
+// ============================================================
+// 3b. 插件 webview 必须一条权限都没有
+// ============================================================
+//
+// 这是插件的**全部安全依据**：`plugin-<id>` 这些 webview 不匹配任何 capability，
+// 于是 Tauri 在 IPC 入口拒绝它们的每一次 invoke —— 包括全部 120 条应用命令。
+//
+// 插件与宿主之间的通信不走 IPC，而走自定义协议（见 plugins/sandbox.rs）：
+// 协议不受 capability 管辖，且处理器能拿到发起请求的 webview 标签，
+// 因此插件**不需要**任何 IPC 权限就能干活。这条断言守的正是那个"不需要"。
+//
+// 一旦有人给插件 webview 加了一条哪怕最小的 capability（比如为了图省事发个事件），
+// 它就重新获得了 IPC 通道，整套模型退回成"插件自报身份"。构建、类型检查、
+// 其余门禁都不会因此变红 —— 所以必须有这一条。
+
+section('插件 webview 的授权（必须为零）');
+
+{
+  const sandboxRs = readSource('../src-tauri/src/modules/plugins/sandbox.rs');
+  const prefixMatch = /pub const LABEL_PREFIX:\s*&str\s*=\s*"([^"]+)"/.exec(sandboxRs);
+  check(prefixMatch !== null, 'sandbox.rs 里能找到 LABEL_PREFIX');
+
+  const prefix = prefixMatch ? prefixMatch[1] : 'plugin-';
+  check(
+    prefix === 'plugin-',
+    `webview 标签前缀是 ${JSON.stringify(prefix)}（改了它就要同步这条门禁与文档）`
+  );
+
+  // Tauri 的匹配是 glob。这里不实现完整 glob，只判定"这个模式会不会命中
+  // 一个以插件前缀开头的标签" —— 对真实会写出来的两种形式（`*` 与 `plugin-*`）
+  // 都覆盖到了。
+  const matchesPluginLabel = (pattern: string): boolean =>
+    pattern === '*' || pattern.startsWith(prefix);
+
+  const offenders: string[] = [];
+  for (const capability of capabilityFiles) {
+    for (const pattern of capability.webviews ?? []) {
+      if (matchesPluginLabel(pattern)) {
+        offenders.push(`${capability.name} → ${pattern}`);
+      }
+    }
+  }
+
+  check(
+    offenders.length === 0,
+    offenders.length === 0
+      ? '没有任何 capability 把插件 webview 纳入作用域（它们因此没有 IPC 权限）'
+      : `这些 capability 会把 IPC 权限发给插件 webview，整套沙箱模型因此失效：${offenders.join(', ')}`
+  );
+
+  // 协议名不能与 Tauri 自己注册的取同名 —— 那会把它顶掉，而且症状是
+  // "某个内置能力莫名失效"，很难归因到这一行。Tauri 注册的是这三个。
+  const schemeMatch = /pub const SCHEME:\s*&str\s*=\s*"([^"]+)"/.exec(sandboxRs);
+  check(schemeMatch !== null, 'sandbox.rs 里能找到 SCHEME');
+
+  const scheme = schemeMatch ? schemeMatch[1] : '';
+  check(
+    !['tauri', 'ipc', 'asset'].includes(scheme),
+    `协议名 ${JSON.stringify(scheme)} 没有与 Tauri 内置的三个（tauri / ipc / asset）冲突`
+  );
+
+  // ORIGIN 必须与 SCHEME 对得上。这两个字符串分开写是因为平台不同（Windows 上
+  // 是 `http://<scheme>.localhost`，别处是 `<scheme>://localhost`），
+  // 但改了一个忘了另一个的症状是"页面加载不出来"，也不会让别的检查变红。
+  const originMatch = /pub const ORIGIN:\s*&str\s*=\s*"([^"]+)"/.exec(sandboxRs);
+  check(originMatch !== null, 'sandbox.rs 里能找到 ORIGIN');
+  check(
+    originMatch !== null && originMatch[1].includes(scheme),
+    `ORIGIN 与 SCHEME 一致（ORIGIN=${JSON.stringify(originMatch ? originMatch[1] : '')}，SCHEME=${JSON.stringify(scheme)}）`
   );
 }
 

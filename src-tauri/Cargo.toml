@@ -27,7 +27,16 @@ tauri-build = { version = "2", features = [] }
 #
 # 这也是唯一一个新增的 Tauri 官方特性 —— 它比引入一个第三方托盘插件更小：
 # 依赖 `tray-icon` 且只在桌面平台编译。
-tauri = { version = "2", features = ["tray-icon"] }
+# `unstable` 是插件沙箱的前提：**在一个窗口里放多个 webview** 的 API
+# （`Window::add_child` / `WebviewBuilder`）在 Tauri 2 里门在这个特性后面。
+#
+# 打开它的代价必须写清楚：Tauri 官方措辞是 "might introduce breaking changes in
+# future minor releases"，即**不受 semver 保护**。升级 Tauri 时要重跑沙箱自检 ——
+# 这不是一条"升上去就没问题"的依赖。
+#
+# 另一个候选是"每个插件开一个独立 WebViewWindow"，那条路用稳定 API，但每个窗口
+# 是一整套 WebView2 进程组。在一个把内存当目标的项目里，那个代价不可接受。
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2.7.1"
 serde = { version = "1", features = ["derive"] }

@@ -6,6 +6,7 @@ pub mod icon;
 pub mod manager;
 pub mod permissions;
 pub mod quota;
+pub mod sandbox;
 pub mod signature;
 pub mod types;
 pub mod validator;

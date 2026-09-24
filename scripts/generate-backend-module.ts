@@ -338,6 +338,16 @@ pub fn run() -> Result<(), tauri::Error> {
         // 放进配置文件才能跟着版本走。
         .plugin(tauri_plugin_updater::Builder::new().build());
 
+    // 插件沙箱的自定义协议。
+    //
+    // 它承载插件界面与宿主之间的**全部**通信（见 modules/plugins/sandbox.rs）。
+    // 插件 webview 一条 IPC 权限都没有，因此没有 event / command 可用 ——
+    // 身份由协议处理器拿到的 webview 标签确定，插件伪造不了。
+    //
+    // 注册在 builder 上而不是某个窗口上：运行时会给**每一个** webview 各注册一遍，
+    // 因此子 webview 用的是同一条协议。
+    builder = modules::plugins::sandbox::register(builder);
+
     // setup 中初始化模块
     builder = builder.setup(move |app| {
         // 窗口居中兜底。
@@ -381,6 +391,15 @@ pub fn run() -> Result<(), tauri::Error> {
         }
 
         app.manage(registry);
+
+        // 沙箱自检：建一个**真的**插件 webview，让它自己跑四项检查并把结果投回日志
+        // （页面在 resources/sandbox-selftest.html）。
+        //
+        // 只在 debug 构建里装：它是验证工具，不是功能。装在 release 里会让每个用户
+        // 平白多一个 webview —— 与"内存是目标"直接冲突。
+        #[cfg(debug_assertions)]
+        modules::plugins::sandbox::spawn_self_test(handle.clone());
+
         Ok(())
     });
 
