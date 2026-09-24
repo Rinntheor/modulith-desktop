@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. The opener plugin needs an explicit path scope: 'allow-open-path' grants the open_path COMMAND but no path, so without scope entries every openPath() call fails with 'Not allowed to open path'. The scoped entries below cover the call sites (Settings > About > open data dir, Settings > Logs > open log dir, and the plugin detail drawer's open plugin folder). NOTE: 'updater:default' is deliberately NO LONGER granted -- app updates go through our own Rust command (src-tauri/src/modules/updater/commands.rs) so that the download-source setting can rewrite both the manifest URL and the installer URL. If the plugin's own commands stayed reachable from the frontend, plugin code (which shares the JS realm) could bypass that setting entirely.",
-  "windows": ["main"],
+  "description": "Capability for the main window. The opener plugin needs an explicit path scope: 'allow-open-path' grants the open_path COMMAND but no path, so without scope entries every openPath() call fails with 'Not allowed to open path'. The scoped entries below cover the call sites (Settings > About > open data dir, Settings > Logs > open log dir, and the plugin detail drawer's open plugin folder). NOTE: 'updater:default' is deliberately NO LONGER granted -- app updates go through our own Rust command (src-tauri/src/modules/updater/commands.rs) so that the download-source setting can rewrite both the manifest URL and the installer URL. If the plugin's own commands stayed reachable from the frontend, plugin code (which shares the JS realm) could bypass that setting entirely. NOTE 2: this is keyed by `webviews`, NOT `windows`. A matching `windows` entry grants the capability to EVERY webview of that window -- once plugin webviews live inside the main window (v2.0 sandbox), that would hand the whole host permission set to the plugin. `pnpm check:acl` fails the build if any capability uses `windows`. The app's own commands are granted separately, in app-commands.json.",
+  "webviews": ["main"],
   "permissions": [
     "core:default",
     "opener:default",

@@ -1,3 +1,154 @@
+// src-tauri/build.rs
+//
+// 除了常规的 Tauri 构建，这里还声明【应用自己的 ACL 清单】。
+//
+// == 为什么必须有这一句 ==
+//
+// Tauri 对应用自己注册的命令默认不设门禁。实现上的判定条件在
+// tauri/src/webview/mod.rs 的 on_message()：
+//
+//     if (plugin_command.is_some() || has_app_acl_manifest || !is_local)
+//        && invoke.acl.is_none() { 拒绝 }
+//
+// 也就是说：只要没有应用级 ACL 清单，本机来源的 webview 调自己的命令时完全跳过
+// ACL 检查。这不是配置写宽了，而是根本没查。在本文件出现之前，应用里任何一个
+// webview —— 包括托盘菜单那个 —— 都能调用下面全部命令。
+//
+// 声明之后语义反转成默认拒绝：命令必须被某个 capability 明确授权才可用，而
+// capability 是按 window / webview 标签匹配的。插件沙箱正建立在这条之上。
+//
+// == 这个列表必须与 generate_handler! 完全一致 ==
+//
+// 少一条 = 那条命令对所有人都不可用，因为没有任何 capability 能授权它。这是一处
+// 只会在运行期暴露的缺陷，因此由 `pnpm check:acl` 逐条比对：build.rs 的列表、
+// lib.rs 的 generate_handler!、以及 capabilities/ 里的授权集合，三处必须一致。
+
 fn main() {
-    tauri_build::build()
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(
+            tauri_build::AppManifest::new().commands(&[
+                "get_auth_status",
+                "verify_session",
+                "get_hardware_fingerprint",
+                "setup_access_key",
+                "verify_access_key",
+                "try_auto_login",
+                "logout",
+                "change_access_key",
+                "set_require_auth",
+                "set_auto_login",
+                "generate_recovery_code",
+                "verify_recovery_code",
+                "reset_access_key_with_recovery_code",
+                "get_security_overview",
+                "get_known_devices",
+                "remove_known_device",
+                "get_login_logs",
+                "clear_login_logs",
+                "list_backup_categories",
+                "export_backup",
+                "open_backup",
+                "restore_backup",
+                "background_host_status",
+                "detect_node_runtime",
+                "set_node_runtime_path",
+                "background_host_probe",
+                "background_host_shutdown",
+                "get_close_to_tray",
+                "set_close_to_tray",
+                "is_tray_available",
+                "tray_menu_state",
+                "tray_menu_action",
+                "get_log_dir",
+                "read_log_tail",
+                "clear_logs",
+                "log_frontend",
+                "report_frontend_crash",
+                "net_policy_modes",
+                "net_log_list",
+                "net_log_clear",
+                "net_log_len",
+                "net_answer_prompt",
+                "net_list_session_grants",
+                "net_clear_session_grants",
+                "net_note_frontend_outbound",
+                "list_notifications",
+                "push_notification",
+                "mark_notification_read",
+                "mark_all_notifications_read",
+                "dismiss_notification",
+                "clear_notifications",
+                "get_notification_summary",
+                "list_plugins",
+                "get_plugin",
+                "list_plugin_permissions",
+                "dev_plugin_fingerprints",
+                "install_plugin_package",
+                "install_plugin_folder",
+                "install_plugin_url",
+                "install_plugin_url_verified",
+                "fetch_registry_text",
+                "verify_plugin_index",
+                "set_plugin_enabled",
+                "uninstall_plugin",
+                "read_plugin_asset",
+                "read_plugin_readme",
+                "export_plugin",
+                "pick_plugin_package",
+                "pick_plugin_folder",
+                "default_export_dir",
+                "plugin_storage_get",
+                "plugin_storage_set",
+                "plugin_storage_delete",
+                "plugin_storage_keys",
+                "plugin_storage_list",
+                "plugin_storage_usage",
+                "plugin_storage_clear",
+                "plugin_http_request",
+                "plugin_launch_program",
+                "plugin_extract_icon",
+                "plugin_reveal_in_folder",
+                "plugin_pick_audio",
+                "get_app_settings",
+                "get_app_info",
+                "update_app_settings",
+                "reload_app_settings",
+                "memory_snapshot",
+                "apply_memory_level_for_visibility",
+                "set_webview_memory_level",
+                "webview_memory_level_supported",
+                "reset_app_settings",
+                "probe_network",
+                "get_app_data_dir",
+                "pick_notification_sound",
+                "load_notification_sound",
+                "get_autostart_status",
+                "set_autostart_enabled",
+                "was_started_by_autostart",
+                "trim_memory_now",
+                "trim_memory_supported",
+                "get_sidebar_preferences",
+                "get_module_preferences",
+                "update_module_order",
+                "toggle_module_visibility",
+                "toggle_module_pin",
+                "move_module_position",
+                "get_module_categories",
+                "create_module_category",
+                "rename_module_category",
+                "delete_module_category",
+                "reorder_module_categories",
+                "set_module_category",
+                "reset_sidebar_preferences",
+                "reset_module_preferences",
+                "record_module_open",
+                "get_recent_modules",
+                "toggle_favorite_module",
+                "get_favorite_modules",
+                "check_app_update",
+                "install_app_update",
+            ]),
+        ),
+    )
+    .expect("tauri-build 失败");
 }

@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray-menu",
+  "description": "托盘菜单窗口的授权。它此前【一条 capability 都没有】却仍能工作 —— 因为应用没有声明 ACL 清单时，本机来源的 webview 调宿主命令根本不经过检查（见 build.rs 的说明）。清单一旦声明就会变成默认拒绝，所以这里必须显式列出它真正用到的那两条。刻意只给两条：这个窗口的全部职责是显示菜单并把点击转成一次 invoke，多给任何一条都没有依据。",
+  "webviews": ["tray-menu"],
+  "permissions": [
+    "allow-tray-menu-state",
+    "allow-tray-menu-action"
+  ]
+}
