@@ -157,6 +157,13 @@ export interface PluginManifest {
   icon?: string;
   iconSvg?: string;
   permissions?: string[];
+  /**
+   * 代码跑在哪里。**必须跟着后端走**（`types.rs` 的 `PluginRuntime`）：
+   * 缺省 `in-process`，写了 `sandboxed` 的插件跑在自己的 webview 里。
+   *
+   * 未知取值后端会让整份清单不合法，因此这里只可能是这两个字符串之一。
+   */
+  runtime?: 'in-process' | 'sandboxed';
   activationEvents?: string[];
   contributes?: unknown;
   preview?: boolean;
@@ -497,6 +504,9 @@ function buildDeclaredModuleDescriptor(
     children: undefined,
     pluginId,
     iconSvg: resolveInlineIconSvg(pluginId, plugin.manifest),
+    // 清单说它跑在自己的 webview 里。渲染端据此换成一块占位，
+    // 由 `SandboxSurface` 把它量出来交给 Rust。
+    sandboxed: plugin.manifest.runtime === 'sandboxed',
   };
 }
 
@@ -525,6 +535,10 @@ function buildRuntimeModuleDescriptor(
     // 内联 SVG 随描述符一起传给渲染层。渲染图标是同步路径，
     // 若等到渲染时再 invoke 读取就会先出现一帧空框，因此在这里取好。
     iconSvg: resolveInlineIconSvg(pluginId, manifest),
+    // 走到这个函数意味着**插件的代码已经在宿主这个 realm 里跑起来了**，
+    // 并且同步调用了 `registerModule`。因此它在定义上就是 in-process ——
+    // 不看清单：一个声明了 sandboxed 的插件根本不会走到这里。
+    sandboxed: false,
   };
 }
 

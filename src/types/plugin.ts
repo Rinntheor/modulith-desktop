@@ -314,6 +314,19 @@ export interface PluginManifest {
   // 宿主无法核实的字段，只会让作者与用户以为存在分级管控。
   // 替代它的是 `permissions`（正在逐步变成真强制）与出站网络策略。
   permissions?: PluginPermission[];
+
+  /**
+   * 代码跑在哪里。
+   *
+   * 与上面那个被删掉的 `sandboxLevel` 的区别不是措辞：**等级**是宿主无法核实的量；
+   * **位置**是可以核实的 —— `sandboxed` 的插件跑在自己的 webview 里，那个 webview
+   * 不匹配任何 capability，因此连宿主命令都调不动。
+   *
+   * 缺省 `'in-process'`：与宿主同一个 webview、同一个 JS 上下文。
+   * 未知取值会让整份清单**不合法**（后端是枚举，不做静默兜底）——
+   * 把 `'sandboxed'` 当成 `'in-process'` 跑，是一次声明了隔离而实际没有的降级。
+   */
+  runtime?: 'in-process' | 'sandboxed';
   
   // 依赖
   dependencies?: Record<string, string>;

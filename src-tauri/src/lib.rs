@@ -54,7 +54,7 @@ pub fn run() -> Result<(), tauri::Error> {
     //
     // 协议注册在 builder 上而不是某个窗口上：运行时会给**每一个** webview 各注册
     // 一遍，因此子 webview 用的是同一条协议。
-    builder = builder.manage(modules::plugins::sandbox::SandboxRegistry::default());
+    builder = builder.manage(modules::plugins::sandbox::SandboxSurfaces::default());
     builder = modules::plugins::sandbox::register(builder);
 
     // setup 中初始化模块
@@ -166,6 +166,9 @@ pub fn run() -> Result<(), tauri::Error> {
         dismiss_notification,
         clear_notifications,
         get_notification_summary,
+        sandbox_surface_open,
+        sandbox_surface_close,
+        sandbox_surface_bounds,
         list_plugins,
         get_plugin,
         list_plugin_permissions,

@@ -15,7 +15,7 @@ use super::icon;
 use super::quota;
 use super::types::{
     ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio, PluginError, PluginManifest,
-    PluginPermission, PluginResult, PluginStatus, RegistryEntry, RegistryFile,
+    PluginPermission, PluginResult, PluginRuntime, PluginStatus, RegistryEntry, RegistryFile,
 };
 use super::validator;
 use crate::modules::net::client::{NetClient, NetError, NetOrigin};
@@ -503,6 +503,76 @@ impl PluginManager {
 // ============================================================
 // 查询
 // ============================================================
+
+/// 沙箱要用到的**全部事实**。
+///
+/// 这些字段都来自已安装插件这一次读取，沙箱那边不再自己记一份 —— 理由见
+/// `PluginManager::sandbox_view`。
+#[derive(Debug, Clone)]
+pub struct SandboxView {
+    /// 插件 id（身份）
+    pub id: String,
+    /// 界面标题
+    pub name: String,
+    pub version: String,
+    /// 资源根目录（开发链接优先，与其它读取路径一致）
+    pub root: PathBuf,
+    /// 入口脚本（相对 `root`）
+    pub main: String,
+    /// 样式（相对 `root`）
+    pub style: Option<String>,
+    /// **当前**清单里声明的权限
+    pub permissions: Vec<String>,
+    /// 清单声明的运行位置
+    pub runtime: PluginRuntime,
+}
+
+impl PluginManager {
+    /// 取一个插件的沙箱视图。
+    ///
+    /// **这是沙箱唯一的真源。** 沙箱那边只记"我建过哪些界面"（标签 → 插件 id），
+    /// 而"这个插件存在吗、它的资源在哪、它声明了什么"全部从这里读。
+    ///
+    /// 为什么不能各记一份：那会变成两个真源，而两套清单一定会漂 —— 漂开的方向是
+    /// "沙箱以为这个插件存在、存储那边不认"。实测撞到过一次，见
+    /// docs/06-项目/已知问题与技术债.md §7.40。
+    ///
+    /// 权限与运行位置都读**当前**清单，不是注册表里的缓存 —— 与 `manifest_of`
+    /// 同一个理由：开发目录里新加/去掉的声明必须立刻影响判定。
+    pub fn sandbox_view(&self, id: &str) -> PluginResult<SandboxView> {
+        let entry = self
+            .registry
+            .get(id)
+            .ok_or_else(|| PluginError::NotFound(format!("插件不存在: {id}")))?;
+
+        // 停用的插件不该有界面。放在读清单之前：一个被停用的插件连它的清单都不必解析。
+        if !entry.enabled {
+            return Err(PluginError::NotFound(format!("插件已停用: {id}")));
+        }
+
+        let root = self.asset_root(entry);
+        let manifest = read_manifest(&root)?;
+
+        Ok(SandboxView {
+            id: id.to_string(),
+            name: if manifest.display_name.trim().is_empty() {
+                manifest.name.clone()
+            } else {
+                manifest.display_name.clone()
+            },
+            version: manifest.version.clone(),
+            root,
+            main: manifest.main.clone(),
+            style: manifest.style.clone(),
+            permissions: manifest
+                .permissions
+                .iter()
+                .map(|permission| permission.as_str().to_string())
+                .collect(),
+            runtime: manifest.runtime,
+        })
+    }
+}
 
 impl PluginManager {
     /// 列出所有已安装插件，按 displayName 排序

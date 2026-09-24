@@ -3,6 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <title>插件沙箱自检</title>
+    <!-- 空图标：没有它，浏览器会去请求根路径的 /favicon.ico，而那与插件的路径规则冲突 -->
+    <link rel="icon" href="data:," />
     <!--
       这份页面由宿主通过 modulith-plugin 协议提供（见 src-tauri/src/modules/plugins/sandbox.rs），
       并带上一条由宿主写死的 CSP。它跑在**插件自己的 webview** 里。
@@ -148,6 +150,16 @@
             button.disabled = true;
             fetch('/selftest/rpc/close', { method: 'POST' }).catch(function () {});
           });
+
+          // 四项都通过时**自己关掉**：这是一次性自检，结论已经进了日志，
+          // 留一块面板挡在界面上只会让人以为它关不掉（第一次真机运行就是这样）。
+          // 有失败时**留着**，并显示关闭按钮 —— 那时人需要看着它。
+          if (ok) {
+            verdict.textContent += '（2 秒后自动关闭，结论已写进日志）';
+            window.setTimeout(function () {
+              fetch('/selftest/rpc/close', { method: 'POST' }).catch(function () {});
+            }, 2000);
+          }
         }
 
         // ---- 1. 引导脚本在不在 -------------------------------------------

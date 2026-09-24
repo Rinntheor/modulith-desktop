@@ -147,6 +147,9 @@ fn main() {
                 "get_favorite_modules",
                 "check_app_update",
                 "install_app_update",
+                "sandbox_surface_open",
+                "sandbox_surface_close",
+                "sandbox_surface_bounds",
             ]),
         ),
     )

@@ -21,6 +21,47 @@ fn to_msg<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+// ============================================================
+// 沙箱界面：前端量矩形，宿主建/摆/关 webview
+// ============================================================
+//
+// 为什么由**前端**给位置：只有它知道标签栏、分屏、侧边栏当前各占多少。
+// 宿主自己算就要把整套布局再实现一遍，而那两份一定会漂。
+//
+// 为什么不是"前端画一个 iframe"：插件界面必须是**独立 webview**，`iframe` 拿不到
+// 真正的隔离（见 docs/08-规划/插件沙箱与数据-v2.0范围.md §2.3）。
+// 代价是它盖在 DOM 之上，位置只能由宿主摆 —— 于是有了这三条命令。
+
+/// 打开一个沙箱插件的界面。
+///
+/// 只对清单里写了 `runtime: "sandboxed"` 的**已安装**插件有效；其余一律拒绝
+/// （理由见 `sandbox::open_surface_at`）。
+#[tauri::command]
+pub fn sandbox_surface_open(
+    app: AppHandle,
+    plugin_id: String,
+    bounds: super::sandbox::SurfaceBounds,
+) -> Result<(), String> {
+    super::sandbox::open_surface_at(&app, &plugin_id, bounds)
+}
+
+/// 关闭一个沙箱插件的界面。没开着时是**静默成功** ——
+/// 前端在卸载时无条件调用它，把"本来就没开"当成错误只会在日志里堆噪声。
+#[tauri::command]
+pub fn sandbox_surface_close(app: AppHandle, plugin_id: String) -> Result<(), String> {
+    super::sandbox::close_surface(&app, &plugin_id)
+}
+
+/// 重新摆放一个沙箱插件的界面。窗口缩放、侧边栏折叠、分屏比例变化都走它。
+#[tauri::command]
+pub fn sandbox_surface_bounds(
+    app: AppHandle,
+    plugin_id: String,
+    bounds: super::sandbox::SurfaceBounds,
+) -> Result<(), String> {
+    super::sandbox::set_surface_bounds(&app, &plugin_id, bounds)
+}
+
 #[tauri::command]
 pub async fn list_plugins(
     state: State<'_, PluginState>,

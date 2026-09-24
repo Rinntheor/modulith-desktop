@@ -13,6 +13,7 @@ import {
   setCachedModuleComponent,
 } from '../services/moduleComponentCache';
 import { reportCrash } from '../services/logger';
+import SandboxSurface from './SandboxSurface';
 
 /**
  * 兼容再导出：模块组件缓存已移入 `services/moduleComponentCache`，
@@ -229,6 +230,17 @@ const ModuleRenderer: React.FC<ModuleRendererProps> = memo(({ moduleId, initial 
 
   // 使用缓存的组件
   const CachedComponent = getCachedModuleComponent(moduleId) || moduleDescriptor.component;
+
+  // 沙箱插件：它的界面在**另一个 webview** 里，DOM 这边只留一块位置正确的空洞。
+  // 走这条分支时**不渲染 `CachedComponent`** —— 那个组件是给 in-process 插件用的，
+  // 而在沙箱里没有 React 可跑。
+  if (moduleDescriptor.sandboxed && moduleDescriptor.pluginId) {
+    return (
+      <ModuleErrorBoundary moduleId={moduleId}>
+        <SandboxSurface pluginId={moduleDescriptor.pluginId} />
+      </ModuleErrorBoundary>
+    );
+  }
 
   return (
     <ModuleErrorBoundary moduleId={moduleId}>

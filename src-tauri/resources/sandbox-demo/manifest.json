@@ -1,9 +1,0 @@
-{
-  "name": "com.modulith.sandbox-demo",
-  "display_name": "沙箱演示插件",
-  "version": "1.0.0",
-  "description": "宿主内置的沙箱链路验证插件。只在 debug 构建里注册，不随发布包分发。",
-  "main": "plugin.js",
-  "style": "plugin.css",
-  "permissions": ["storage"]
-}

@@ -56,7 +56,7 @@
 // 且把 id 直接拼进标签会在 `a.b` 与 `a-b` 之间产生歧义。因此：
 //
 //   * 标签只是**去重用的名字**（`plugin-<净化后的 id>`），由 `label_for` 产出；
-//   * 真正的身份是 `SandboxRegistry` 里那条 `标签 → 插件 id` 的记录；
+//   * 真正的身份是 `SandboxSurfaces` 里那条 `标签 → 插件 id` 的记录；
 //   * 注册时检测标签冲突并拒绝 —— 冲突意味着两个插件抢同一个 webview 名字，
 //     那必须是一个显式错误，而不是让其中一个静默失效。
 //
@@ -78,6 +78,8 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use tauri::{http, AppHandle, Manager, Runtime};
+
+use super::manager::SandboxView;
 
 /// 承载插件界面的自定义协议名。
 ///
@@ -105,87 +107,69 @@ pub const SELFTEST_ID: &str = "selftest";
 const SELFTEST_HTML: &str = include_str!("../../../resources/sandbox-selftest.html");
 const BRIDGE_JS: &str = include_str!("../../../resources/sandbox-bridge.js");
 
-/// 内置演示插件的 id。它只用一次：证明"真插件走这条链路"是通的。
-pub const DEMO_ID: &str = "com.modulith.sandbox-demo";
-
 // ============================================================
-// 注册表
-// ============================================================
-
-// ============================================================
-// 注册表：**目前有两个真源，这是一个已知的问题**
+// 沙箱这边**不记插件的事实**，只记"我建过哪些界面"
 // ============================================================
 //
-// 已经有过两套"什么插件存在、它能做什么"：
+// 曾经的做法是本模块记一份 `标签 → {根目录, 入口, 样式, 权限}`。那是错的：
+// 宿主里于是有了两套"什么插件存在、它能做什么"（另一套是 `PluginManager`，
+// 存储的权限与配额判定都在它那里）。两套清单一定会漂，而漂开的方向是
+// **"沙箱以为这个插件存在、存储那边不认"** —— 实测撞到过一次，
+// 见 docs/06-项目/已知问题与技术债.md §7.40。
 //
-//   * `PluginManager` —— 已安装插件的真源，存储权限与配额判定都在它那里；
-//   * `SandboxRegistry`（本模块）—— 沙箱界面要用的那份同步缓存。
+// 现在的事实只有一个来源：`PluginManager::sandbox_view`。本模块只保留
+// **标签 → 插件 id** 这一条映射，而它不可能与真源漂开 —— 因为每一次界面创建
+// 都必须先通过 `sandbox_view` 拿到那个插件，拿不到就建不出来。
 //
-// 对**已安装的插件**，这两者描述同一个东西，因此不冲突。但内置演示插件只在后者里
-// 出现，于是它调存储时被 `PluginManager` 拒绝（"插件不存在"）—— 那是**正确行为**
-// （未知身份必须 fail-closed），但它也说明：真做一个真插件迁移时，
-// **`SandboxRegistry` 必须由 `PluginManager` 派生**，而不是各记一份。
-// 两套清单一定会漂，而漂开的方向是"沙箱以为这个插件存在、存储那边不认"。
-//
-// 这一点记在 docs/06-项目/已知问题与技术债.md §7.40，属于增量 C 的工作。
+// 也就是说：**没安装的插件拿不到界面，这是构造上就成立的**，不是靠一道检查。
 
-/// 沙箱里一个插件的运行时信息。
-///
-/// 这些字段都来自清单，在**注册时**读一次。协议处理器因此不必去碰
-/// `PluginManager`（它在一把异步锁后面），每条资源请求也不会多一次加锁。
-#[derive(Clone)]
-struct SandboxPlugin {
-    /// 真插件 id（身份）
-    id: String,
-    /// 界面标题
-    name: String,
-    /// 版本，交给桥接层展示
-    version: String,
-    /// 资源根目录（插件版本目录）
-    root: PathBuf,
-    /// 入口脚本（相对 `root`）
-    main: String,
-    /// 样式（相对 `root`）
-    style: Option<String>,
-    /// 清单里声明的权限，供桥接层做特性探测
-    permissions: Vec<String>,
-}
-
-/// 标签 → 插件 的注册表。由 Tauri 托管。
+/// Tauri 托管的沙箱界面表：`webview 标签 → 插件 id`。
 ///
 /// 用 `std::sync::RwLock` 而不是 tokio 的：协议处理器要同步读它，而临界区里只做
 /// 一次哈希查找 —— 短到不会成为一个需要异步的理由。
 #[derive(Default)]
-pub struct SandboxRegistry(RwLock<HashMap<String, SandboxPlugin>>);
+pub struct SandboxSurfaces(RwLock<HashMap<String, String>>);
 
-impl SandboxRegistry {
-    /// 注册一个沙箱插件，返回它的 webview 标签。
+impl SandboxSurfaces {
+    /// 记下"我给这个插件建了界面"，返回它的 webview 标签。
     ///
     /// 标签冲突**必须**是显式错误：两个插件抢同一个 webview 名字时，静默让后来者
     /// 覆盖先来者会造成"其中一个插件的界面永远打不开"，而那看起来像插件本身坏了。
-    fn register(&self, plugin: SandboxPlugin) -> Result<String, String> {
-        let label = label_for(&plugin.id);
+    fn claim(&self, plugin_id: &str) -> Result<String, String> {
+        let label = label_for(plugin_id);
         let mut map = self.0.write().unwrap_or_else(|e| e.into_inner());
 
         if let Some(existing) = map.get(&label) {
-            if existing.id != plugin.id {
+            if existing != plugin_id {
                 return Err(format!(
-                    "webview 标签冲突：{label} 已经属于 {}，不能给 {}",
-                    existing.id, plugin.id
+                    "webview 标签冲突：{label} 已经属于 {existing}，不能再给 {plugin_id}（两者的 id 净化后同名）"
                 ));
             }
         }
 
-        map.insert(label.clone(), plugin);
+        map.insert(label.clone(), plugin_id.to_string());
         Ok(label)
     }
 
-    fn get(&self, label: &str) -> Option<SandboxPlugin> {
+    /// 这个标签是哪个插件的界面。没建过就返回 `None` —— 调用方必须把它当成
+    /// "这个请求不是来自插件 webview"，而不是"插件 id 是空串"。
+    fn plugin_of(&self, label: &str) -> Option<String> {
         self.0
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(label)
             .cloned()
+    }
+
+    /// 忘掉一条占位。界面被关掉、或建失败回滚时调用。
+    ///
+    /// 它与"关掉 webview"必须**成对**发生：只关 webview 而留着占位，下一次建界面时
+    /// 会以为"已经建过了"，而 webview 其实已经不在了。
+    fn forget(&self, label: &str) {
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(label);
     }
 }
 
@@ -243,17 +227,35 @@ async fn handle<R: Runtime>(
 ) -> http::Response<Cow<'static, [u8]>> {
     // 自检页是内置的，不在注册表里（它没有插件目录）。
     if label == label_for(SELFTEST_ID) {
-        return handle_selftest(request).await;
+        return handle_selftest(app, request).await;
     }
 
-    let Some(state) = app.try_state::<SandboxRegistry>() else {
-        log::warn!("[sandbox] 注册表尚未就绪，拒绝 {label} 的请求");
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        log::warn!("[sandbox] 界面表尚未就绪，拒绝 {label} 的请求");
         return text(503, "沙箱尚未就绪");
     };
 
-    let Some(plugin) = state.get(label) else {
-        log::warn!("[sandbox] 拒绝来自未注册 webview 的协议请求：{label}");
-        return text(403, "这个来源不是已注册的插件 webview");
+    // 身份来自这张表，而表里的每一条都是**建界面时经 `PluginManager` 核实过**的。
+    // 也就是说：一个没安装的插件不可能出现在这里。
+    let Some(plugin_id) = surfaces.plugin_of(label) else {
+        log::warn!("[sandbox] 拒绝来自未建界面的 webview 的协议请求：{label}");
+        return text(403, "这个来源不是插件界面");
+    };
+
+    // 插件的事实（根目录、入口、样式、权限）从 `PluginManager` 读 —— 单一真源。
+    // 锁在文件 IO 之前放掉（下面的入口文档与资源读取都要碰磁盘）。
+    let view = {
+        let Some(state) = app.try_state::<super::PluginState>() else {
+            return text(503, "插件系统尚未就绪");
+        };
+        let manager = state.0.read().await;
+        match manager.sandbox_view(&plugin_id) {
+            Ok(view) => view,
+            Err(e) => {
+                log::warn!("[sandbox] 取不到 {plugin_id} 的沙箱视图：{e}");
+                return text(404, "这个插件当前不可用");
+            }
+        }
     };
 
     let path = request.uri().path().to_string();
@@ -261,10 +263,10 @@ async fn handle<R: Runtime>(
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
 
     let claimed = segments.first().copied().unwrap_or("");
-    if claimed != plugin.id {
+    if claimed != view.id {
         log::warn!(
             "[sandbox] 拒绝跨插件的协议请求：webview={label}（属于 {}）声明了 {claimed}",
-            plugin.id
+            view.id
         );
         return text(403, "请求的路径与所在 webview 不匹配");
     }
@@ -272,33 +274,40 @@ async fn handle<R: Runtime>(
     match (method.as_str(), segments.get(1).copied()) {
         // 入口文档。**由宿主合成** —— 插件包因此不必自带 HTML。
         ("GET", None) | ("GET", Some("")) | ("GET", Some("index.html")) => {
-            entry_document(&plugin)
+            entry_document(&view)
         }
 
         // 桥接层。它是宿主的一部分，不来自插件目录：插件拿不到它，也就改不了它。
         //
         // 每次响应都**按身份重新渲染一遍**（`bridge_script`），因此插件在顶层就能
         // 同步读到自己的 id / 名称 / 权限，不必先 await 一次握手。
-        ("GET", Some("bridge.js")) => bridge_script(&plugin),
+        ("GET", Some("bridge.js")) => bridge_script(&view),
 
         ("GET", Some("asset")) => {
             let rel = segments[2..].join("/");
-            serve_asset(&plugin, &rel)
+            serve_asset(&view, &rel)
         }
 
         ("POST", Some("rpc")) => {
             let Some(method) = segments.get(2).copied() else {
                 return text(404, "缺少 RPC 方法");
             };
-            dispatch_rpc(app, &plugin, method, request.body()).await
+            dispatch_rpc(app, &view, method, request.body()).await
         }
 
         _ => text(404, "没有这条路径"),
     }
 }
 
-/// 自检页的路由。它只有四条路径，且不涉及任何插件目录。
-async fn handle_selftest(request: http::Request<Vec<u8>>) -> http::Response<Cow<'static, [u8]>> {
+/// 自检页的路由。它只涉及宿主内置的那一份文档。
+///
+/// `close` 是一条**独立的**方法，不能落进下面的"结果上报"分支 —— 它发的是
+/// 无 body 的 POST，被当成上报解析会得到一条 `EOF while parsing a value`
+/// 的告警，而面板**关不掉**。这里踩过一次。
+async fn handle_selftest<R: Runtime>(
+    app: &AppHandle<R>,
+    request: http::Request<Vec<u8>>,
+) -> http::Response<Cow<'static, [u8]>> {
     let path = request.uri().path().to_string();
     let method = request.method().as_str().to_string();
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -315,12 +324,35 @@ async fn handle_selftest(request: http::Request<Vec<u8>>) -> http::Response<Cow<
             _ => text(404, "未知的 RPC 方法"),
         },
         ("POST", Some("rpc")) => {
+            if segments.get(2).copied() == Some("close") {
+                close_off_main_thread(app, &label_for(SELFTEST_ID));
+                return json(r#"{"ok":true}"#);
+            }
+
             let body = String::from_utf8_lossy(request.body()).to_string();
             log_selftest_report(&body);
             json(r#"{"ok":true}"#)
         }
         _ => text(404, "没有这条路径"),
     }
+}
+
+/// 关掉一个沙箱 webview。
+///
+/// **不在协议处理器里直接 `close()`。** 处理器跑在引擎的请求路径上，而销毁一个
+/// webview 会走 `DestroyWindow` 一类的窗口操作 —— 在 Windows 上从窗口消息的
+/// 处理链里做这件事有明确的死锁面。丢给一个独立线程，代价是一次线程创建。
+fn close_off_main_thread<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    let app = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        if let Some(webview) = app.get_webview(&label) {
+            match webview.close() {
+                Ok(()) => log::info!("[sandbox] 已关闭 {label}"),
+                Err(e) => log::warn!("[sandbox] 关闭 {label} 失败：{e}"),
+            }
+        }
+    });
 }
 
 // ============================================================
@@ -337,7 +369,7 @@ async fn handle_selftest(request: http::Request<Vec<u8>>) -> http::Response<Cow<
 ///
 /// `script-src 'self'`（不是 `'unsafe-inline'`）：桥接与插件脚本都是同源外部文件，
 /// 插件因此不能靠内联脚本绕过 —— 它的入口只有一个。
-fn entry_document(plugin: &SandboxPlugin) -> http::Response<Cow<'static, [u8]>> {
+fn entry_document(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
     let style = match &plugin.style {
         Some(rel) => format!(
             r#"  <link rel="stylesheet" href="/{id}/asset/{rel}">"#,
@@ -353,6 +385,15 @@ fn entry_document(plugin: &SandboxPlugin) -> http::Response<Cow<'static, [u8]>> 
   <head>
     <meta charset="utf-8">
     <title>{name}</title>
+    <!--
+      空图标。
+      没有这一行，浏览器会自动去请求文档根路径的 /favicon.ico，而那个路径的第一段
+      不是任何插件 id —— 于是它会撞上"路径必须与 webview 所属插件相符"这条判断，
+      在日志里留下一条**看起来像攻击的告警**，实际上只是浏览器的固定行为。
+      实测撞到过。这里用一个空 data URL 把那一次请求彻底消掉，
+      而不是去放宽那条判断。
+    -->
+    <link rel="icon" href="data:,">
 {style}
   </head>
   <body>
@@ -416,7 +457,7 @@ fn page(body: String, script_and_style: &str) -> http::Response<Cow<'static, [u8
 ///   * 插件在**顶层同步**就能读到自己的身份与权限，不必先 await 一次握手 ——
 ///     而"顶层同步可用"正是 v1.5 花一整轮保住的性质；
 ///   * 少一条往返。身份校验照旧在协议处理器里做，这条替换不是安全依据。
-fn bridge_script(plugin: &SandboxPlugin) -> http::Response<Cow<'static, [u8]>> {
+fn bridge_script(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
     let permissions = serde_json::to_string(&plugin.permissions)
         .unwrap_or_else(|_| "[]".to_string());
 
@@ -463,7 +504,7 @@ fn js_string(value: &str) -> String {
 ///
 /// 不用"检查字符串里有没有 `..`"那种做法：它在 Windows 上会被 `\`、短名、UNC
 /// 路径绕过，而这类判据的失效方式恰好是"看起来正常但读到了别的文件"。
-fn serve_asset(plugin: &SandboxPlugin, rel: &str) -> http::Response<Cow<'static, [u8]>> {
+fn serve_asset(plugin: &SandboxView, rel: &str) -> http::Response<Cow<'static, [u8]>> {
     let Some(decoded) = urlencoding::decode(rel).ok() else {
         return text(400, "资源路径无法解码");
     };
@@ -542,7 +583,7 @@ fn content_type_of(path: &Path) -> &'static str {
 
 async fn dispatch_rpc<R: Runtime>(
     app: &AppHandle<R>,
-    plugin: &SandboxPlugin,
+    plugin: &SandboxView,
     method: &str,
     body: &[u8],
 ) -> http::Response<Cow<'static, [u8]>> {
@@ -753,13 +794,6 @@ fn log_selftest_report(body: &str) {
     }
 }
 
-/// 内置演示插件的资源目录。
-///
-/// 用 `CARGO_MANIFEST_DIR` 而不是 `resource_dir()`：只有 debug 构建会用到它，
-/// 而 cargo 运行的产物目录里没有 `resources/`。它**不随发布包分发**，这是有意的 ——
-/// 演示插件是验证工具，不是功能。
-#[cfg(debug_assertions)]
-const DEMO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/sandbox-demo");
 
 /// 注册自检与演示插件，并建它们的 webview。**只在 debug 构建里存在**。
 ///
@@ -774,104 +808,188 @@ pub fn spawn_debug_harness<R: Runtime>(app: AppHandle<R>) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(4));
 
-        // 自检 webview 不走注册表（它没有插件目录），因此这里不必注册它。
-        open_surface(&app, &label_for(SELFTEST_ID), SELFTEST_ID, 24.0);
-
-        match demo_plugin() {
-            Ok(plugin) => {
-                let plugin_id = plugin.id.clone();
-                let Some(state) = app.try_state::<SandboxRegistry>() else {
-                    log::warn!("[sandbox自检] 沙箱注册表尚未就绪，跳过演示插件");
-                    return;
-                };
-                // 演示插件**只**登记在沙箱注册表里，不在 `PluginManager` 里 ——
-                // 它不是一个已安装的插件。因此它的存储调用会被正确拒绝，
-                // 而页面把那条拒绝本身当成一项检查（fail-closed）。
-                // 见文件头"目前有两个真源"。
-                match state.register(plugin) {
-                    // 标签用**注册返回的那个**，不用 `label_for(DEMO_ID)` 重算：
-                    // 演示插件的 id 来自清单，清单与 DEMO_ID 一旦不一致，重算出来的
-                    // 标签就查不到注册表，症状是 403 而不是"id 写错了"。
-                    Ok(label) => open_surface(&app, &label, &plugin_id, 24.0 + 300.0),
-                    Err(e) => log::warn!("[sandbox自检] 演示插件注册失败：{e}"),
-                }
-            }
-            Err(e) => log::warn!("[sandbox自检] 演示插件不可用：{e}"),
+        // 自检 webview 不走界面表（它没有插件目录），因此这里不必登记它。
+        // 位置尺寸写死：这是一次性的验证面板，不参与布局，而且四项全过之后会自己关掉。
+        let bounds = SurfaceBounds {
+            x: 24.0,
+            y: 24.0,
+            width: 560.0,
+            height: 420.0,
+        };
+        if let Err(e) = open_surface(&app, &label_for(SELFTEST_ID), SELFTEST_ID, bounds) {
+            log::warn!("[sandbox自检] 自检界面建不出来：{e}");
+            return;
         }
+
+        // **刻意不再自动给插件建界面。**
+        //
+        // 这里曾经无条件地给"第一个声明了 sandboxed 的已安装插件"开一块面板，
+        // 用来验证真插件那一半。第一次真机运行证明那样做是错的：用户没打开任何插件，
+        // 界面上却多出一块挡在那里的面板，而且**没有任何方式关掉它**。
+        //
+        // 真插件那一半现在走**真实路径**：用户在侧边栏打开模块时，前端量出内容区
+        // 矩形并调用 `sandbox_surface_open`。自检页留着，因为它验的是**边界本身**，
+        // 而那件事没有别的触发点；它还会在四项全过之后自己关掉。
     });
 }
 
-/// 装配内置演示插件。
+/// 沙箱界面在窗口里的位置与尺寸（**逻辑像素**，相对窗口客户区左上角）。
 ///
-/// **走的是真清单类型**（`PluginManifest`）而不是自己发明一份小格式：多一份格式就
-/// 多一处会与真清单漂开的地方，而漂开的方向恰好是"演示能跑、真插件不能"。
-///
-/// 资源目录用 `CARGO_MANIFEST_DIR` 而不是 `resource_dir()`：只有 debug 构建会用到它，
-/// 而 cargo 运行的产物目录里没有 `resources/`。它**不随发布包分发**，这是有意的。
-#[cfg(debug_assertions)]
-fn demo_plugin() -> Result<SandboxPlugin, String> {
-    let root = PathBuf::from(DEMO_ROOT);
-    let text = std::fs::read_to_string(root.join("manifest.json"))
-        .map_err(|e| format!("读不到清单：{e}"))?;
-    let manifest: super::types::PluginManifest =
-        serde_json::from_str(&text).map_err(|e| format!("清单不合法：{e}"))?;
-
-    Ok(SandboxPlugin {
-        id: manifest.name.clone(),
-        name: if manifest.display_name.trim().is_empty() {
-            manifest.name.clone()
-        } else {
-            manifest.display_name.clone()
-        },
-        version: manifest.version.clone(),
-        root,
-        main: manifest.main.clone(),
-        style: manifest.style.clone(),
-        permissions: manifest
-            .permissions
-            .iter()
-            .map(|permission| permission.as_str().to_string())
-            .collect(),
-    })
+/// 由**前端**量出来传进来，宿主不自己算：只有前端知道标签栏、分屏、侧边栏当前
+/// 各占多少。
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
-/// 在指定位置开一个沙箱 webview。目前只有 debug 自检用它。
+impl SurfaceBounds {
+    /// 夹到至少 1×1。WebView2 不接受 0 尺寸的控件，而"内容区被折叠到 0 宽"
+    /// 是一个真实会出现的状态（侧边栏展开动画的第一帧）。
+    fn sanitized(self) -> Self {
+        Self {
+            x: self.x,
+            y: self.y,
+            width: self.width.max(1.0),
+            height: self.height.max(1.0),
+        }
+    }
+}
+
+/// 给一个**已安装**的插件建沙箱界面。这是真插件唯一的入口。
 ///
-/// `label` 与 `plugin_id` 分开传：标签是注册表给的**名字**，插件 id 是**身份**，
+/// 三步的顺序是有意的，每一步都在为一个失效方式兜底：
+///
+///   1. 先经 `PluginManager` 核实它存在、已启用、且声明了 `runtime: sandboxed`
+///      —— 拿不到就**什么都不建**。没安装的插件因此构造上就不可能拿到界面；
+///   2. 再在界面表里占位。**先占位再建 webview**：反过来的话，webview 起来了而
+///      协议请求先到，那一刻表里还没有这条记录，请求会被判成"不是插件界面"；
+///   3. 最后建 webview。建失败就撤销占位，免得留下一条指向不存在界面的记录。
+pub fn open_surface_at<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    bounds: SurfaceBounds,
+) -> Result<(), String> {
+    let view = {
+        let Some(state) = app.try_state::<super::PluginState>() else {
+            return Err("插件系统尚未就绪".to_string());
+        };
+        let manager = tauri::async_runtime::block_on(async { state.0.read().await });
+        manager.sandbox_view(plugin_id).map_err(|e| e.to_string())?
+    };
+
+    if !view.runtime.needs_own_webview() {
+        return Err(format!(
+            "{} 的清单写的是 runtime={}，不该给它建独立界面",
+            view.id,
+            view.runtime.as_str()
+        ));
+    }
+
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        return Err("沙箱界面表尚未就绪".to_string());
+    };
+    let label = surfaces.claim(&view.id)?;
+
+    match open_surface(app, &label, &view.id, bounds) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 建失败就把占位撤掉：留一条指向不存在界面的记录，会让下一次
+            // `claim` 认为"已经建过了"，于是**永远建不出来**。
+            surfaces.forget(&label);
+            Err(e)
+        }
+    }
+}
+
+/// 关掉一个插件的沙箱界面，并撤销它的占位。
+///
+/// 关掉之后同一个插件可以再建一次（用户切走标签再切回来）。因此这一步必须
+/// **同时**清掉界面表里的那条记录 —— 只关 webview 而留着记录，下一次建的时候
+/// `claim` 会成功返回旧标签，但 `open_surface` 里"已存在就跳过"的判断会发现
+/// webview 已经没了……于是建不出来。两处状态必须一起动。
+pub fn close_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
+    let label = label_for(plugin_id);
+
+    if let Some(surfaces) = app.try_state::<SandboxSurfaces>() {
+        surfaces.forget(&label);
+    }
+
+    if let Some(webview) = app.get_webview(&label) {
+        webview.close().map_err(|e| format!("关闭 {label} 失败：{e}"))?;
+        log::info!("[sandbox] 已关闭 {label}");
+    }
+
+    Ok(())
+}
+
+/// 重新摆放一个插件的沙箱界面。界面不存在时**什么都不做**（返回 `Ok`）——
+/// 前端在布局变化时无条件调用它，把"还没打开"当成错误会让每次缩放都报一次。
+pub fn set_surface_bounds<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    bounds: SurfaceBounds,
+) -> Result<(), String> {
+    let Some(webview) = app.get_webview(&label_for(plugin_id)) else {
+        return Ok(());
+    };
+
+    let bounds = bounds.sanitized();
+    webview
+        .set_position(tauri::LogicalPosition::new(bounds.x, bounds.y))
+        .map_err(|e| format!("移动界面失败：{e}"))?;
+    webview
+        .set_size(tauri::LogicalSize::new(bounds.width, bounds.height))
+        .map_err(|e| format!("调整界面失败：{e}"))?;
+
+    Ok(())
+}
+
+/// 在指定位置开一个沙箱 webview。
+///
+/// `label` 与 `plugin_id` 分开传：标签是界面表给的**名字**，插件 id 是**身份**，
 /// 两者不保证能互相推出（见文件头"标签不是身份"）。
-#[cfg(debug_assertions)]
-fn open_surface<R: Runtime>(app: &AppHandle<R>, label: &str, plugin_id: &str, y: f64) {
+fn open_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+    plugin_id: &str,
+    bounds: SurfaceBounds,
+) -> Result<(), String> {
     if app.get_webview(label).is_some() {
-        log::info!("[sandbox自检] {label} 已存在，跳过");
-        return;
+        // 已经开着：当成一次"重新摆放"，而不是失败。用户切标签回来时会走到这里。
+        return set_surface_bounds(app, plugin_id, bounds);
     }
 
     // 注意这里用 `get_window` 而不是 `get_webview_window`：后者内部的
     // `is_webview_window()` 会在一个窗口拥有多个 webview 之后变成 false，
     // 于是"窗口明明在，却拿不到" —— 这是多 webview 模式下的第一个坑。
     let Some(window) = app.get_window("main") else {
-        log::warn!("[sandbox自检] 找不到主窗口，跳过 {label}");
-        return;
+        return Err("找不到主窗口".to_string());
     };
 
-    let url = match tauri::Url::parse(&format!("{ORIGIN}/{plugin_id}/")) {
-        Ok(url) => url,
-        Err(e) => {
-            log::warn!("[sandbox自检] {plugin_id} 的地址不合法：{e}");
-            return;
-        }
-    };
+    let url = tauri::Url::parse(&format!("{ORIGIN}/{plugin_id}/"))
+        .map_err(|e| format!("{plugin_id} 的地址不合法：{e}"))?;
 
     let builder = tauri::webview::WebviewBuilder::new(label, tauri::WebviewUrl::External(url));
+    let bounds = bounds.sanitized();
 
-    // 位置与尺寸写死：这是一次性验证面板，不参与布局。真插件的界面要跟着标签栏与
-    // 侧边栏走，那是增量 C 的事（`set_bounds` + 前端量矩形）。
-    match window.add_child(
-        builder,
-        tauri::LogicalPosition::new(24.0, y),
-        tauri::LogicalSize::new(560.0, 280.0),
-    ) {
-        Ok(_) => log::info!("[sandbox自检] 已创建 webview {label}"),
-        Err(e) => log::warn!("[sandbox自检] 创建 webview {label} 失败：{e}"),
-    }
+    window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(bounds.x, bounds.y),
+            tauri::LogicalSize::new(bounds.width, bounds.height),
+        )
+        .map_err(|e| format!("创建 webview {label} 失败：{e}"))?;
+
+    log::info!(
+        "[sandbox] 已创建 webview {label}（{}×{} @ {},{})",
+        bounds.width,
+        bounds.height,
+        bounds.x,
+        bounds.y
+    );
+    Ok(())
 }

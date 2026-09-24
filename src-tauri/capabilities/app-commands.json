@@ -123,6 +123,9 @@
     "allow-toggle-favorite-module",
     "allow-get-favorite-modules",
     "allow-check-app-update",
-    "allow-install-app-update"
+    "allow-install-app-update",
+    "allow-sandbox-surface-open",
+    "allow-sandbox-surface-close",
+    "allow-sandbox-surface-bounds"
   ]
 }

@@ -49,6 +49,16 @@ export interface ModuleDescriptor {
    * 因此把结果固化到描述符里，渲染端保持纯同步。
    */
   iconSvg?: string;
+  /**
+   * 这个模块的界面跑在一个**独立 webview** 里（插件清单写了 `runtime: "sandboxed"`）。
+   *
+   * 有它时 `component` 不再被渲染 —— `ModuleRenderer` 改为渲染一块占位，
+   * 由 `SandboxSurface` 把它量出来交给 Rust，让宿主把 webview 摆在那个位置。
+   *
+   * 为什么不干脆不给 `component`：描述符的形状保持统一，调用方少一堆分支；
+   * 而且旧式插件仍走 `component` 那条路，两者要能共存。
+   */
+  sandboxed?: boolean;
 }
 
 export interface ModuleTomlChild {

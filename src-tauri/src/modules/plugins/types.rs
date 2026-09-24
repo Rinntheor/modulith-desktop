@@ -334,6 +334,41 @@ pub struct PluginEngines {
     pub loopcore: String,
 }
 
+/// 插件代码运行在哪里。
+///
+/// 两个取值都对应**宿主真能核实的**一件事，不是插件自己说了算的等级：
+///
+///   * `in-process` —— 与宿主同一个 webview、同一个 JS 上下文。今天全部插件都是
+///     这一档，也是缺省值。宿主**区分不了**它的调用与宿主自己的调用；
+///   * `sandboxed` —— 插件自己的 webview。独立 realm、没有 IPC 权限、身份与资源
+///     都由宿主按 webview 标签决定。见 `modules/plugins/sandbox.rs`。
+///
+/// 名字里刻意不带 `sandboxLevel` 那类"等级"字样：等级是一个宿主无法核实的量，
+/// 而这里是一个二元的、可核实的位置。见 `PluginManifest::runtime` 上的说明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginRuntime {
+    /// 与宿主同一个 webview（缺省）
+    #[default]
+    InProcess,
+    /// 插件自己的 webview
+    Sandboxed,
+}
+
+impl PluginRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcess => "in-process",
+            Self::Sandboxed => "sandboxed",
+        }
+    }
+
+    /// 是否需要宿主为它建一个独立 webview
+    pub fn needs_own_webview(self) -> bool {
+        matches!(self, Self::Sandboxed)
+    }
+}
+
 pub fn default_engine_range() -> String {
     "*".to_string()
 }
@@ -411,6 +446,24 @@ pub struct PluginManifest {
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
 
+    // ---- 运行位置 ----
+    //
+    // 上面那一段说的是"**等级**"（L0..L3）为什么被删：宿主无法按等级限制一个同 realm
+    // 的插件，那是一个自己声明、宿主核实不了的字段。
+    //
+    // 这一项不是等级，是**位置**：插件代码跑在宿主这个 webview 里，还是跑在它自己的
+    // webview 里。后者宿主**能核实** —— 插件 webview 的标签不匹配任何 capability，
+    // 它在 IPC 入口就被拒绝；身份与资源访问都由宿主按标签决定。
+    // 见 `modules/plugins/sandbox.rs` 与 docs/04-安全/应用命令的访问控制.md。
+    //
+    // 缺省是 `in-process`：不写就等于今天的行为，不给已发布的插件制造意外。
+    //
+    // **这里刻意不做"未知值退化成缺省"。** 一个写了 `sandboxed`、却被旧宿主当成
+    // `in-process` 跑起来的插件，是一次**静默的安全降级** —— 它声明了隔离，实际没有。
+    // 枚举反序列化失败会让整份清单不合法、安装直接失败，那正是这里想要的失败方式。
+    #[serde(default)]
+    pub runtime: PluginRuntime,
+
     // ---- 激活事件 ----
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_events: Option<Vec<String>>,
@@ -448,6 +501,9 @@ impl PluginManifest {
             icon: None,
             icon_svg: None,
             permissions: Vec::new(),
+            // 兜底清单永远是 `in-process`：这份清单来自"读不出来"，
+            // 把一个读不出来的插件当成沙箱插件会更糟 —— 它连界面都建不起来。
+            runtime: PluginRuntime::InProcess,
             activation_events: None,
             contributes: None,
             preview: None,

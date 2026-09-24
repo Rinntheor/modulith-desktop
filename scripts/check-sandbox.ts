@@ -49,7 +49,6 @@ const exists = (relative: string): boolean => existsSync(resolve(here, relative)
 
 const sandboxRs = read('../src-tauri/src/modules/plugins/sandbox.rs');
 const bridgeJs = read('../src-tauri/resources/sandbox-bridge.js');
-const demoTsx = read('../src-tauri/resources/sandbox-demo/plugin.js');
 
 // ============================================================
 // 1. 桥接层的占位符必须被替换干净
@@ -219,112 +218,180 @@ section('资源路径的越界判断');
 }
 
 // ============================================================
-// 5. 演示插件的资源必须真的在
+// 5. 单一真源：沙箱这边**不记插件的事实**
 // ============================================================
 //
-// 它是 debug 构建里验证整条链路的那个实例。清单里指向的文件不存在的话，
-// 症状是面板空白 + 日志里一行 404，而门禁全绿。
+// 曾经的做法是本模块记一份 `标签 → {根目录, 入口, 样式, 权限}`。那让宿主里出现了
+// 两套"什么插件存在、它能做什么"，而两套清单一定会漂 —— 漂开的方向是
+// **"沙箱以为这个插件存在、存储那边不认"**。实测撞到过一次（§7.40）。
+//
+// 现在的事实只有一个来源：`PluginManager::sandbox_view`。本模块只保留
+// **标签 → 插件 id** 一条映射，而它不可能与真源漂开：每次建界面都必须先通过
+// `sandbox_view`，拿不到就建不出来 —— **没安装的插件构造上就拿不到界面**。
 
-section('演示插件');
+section('单一真源');
 
 {
-  const manifestPath = '../src-tauri/resources/sandbox-demo/manifest.json';
-  check(exists(manifestPath), '演示插件的清单存在');
+  // 沙箱**不得**自己读清单。它一旦读，就又多了一份迟早会与 PluginManager 漂开的事实。
+  check(
+    !/manifest\.json/.test(sandboxRs),
+    'sandbox.rs 不自己读 manifest.json（事实全部来自 PluginManager）'
+  );
+  check(
+    !/PluginManifest/.test(sandboxRs),
+    'sandbox.rs 不反序列化清单（那是 PluginManager 的活）'
+  );
 
-  if (exists(manifestPath)) {
-    let manifest: { name?: string; main?: string; style?: string; permissions?: string[] } | null = null;
-    try {
-      manifest = JSON.parse(read(manifestPath));
-    } catch (error) {
-      check(false, `演示插件清单不是合法 JSON：${(error as Error).message}`);
-    }
+  // 界面表只记身份，不记事实。
+  check(
+    /pub struct SandboxSurfaces\(RwLock<HashMap<String, String>>\)/.test(sandboxRs),
+    'SandboxSurfaces 只映射「标签 → 插件 id」，不存放插件的事实'
+  );
 
-    if (manifest) {
-      check(typeof manifest.main === 'string' && manifest.main.length > 0, '清单声明了 main');
+  // 建界面的第一步必须是核实插件存在。
+  const openFn = /pub fn open_surface_at[\s\S]*?\n}/.exec(sandboxRs);
+  check(openFn !== null, 'sandbox.rs 里能找到 open_surface_at()');
 
-      if (manifest.main) {
-        check(
-          exists(`../src-tauri/resources/sandbox-demo/${manifest.main}`),
-          `清单指向的入口文件存在（${manifest.main}）`
-        );
-      }
-      if (manifest.style) {
-        check(
-          exists(`../src-tauri/resources/sandbox-demo/${manifest.style}`),
-          `清单指向的样式文件存在（${manifest.style}）`
-        );
-      }
-
-      // 演示插件只该声明它真的会用到的那一项。
-      check(
-        Array.isArray(manifest.permissions) && manifest.permissions.length === 1,
-        '演示插件只声明一项权限（它是验证工具，多声明等于把权限列表教坏）'
-      );
-
-      // `DEMO_ID` 与清单里的 `name` 必须一致。
-      //
-      // 不一致时**不会**有任何症状看起来像"id 写错了"：演示插件的 id 取自清单，
-      // 而 debug 自检用它去算 webview 标签 —— 算出来的标签查不到注册表，
-      // 于是表现为一次 403，日志里只有一句"请求的路径与所在 webview 不匹配"。
-      const demoId = /pub const DEMO_ID:\s*&str\s*=\s*"([^"]+)"/.exec(sandboxRs)?.[1];
-      check(demoId !== undefined, 'sandbox.rs 里能找到 DEMO_ID');
-      check(
-        demoId === manifest.name,
-        `DEMO_ID 与清单的 name 一致（sandbox.rs=${JSON.stringify(demoId)}，清单=${JSON.stringify(manifest.name)}）`
-      );
-    }
+  if (openFn) {
+    const body = openFn[0];
+    check(
+      /sandbox_view\(/.test(body),
+      'open_surface_at 先经 PluginManager 核实插件（这一步拿不到就什么都不建）'
+    );
+    check(
+      body.indexOf('sandbox_view(') < body.indexOf('claim('),
+      '核实排在占位之前 —— 反过来的话，未安装的插件也能先占住标签'
+    );
+    check(
+      body.indexOf('claim(') < body.indexOf('open_surface('),
+      '占位排在建 webview 之前 —— 反过来的话，首条协议请求会先到而表里还没有记录'
+    );
+    check(
+      /needs_own_webview\(\)/.test(body),
+      'open_surface_at 检查清单声明的是 sandboxed（否则 in-process 插件也能拿到界面）'
+    );
+    check(
+      /forget\(/.test(body),
+      '建 webview 失败时撤销占位 —— 留一条指向不存在界面的记录会让这个插件**永远建不出来**'
+    );
   }
+
+  // 关界面时**必须**同时撤销占位。只关 webview 而留着记录，下一次建界面会以为
+  // "已经建过了"，而 webview 其实已经不在了。
+  const closeFn = /pub fn close_surface[\s\S]*?\n}/.exec(sandboxRs);
+  check(closeFn !== null, 'sandbox.rs 里能找到 close_surface()');
+  check(
+    closeFn !== null && /forget\(/.test(closeFn[0]),
+    'close_surface 同时撤销占位（两处状态必须一起动）'
+  );
+
+  // ============================================================
+  // 5b. debug 自检**不许**自己给插件建界面
+  // ============================================================
+  //
+  // 这里曾经无条件地给"第一个声明了 sandboxed 的已安装插件"开一块面板，
+  // 用来验证真插件那一半。第一次真机运行的反馈是：用户没打开任何插件，
+  // 界面上却多出一块挡在那里的面板，而且**没有任何方式关掉它**。
+  //
+  // 真插件那一半现在走真实路径（前端量矩形 → `sandbox_surface_open`）。
+  // 这条断言盯的就是"别再把它加回启动路径里"。
+  const harnessFn = /pub fn spawn_debug_harness[\s\S]*?\n}\n/.exec(sandboxRs);
+  check(harnessFn !== null, 'sandbox.rs 里能找到 spawn_debug_harness()');
+  check(
+    harnessFn !== null && !/open_surface_at/.test(harnessFn[0]),
+    'debug 自检不给插件建界面（它只建自检页，而自检页会自己关掉）'
+  );
+
+  // 不再有内置演示插件：它曾经是"沙箱这边有一个 PluginManager 不认识的插件"，
+  // 也就是两个真源的来源。
+  check(
+    !exists('../src-tauri/resources/sandbox-demo'),
+    '内置演示插件目录已删除（它正是两个真源的来源）'
+  );
+  check(
+    !/DEMO_ID|DEMO_ROOT|demo_plugin/.test(sandboxRs),
+    'sandbox.rs 里没有演示插件的残留'
+  );
 }
 
 // ============================================================
-// 6. 身份来自注册表，不是从标签反推
+// 6. 身份来自界面表，不是从标签反推
 // ============================================================
 //
 // 插件 id 允许含 `.` `_` `-`，而标签的字符集更窄 —— 把 id 直接拼进标签会在
-// `a.b` 与 `a-b` 之间产生歧义。真正的身份必须是注册表里那条记录。
+// `a.b` 与 `a-b` 之间产生歧义。
 
 section('身份来源');
 
 {
   check(
-    /state\.get\(label\)/.test(sandboxRs),
-    'handle() 从注册表取插件（而不是解析标签前缀）'
+    /surfaces\.plugin_of\(label\)/.test(sandboxRs),
+    'handle() 从界面表取插件 id（而不是解析标签前缀）'
   );
   check(
-    /claimed != plugin\.id/.test(sandboxRs),
-    '路径第一段必须与注册表给出的插件 id 相符'
+    /claimed != view\.id/.test(sandboxRs),
+    '路径第一段必须与插件 id 相符'
   );
   check(
     /fn label_for/.test(sandboxRs) && /LABEL_PREFIX/.test(sandboxRs),
     '标签由 label_for 统一产出'
   );
   check(
-    /冲突/.test(sandboxRs),
+    /标签冲突/.test(sandboxRs),
     '标签冲突被显式检测（否则两个插件里有一个会静默失效）'
   );
 }
 
 // ============================================================
-// 7. 演示插件不依赖任何构建步骤
+// 7. 运行位置字段不许静默降级
 // ============================================================
 //
-// 它刻意用最朴素的写法：如果它跑不起来，问题一定在沙箱这一侧，而不是在打包工具链里。
+// 一个写了 `sandboxed`、却被旧宿主当成 `in-process` 跑起来的插件，是一次
+// **静默的安全降级** —— 它声明了隔离，实际没有。因此这个枚举**不能**有
+// `#[serde(other)]` 那种"未知值折算到某一档"的写法：未知值必须让整份清单不合法，
+// 安装直接失败。
+//
+// 这一条盯的是一个很自然的"顺手加个兜底"的改动。
 
-section('演示插件的可诊断性');
+section('运行位置字段');
 
 {
-  check(!/\bimport\s/.test(demoTsx), '演示插件没有 import（它是经典脚本，不是模块）');
+  const typesRs = read('../src-tauri/src/modules/plugins/types.rs');
+
+  // 属性行在 `pub enum` **之前**，因此匹配要把它们一起圈进来 ——
+  // 只从 `pub enum` 开始的话，`rename_all` 永远不在块里，这条断言就恒为真。
+  const enumBlock = /(?:#\[[^\]]*\]\s*)*pub enum PluginRuntime \{[\s\S]*?\n}/.exec(typesRs);
+  check(enumBlock !== null, 'types.rs 里有 PluginRuntime 枚举');
+
+  if (enumBlock) {
+    check(
+      !/#\[serde\(other\)\]/.test(enumBlock[0]),
+      'PluginRuntime 没有 #[serde(other)]（未知值必须让清单不合法，不能折算）'
+    );
+    check(
+      /rename_all = "kebab-case"/.test(enumBlock[0]),
+      'PluginRuntime 用 kebab-case（清单里写的是 "in-process" / "sandboxed"）'
+    );
+  }
+
   check(
-    !/\brequire\(/.test(demoTsx),
-    '演示插件没有 require（沙箱里没有 CommonJS）'
+    /pub runtime: PluginRuntime/.test(typesRs),
+    'PluginManifest 上有 runtime 字段'
   );
   check(
-    /window\.Modulith/.test(demoTsx),
-    '演示插件通过 window.Modulith 与宿主通信'
+    /runtime: PluginRuntime::InProcess/.test(typesRs),
+    '兜底清单（清单损坏时）用 in-process —— 读不出来的插件不该被当成沙箱插件'
   );
   check(
-    /桥接层没有加载/.test(demoTsx),
-    '演示插件在桥接层缺失时给出一句人话，而不是抛 undefined 的错'
+    /pub fn needs_own_webview/.test(typesRs),
+    'PluginRuntime::needs_own_webview() 存在，供建界面那一侧判断'
+  );
+
+  // 文档必须说清"未知值不让装"，否则下一个人会把它读成"写错了会自动兜底"。
+  const manifestDoc = read('../docs/02-开发指南/插件开发/清单文件参考.md');
+  check(
+    /runtime/.test(manifestDoc),
+    '清单文件参考里写了 runtime 字段'
   );
 }
 
