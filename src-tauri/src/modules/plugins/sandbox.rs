@@ -551,6 +551,14 @@ fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::
             &app.try_state::<super::theme::PluginTheme>()
                 .map(|state| state.describe().to_string())
                 .unwrap_or_else(|| "null".to_string()),
+        )
+        // 快捷键表同样注入成字面量：桥接层要**同步**判断某个组合该不该转发，
+        // 而那个判断不能靠 IPC 往返 —— 那是每敲一个键一次。
+        .replace(
+            "__PLUGIN_SHORTCUTS__",
+            &app.try_state::<super::shortcuts::PluginShortcuts>()
+                .map(|state| state.describe().to_string())
+                .unwrap_or_else(|| r#"{"entries":[]}"#.to_string()),
         );
 
     // 占位符没被替换掉 = 桥接层与这里的约定漂了。那时交给插件的会是一段
@@ -564,7 +572,8 @@ fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::
             && !source.contains("__PLUGIN_DATA_AVAILABLE__")
             && !source.contains("__PLUGIN_RUNTIME__")
             && !source.contains("__PLUGIN_ACTIVATION__")
-            && !source.contains("__PLUGIN_THEME__"),
+            && !source.contains("__PLUGIN_THEME__")
+            && !source.contains("__PLUGIN_SHORTCUTS__"),
         "桥接脚本里的占位符没有被全部替换 —— sandbox-bridge.js 与 bridge_script 的约定漂了"
     );
 
@@ -627,6 +636,33 @@ pub async fn apply_theme<R: Runtime>(app: &AppHandle<R>) {
         if let Err(error) = actor.eval(&label, script.clone()).await {
             // 一个界面推不到（多半是刚被销毁）不该影响其余界面。
             log::debug!("向沙箱界面 {label} 推送主题失败：{error}");
+        }
+    }
+}
+
+/// 把当前的快捷键表推给每一个还活着的沙箱界面。
+///
+/// 与主题推送同一条路子（换数据、不重载），但**驱动方不同**：主题由用户改设置
+/// 触发，快捷键表由插件注册表变化触发（插件可以贡献快捷键，而那会让整张表变）。
+pub async fn apply_shortcuts<R: Runtime>(app: &AppHandle<R>) {
+    let Some(table) = app.try_state::<super::shortcuts::PluginShortcuts>() else {
+        return;
+    };
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        return;
+    };
+    let Some(actor) = app.try_state::<super::surface::SurfaceActor>() else {
+        return;
+    };
+
+    let script = format!(
+        "window.__modulithShortcutsChanged && window.__modulithShortcutsChanged(JSON.parse({}));",
+        js_string(&table.describe().to_string())
+    );
+
+    for (label, _plugin_id) in surfaces.live() {
+        if let Err(error) = actor.eval(&label, script.clone()).await {
+            log::debug!("向沙箱界面 {label} 推送快捷键表失败：{error}");
         }
     }
 }

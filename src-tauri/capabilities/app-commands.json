@@ -38,6 +38,8 @@
     "allow-plugin-background-contribution",
     "allow-set-plugin-theme",
     "allow-get-plugin-theme",
+    "allow-set-plugin-shortcuts",
+    "allow-get-plugin-shortcuts",
     "allow-get-close-to-tray",
     "allow-set-close-to-tray",
     "allow-is-tray-available",

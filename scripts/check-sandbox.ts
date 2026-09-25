@@ -70,7 +70,7 @@ section('桥接层的占位符');
     check(occurrences === 1, `${token} 恰好出现一次（带引号的形式）`);
   }
 
-  for (const token of ['__PLUGIN_PERMISSIONS__', '__PLUGIN_DATA_AVAILABLE__', '__PLUGIN_THEME__']) {
+  for (const token of ['__PLUGIN_PERMISSIONS__', '__PLUGIN_DATA_AVAILABLE__', '__PLUGIN_THEME__', '__PLUGIN_SHORTCUTS__']) {
     const occurrences = bridgeJs.split(token).length - 1;
     check(occurrences === 1, `${token} 恰好出现一次`);
   }
@@ -87,6 +87,10 @@ section('桥接层的占位符');
     .replaceAll(
       '__PLUGIN_THEME__',
       '{"resolved":"dark","reduceMotion":false,"glass":true,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
+    )
+    .replaceAll(
+      '__PLUGIN_SHORTCUTS__',
+      '{"entries":[{"id":"host.search","combo":"mod+k","normalized":"mod+k","description":"搜索","allowInInput":true}]}'
     );
 
   const leftover = [
@@ -98,6 +102,7 @@ section('桥接层的占位符');
     '__PLUGIN_PERMISSIONS__',
     '__PLUGIN_DATA_AVAILABLE__',
     '__PLUGIN_THEME__',
+    '__PLUGIN_SHORTCUTS__',
   ].filter((token) => rendered.includes(token));
 
   check(
@@ -795,6 +800,10 @@ section('完整 API 表面');
       .replaceAll(
         '__PLUGIN_THEME__',
         '{"resolved":"light","reduceMotion":true,"glass":false,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
+      )
+      .replaceAll(
+        '__PLUGIN_SHORTCUTS__',
+        '{"entries":[{"id":"host.search","combo":"mod+k","normalized":"mod+k","description":"搜索","allowInInput":true}]}'
       );
 
   const fakeWindow: Record<string, unknown> = {
@@ -886,6 +895,11 @@ section('完整 API 表面');
       ['theme.current', isFunction],
       ['theme.tokens', isFunction],
       ['theme.onChange', isFunction],
+
+      // 3.5 输入 · 快捷键
+      ['shortcuts.current', isFunction],
+      ['shortcuts.refresh', isFunction],
+      ['shortcuts.isTaken', isFunction],
       ['launcher.launch', isFunction],
       ['icons.extract', isFunction],
       ['shell.revealInFolder', isFunction],
@@ -1092,6 +1106,97 @@ section('主题链路');
     '注入里带了 color-scheme（否则深色主题下插件的滚动条是白的）'
   );
 }
+
+// ============================================================
+// 13. 快捷键：焦点在插件里时宿主按键仍然要生效
+// ============================================================
+//
+// 焦点落进插件的 webview 之后，keydown 只在**插件自己的文档**里派发 ——
+// 宿主窗口上的监听器收不到。因此这一整条链路必须是通的，否则用户在插件里按
+// Ctrl+K / Ctrl+W / Ctrl+Tab 全都**一点反应都没有**，而在宿主里是好的。
+
+section('快捷键链路');
+
+{
+  const commandsRs = read('../src-tauri/src/modules/plugins/commands.rs');
+  const rpcRs = read('../src-tauri/src/modules/plugins/rpc.rs');
+  const shortcutsRs = read('../src-tauri/src/modules/plugins/shortcuts.rs');
+  const syncTs = read('../src/services/pluginShortcutSync.ts');
+  const mainTsx = read('../src/main.tsx');
+  const registryTs = read('../src/services/shortcutRegistry.ts');
+
+  // 环 1：宿主注册表 → 前端推给后端。**必须用 `normalized`**，不是 `combo`。
+  //
+  // 这是整条链路上最容易漂的一处：规范化规则在宿主注册表里，而桥接层拿它做
+  // 匹配。两份规则漂开的表现是"某些组合在插件里按了没反应" —— 而宿主里是好的。
+  check(
+    /normalized: shortcut\.normalized/.test(syncTs),
+    '推给宿主的是注册表**规范化**出来的组合键（不是原始写法）'
+  );
+  check(
+    /installPluginShortcutSync\(\)/.test(mainTsx) && /subscribeShortcuts\(push\)/.test(syncTs),
+    '快捷键同步装在启动路径上，且订阅了注册表变化（否则插件贡献的快捷键不会生效）'
+  );
+
+  // 环 2：后端 → 入口文档 + 已经打开的界面。
+  check(
+    /__PLUGIN_SHORTCUTS__/.test(sandboxRs) && /PluginShortcuts/.test(sandboxRs),
+    '入口文档里注入了快捷键表'
+  );
+  check(
+    /set_plugin_shortcuts[\s\S]{0,1400}?apply_shortcuts\(&app\)\.await/.test(commandsRs),
+    '快捷键表变了会推给已经打开的插件界面'
+  );
+
+  // 环 3：桥接层的优先级 —— **插件自己的处理器先跑**。
+  //
+  // 挂在冒泡阶段（第三参数 false）时，插件在元素上注册的处理器已经跑过了，
+  // 因此它调的 `preventDefault()` 我们看得到。挂在捕获阶段的话宿主永远赢，
+  // 而一个编辑类插件需要能用 Ctrl+B 加粗。
+  check(
+    /addEventListener\('keydown', onKeyDown, false\)/.test(bridgeJs),
+    '快捷键监听挂在**冒泡**阶段（捕获阶段会让宿主永远赢过插件自己的处理器）'
+  );
+  check(
+    /if \(event\.defaultPrevented\) return;/.test(bridgeJs),
+    '插件自己处理过的按键不转发（它的处理器优先）'
+  );
+
+  // 环 4：输入框里的规则由**宿主那条记录**说了算。
+  //
+  // 桥接层自己判断"正在打字就不转发"是错的：宿主有几条快捷键（Ctrl+K）
+  // 是刻意在输入框里也生效的。
+  check(
+    /shortcut\.allowInInput/.test(bridgeJs),
+    '输入框里是否生效由宿主的 allowInInput 决定，而不是桥接层自己猜'
+  );
+
+  // 环 5：规范化不能自己判断平台。
+  check(
+    /event\.ctrlKey \|\| event\.metaKey/.test(bridgeJs) && /parts\.push\('mod'\)/.test(bridgeJs),
+    '桥接层把 Ctrl / Cmd 统一成 mod（与宿主同一套写法，不自己判断平台）'
+  );
+
+  // 环 6：执行仍然在宿主那一侧。
+  check(
+    /runShortcutByCombo\(normalized\)/.test(syncTs) && /runShortcutByCombo/.test(registryTs),
+    '转发回来的按键由宿主的注册表执行（动作实现不在插件那一侧）'
+  );
+
+  // 环 7：**Rust 复核**。桥接层跑在插件文档里，而插件能改自己文档里的任何东西 ——
+  // 只信它等于让插件可以触发任意一个"看起来像快捷键"的动作。
+  check(
+    /is_host_combo\(normalized\)/.test(rpcRs) && /fn is_host_combo/.test(shortcutsRs),
+    'Rust 复核转发的组合确实是宿主的快捷键（桥接层跑在插件文档里，不可全信）'
+  );
+
+  // 表长有上限：它会被注入**每一个**插件文档，因此长度是一份乘数。
+  check(
+    /MAX_ENTRIES/.test(shortcutsRs) && /entries\.truncate\(MAX_ENTRIES\)/.test(shortcutsRs),
+    '快捷键表有长度上限（它会被注入每一个插件文档）'
+  );
+}
+
 
 // ============================================================
 // 收尾

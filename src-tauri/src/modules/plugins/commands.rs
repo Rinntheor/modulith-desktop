@@ -134,6 +134,46 @@ pub fn get_plugin_theme(app: AppHandle) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// 把宿主的快捷键表交给插件系统。由前端在快捷键注册表变化时调用。
+///
+/// ============================================================
+/// 这张表要解决的事
+/// ============================================================
+///
+/// 键盘焦点落进插件的 webview 之后，keydown 就只在**插件自己的文档**里派发 ——
+/// 宿主窗口上的监听器什么都收不到。因此用户在插件界面里按 Ctrl+K（全局搜索）、
+/// Ctrl+W（关闭标签）会一点反应都没有，而在宿主界面里是好的。
+///
+/// 桥接层据此表判断某个组合该不该转发回来。它必须是**整张表**而不是一个
+/// "是不是宿主快捷键"的布尔 —— 桥接层没法每次按键都问宿主一趟。
+///
+/// **返回是否真的变了**：注册表会因为它自己的理由重推同一张表，而每一次
+/// "真的变了"都会触发一圈 `eval`。
+#[tauri::command]
+pub async fn set_plugin_shortcuts(
+    app: AppHandle,
+    table: super::shortcuts::ShortcutTable,
+) -> Result<bool, String> {
+    let Some(state) = app.try_state::<super::shortcuts::PluginShortcuts>() else {
+        return Err("快捷键表尚未就绪".to_string());
+    };
+
+    if !state.set(table) {
+        return Ok(false);
+    }
+
+    super::sandbox::apply_shortcuts(&app).await;
+    Ok(true)
+}
+
+/// 当前的快捷键表（诊断与自检用）。
+#[tauri::command]
+pub fn get_plugin_shortcuts(app: AppHandle) -> serde_json::Value {
+    app.try_state::<super::shortcuts::PluginShortcuts>()
+        .map(|state| state.describe())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 #[tauri::command]
 pub async fn list_plugins(
     state: State<'_, PluginState>,

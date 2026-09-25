@@ -466,6 +466,142 @@
   };
 
   // ============================================================
+  // 快捷键
+  // ============================================================
+  //
+  // ============================================================
+  // 这一段解决的是"焦点在插件里时宿主快捷键全都不响应"
+  // ============================================================
+  //
+  // 键盘焦点一旦落进这个 webview，keydown 就只在**本文档**里派发 ——
+  // 宿主窗口上的监听器什么都收不到。因此用户在插件界面里按 Ctrl+K（全局搜索）、
+  // Ctrl+W（关闭标签）、Ctrl+Tab（切标签）会**一点反应都没有**。
+  //
+  // 这件事无法在宿主那一侧补救，必须是这里接住并转回去。
+  //
+  // ============================================================
+  // 为什么挂在**冒泡**阶段而不是捕获阶段
+  // ============================================================
+  //
+  // 冒泡到 window 时，插件自己在元素上注册的处理器**已经跑过了**。
+  // 如果它调了 `preventDefault()`，我们就不转发 —— 一个编辑类插件需要能用
+  // Ctrl+B 加粗，而宿主不该把它抢走。
+  //
+  // 挂在捕获阶段的话宿主永远赢，而那个方向是不可协商的。
+
+  var shortcutTable = __PLUGIN_SHORTCUTS__;
+
+  /** 把一次 keydown 规范化成与宿主一致的组合键写法 */
+  function normalizeCombo(event) {
+    var parts = [];
+
+    // `mod` 在 Windows / Linux 上是 Ctrl，在 macOS 上是 Cmd。宿主用的是同一个
+    // 名字，因此这里**不**自己判断平台 —— 那是宿主规范化规则的职责，
+    // 两份实现一定会漂，而漂开的表现是"某些组合在插件里按了没反应"。
+    if (event.ctrlKey || event.metaKey) parts.push('mod');
+    if (event.shiftKey) parts.push('shift');
+    if (event.altKey) parts.push('alt');
+
+    var key = String(event.key || '').toLowerCase();
+    if (!key) return null;
+
+    // 只按修饰键本身不算一次组合（Ctrl 单独按下不该触发任何东西）
+    if (key === 'control' || key === 'meta' || key === 'shift' || key === 'alt') return null;
+
+    // 空格键的 `key` 是一个空格字符，而宿主那边写的是 `space`
+    if (key === ' ') key = 'space';
+
+    parts.push(key);
+    return parts.join('+');
+  }
+
+  function findShortcut(normalized) {
+    var entries = (shortcutTable && shortcutTable.entries) || [];
+    for (var index = 0; index < entries.length; index += 1) {
+      // 取**第一个**匹配项，与宿主的"按注册顺序取第一个"一致 ——
+      // 两边取的不是同一条时，表现是"按了之后执行的是另一个动作"。
+      if (entries[index].normalized === normalized) return entries[index];
+    }
+    return null;
+  }
+
+  function onKeyDown(event) {
+    // 插件自己处理过了：这是它的快捷键，不是宿主的。
+    if (event.defaultPrevented) return;
+
+    var normalized = normalizeCombo(event);
+    if (!normalized) return;
+
+    var shortcut = findShortcut(normalized);
+    if (!shortcut) return;
+
+    // 输入框里的规则由**宿主**那条记录说了算（`allowInInput`）。
+    // 在这里自己判断"正在打字就不转发"是错的：宿主有几条快捷键
+    // （Ctrl+K）是刻意在输入框里也生效的。
+    if (isTypingTarget(event.target) && !shortcut.allowInInput) return;
+
+    // 拦掉默认行为再转发。不拦的话引擎可能同时执行它自己的处理
+    // （例如某些组合上的滚动、查找）。
+    event.preventDefault();
+
+    rpc('shortcut.trigger', { normalized: normalized }).catch(function (error) {
+      // 转发失败**只记日志**：宿主那边拒绝说明这个组合已经不是快捷键了
+      // （表刚变过），而那不是插件能补救的事。
+      console.warn('[Modulith] 转发快捷键失败:', error);
+    });
+  }
+
+  /** 与宿主 `isTypingTarget` 同义：焦点在输入框 / 可编辑区域里 */
+  function isTypingTarget(target) {
+    if (!target || !target.tagName) return false;
+    var tag = String(target.tagName).toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+    return target.isContentEditable === true;
+  }
+
+  var shortcuts = {
+    /** 宿主当前的快捷键表（`{ entries: [...] }`） */
+    current: function () {
+      return shortcutTable;
+    },
+
+    /** 问宿主再取一次表。正常情况下不必用 —— 变化会被主动推过来。 */
+    refresh: function () {
+      return rpc('shortcuts.list', {}).then(function (value) {
+        shortcutTable = value || shortcutTable;
+        return shortcutTable;
+      });
+    },
+
+    /**
+     * 某个组合是不是被宿主占用了。
+     *
+     * 插件**应当**用它来避免把自己的快捷键绑到同一个组合上 —— 绑了的话它的
+     * 处理器永远收不到，因为事件在到达它之前就被这里转发走了。
+     */
+    isTaken: function (combo) {
+      return findShortcut(String(combo)) !== null;
+    },
+  };
+
+  var shortcutsInstalled = false;
+
+  /** 装上监听。宿主推来新表时会重新调一次（幂等）。 */
+  function installShortcutListener() {
+    if (shortcutsInstalled) return;
+    shortcutsInstalled = true;
+    window.addEventListener('keydown', onKeyDown, false);
+  }
+
+  installShortcutListener();
+
+  /** 宿主换了快捷键表时调用的入口（见 sandbox.rs 的 apply_shortcuts）。 */
+  window.__modulithShortcutsChanged = function (next) {
+    shortcutTable = next || shortcutTable;
+    installShortcutListener();
+  };
+
+  // ============================================================
   // 对外的那一个对象
   // ============================================================
 
@@ -643,6 +779,8 @@
     events: events,
 
     theme: theme,
+
+    shortcuts: shortcuts,
 
     disposables: {
       add: disposables.add,

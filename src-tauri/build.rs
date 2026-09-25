@@ -169,6 +169,8 @@ fn main() {
                 "sandbox_self_test",
                 "set_plugin_theme",
                 "get_plugin_theme",
+                "set_plugin_shortcuts",
+                "get_plugin_shortcuts",
             ]),
         ),
     )

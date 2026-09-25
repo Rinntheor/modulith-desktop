@@ -11,6 +11,7 @@ import { installMemoryLevelPolicy } from './services/memoryLevel';
 import { subscribeBackendNotificationEvents } from './services/notifications';
 import { subscribePluginEvents } from './services/backgroundPlugins';
 import { installPluginThemeSync } from './services/pluginThemeSync';
+import { installPluginShortcutSync } from './services/pluginShortcutSync';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
@@ -94,6 +95,15 @@ void subscribePluginEvents();
  * 前端推上去。见 `pluginThemeSync` 的文件头。
  */
 installPluginThemeSync();
+
+/*
+ * 让宿主的快捷键在插件界面里也生效。
+ *
+ * 焦点落进插件的 webview 之后，keydown 只在**插件自己的文档**里派发 ——
+ * 宿主窗口上的监听器收不到，于是 Ctrl+K / Ctrl+W / Ctrl+Tab 在插件里全都
+ * 没有反应，而在宿主里是好的。插件那一侧的桥接层接住并转发回来，这里负责执行。
+ */
+installPluginShortcutSync();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

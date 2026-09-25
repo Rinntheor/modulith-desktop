@@ -116,6 +116,13 @@ pub fn run() -> Result<(), tauri::Error> {
         // 宿主负责注入插件入口文档并推给已经打开的界面。见 modules/plugins/theme.rs。
         app.manage(modules::plugins::theme::PluginTheme::new());
 
+        // 宿主快捷键表。
+        //
+        // 键盘焦点落进插件 webview 之后，keydown 只在**插件自己的文档**里派发 ——
+        // 宿主窗口上的监听器收不到。桥接层据此表判断某个组合该不该转发回来，
+        // 而那个判断不能靠 IPC 往返（那是每敲一个键一次）。见 modules/plugins/shortcuts.rs。
+        app.manage(modules::plugins::shortcuts::PluginShortcuts::new());
+
         // 沙箱自检**不在启动路径上**。
         //
         // 它曾经在这里起一个 4 秒后的异步任务，无条件弹出一块 560×420 的诊断面板。
@@ -201,6 +208,8 @@ pub fn run() -> Result<(), tauri::Error> {
         sandbox_self_test,
         set_plugin_theme,
         get_plugin_theme,
+        set_plugin_shortcuts,
+        get_plugin_shortcuts,
         list_plugins,
         get_plugin,
         list_plugin_permissions,

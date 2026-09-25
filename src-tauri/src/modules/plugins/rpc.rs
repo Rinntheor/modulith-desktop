@@ -602,9 +602,56 @@ pub async fn dispatch<R: Runtime>(
             json_value(state.describe())
         }
 
+        // ---- 快捷键 --------------------------------------------------------
+        //
+        // 表已经在**入口文档**里注入了（桥接层要拿它判断某个组合该不该转发，
+        // 而那个判断不能靠 IPC 往返 —— 那是每敲一个键一次）。这一条只是给插件
+        // 一个"再取一次"的入口。
+        "shortcuts.list" => {
+            let Some(state) = app.try_state::<super::shortcuts::PluginShortcuts>() else {
+                return rpc_error("快捷键表尚未就绪");
+            };
+            json_value(state.describe())
+        }
+
+        // 桥接层认定"用户按了宿主的某个快捷键"之后走它。
+        //
+        // `normalized` 由宿主**复核**一遍：桥接层跑在插件文档里，而插件能改
+        // 自己文档里的任何东西。只信它等于让插件可以触发任意一个"看起来像
+        // 快捷键"的动作。
+        //
+        // 复核通过之后发给界面那一侧执行 —— 动作的真正实现（打开搜索、切标签）
+        // 在宿主前端，不在 Rust 里。
+        "shortcut.trigger" => {
+            let Some(normalized) = arg_str(args, "normalized") else {
+                return rpc_error("缺少 normalized");
+            };
+
+            let Some(state) = app.try_state::<super::shortcuts::PluginShortcuts>() else {
+                return rpc_error("快捷键表尚未就绪");
+            };
+            if !state.is_host_combo(normalized) {
+                return rpc_error(&format!("{normalized} 不是宿主的快捷键"));
+            }
+
+            use tauri::Emitter;
+            if let Err(error) = app.emit(
+                SHORTCUT_TRIGGERED,
+                serde_json::json!({ "normalized": normalized, "source": plugin_id }),
+            ) {
+                log::warn!("转发快捷键失败：{error}");
+                return rpc_error("无法把快捷键交给宿主");
+            }
+
+            json_ok()
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
     }
 }
+
+/// 沙箱插件里按下宿主快捷键时，宿主广播的事件名。
+pub const SHORTCUT_TRIGGERED: &str = "modulith://plugin-shortcut";
 
 /// 把一条跨插件事件推给每一个还活着的**沙箱界面**。
 ///
