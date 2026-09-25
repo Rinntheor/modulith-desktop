@@ -31,11 +31,16 @@
 // 插件自己写错了。`check:sandbox` 里有一条断言逐项比对两份清单。
 //
 // 两处**刻意不同**的地方：
-//   * `ctx.ui.registerModule` 在沙箱里不存在（沙箱插件自己就是界面，
-//     不需要向宿主注册一个 React 组件）；
 //   * `ctx.fileDrop` 不存在（拖放是窗口级事件，沙箱 webview 是子窗口，
-//     主窗口收到的事件到不了这里）。
-// 这两条是**能力差异**，不是"还没做" —— 它们写进插件开发文档。
+//     主窗口收到的事件到不了这里）；
+//   * `registerModule` 的**含义**不同：in-process 是"向宿主注册一个组件"，
+//     沙箱是"把我这个组件挂到本界面上"（插件自己就是界面）。名字与入参形状
+//     刻意保持一致，因此同一份插件代码在两侧都能跑。
+// 第一条是**能力差异**，不是"还没做" —— 它写进插件开发文档。
+//
+// 另外三个只在沙箱里有的成员：`React` / `jsx` / `jsxs` / `Fragment` /
+// `createContext`。它们不是宿主能力，而是**宿主把自己那份 React 借给插件**，
+// 理由见 `sandbox.rs` 里 `PLUGIN_REACT_JS` 的说明。
 //
 // ============================================================
 // 关于 fetch
@@ -1069,9 +1074,106 @@
       },
     };
 
+  // ============================================================
+  // React：宿主那一份，经 `/<id>/react.js` 送过来
+  // ============================================================
+  //
+  // 它由入口文档在**桥接层之前**加载（宿主写死的顺序），因此这里同步就能读到。
+  // 送过来的原因见 `sandbox.rs` 里 `PLUGIN_REACT_JS` 的说明：插件仓库的构建把
+  // `react` / `react/jsx-runtime` 接到 `globalThis.Modulith.React` 与
+  // `globalThis.Modulith` 上，而那条约定的前提是**一个文档里只有一个 React 实例**。
+  //
+  // `null` 是可能的（脚本没加载起来）。那种情况下 `Modulith.React` 就是
+  // `undefined`，插件报的是 "Cannot read properties of undefined" —— 看起来像
+  // 它自己写错了。因此这里留一条明确的告警，并把原因说清楚。
+  var PLUGIN_REACT = window.__MODULITH_PLUGIN_REACT__ || null;
+
+  if (!PLUGIN_REACT) {
+    log('error')(
+      '宿主的 React 运行时没有加载（/<id>/react.js 没到）—— 用到 React 的插件会在这里失败'
+    );
+  }
+
+  /**
+   * 在沙箱里挂载一个 React 组件。
+   *
+   * **这是与 in-process 唯一需要说清楚的区别。** 那边的 `registerModule` 是向宿主
+   * 注册一个组件，由宿主决定何时渲染、渲染到哪；这里插件**自己就是界面**，
+   * 于是它退化成"把组件挂到我这块区域上"。
+   *
+   * 入参形状刻意与 in-process 一致（`{ id, name, description, icon, priority,
+   * component }`），因为同一份插件代码可能跑在任一侧 —— 多出来的那几个字段
+   * （侧边栏要靠的 name / icon / priority）在沙箱里由**清单的 `contributes.modules`**
+   * 提供，不再由运行期声明。因此这里只认 `component`，其余忽略而不是报错。
+   */
+  function registerModule(definition) {
+    var options = definition || {};
+    var component = options.component;
+
+    if (typeof component !== 'function') {
+      log('error')('registerModule 需要一个 component 函数（收件到的类型：' + typeof component + '）');
+      return { dispose: function () {} };
+    }
+    if (!PLUGIN_REACT) {
+      log('error')('没有 React 运行时，registerModule 无法挂载');
+      return { dispose: function () {} };
+    }
+
+    var root = document.getElementById('modulith-root');
+    if (!root) {
+      log('error')('入口文档里没有 #modulith-root —— 这不是插件能改的东西，说明宿主合成文档时漏了');
+      return { dispose: function () {} };
+    }
+
+    var mounted = PLUGIN_REACT.ReactDomClient.createRoot(root);
+    mounted.render(PLUGIN_REACT.React.createElement(component));
+
+    return {
+      dispose: function () {
+        mounted.unmount();
+      },
+    };
+  }
+
+  /**
+   * 我这个模块是不是"当前可见的那个"。
+   *
+   * in-process 插件需要它，是因为同一份文档里同时住着宿主与所有插件 ——
+   * 不判断就会在别人的模块里也抢快捷键、抢拖放。
+   *
+   * 沙箱里这个问题的**前提不存在**：一个界面一个文档，里面只有它自己。
+   * 界面不可见时宿主会把整个 webview 收起来（`hide()`），文档里的监听本来
+   * 也不会有人去触发。因此恒为 `true` 是**准确的**，不是偷懒 —— 返回 `false`
+   * 反而会让插件误以为自己没在被用。
+   */
+  function useModuleActive() {
+    return true;
+  }
+
   var Modulith = {
     dataDir: dataDir,
      db: db,
+
+    // ---- React：宿主那一份 ----
+    //
+    // `React` 与 `jsx` / `jsxs` / `Fragment` 分开给，不是为了整齐：
+    // 插件仓库的 shim 把 `require('react')` 接到 `Modulith.React`、
+    // 把 `require('react/jsx-runtime')` 接到 **`Modulith` 本身**。
+    // 后者要的正是 `jsx` / `jsxs` / `Fragment` 这三个成员。
+    // 两边对上，插件的 bundle 一个字都不用改。
+    React: PLUGIN_REACT ? PLUGIN_REACT.React : undefined,
+    jsx: PLUGIN_REACT ? PLUGIN_REACT.JsxRuntime.jsx : undefined,
+    jsxs: PLUGIN_REACT ? PLUGIN_REACT.JsxRuntime.jsxs : undefined,
+    jsxDEV: PLUGIN_REACT ? PLUGIN_REACT.JsxDevRuntime.jsxDEV : undefined,
+    Fragment: PLUGIN_REACT ? PLUGIN_REACT.JsxRuntime.Fragment : undefined,
+    /** 与 in-process 同名同义。插件用 `Modulith.createContext(...)` 建自己的 context */
+    createContext: PLUGIN_REACT ? PLUGIN_REACT.React.createContext : undefined,
+
+    /** 沙箱里退化成"把自己挂到本界面" —— 见上面的说明 */
+    registerModule: registerModule,
+
+    /** 恒为 true；理由见上面的说明（沙箱里"别的模块"这个概念不存在） */
+    useModuleActive: useModuleActive,
     /** 沙箱插件的身份。**宿主给出的**，不是插件自报的。 */
     plugin: {
       id: PLUGIN_ID,

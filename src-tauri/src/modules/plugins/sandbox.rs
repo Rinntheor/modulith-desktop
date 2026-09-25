@@ -108,6 +108,19 @@ pub const SELFTEST_ID: &str = "selftest";
 const SELFTEST_HTML: &str = include_str!("../../../resources/sandbox-selftest.html");
 const BRIDGE_JS: &str = include_str!("../../../resources/sandbox-bridge.js");
 
+/// 送给沙箱插件的 React + ReactDOM + JSX 运行时。
+///
+/// **它是宿主的，不是插件的。** 由 `scripts/build-plugin-react.ts` 从宿主自己那份
+/// `react` / `react-dom` 生成，因此插件页面里跑的与宿主页面里跑的是**同一个版本** ——
+/// 而不是"每个插件各钉一个"。
+///
+/// 为什么必须由宿主送：插件仓库的构建把 `react` 与 `react/jsx-runtime` 标成
+/// external，并接到 `globalThis.Modulith.React` 上；那条约定的前提是
+/// **同一个文档里只有一个 React 实例**（两个实例互相不认识，context 取不到、
+/// hook 调用错乱）。in-process 插件拿的是宿主页面那个实例，沙箱插件是独立文档 ——
+/// 不送过去，它就只能自己打一份，那正是这条约定要防的事。
+const PLUGIN_REACT_JS: &str = include_str!("../../../resources/react-runtime.js");
+
 // ============================================================
 // 沙箱这边**不记插件的事实**，只记"我建过哪些界面"
 // ============================================================
@@ -405,6 +418,11 @@ async fn handle<R: Runtime>(
         // 同步读到自己的 id / 名称 / 权限 / 界面名，不必先 await 一次握手。
         ("GET", Some("bridge.js")) => bridge_script(app, &view, &key.surface),
 
+        // 宿主那一份 React。**在桥接层之前加载** —— 桥接层要在定义
+        // `Modulith.React` 时就能读到它，而插件脚本又必须在桥接层之后。
+        // 顺序由入口文档写死，插件无法插队（见 `entry_document`）。
+        ("GET", Some("react.js")) => script(PLUGIN_REACT_JS),
+
         ("GET", Some("asset")) => {
             let rel = segments[2..].join("/");
             serve_asset(&view, &rel)
@@ -559,6 +577,14 @@ fn entry_document<R: Runtime>(
   <body>
     <div id="modulith-root"></div>
     <!-- 桥接层先于插件脚本加载：插件的入口只有这一个，它拿不到更早的位置 -->
+    <!--
+      宿主那一份 React 排在桥接层**之前**：桥接层在定义 `Modulith.React` 时就要
+      读到它。三者的顺序（React → 桥接层 → 插件）由宿主写死，插件无法插队。
+
+      它同时受 `script-src 'self'` 约束 —— 三者都是同源外部文件，
+      没有一条是内联。
+    -->
+    <script src="/{id}/react.js"></script>
     <script src="/{id}/bridge.js"></script>
     <script src="/{id}/asset/{main}"></script>
   </body>

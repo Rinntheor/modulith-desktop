@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && vite",
-    "build": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && tsc && vite build",
+    "build": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && pnpm gen:plugin-react && tsc && vite build",
     "gen:modules": "node scripts/generate-modules.ts",
     "gen:backend": "node scripts/generate-backend-module.ts",
+    "gen:plugin-react": "node scripts/build-plugin-react.ts",
     "check:samples": "node scripts/check-samples.ts",
     "check:semver": "node scripts/check-semver.ts",
     "check:update": "node scripts/check-update-throttle.ts",

@@ -2405,6 +2405,151 @@ section('下载到数据目录（ctx.http.download）');
 
 
 // ============================================================
+// 19. 宿主把自己的 React 送给沙箱插件
+// ============================================================
+//
+// 这一节守的是"沙箱插件从哪来 React"这条决定。它不是为了好看：插件仓库的构建把
+// `react` 与 `react/jsx-runtime` 标成 external，并接到 `globalThis.Modulith.React`
+// 与 `globalThis.Modulith` 上 —— 那条约定的前提是**一个文档里只有一个 React 实例**。
+// 沙箱插件是独立文档，宿主页面上的东西一个都到不了，因此必须由宿主送过去。
+//
+// 坏掉的症状全是静默的：
+//   * 顺序反了（桥接层先于 react.js）→ `Modulith.React` 是 undefined，
+//     插件报 "Cannot read properties of undefined"，看起来像插件自己写错了；
+//   * 忘了发 jsx / jsxs / Fragment → 只有用 JSX 语法的插件坏，手写
+//     `createElement` 的插件照样跑；
+//   * 产物与宿主用的 React 版本漂开 → 只在其一里复现的 hooks 报错。
+// 三条都不报错，只让一部分插件坏。
+
+section('宿主把自己的 React 送给沙箱插件');
+
+{
+  const sandboxRsForReact = read('../src-tauri/src/modules/plugins/sandbox.rs');
+  const bridgeForReact = read('../src-tauri/resources/sandbox-bridge.js');
+  const reactArtifact = '../src-tauri/resources/react-runtime.js';
+
+  // ---- 1. 宿主确实带着它 ----
+
+  check(
+    /const PLUGIN_REACT_JS: &str = include_str!\("\.\.\/\.\.\/\.\.\/resources\/react-runtime\.js"\);/.test(
+      sandboxRsForReact
+    ),
+    '宿主把 react-runtime.js 编进二进制（include_str!）'
+  );
+  check(
+    /\(\"GET\", Some\(\"react\.js\"\)\) => script\(PLUGIN_REACT_JS\)/.test(sandboxRsForReact),
+    '插件协议上有一条 GET /<id>/react.js'
+  );
+
+  // ---- 2. 加载顺序：React → 桥接层 → 插件 ----
+  //
+  // 三者都是入口文档里的 `<script src>`，因此按**出现位置**比大小就够了。
+  // 这一条不能只查"三个标签都在" —— 顺序反了标签也都在，而结果是
+  // `Modulith.React` 为 undefined。
+  const entryDoc = /fn entry_document<R: Runtime>\([\s\S]*?\n\}/.exec(sandboxRsForReact)?.[0] ?? '';
+  check(entryDoc.length > 0, '能定位到 entry_document 的函数体');
+  const reactAt = entryDoc.indexOf('<script src="/{id}/react.js">');
+  const bridgeAt = entryDoc.indexOf('<script src="/{id}/bridge.js">');
+  // 锚在**脚本标签**上，不是裸的 `/asset/`：同一个函数体里还有一行
+  // `<link rel="stylesheet" href="/{id}/asset/{rel}">`（样式表），它在 `<head>` 里、
+  // 排在所有脚本之前。用裸 `/asset/` 会命中那一行，于是这条断言恒为"顺序错了"。
+  const mainAt = entryDoc.indexOf('<script src="/{id}/asset/');
+  check(
+    reactAt >= 0 && bridgeAt >= 0 && mainAt >= 0 && reactAt < bridgeAt && bridgeAt < mainAt,
+    reactAt >= 0 && bridgeAt >= 0 && mainAt >= 0 && reactAt < bridgeAt && bridgeAt < mainAt
+      ? '入口文档里三者顺序是 React → 桥接层 → 插件'
+      : `入口文档里的加载顺序不对（react ${reactAt} / bridge ${bridgeAt} / main ${mainAt}）—— 标签都在但顺序错了，症状是 Modulith.React 为 undefined`
+  );
+
+  // ---- 3. 桥接层把两侧的约定接上 ----
+
+  check(
+    /window\.__MODULITH_PLUGIN_REACT__/.test(bridgeForReact),
+    '桥接层读的是 react.js 挂的那个全局'
+  );
+
+  // 插件仓库的 shim：`require('react')` → `Modulith.React`，
+  // `require('react/jsx-runtime')` → **Modulith 本身**。后者要的就是下面这三个。
+  for (const member of ['React', 'jsx', 'jsxs', 'Fragment', 'createContext']) {
+    check(
+      new RegExp(`^\\s{4}${member}: PLUGIN_REACT \\? PLUGIN_REACT\\.`, 'm').test(bridgeForReact),
+      `桥接层把 ${member} 交给插件（来自宿主那一份 React，不是插件自带的）`
+    );
+  }
+
+  // ---- 4. registerModule 必须真的挂载 ----
+  //
+  // 名字与 in-process 相同而行为不同，这正是最容易写成"注册了但什么都没发生"的地方：
+  // 一个只 log 一句然后返回的实现能让上面每一条断言都通过。
+  const registerFn = /function registerModule\(definition\) \{[\s\S]*?\n  \}/.exec(bridgeForReact)?.[0] ?? '';
+  check(registerFn.length > 0, '能定位到 registerModule 的函数体');
+  check(
+    /ReactDomClient\.createRoot\(root\)/.test(registerFn) && /\.render\(/.test(registerFn),
+    'registerModule 真的 createRoot(...).render(...) —— 不是"注册了但什么都没发生"'
+  );
+  check(
+    /getElementById\('modulith-root'\)/.test(registerFn),
+    'registerModule 挂到入口文档那个 #modulith-root 上'
+  );
+  check(
+    /typeof component !== 'function'/.test(registerFn),
+    '入参不是组件时给出明确报错，而不是抛一个看不懂的异常'
+  );
+
+  // ---- 5. useModuleActive 恒真，且理由是"前提不存在"而不是"没实现" ----
+  const useActiveFn = /function useModuleActive\(\) \{[\s\S]*?\n  \}/.exec(bridgeForReact)?.[0] ?? '';
+  check(
+    /return true;/.test(useActiveFn),
+    'useModuleActive 在沙箱里恒为 true（一个界面一个文档，"别的模块"不存在）'
+  );
+
+  // ---- 6. 产物存在，且与宿主用的是同一个 React 版本 ----
+  const reactPkg = JSON.parse(
+    readFileSync(resolve(here, '../node_modules/react/package.json'), 'utf8')
+  ) as { version: string };
+
+  check(exists(reactArtifact), `产物存在：${reactArtifact.replace('../', '')}`);
+  if (exists(reactArtifact)) {
+    const artifact = read(reactArtifact);
+    // 版本号是**从产物里读出来**再与 node_modules 比，而不是断言"文件里有某个字面量"：
+    // 后者在升级 React 却忘了重新生成时照样通过 —— 那正是这条断言要防的事。
+    const recorded = /react (\d+\.\d+\.\d+) \/ react-dom/.exec(artifact)?.[1] ?? '';
+    check(
+      recorded === reactPkg.version,
+      recorded === reactPkg.version
+        ? `产物里的 React ${recorded} 与宿主用的那一份一致`
+        : `★ 产物里的 React 是 ${recorded || '（读不到）'}，而 node_modules 里是 ${reactPkg.version} —— 跑 node scripts/build-plugin-react.ts 重新生成`
+    );
+    check(
+      /globalThis\.__MODULITH_PLUGIN_REACT__/.test(artifact),
+      '产物挂上了桥接层要读的那个全局'
+    );
+    // 压缩过：它同时进 git 与二进制，而没有哪个人会去读 React 自己的代码。
+    // 上界给得宽松，只用来挡"忘了压缩"（那份是 ~600 KB）。
+    check(
+      artifact.length < 320 * 1024,
+      `产物体积 ${(artifact.length / 1024).toFixed(1)} KB（压缩过；未压缩约 600 KB）`
+    );
+  }
+
+  // ---- 7. 生成脚本本身在仓库里，且能用 ----
+  check(
+    exists('../scripts/build-plugin-react.ts'),
+    '生成脚本在仓库里（产物可复现，不是"某台机器上构建出来就是什么"）'
+  );
+  const buildScript = read('../scripts/build-plugin-react.ts');
+  check(
+    // esbuild 从 vite 那里解析，而不是再声明一份 —— 两个 esbuild 会漂。
+    /createRequire\(import\.meta\.resolve\('vite\/package\.json'\)\)/.test(buildScript),
+    'esbuild 从 vite 的依赖里解析（避免磁盘上出现两个 esbuild）'
+  );
+  check(
+    /legalComments: 'inline'/.test(buildScript),
+    '压缩时保留版权声明（React 是 MIT，分发必须带上）'
+  );
+}
+
+// ============================================================
 // 收尾
 // ============================================================
 
