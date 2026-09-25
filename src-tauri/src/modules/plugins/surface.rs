@@ -146,6 +146,20 @@ enum Job {
     },
     /// 销毁。界面不存在时静默成功。
     Close { label: String, reply: Reply },
+
+    /// 在界面里执行一段脚本。
+    ///
+    /// 这是**宿主 → 插件的唯一推送通道**：事件总线、主题变化、设置变化、
+    /// 通知点击回执都走它。没有它的话，插件要拿到任何"事后发生的事"都只能轮询。
+    ///
+    /// 为什么不直接调 `webview.eval`：`eval` 同样要落到主线程，而"所有界面操作
+    /// 只在所有者线程上做"这条铁律没有例外 —— 理由见文件头，假死那一次就是从
+    /// 一个"看起来无害、其实要回主线程"的调用开始的。
+    Eval {
+        label: String,
+        script: String,
+        reply: Reply,
+    },
 }
 
 // ============================================================
@@ -212,6 +226,18 @@ impl SurfaceActor {
         self.submit(move |reply| Job::Visible {
             label,
             visible,
+            reply,
+        })
+        .await
+    }
+
+    /// 往界面里推一段脚本。界面不存在时**成功**（它可能已经被回收了，
+    /// 而推送方不该因为"订阅者不在了"而看到一个错误）。
+    pub async fn eval(&self, label: &str, script: String) -> Outcome {
+        let label = label.to_string();
+        self.submit(move |reply| Job::Eval {
+            label,
+            script,
             reply,
         })
         .await
@@ -308,6 +334,19 @@ fn run(app: AppHandle, jobs: Receiver<Job>) {
                 residents.remove(&label);
                 forget_claim(&app, &label);
                 let _ = reply.send(report("关闭", &label, outcome));
+            }
+            Job::Eval {
+                label,
+                script,
+                reply,
+            } => {
+                let outcome = eval(&app, &label, &script);
+                if outcome.is_ok() {
+                    touch(&mut residents, &label);
+                }
+                // 推送**刻意不记 info**：它可能是每秒一次的事件，把日志刷满
+                // 反而让"停在哪"这个最有用的信号失效。失败才记。
+                let _ = reply.send(outcome);
             }
         }
     }
@@ -535,8 +574,7 @@ fn destroy<R: Runtime>(app: &AppHandle<R>, label: &str) -> Outcome {
 }
 
 /// 摆位置与尺寸。两件事分开调用是 Tauri 的接口形状，不是我们的选择。
-fn apply_bounds<R: Runtime>(
-    webview: &tauri::Webview<R>,
+fn apply_bounds<R: Runtime>(    webview: &tauri::Webview<R>,
     label: &str,
     bounds: SurfaceBounds,
 ) -> Outcome {
@@ -550,4 +588,18 @@ fn apply_bounds<R: Runtime>(
         .map_err(|e| format!("调整 {label} 尺寸失败：{e}"))?;
 
     Ok(())
+}
+
+/// 往界面里推一段脚本。界面不存在时成功。
+///
+/// 脚本由调用方拼好（见 `sandbox.rs` 的 `push_script`），这里只负责送达 ——
+/// 在这一层再拼一次 HTML/JS 会让"谁在往插件里写东西"这条线索散成两处。
+fn eval<R: Runtime>(app: &AppHandle<R>, label: &str, script: &str) -> Outcome {
+    let Some(webview) = app.get_webview(label) else {
+        return Ok(());
+    };
+
+    webview
+        .eval(script)
+        .map_err(|e| format!("向 {label} 推送脚本失败：{e}"))
 }

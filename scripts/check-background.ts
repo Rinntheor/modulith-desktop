@@ -87,8 +87,25 @@ check(
   'setup 的注释说明了「这里不拉起子进程」（否则每个用户都要多付一个进程）'
 );
 check(
-  desktopModRs.includes('fn stop(') && desktopModRs.includes('host.shutdown()'),
+  desktopModRs.includes('fn stop(') && /\.shutdown\(\)/.test(desktopModRs),
   '模块 stop 时优雅停止后台宿主（强杀会让插件来不及保存状态）'
+);
+
+// 后台插件是**各自独立的进程**，而它们同样必须在退出前被优雅收掉。
+//
+// 这条断言是这次改动**顺带补上**的：原来的检查只看通用宿主的 `shutdown()`，
+// 于是"插件进程被随进程一起强杀"这件事不会被任何一条断言拦住 ——
+// 而强杀的后台插件来不及落盘，表现出来是"关掉应用之后数据丢了"。
+check(
+  /stop_all\(\)/.test(desktopModRs),
+  '模块 stop 时也收掉全部后台插件进程（否则它们被随进程强杀，来不及落盘）'
+);
+
+// 后台插件必须先于通用宿主停止：顺序反过来的话，通用宿主已经走了，
+// 而插件进程还在跑着写数据。
+check(
+  desktopModRs.indexOf('stop_all()') < desktopModRs.indexOf('.0.shutdown()'),
+  '后台插件先于通用后台宿主停止'
 );
 
 // ============================================================
@@ -108,9 +125,22 @@ check(
 
 // 宿主脚本必须逐条校验版本，而不是只在启动时检查一次：
 // 应用可能在使用中被升级，而继续用旧语义解释新字段会得出错误的结论。
+//
+// 变量名是 `message` 而不是 `request`：协议从 2 起是**双向**的（子进程也会
+// 发起请求），因此读循环里那个东西已经不再一定是"一条请求"了。
 check(
-  /request\.v !== PROTOCOL_VERSION/.test(script),
-  '宿主脚本**逐条**校验请求的协议版本（不只是启动时检查一次）'
+  /message\.v !== PROTOCOL_VERSION/.test(script),
+  '宿主脚本**逐条**校验消息的协议版本（不只是启动时检查一次）'
+);
+
+// 反向消息的分类只能依赖"有没有 method"这一个判据。
+//
+// 这条断言守的是一次具体的手滑：把子进程发来的 `ctx.*` 请求当成响应，
+// 于是它在待处理表里查不到 id、被记成一句"收到没有等待者的响应"然后丢掉 ——
+// 而插件那边只是永远等不到回答。
+check(
+  /message\.method === undefined/.test(script) && /deliverResponse\(message\)/.test(script),
+  '宿主脚本把「不带 method 的消息」识别为响应并交给等待者'
 );
 
 // ============================================================
@@ -312,6 +342,88 @@ check(
   /detectNodeRuntime/.test(perfSettingsTsx),
   '那一节会把探测结果显示出来（找到没有、用的是哪个路径、失败原因）'
 );
+
+// ============================================================
+// N. 后台插件的 ctx 与共用实现必须逐条对上
+// ============================================================
+//
+// 同一个 `ctx` 现在有**三个**参与方：
+//
+//   1. `resources/sandbox-bridge.js`  —— 沙箱界面插件读到的形状
+//   2. `resources/background-host.mjs` —— 后台插件读到的形状
+//   3. `src/modules/plugins/rpc.rs`   —— 两者的**共同**实现
+//
+// `check:sandbox` 守着 (1) ↔ (3)。这里守 (2) ↔ (3)：后台那条路径的每一个
+// `ctx.*` 调用都必须在共用方法表里有对应分支。
+//
+// 写错一个字的表现是：后台插件在某个成员上收到一句"未知的 RPC 方法"，
+// 而那句话在日志里看起来像插件自己乱调 —— 两边的代码又都"看起来是对的"。
+console.log('\n后台插件的 ctx 表面：');
+
+{
+  const rpcRs = read('src-tauri/src/modules/plugins/rpc.rs');
+
+  const called = new Set(
+    [...script.matchAll(/callHost\(\s*'ctx\.([a-zA-Z.]+)'/g)].map((match) => match[1])
+  );
+
+  check(called.size > 0, `后台宿主脚本调用了 ${called.size} 个 ctx 成员`);
+
+  const dispatchStart = rpcRs.indexOf('pub async fn dispatch');
+  const dispatchEnd = rpcRs.indexOf('#[cfg(test)]');
+  check(
+    dispatchStart > 0 && dispatchEnd > dispatchStart,
+    '能在 rpc.rs 里定位到 ctx 的方法表'
+  );
+
+  const dispatch = dispatchStart > 0 && dispatchEnd > dispatchStart
+    ? rpcRs.slice(dispatchStart, dispatchEnd)
+    : '';
+  const handled = new Set(
+    [...dispatch.matchAll(/^ {8}"([a-zA-Z]+(?:\.[a-zA-Z]+)?)"\s*=>/gm)].map((match) => match[1])
+  );
+
+  const orphans = [...called].filter((name) => !handled.has(name));
+  check(
+    orphans.length === 0,
+    orphans.length === 0
+      ? `后台插件调用的 ${called.size} 个 ctx 成员在共用实现里都有分支`
+      : `共用实现里没有这些成员：${orphans.join('、')}`
+  );
+
+  // ============================================================
+  // 隔离的两条硬要求
+  // ============================================================
+
+  // 1. 子进程必须清空环境变量。
+  //
+  // `process.env` 在 `--permission` 之下**仍然可读**（实测），而环境变量里
+  // 常常有令牌。不清的话，一个逃出 vm 的插件能把整份环境整个读走。
+  check(
+    /clear_env:\s*true/.test(read('src-tauri/src/modules/desktop/background/plugins.rs')),
+    '后台插件进程以 clear_env 启动（process.env 在权限模型下仍然可读）'
+  );
+
+  // 2. 权限模型的门槛必须是"不够就降级"，而不是"未知即支持"。
+  check(
+    /PERMISSION_MODEL_MIN_MAJOR:\s*u64\s*=\s*(\d+)/.test(
+      read('src-tauri/src/modules/desktop/background/plugins.rs')
+    ),
+    '后台插件有一个明确的 Node 版本门槛'
+  );
+
+  // 3. 放行目录只能是插件自己的代码目录 —— 数据目录**不**放开，
+  //    因为 `ctx.dataDir.*` 全部经过宿主，子进程根本不需要碰那些文件。
+  const pluginHostRs = read('src-tauri/src/modules/desktop/background/plugins.rs');
+  check(
+    /--allow-fs-read=/.test(pluginHostRs) && !/--allow-fs-write=/.test(pluginHostRs),
+    '子进程只被放开读权限，且没有任何写权限'
+  );
+  check(
+    !/--allow-child-process|--allow-worker|--allow-addons|--allow-net/.test(pluginHostRs),
+    '子进程没有额外放开子进程 / worker / addon / 网络'
+  );
+}
 
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);

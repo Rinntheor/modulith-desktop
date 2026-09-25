@@ -9,6 +9,7 @@ import AppErrorBoundary from './components/AppErrorBoundary';
 import { installGlobalErrorHandlers } from './services/globalErrorHandlers';
 import { installMemoryLevelPolicy } from './services/memoryLevel';
 import { subscribeBackendNotificationEvents } from './services/notifications';
+import { subscribePluginEvents } from './services/backgroundPlugins';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
@@ -67,6 +68,20 @@ installMemoryLevelPolicy();
  * 它是异步的，因此这里不 await —— 订阅失败只记一条警告，不该挡住启动。
  */
 void subscribeBackendNotificationEvents();
+
+/*
+ * 订阅宿主的"跨插件事件"广播。
+ *
+ * 后台插件（它们跑在各自的 Node 进程里）发出的 `ctx.events.emit` 会由宿主同时
+ * 送往后台侧与**界面侧**。界面侧这一半必须有人接进事件总线 —— 否则 in-process
+ * 与沙箱界面插件收不到后台插件发出的事件，而那看起来像"某个插件的订阅没生效"。
+ *
+ * 与通知订阅同样的理由装在最外层：插件界面可能还没挂载。
+ *
+ * 拉起后台插件**不在这里**：那要等插件列表读完（BootGate 之后），
+ * 见 `BootGate` 里对 `syncBackgroundPlugins` 的调用。
+ */
+void subscribePluginEvents();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

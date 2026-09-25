@@ -203,6 +203,72 @@ pub async fn background_host_shutdown(
     Ok(state.inner().0.describe())
 }
 
+// ============================================================
+// 后台（无界面）插件
+// ============================================================
+
+/// 让"该跑的后台插件"跑起来，并回报当前状态。
+///
+/// 前端在插件列表就绪之后调一次。**由前端决定时机而不是宿主在启动时自动扫**：
+/// 插件注册表读完的时刻只有它知道，而宿主猜一个时机的表现是"该起的没起"。
+///
+/// 幂等：已经跑着的不会重启。
+#[tauri::command]
+pub async fn background_plugins_sync(
+    app: AppHandle,
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+) -> Result<Vec<super::background::plugins::BackgroundPluginStatus>, String> {
+    Ok(state.inner().sync_startup(&app).await)
+}
+
+/// 当前有哪些后台插件在跑。**不启动任何东西。**
+#[tauri::command]
+pub async fn background_plugins_status(
+    app: AppHandle,
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+) -> Result<Vec<super::background::plugins::BackgroundPluginStatus>, String> {
+    Ok(state.inner().status(&app))
+}
+
+/// 手动拉起一个后台插件（用户点了"现在运行"）。
+#[tauri::command]
+pub async fn background_plugin_start(
+    app: AppHandle,
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+    id: String,
+) -> Result<(), String> {
+    state.inner().start(&app, &id).await
+}
+
+/// 手动停掉一个后台插件。
+///
+/// 与"拉起"成对：一个能起不能停的后台能力会把用户逼到任务管理器里 ——
+/// 而他在那里看到的是一个叫 node.exe 的东西，不知道自己该不该结束它。
+#[tauri::command]
+pub async fn background_plugin_stop(
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+    id: String,
+) -> Result<(), String> {
+    state.inner().stop(&id).await
+}
+
+/// 一个插件有没有声明后台入口（界面据此决定显示不显示"后台"那一节）。
+///
+/// 做成独立命令而不是让前端去解析清单：`contributes.background` 的合法形状由
+/// Rust 侧的 `background_manifest::parse` 定义（它还要挡路径越界），
+/// 前端再实现一遍判断只会多出一套会漂的规则。
+#[tauri::command]
+pub async fn plugin_background_contribution(
+    state: State<'_, crate::modules::plugins::PluginState>,
+    id: String,
+) -> Result<Option<crate::modules::plugins::background_manifest::BackgroundContribution>, String> {
+    let manager = state.inner().0.read().await;
+    manager
+        .background_launch(&id)
+        .map(|launch| launch.map(|value| value.contribution))
+        .map_err(|error| error.to_string())
+}
+
 /// 读取当前「关闭窗口时最小化到托盘」的设置
 ///
 /// 托盘菜单可以改这一项，因此界面不能只依赖自己那份设置缓存 ——

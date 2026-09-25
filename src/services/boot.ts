@@ -28,6 +28,7 @@ import {
 } from './pluginRuntime';
 import { computeBootProgress, type BootPhase, type BootStepStatus } from './bootProgress';
 import { startPluginDevWatch } from './pluginDevWatch';
+import { syncBackgroundPlugins } from './backgroundPlugins';
 import { tryAutoLogin } from './auth';
 
 export type { BootPhase, BootStepStatus };
@@ -226,6 +227,10 @@ const STEPS: BootStepDefinition[] = [
         // `devPluginIds()` 才有东西可答。放早了会看到空列表，于是监听根本没起来。
         void loadPluginsInBackground({ timeoutMs: settings.pluginLoadTimeoutMs }).finally(() => {
           startPluginDevWatch();
+          // 清单已经在手，现在可以判断"哪些后台插件该跑"了。
+          // 放在这里而不是启动更早的地方：那一刻插件列表可能还是空的，
+          // 而"该起的没起"会表现成一次随机失败。
+          void startBackgroundPlugins();
         });
         return;
       }
@@ -245,6 +250,10 @@ const STEPS: BootStepDefinition[] = [
       // 开发模式自动重载：清单已在手，可以判断有没有开发链接的插件了。
       // 没有的话它什么都不做（连定时器都不建）—— 见 `startPluginDevWatch`。
       startPluginDevWatch();
+
+      // 拉起清单里声明了 `onStartup` 的后台插件。失败只记警告 ——
+      // 一个后台插件起不来不该把用户挡在应用之外。
+      void startBackgroundPlugins();
     },
   },
   {
@@ -584,6 +593,48 @@ class BootManager {
   private updateStep(index: number, patch: Partial<BootStepState>): void {
     const steps = this.state.steps.map((step, i) => (i === index ? { ...step, ...patch } : step));
     this.setState({ steps });
+  }
+}
+
+/**
+ * 拉起清单里声明了 `onStartup` 的后台插件。
+ *
+ * ============================================================
+ * 为什么它**永不抛错**
+ * ============================================================
+ *
+ * 后台插件需要一个用户自己安装的 Node 运行时（应用不随包分发它）。也就是说
+ * "没有 Node" 是一个**正常状态**，而不是异常 —— 绝大多数用户第一次装这个应用
+ * 时就是那样。
+ *
+ * 因此这里把失败降级成一条警告：后台功能明确不可用，而应用照常可用。
+ * 让一个可选能力把用户挡在启动界面之外，是这里最不该发生的事。
+ *
+ * 状态不在这里缓存：要显示"哪个后台插件在跑"的地方各自调
+ * `backgroundPluginStatus()`（见插件详情）。多存一份必然漂。
+ */
+async function startBackgroundPlugins(): Promise<void> {
+  try {
+    const started = await syncBackgroundPlugins();
+
+    if (started.length > 0) {
+      console.info(`[boot] 后台插件已就绪：${started.map((item) => item.id).join('、')}`);
+    }
+
+    // 降级运行**必须说出来**。`isolated: false` 意味着 Node 的 `--permission`
+    // 那一层不存在，只剩 `vm` —— 而 `vm` 不是安全边界（实测一行就能出去）。
+    const degraded = started.filter((item) => item.running && !item.isolated);
+    if (degraded.length > 0) {
+      console.warn(
+        `[boot] 这些后台插件在**没有引擎级权限**的情况下运行（Node 版本偏低）：` +
+          degraded.map((item) => item.id).join('、')
+      );
+    }
+  } catch (error) {
+    console.warn(
+      '[boot] 后台插件未能启动（多半是没有可用的 Node 运行时）：',
+      error instanceof Error ? error.message : error
+    );
   }
 }
 

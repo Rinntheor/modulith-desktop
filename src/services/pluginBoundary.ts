@@ -261,6 +261,12 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     note: '键值存储。需要 storage 权限，Rust 侧强制',
   },
   {
+    name: 'dataDir',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '插件私有文件目录。需要 plugin-data 权限，Rust 侧强制；路径严格锁在该插件自己的目录内',
+  },
+  {
     name: 'http',
     kind: 'handle',
     migration: 'rpc',
@@ -358,6 +364,26 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
     { name: 'list', io: 'value', migration: 'as-is', note: '返回 PluginStoragePage（keys / nextCursor / usage），是纯数据' },
     { name: 'usage', io: 'value', migration: 'as-is', note: '返回 PluginStorageUsage（totalBytes / keyCount）' },
     { name: 'all', io: 'value', migration: 'as-is', note: '返回 Record<string, unknown>，值由插件自己写进去' },
+  ],
+  dataDir: [
+    // `ctx.dataDir` 是插件自己的文件目录。跨边界方式与 `storage` 同类（全是值），
+    // 但有两处必须写清楚：
+    //
+    //   * `read` / `write` 传的是**二进制**，而消息只能带结构化克隆能表达的东西。
+    //     今天的实际通道是 base64（`invoke` 的参数走 JSON），代价是 33% 体积与一次
+    //     字符串拷贝。这里标 `re-encode` 是如实描述**今天**的形态，而不是它该有的
+    //     形态 —— Tauri 支持把 `Uint8Array` 直接作为请求体，那才是终点。
+    //   * `list` / `stat` 返回的是普通对象，没有任何不可克隆的东西。
+    { name: 'available', io: 'value', migration: 'as-is', note: '返回 boolean：数据目录现在能不能用' },
+    { name: 'list', io: 'value', migration: 'as-is', note: '返回 DataEntry[]（name / isDir / size / modified），纯数据' },
+    { name: 'stat', io: 'value', migration: 'as-is', note: '返回 DataStat 或 null' },
+    { name: 'read', io: 'value', migration: 'as-is', note: '返回 Uint8Array；今天经 base64 过 JSON，有 33% 膨胀' },
+    { name: 'readText', io: 'value', migration: 'as-is', note: '同上，解码成字符串' },
+    { name: 'write', io: 'value', migration: 'as-is', note: '入参 Uint8Array；今天经 base64 过 JSON' },
+    { name: 'writeText', io: 'value', migration: 'as-is', note: '同上' },
+    { name: 'mkdir', io: 'value', migration: 'as-is', note: '返回 void' },
+    { name: 'remove', io: 'value', migration: 'as-is', note: '返回 void；目录会递归删除' },
+    { name: 'used', io: 'value', migration: 'as-is', note: '返回 number：数据目录当前占用字节数' },
   ],
   http: [
     { name: 'fetch', io: 'host-object', migration: 'pass-data', note: '**返回原生 Response**：带方法、body 是 ReadableStream，不可克隆' },

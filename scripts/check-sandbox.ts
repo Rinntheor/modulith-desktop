@@ -64,24 +64,36 @@ const bridgeJs = read('../src-tauri/resources/sandbox-bridge.js');
 section('桥接层的占位符');
 
 {
-  const quoted = ['__PLUGIN_ID__', '__PLUGIN_NAME__', '__PLUGIN_VERSION__'];
+  const quoted = ['__PLUGIN_ID__', '__PLUGIN_NAME__', '__PLUGIN_VERSION__', '__PLUGIN_RUNTIME__', '__PLUGIN_ACTIVATION__'];
   for (const token of quoted) {
     const occurrences = bridgeJs.split(`'${token}'`).length - 1;
     check(occurrences === 1, `${token} 恰好出现一次（带引号的形式）`);
   }
 
-  const permissionsOccurrences = bridgeJs.split('__PLUGIN_PERMISSIONS__').length - 1;
-  check(permissionsOccurrences === 1, '__PLUGIN_PERMISSIONS__ 恰好出现一次');
+  for (const token of ['__PLUGIN_PERMISSIONS__', '__PLUGIN_DATA_AVAILABLE__']) {
+    const occurrences = bridgeJs.split(token).length - 1;
+    check(occurrences === 1, `${token} 恰好出现一次`);
+  }
 
   // 模拟 `bridge_script` 的替换（Rust 侧用的是"替换全部"），确认一个记号都不剩。
   const rendered = bridgeJs
     .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
     .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
     .replaceAll("'__PLUGIN_VERSION__'", '"1.0.0"')
-    .replaceAll('__PLUGIN_PERMISSIONS__', '["storage"]');
+    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
+    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
+    .replaceAll('__PLUGIN_PERMISSIONS__', '["storage"]')
+    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true');
 
-  const leftover = ['__PLUGIN_ID__', '__PLUGIN_NAME__', '__PLUGIN_VERSION__', '__PLUGIN_PERMISSIONS__']
-    .filter((token) => rendered.includes(token));
+  const leftover = [
+    '__PLUGIN_ID__',
+    '__PLUGIN_NAME__',
+    '__PLUGIN_VERSION__',
+    '__PLUGIN_RUNTIME__',
+    '__PLUGIN_ACTIVATION__',
+    '__PLUGIN_PERMISSIONS__',
+    '__PLUGIN_DATA_AVAILABLE__',
+  ].filter((token) => rendered.includes(token));
 
   check(
     leftover.length === 0,
@@ -722,9 +734,16 @@ section('前端界面协作');
     /if \(rect\.width < 1 \|\| rect\.height < 1\) return null;/.test(componentTsx),
     '视口本身是退化尺寸（宽或高为 0）时返回 null'
   );
+  // 插件界面**不该内缩**。这里原来会减掉父级 2rem 内边距，为的是"与其它模块
+  // 看起来一致" —— 那个意图是错的：其它模块是一张卡片，留白是设计；插件界面是
+  // 一个应用，它该占满自己那一块。实测这就是用户报的"留白、未全屏"的一半来源。
   check(
-    /if \(width < 1 \|\| height < 1\) return null;/.test(componentTsx),
-    '扣掉内边距之后仍是退化尺寸时返回 null'
+    !/getComputedStyle/.test(componentTsx),
+    '插件界面不按父级内边距内缩（它是应用，不是卡片）'
+  );
+  check(
+    /x: rect\.left,\s*\n\s*y: rect\.top,/.test(componentTsx),
+    '矩形直接就是内容视口本身'
   );
 
   // 而调用方必须真的**因此返回**。只让 measureSurface 返回 null、调用方继续往下走，
@@ -734,6 +753,253 @@ section('前端界面协作');
     applyBody !== null && /if \(!bounds\) \{[\s\S]*?return;/.test(applyBody[0]),
     '量不到视口时直接返回，不让退化尺寸走到宿主那边去'
   );
+}
+
+// ============================================================
+// 11. 完整 API 表面：桥接层 ↔ 宿主
+// ============================================================
+//
+// 这一节守的是整个方案里最容易悄悄腐坏的一件事：**同一个 `ctx`，两处实现。**
+// 宿主侧是 `pluginRuntime.ts`（in-process 插件用），沙箱侧是 `sandbox-bridge.js`
+// （sandboxed 插件用）。一个插件可以在两者之间切换，它的代码不该因此改一行 ——
+// 因此两边的成员必须一一对应。
+//
+// ============================================================
+// 为什么是"真的跑一遍"而不是文本匹配
+// ============================================================
+//
+// 文本匹配能查到"这行代码还在"，但查不到"这个成员真的挂在对象上"。两者差别很大：
+// 把 `dataDir` 从 `Modulith` 字面量里删掉、只留下它的定义，文本断言照样通过，
+// 而插件拿到的是 `undefined`。因此这里把渲染后的桥接脚本**执行一遍**，
+// 再遍历得到的 `Modulith` 对象。
+//
+// 执行它需要三个假东西：`window`（对象会被挂上去）、`fetch`（这条检查不发网络）、
+// `navigator.clipboard`。除此之外它只用到语言内置的东西。
+
+section('完整 API 表面');
+
+{
+  const rendered = bridgeJs
+    .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
+    .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
+    .replaceAll("'__PLUGIN_VERSION__'", '"1.2.3"')
+    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
+    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
+    .replaceAll('__PLUGIN_PERMISSIONS__', '["storage","plugin-data","clipboard"]')
+    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true');
+
+  const fakeWindow: Record<string, unknown> = {
+    // 桥接层在文档消失时要跑清理函数；这条检查里没有真实的页面生命周期。
+    addEventListener: () => {},
+  };
+
+  let api: Record<string, any> | null = null;
+  let failure = '';
+  try {
+    const factory = new Function(
+      'window',
+      'fetch',
+      'navigator',
+      `${rendered}\nreturn window.Modulith;`
+    );
+    api = factory(
+      fakeWindow,
+      () => Promise.reject(new Error('这条检查不发网络请求')),
+      { clipboard: { readText: async () => '', writeText: async () => {} } }
+    );
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+  }
+
+  check(api !== null, api !== null ? '桥接脚本可以被实例化' : `桥接脚本执行失败：${failure}`);
+
+  if (api) {
+    // 身份必须是**宿主给的那一份**（占位符替换的结果），不是插件自报的。
+    check(api.plugin?.id === 'com.modulith.sandbox-demo', 'plugin.id 来自宿主注入的身份');
+    check(api.plugin?.version === '1.2.3', 'plugin.version 来自宿主注入的版本');
+    check(api.plugin?.runtime === 'sandboxed', 'plugin.runtime 如实报告运行位置');
+    check(
+      Array.isArray(api.plugin?.permissions) && api.plugin.permissions.length === 3,
+      'plugin.permissions 来自清单'
+    );
+    check(api.activationEvent === 'open', 'activationEvent 由宿主注入');
+    check(api.has('storage') === true && api.has('native-module') === false, 'has() 按清单判定');
+
+    // §3 的成员表。**它是一份显式的清单而不是遍历对象**：遍历只能证明"有东西"，
+    // 而这份清单能证明"就是这些，一个不少"。
+    const members: Array<[string, (value: unknown) => boolean]> = [
+      // 3.1 身份与元信息
+      ['log.debug', isFunction],
+      ['log.info', isFunction],
+      ['log.warn', isFunction],
+      ['log.error', isFunction],
+
+      // 3.2 数据 · 键值存储
+      ['storage.get', isFunction],
+      ['storage.set', isFunction],
+      ['storage.delete', isFunction],
+      ['storage.keys', isFunction],
+      ['storage.list', isFunction],
+      ['storage.usage', isFunction],
+      ['storage.all', isFunction],
+      ['storage.clear', isFunction],
+
+      // 3.2 数据 · 文件目录
+      ['dataDir.available', (value) => typeof value === 'boolean'],
+      ['dataDir.status', isFunction],
+      ['dataDir.list', isFunction],
+      ['dataDir.stat', isFunction],
+      ['dataDir.read', isFunction],
+      ['dataDir.readText', isFunction],
+      ['dataDir.write', isFunction],
+      ['dataDir.writeText', isFunction],
+      ['dataDir.readBase64', isFunction],
+      ['dataDir.writeBase64', isFunction],
+      ['dataDir.mkdir', isFunction],
+      ['dataDir.remove', isFunction],
+      ['dataDir.used', isFunction],
+
+      // 3.3 网络
+      ['http.fetch', isFunction],
+
+      // 3.4 界面（沙箱里没有 registerModule —— 沙箱插件自己就是界面）
+      ['notifications.notify', isFunction],
+
+      // 3.5 输入
+      ['clipboard.read', isFunction],
+      ['clipboard.write', isFunction],
+
+      // 3.6 系统与集成
+      ['events.emit', isFunction],
+      ['events.on', isFunction],
+      ['launcher.launch', isFunction],
+      ['icons.extract', isFunction],
+      ['shell.revealInFolder', isFunction],
+      ['audio.pick', isFunction],
+      ['settings.get', isFunction],
+      ['settings.all', isFunction],
+      ['settings.set', isFunction],
+      ['disposables.add', isFunction],
+      ['disposables.size', isFunction],
+    ];
+
+    const missing = members
+      .filter(([path, predicate]) => {
+        const value = path.split('.').reduce<any>((node, key) => node?.[key], api);
+        return !predicate(value);
+      })
+      .map(([path]) => path);
+
+    check(
+      missing.length === 0,
+      missing.length === 0
+        ? `§3 的 ${members.length} 个成员在桥接层里都有实现`
+        : `桥接层缺少这些成员：${missing.join('、')}`
+    );
+
+    // ============================================================
+    // 桥接层调用的每一条 RPC 都必须有宿主侧的处理分支
+    // ============================================================
+    //
+    // 两份文件、两种语言，中间只靠字符串约定。写错一个字的表现是插件在某个成员上
+    // 拿到一句"未知的 RPC 方法"，而那句话在日志里看起来像插件自己乱调。
+
+    const called = new Set(
+      [...bridgeJs.matchAll(/\brpc\(\s*'([a-zA-Z.]+)'/g)].map((match) => match[1])
+    );
+
+    // 方法表现在在**共用**的 `rpc.rs` 里（沙箱与 Node 后台两条路径共用同一份
+    // ctx 实现）。因此这里查的是那个文件，同时要求 `sandbox.rs` 自己**不再**
+    // 有一套方法表 —— 否则这条断言查的就不是沙箱真正走的那条路径了。
+    const rpcRs = read('../src-tauri/src/modules/plugins/rpc.rs');
+    const dispatchStart = rpcRs.indexOf('pub async fn dispatch');
+    const dispatchEnd = rpcRs.indexOf('#[cfg(test)]');
+    check(
+      dispatchStart > 0 && dispatchEnd > dispatchStart,
+      '能在 rpc.rs 里定位到 ctx 的方法表'
+    );
+
+    const dispatch = dispatchStart > 0 && dispatchEnd > dispatchStart
+      ? rpcRs.slice(dispatchStart, dispatchEnd)
+      : '';
+    const handled = new Set(
+      // 只认**外层** match 的分支：它们的缩进是 8 个空格。不锚定缩进的话，
+      // `"log"` 处理分支内部的日志级别分支（`"debug" =>` 等，缩进 16）会被
+      // 当成三个不存在的 RPC 方法，于是这条断言自己制造三个假缺陷。
+      //
+      // 方法名带着点号（`storage.get`），但有几个是单词（`log`、`notify`），
+      // 因此点号那段是可选的。
+      [...dispatch.matchAll(/^ {8}"([a-zA-Z]+(?:\.[a-zA-Z]+)?)"\s*=>/gm)].map(
+        (match) => match[1]
+      )
+    );
+
+    // 沙箱必须**转发**给共用实现，而不是自己再实现一遍。
+    check(
+      /super::rpc::dispatch\(/.test(sandboxRs),
+      'sandbox.rs 把 ctx 调用转发给共用的 rpc.rs（而不是自己再实现一套）'
+    );
+    check(
+      !/^ {8}"storage\.get"\s*=>/m.test(sandboxRs),
+      'sandbox.rs 里没有第二套 RPC 方法表'
+    );
+
+    const orphans = [...called].filter((name) => !handled.has(name));
+    check(
+      orphans.length === 0,
+      orphans.length === 0
+        ? `桥接层调用的 ${called.size} 条 RPC 在宿主侧都有处理分支`
+        : `宿主侧没有这些 RPC 的处理分支：${orphans.join('、')}`
+    );
+
+    // 反方向：留着一个永远调不到的分支同样是缺陷 —— 它看起来"已经实现了"，
+    // 而实际上没有任何代码路径能到达它。
+    const dead = [...handled].filter((name) => !called.has(name));
+    check(
+      dead.length === 0,
+      dead.length === 0
+        ? '宿主侧的每一条 RPC 分支都真的被桥接层调用'
+        : `宿主侧有调不到的分支（要么桥接层漏了，要么分支名写错了）：${dead.join('、')}`
+    );
+
+    // ============================================================
+    // 大文件走的必须是原始字节通道，不是 base64
+    // ============================================================
+    //
+    // 这是本方案对"文档 / 图库类插件"的硬要求：几百 MB 的文件过一遍 base64
+    // 意味着 +33% 体积、一次完整字符串拷贝，而且全程驻留在 JS 堆里。
+    // 断言"read 走 fetch 的 arrayBuffer"而不是"存在 data.readBase64"——
+    // 后者只是一个便捷入口，前者才是大文件的路径。
+
+    check(
+      /read: function \(rel\) \{[\s\S]*?dataRequest\(rel, \{ method: 'GET' \}\)[\s\S]*?\.arrayBuffer\(\)/.test(bridgeJs),
+      'dataDir.read 走原始字节通道并返回 ArrayBuffer'
+    );
+    check(
+      /write: function \(rel, data\) \{[\s\S]*?method: 'PUT'/.test(bridgeJs),
+      'dataDir.write 用 PUT 把字节放进请求体（不经过 base64）'
+    );
+
+    // 宿主侧那条路由必须真的存在，且两种方法都有。
+    check(
+      /\(\"GET\", Some\(\"data\"\)\)/.test(sandboxRs) && /\(\"PUT\", Some\(\"data\"\)\)/.test(sandboxRs),
+      '宿主侧注册了原始字节通道的 GET / PUT 路由'
+    );
+    check(
+      /async fn serve_data/.test(sandboxRs) && /async fn store_data/.test(sandboxRs),
+      '原始字节通道的两端都有实现'
+    );
+
+    // 路径净化**只有一处实现**：协议层不再自己过滤一遍，两套规则一定会漂开。
+    check(
+      !/fn serve_data[\s\S]{0,600}?\.\./.test(sandboxRs.split('async fn serve_data')[1]?.slice(0, 600) ?? ''),
+      '原始字节通道不自己重复一遍路径净化（净化只在 data_dir::resolve 里）'
+    );
+  }
+}
+
+function isFunction(value: unknown): boolean {
+  return typeof value === 'function';
 }
 
 // ============================================================

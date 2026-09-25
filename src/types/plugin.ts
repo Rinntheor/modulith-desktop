@@ -446,6 +446,21 @@ export interface PluginContext {
   
   // 存储
   storage: PluginStorage;
+
+  /**
+   * 插件私有文件目录。
+   *
+   * 与 `storage` 的分工：那个是一键一个 JSON（单值 1 MB、总量 8 MB），
+   * 适合配置与小状态；这个是**目录**，能建子目录、能存二进制，
+   * 适合文档、图片、缓存（单文件 256 MB、目录总量 1 GiB）。
+   *
+   * 路径严格锁在插件自己的目录内：`..`、盘符、以及指向外面的符号链接都会被
+   * 宿主拒绝。语义是 chroot —— `/a` 指的是 `<数据根>/a`。
+   *
+   * 需要清单声明 `plugin-data`。未声明时每个方法都会抛错，而 `available()`
+   * 返回 false。
+   */
+  dataDir: PluginDataDir;
   
   // 事件
   events: PluginEventBus;
@@ -496,6 +511,51 @@ export interface PluginAPI {
   
   // 获取用户数据路径
   getUserDataPath(): string;
+}
+
+/**
+ * 插件数据目录里的一个条目
+ */
+export interface PluginDataEntry {
+  name: string;
+  isDir: boolean;
+  size: number;
+  /** Unix 毫秒 */
+  modified: number;
+}
+
+/**
+ * 插件私有文件目录（`ctx.dataDir`）。
+ *
+ * 所有路径都是**相对插件数据根**的：`''` 表示根，`'notes/2026/a.md'` 表示子路径。
+ * 语义是 chroot —— 前导 `/` 没有特殊含义，`/a` 与 `a` 等价。
+ * 需要 `plugin-data` 权限；未声明时每个方法都会抛错。
+ */
+export interface PluginDataDir {
+  /**
+   * 数据目录现在能不能用。
+   *
+   * **它不是装饰。** 数据放在外置盘或网络盘上时，"盘没插"是一个真实状态；
+   * 那时读出来是空的，而"空"与"还没有数据"看起来一模一样。插件应当在写之前
+   * 先问一次，并在为假时**告诉用户"数据目录不可用"**，而不是让用户以为数据丢了。
+   */
+  available(): Promise<boolean>;
+
+  list(rel?: string): Promise<PluginDataEntry[]>;
+  stat(rel: string): Promise<PluginDataEntry | null>;
+
+  read(rel: string): Promise<Uint8Array>;
+  readText(rel: string): Promise<string>;
+
+  write(rel: string, bytes: Uint8Array): Promise<void>;
+  writeText(rel: string, text: string): Promise<void>;
+
+  /** 建目录（含中间层）。 */
+  mkdir(rel: string): Promise<void>;
+  /** 删除文件或**整棵目录树**。不可撤销。 */
+  remove(rel: string): Promise<void>;
+  /** 当前占用字节数。 */
+  used(): Promise<number>;
 }
 
 /**

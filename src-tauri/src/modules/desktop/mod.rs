@@ -64,6 +64,14 @@ impl Module for DesktopModule {
         // 而我们正在做的整件事就是降低内存占用。
         app.manage(commands::BackgroundState::new());
 
+        // 后台（无界面）插件的托管状态。
+        //
+        // 与上面那个宿主壳一样，**这里不拉起任何进程**：装了哪些后台插件要等
+        // 插件注册表读完才知道，而那个时机比这里晚。真正的拉起由前端在插件列表
+        // 就绪之后调一次 `background_plugins_sync` —— 在这里猜一个时机的结果是
+        // "该起的没起"，而那种失败表现为随机。
+        app.manage(background::plugins::BackgroundPlugins::new());
+
         if let Some(state) = app.try_state::<commands::BackgroundState>() {
             // 把用户在设置里指定的 Node 路径交给后台宿主。
             //
@@ -127,12 +135,21 @@ impl Module for DesktopModule {
     fn stop(&self, app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         use tauri::Manager;
 
-        let Some(state) = app.try_state::<commands::BackgroundState>() else {
-            return Ok(());
-        };
+        // 后台插件先停：它们各自是一个 Node 进程，而其中任何一个都可能正在
+        // 写数据。顺序反过来的话，通用的后台宿主会先走，而插件进程还在跑着。
+        let plugins = app.try_state::<background::plugins::BackgroundPlugins>();
+        let generic = app.try_state::<commands::BackgroundState>();
 
-        let host = &state.0;
-        if !host.status().running {
+        let needs_runtime = plugins
+            .as_ref()
+            .map(|state| !state.inner().status(app).is_empty())
+            .unwrap_or(false)
+            || generic
+                .as_ref()
+                .map(|state| state.inner().0.status().running)
+                .unwrap_or(false);
+
+        if !needs_runtime {
             // 从没被拉起过：什么都不用做。这是绝大多数用户的情况。
             return Ok(());
         }
@@ -145,7 +162,14 @@ impl Module for DesktopModule {
             .enable_all()
             .build()
         {
-            Ok(runtime) => runtime.block_on(host.shutdown()),
+            Ok(runtime) => {
+                if let Some(state) = &plugins {
+                    runtime.block_on(state.inner().stop_all());
+                }
+                if let Some(state) = &generic {
+                    runtime.block_on(state.inner().0.shutdown());
+                }
+            }
             Err(error) => {
                 log::warn!("无法为后台宿主收尾建立运行时（{error}），它会被随进程一起结束");
             }

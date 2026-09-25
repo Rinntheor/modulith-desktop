@@ -574,8 +574,7 @@ impl PluginManager {
     ///
     /// 权限与运行位置都读**当前**清单，不是注册表里的缓存 —— 与 `manifest_of`
     /// 同一个理由：开发目录里新加/去掉的声明必须立刻影响判定。
-    pub fn sandbox_view(&self, id: &str) -> PluginResult<SandboxView> {
-        let entry = self
+    pub fn sandbox_view(&self, id: &str) -> PluginResult<SandboxView> {        let entry = self
             .registry
             .get(id)
             .ok_or_else(|| PluginError::NotFound(format!("插件不存在: {id}")))?;
@@ -607,6 +606,100 @@ impl PluginManager {
             runtime: manifest.runtime,
         })
     }
+
+    /// 一个后台（无界面）插件启动所需的事实。
+    ///
+    /// 返回 `Ok(None)` 表示**这个插件没有后台声明**，因此不该被拉起 ——
+    /// 与"声明了但有问题"（`Err`）分开：前者是常态，后者要能被界面说出来。
+    ///
+    /// ============================================================
+    /// 为什么根目录必须规范化
+    /// ============================================================
+    ///
+    /// `root` 会被当作 Node 的 `--allow-fs-read` 放行目标交给子进程。而权限模型
+    /// 是按**真实路径**比对的：一个指向别处的符号链接会让"看起来在插件目录里"
+    /// 的放行实际打开另一个目录。因此这里 `canonicalize`，并在拼出入口之后再
+    /// 验一次它确实仍在根目录之下。
+    ///
+    /// 两道检查不是冗余：`background_manifest` 验的是**那段相对路径**本身安全，
+    /// 这里验的是**拼出来的路径**没跑出去。符号链接恰好只被第二道拦住。
+    pub fn background_launch(&self, id: &str) -> PluginResult<Option<BackgroundLaunch>> {
+        let Some(entry) = self.registry.get(id) else {
+            return Err(PluginError::NotFound(format!("插件不存在: {id}")));
+        };
+
+        // 停用的插件不该被拉起进程。与界面一样：一个被停用的插件连清单都不必解析。
+        if !entry.enabled {
+            return Ok(None);
+        }
+
+        let root = self.asset_root(entry);
+        let manifest = read_manifest(&root)?;
+
+        let Some(contribution) = super::background_manifest::parse(manifest.contributes.as_ref())
+        else {
+            return Ok(None);
+        };
+
+        let root = root.canonicalize().unwrap_or(root);
+        let entry_path = root.join(&contribution.entry);
+
+        if !entry_path.starts_with(&root) {
+            return Err(PluginError::InvalidManifest(format!(
+                "后台入口跳出插件目录：{}",
+                contribution.entry
+            )));
+        }
+        if !entry_path.is_file() {
+            return Err(PluginError::InvalidManifest(format!(
+                "后台入口不存在：{}（清单里写的是 {}）",
+                entry_path.display(),
+                contribution.entry
+            )));
+        }
+
+        let manifest_json = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+
+        Ok(Some(BackgroundLaunch {
+            id: id.to_string(),
+            name: if manifest.display_name.trim().is_empty() {
+                manifest.name.clone()
+            } else {
+                manifest.display_name.clone()
+            },
+            version: manifest.version.clone(),
+            root,
+            entry: entry_path,
+            permissions: manifest
+                .permissions
+                .iter()
+                .map(|permission| permission.as_str().to_string())
+                .collect(),
+            manifest: manifest_json,
+            contribution,
+        }))
+    }
+}
+
+/// 一个后台插件启动所需的事实。
+///
+/// 与 `SandboxView` 并列而不是复用它：两者的字段只重叠一半（后台没有 `main`
+/// 与 `style`，界面没有 `entry` 与 `contribution`），而合并成一个"什么都有、
+/// 一半是 `None`"的结构会让每一个使用点都要判空。
+#[derive(Debug, Clone)]
+pub struct BackgroundLaunch {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// 插件根目录。**已规范化** —— 见 `PluginManager::background_launch`。
+    pub root: PathBuf,
+    /// 后台入口的绝对路径（已校验仍在 `root` 之下且确实存在）
+    pub entry: PathBuf,
+    pub permissions: Vec<String>,
+    /// 交给子进程的清单原文。插件据此知道自己声明了什么。
+    pub manifest: serde_json::Value,
+    /// 这次启动要遵守的声明
+    pub contribution: super::background_manifest::BackgroundContribution,
 }
 
 impl PluginManager {

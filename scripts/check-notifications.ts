@@ -78,9 +78,11 @@ console.log('\n广播覆盖：');
 
 /** 取出一个命令函数体（括号配平） */
 function commandBody(source: string, name: string): string | null {
-  const signature = `pub fn ${name}(`;
-  const start = source.indexOf(signature);
-  if (start === -1) return null;
+  // 允许泛型参数：`pub fn push<R: Runtime>(`。沙箱插件的协议处理器拿到的是
+  // `AppHandle<R>` 而不是具体的 `AppHandle`，因此那条推送路径必须是泛型的。
+  const match = new RegExp(`pub fn ${name}(?:<[^>]*>)?\\(`).exec(source);
+  if (!match) return null;
+  const start = match.index;
   const open = source.indexOf('{', start);
   if (open === -1) return null;
   let depth = 0;
@@ -94,6 +96,37 @@ function commandBody(source: string, name: string): string | null {
   return null;
 }
 
+/**
+ * `push_notification` 如今是一个**薄壳**：真正的实现在 `push` 里。
+ *
+ * 为什么要拆：沙箱插件界面没有 Tauri IPC（零 capability），它发的每一条请求都由
+ * 宿主的协议处理器代为执行 —— 而那条路径只有 `AppHandle`，拿不到 `State<_>`。
+ * 如果推送逻辑只写在命令里，沙箱插件就没有合法的推送入口，只能复制一份出来，
+ * 而"来源字段与广播行为"两份实现迟早会不一致。
+ *
+ * ============================================================
+ * 这条检查因此必须先证明"壳真的转发了"
+ * ============================================================
+ *
+ * 只把检查目标从 `push_notification` 换成 `push` 是不够的：那样一来，把命令体
+ * 改成什么都不做，下面所有断言照样通过 —— 检查守卫的路径已经不是用户走的路径了。
+ * 因此这里要求壳体内出现一次对目标的调用，找不到就返回 `null`（= 检查变红）。
+ */
+const DELEGATED_TO: Record<string, string> = {
+  push_notification: 'push',
+};
+
+function effectiveBody(command: string): string | null {
+  const delegate = DELEGATED_TO[command];
+  if (!delegate) return commandBody(commandsRs, command);
+
+  const shell = commandBody(commandsRs, command);
+  if (shell === null) return null;
+  if (!new RegExp(`\\b${delegate}\\(`).test(shell)) return null;
+
+  return commandBody(commandsRs, delegate);
+}
+
 const MUTATING_COMMANDS = [
   'push_notification',
   'mark_notification_read',
@@ -103,7 +136,7 @@ const MUTATING_COMMANDS = [
 ];
 
 for (const command of MUTATING_COMMANDS) {
-  const body = commandBody(commandsRs, command);
+  const body = effectiveBody(command);
   check(body !== null, `能找到 ${command} 的实现`);
   check(
     body !== null && body.includes('broadcast_changed'),
@@ -125,7 +158,7 @@ check(emitCalls === 1, `emit 只在一处出现（实际 ${emitCalls} 处）—�
 console.log('\n广播的位置：');
 
 for (const command of MUTATING_COMMANDS) {
-  const body = commandBody(commandsRs, command);
+  const body = effectiveBody(command);
   if (!body) continue;
 
   // 广播必须出现在最后一个 lock() 之后、且不在同一个 `{}` 块里 ——
@@ -179,7 +212,7 @@ function broadcastsInsideTheCommand(body: string): boolean {
 
 check(
   MUTATING_COMMANDS.every((command) => {
-    const body = commandBody(commandsRs, command);
+    const body = effectiveBody(command);
     return body !== null && broadcastsInsideTheCommand(body);
   }),
   '广播发生在每个命令的函数体内'

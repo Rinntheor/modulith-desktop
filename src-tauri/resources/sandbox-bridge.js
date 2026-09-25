@@ -11,8 +11,8 @@
 //   1. 把 `ctx.*` 变成对宿主的 RPC（走自定义协议，不是 Tauri 的 IPC）；
 //   2. 把插件身份与已声明的权限**同步**交给插件 —— 插件在顶层就能读到，
 //      不必先 await 一次；
-//   3. 不提供任何别的东西。插件拿不到 DOM 之外的宿主对象、拿不到 require、
-//      拿不到原生的 `fetch` 之外的网络能力（那被 CSP 限制在插件自己的来源上）。
+//   3. 不提供任何别的东西。插件拿不到 require、拿不到宿主的对象、
+//      也拿不到一个能绕开宿主的网络出口（CSP 把它限制在插件自己的来源上）。
 //
 // 文件里的 `__PLUGIN_*__` 占位符由宿主在**每次响应时**替换（见 sandbox.rs 的
 // `bridge_script`）。因此这段脚本虽然是一个静态文件，交给插件的却是带身份的那一份。
@@ -20,6 +20,22 @@
 // 注意上面写的是 `__PLUGIN_*__` 而不是某个具体占位符：`bridge_script` 会断言
 // "替换之后一个原始占位符都不剩"，因此**连注释里也不能出现它们**。
 // 这里曾经因为注释里原样写了一遍而让那条断言在 debug 构建里直接 panic。
+//
+// ============================================================
+// 这一层为什么必须与宿主侧的 ctx 一一对应
+// ============================================================
+//
+// 同一个插件可以在 `runtime: "in-process"` 与 `"sandboxed"` 之间切换，而它的
+// 代码不该因此改一行。因此 `Modulith` 暴露的名字必须与宿主侧 `ctx` 的成员完全
+// 一致 —— 少一个的表现是插件在沙箱里拿到 `undefined`，而那种错误看起来像
+// 插件自己写错了。`check:sandbox` 里有一条断言逐项比对两份清单。
+//
+// 两处**刻意不同**的地方：
+//   * `ctx.ui.registerModule` 在沙箱里不存在（沙箱插件自己就是界面，
+//     不需要向宿主注册一个 React 组件）；
+//   * `ctx.fileDrop` 不存在（拖放是窗口级事件，沙箱 webview 是子窗口，
+//     主窗口收到的事件到不了这里）。
+// 这两条是**能力差异**，不是"还没做" —— 它们写进插件开发文档。
 //
 // ============================================================
 // 关于 fetch
@@ -35,9 +51,17 @@
   var PLUGIN_ID = '__PLUGIN_ID__';
   var PLUGIN_NAME = '__PLUGIN_NAME__';
   var PLUGIN_VERSION = '__PLUGIN_VERSION__';
+  var PLUGIN_RUNTIME = '__PLUGIN_RUNTIME__';
+  var ACTIVATION_EVENT = '__PLUGIN_ACTIVATION__';
   var PERMISSIONS = __PLUGIN_PERMISSIONS__;
+  var DATA_AVAILABLE = __PLUGIN_DATA_AVAILABLE__;
 
   var RPC_ROOT = '/' + PLUGIN_ID + '/rpc/';
+  var DATA_ROOT = '/' + PLUGIN_ID + '/data/';
+
+  function has(permission) {
+    return PERMISSIONS.indexOf(permission) !== -1;
+  }
 
   /**
    * 发一条 RPC。
@@ -85,14 +109,312 @@
     };
   }
 
+  // ============================================================
+  // 数据目录
+  // ============================================================
+  //
+  // 读写走 `/<id>/data/<相对路径>` 这条**原始字节**通道，不是 RPC：
+  // 请求体/响应体就是文件内容，没有 base64、没有中间字符串。
+  // 这是文档、图库一类"几百 MB"的插件唯一能用的路径。
+  //
+  // `rel` 里的 `..`、盘符、保留设备名由宿主侧的 `data_dir::resolve` 拒绝，
+  // 而不是在这里过滤 —— 边界只有一处实现，才不会两处漂开。
+
+  function dataUrl(rel) {
+    // 逐段编码，**不编码斜杠**：整个相对路径编码成一段会让宿主的路径解析
+    // 收到一个 `%2F` 而认不出目录层级。
+    var segments = String(rel === undefined || rel === null ? '' : rel)
+      .split('/')
+      .filter(function (segment) {
+        return segment.length > 0;
+      })
+      .map(encodeURIComponent);
+    return DATA_ROOT + segments.join('/');
+  }
+
+  /**
+   * 把插件给的东西变成可以放进请求体的字节。
+   *
+   * 接受 `ArrayBuffer` / 类型化数组 / `Blob` / 字符串。字符串按 **UTF-8** 编码
+   * （`TextEncoder`），而不是 `fetch` 默认的 latin-1 —— 中文写进去变成乱码
+   * 是一类很难自查的问题，因为它在 ASCII 上完全正常。
+   */
+  function toBody(data) {
+    if (typeof data === 'string') return new TextEncoder().encode(data);
+    if (data instanceof ArrayBuffer) return data;
+    if (ArrayBuffer.isView(data)) {
+      return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    }
+    if (typeof Blob !== 'undefined' && data instanceof Blob) return data;
+    throw new Error('ctx.dataDir.write 需要字符串、ArrayBuffer、类型化数组或 Blob');
+  }
+
+  function dataRequest(rel, init) {
+    return fetch(dataUrl(rel), init).then(
+      function (response) {
+        if (!response.ok) {
+          // 404 是"这个文件不在"，其余是宿主拒绝（路径越界、配额、数据根不可用）。
+          // 两者都抛，但**消息不同** —— 插件据此能分辨"该建这个文件"与"该提示用户"。
+          if (response.status === 404) {
+            throw new Error('文件不存在：' + rel);
+          }
+          return response.text().then(function (message) {
+            throw new Error(message || '数据通道失败：HTTP ' + response.status);
+          });
+        }
+        return response;
+      },
+      function (error) {
+        throw new Error('数据通道不可用：' + (error && error.message ? error.message : error));
+      }
+    );
+  }
+
+  var dataDir = {
+    /**
+     * 数据根目录当前是否可用。
+     *
+     * 这个值是**文档加载时**宿主注入的快照，因此它同步可读（插件在顶层就能用它
+     * 决定"先建目录还是先提示用户去配置"）。要拿实时状态用 `status()`。
+     */
+    available: DATA_AVAILABLE,
+
+    /**
+     * 问一次宿主的**当前**状态：`{available, configured, path, reason}`。
+     *
+     * 与上面那个布尔值的分工：不可用时 `reason` 是给用户看的一句话
+     * （"数据目录不存在" / "未配置" / "不可写"），插件据此能告诉用户该做什么，
+     * 而不是只报一句"用不了"。
+     */
+    status: function () {
+      return rpc('data.available', {});
+    },
+
+    /** 列一个目录。`rel` 省略表示数据根。 */
+    list: function (rel) {
+      return rpc('data.list', { rel: rel === undefined ? '' : rel });
+    },
+
+    /** 取元信息。不存在时返回 `null`（不是错误）。 */
+    stat: function (rel) {
+      return rpc('data.stat', { rel: rel });
+    },
+
+    /** 读成 `ArrayBuffer`。 */
+    read: function (rel) {
+      return dataRequest(rel, { method: 'GET' }).then(function (response) {
+        return response.arrayBuffer();
+      });
+    },
+
+    /** 读成文本（按 UTF-8）。 */
+    readText: function (rel) {
+      return dataRequest(rel, { method: 'GET' }).then(function (response) {
+        return response.text();
+      });
+    },
+
+    /** 覆盖写入。内容原样进请求体，不经过 base64。 */
+    write: function (rel, data) {
+      return dataRequest(rel, {
+        method: 'PUT',
+        body: toBody(data),
+        headers: { 'Content-Type': 'application/octet-stream' },
+      }).then(function () {});
+    },
+
+    /** 覆盖写入一段文本（UTF-8）。 */
+    writeText: function (rel, text) {
+      return dataDir.write(rel, String(text));
+    },
+
+    /** 建目录（含中间层）。 */
+    mkdir: function (rel) {
+      return rpc('data.mkdir', { rel: rel });
+    },
+
+    /** 删除文件或整棵目录树。 */
+    remove: function (rel) {
+      return rpc('data.remove', { rel: rel });
+    },
+
+    /** 这个插件的数据目录当前占了多少字节。 */
+    used: function () {
+      return rpc('data.used', {});
+    },
+
+    /**
+     * 读成 base64 字符串。
+     *
+     * 只在小内容上用它（把图片塞进 CSS 的 `url()`、塞进一个 JSON 字段）。
+     * 大文件用 `read()` —— 这一条会多出 33% 体积与一次完整字符串。
+     */
+    readBase64: function (rel) {
+      return rpc('data.read', { rel: rel });
+    },
+
+    /** 从 base64 字符串写入。同样只建议小内容。 */
+    writeBase64: function (rel, base64) {
+      return rpc('data.write', { rel: rel, content: String(base64) });
+    },
+  };
+
+  // ============================================================
+  // 剪贴板
+  // ============================================================
+  //
+  // 用页面自己的 `navigator.clipboard`。这不是"绕开宿主"——它就是浏览器 API，
+  // 插件本来就能直接调它；宿主在这里提供的价值是**统一的形状与权限提示**，
+  // 而不是一道能真正挡住谁的门。权限表里这一项标的是 `frontend` 强制，
+  // 与 Rust 侧一致（见 permissions.rs 与 pluginRuntime.ts 的说明）。
+  //
+  // `http://<名字>.localhost` 被浏览器当作**可信来源**，因此不需要 https 就能
+  // 用剪贴板 API —— 这是这条自定义协议能承载完整插件界面的一部分原因。
+
+  var clipboard = {
+    read: function () {
+      if (!has('clipboard')) {
+        return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
+      }
+      return navigator.clipboard.readText();
+    },
+    write: function (text) {
+      if (!has('clipboard')) {
+        return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
+      }
+      return navigator.clipboard.writeText(String(text));
+    },
+  };
+
+  // ============================================================
+  // 清理登记
+  // ============================================================
+  //
+  // 纯 JS，不经过宿主：它登记的是**这个文档里**的资源（定时器、监听器、
+  // 观察者），而文档被销毁时它们本来就随之消失。宿主那一侧的 `disposables`
+  // 是为"卸载插件但页面还活着"（in-process）准备的。
+
+  var disposables = (function () {
+    var list = [];
+
+    function runOne(fn) {
+      try {
+        fn();
+      } catch (error) {
+        // 一个清理函数抛错不该让其余的清理不执行 —— 那会把一次小错误
+        // 放大成"后面那些资源全都泄漏了"。
+        console.error('[Modulith] 清理函数执行出错:', error);
+      }
+    }
+
+    return {
+      add: function (dispose) {
+        if (typeof dispose !== 'function') {
+          throw new Error('ctx.disposables.add 需要一个函数');
+        }
+        list.push(dispose);
+        return dispose;
+      },
+      size: function () {
+        return list.length;
+      },
+      /** 执行并清空。宿主在页面销毁前会调一次（见 pagehide 的接线）。 */
+      flush: function () {
+        var pending = list;
+        list = [];
+        pending.forEach(runOne);
+        return pending.length;
+      },
+    };
+  })();
+
+  // 页面消失时把清理函数跑掉。**这不是可选的整洁**：沙箱界面在切换标签时是
+  // `hide` 而不是销毁，但驻留淘汰与关闭会真的销毁它 —— 而那时如果插件的
+  // 定时器还在跑，它会在一个已经不可见的文档里继续消耗 CPU。
+  window.addEventListener('pagehide', function () {
+    disposables.flush();
+  });
+
+  // ============================================================
+  // 跨插件事件
+  // ============================================================
+  //
+  // 发送走 RPC（宿主再广播给后台插件与其余界面）；接收走宿主推过来的一段脚本。
+  //
+  // **宿主推给每一个还活着的界面，由这里过滤**。原因见 SandboxSurfaces::live：
+  // 登记订阅需要多一整套会漂的状态（注册 / 注销 / 界面销毁时清理），而活着的
+  // 界面数量受驻留上限约束，推一圈的代价是有界的。
+
+  var eventHandlers = Object.create(null);
+
+  /**
+   * 宿主推来一条事件时调用的入口。
+   *
+   * 名字以双下划线 modulith 开头是刻意的：插件一眼能看出这是宿主的东西，
+   * 而不是它自己的某个全局。宿主调用它之前会先判它存不存在（见 rpc.rs）。
+   */
+  window.__modulithDeliver = function (envelope) {
+    if (!envelope || typeof envelope.name !== 'string') return;
+
+    var list = eventHandlers[envelope.name];
+    if (!list || list.length === 0) return;
+
+    // 复制一份再遍历：处理器里取消订阅会让原数组在遍历中变短，
+    // 于是后面几个处理器被静默跳过 —— 而那看起来像"订阅偶尔不生效"。
+    list.slice().forEach(function (handler) {
+      try {
+        handler(envelope.payload, envelope.source);
+      } catch (error) {
+        console.error('[Modulith] 事件处理器抛错（' + envelope.name + '）:', error);
+      }
+    });
+  };
+
+  var events = {
+    /** 发一条跨插件事件。需要 plugin-communicate 权限。 */
+    emit: function (name, payload) {
+      return rpc('events.emit', { name: String(name), payload: payload });
+    },
+
+    /**
+     * 订阅一条跨插件事件。返回取消订阅的函数。
+     *
+     * 处理器收到 (payload, source) —— **来源是宿主给的**，不是发送方自报的：
+     * 一个插件不该能冒充另一个插件发事件。
+     */
+    on: function (name, handler) {
+      if (typeof handler !== 'function') {
+        throw new Error('ctx.events.on 需要一个函数');
+      }
+      var key = String(name);
+      if (!eventHandlers[key]) eventHandlers[key] = [];
+      eventHandlers[key].push(handler);
+
+      return function () {
+        var list = eventHandlers[key] || [];
+        eventHandlers[key] = list.filter(function (item) {
+          return item !== handler;
+        });
+      };
+    },
+  };
+
+  // ============================================================
+  // 对外的那一个对象
+  // ============================================================
+
   var Modulith = {
     /** 沙箱插件的身份。**宿主给出的**，不是插件自报的。 */
     plugin: {
       id: PLUGIN_ID,
       name: PLUGIN_NAME,
       version: PLUGIN_VERSION,
+      runtime: PLUGIN_RUNTIME,
       permissions: PERMISSIONS.slice(),
     },
+
+    /** 本次由什么唤醒（沙箱界面总是 `open`：用户打开了它）。 */
+    activationEvent: ACTIVATION_EVENT,
 
     /**
      * 声明了某个权限没有。
@@ -100,9 +422,7 @@
      * 插件应当用它做特性探测，而不是去比较宿主版本 —— 与 `Modulith.capabilities`
      * 的既有约定一致。未声明的能力即使被调用，宿主也会拒绝。
      */
-    has: function (permission) {
-      return PERMISSIONS.indexOf(permission) !== -1;
-    },
+    has: has,
 
     log: {
       debug: log('debug'),
@@ -112,11 +432,7 @@
     },
 
     storage: {
-      /**
-       * 读一个键。不存在时返回 `fallback`。
-       *
-       * 值以 JSON 存储，因此对象、数组、数字都能原样取回。
-       */
+      /** 读一个键。不存在时返回 `fallback`。值以 JSON 存储，对象与数组原样取回。 */
       get: function (key, fallback) {
         return rpc('storage.get', { key: key }).then(function (raw) {
           if (raw === null || raw === undefined) return fallback;
@@ -141,6 +457,128 @@
           return value || [];
         });
       },
+
+      /**
+       * 分页枚举键 —— 数据量大时**应当用这个**而不是 `keys()`。
+       *
+       * 游标是不透明的：原样回传 `nextCursor`，`null` 表示到底。
+       */
+      list: function (options) {
+        var options0 = options || {};
+        return rpc('storage.list', {
+          prefix: options0.prefix === undefined ? '' : options0.prefix,
+          cursor: options0.cursor === undefined ? null : options0.cursor,
+          pageSize: options0.pageSize === undefined ? null : options0.pageSize,
+        });
+      },
+
+      /** 当前用量（字节数与键数）。 */
+      usage: function () {
+        return rpc('storage.usage', {});
+      },
+
+      /** 读出全部键值。键数超过 500 时会**抛错**而不是截断。 */
+      all: function () {
+        return rpc('storage.all', {});
+      },
+
+      /** 清空这个插件的键值存储（不动数据目录）。 */
+      clear: function () {
+        return rpc('storage.clear', {});
+      },
+    },
+
+    dataDir: dataDir,
+
+    http: {
+      /**
+       * 受管网络请求。需要 `network`（本机/回环）或 `network-external` 权限。
+       *
+       * 它**不是** `window.fetch` 的别名：出口在宿主侧，因此权限与来源判定
+       * 都在那里做，插件改不掉。
+       */
+      fetch: function (url, options) {
+        var options0 = options || {};
+        return rpc('http.fetch', {
+          url: url,
+          method: options0.method === undefined ? 'GET' : options0.method,
+          headers: options0.headers === undefined ? null : options0.headers,
+          body: options0.body === undefined ? null : options0.body,
+        });
+      },
+    },
+
+    notifications: {
+      /** 推一条通知。需要 `notification` 权限。 */
+      notify: function (input) {
+        var input0 = input || {};
+        return rpc('notify', {
+          title: input0.title,
+          body: input0.body === undefined ? '' : input0.body,
+          level: input0.level === undefined ? 'info' : input0.level,
+          dedupeKey: input0.dedupeKey === undefined ? null : input0.dedupeKey,
+        });
+      },
+    },
+
+    launcher: {
+      launch: function (program, args) {
+        return rpc('system.launch', {
+          program: program,
+          args: args === undefined ? [] : args,
+        });
+      },
+    },
+
+    icons: {
+      extract: function (path) {
+        return rpc('system.icon', { path: path });
+      },
+    },
+
+    shell: {
+      revealInFolder: function (path) {
+        return rpc('system.reveal', { path: path });
+      },
+    },
+
+    audio: {
+      /** 让用户选一个音频文件。返回可直接播放的 data URL，取消时为 `null`。 */
+      pick: function () {
+        return rpc('system.pickAudio', {});
+      },
+    },
+
+    settings: {
+      /**
+       * 读插件贡献的设置项。
+       *
+       * 值存在插件自己的存储里（键前缀由宿主保留），因此**需要 `storage` 权限**。
+       * `fallback` 在没改过时返回 —— 缺省值写在清单里，插件自己知道它是什么。
+       */
+      get: function (id, fallback) {
+        return rpc('settings.all', {}).then(function (all) {
+          var values = all || {};
+          return Object.prototype.hasOwnProperty.call(values, id) ? values[id] : fallback;
+        });
+      },
+
+      all: function () {
+        return rpc('settings.all', {});
+      },
+
+      set: function (id, value) {
+        return rpc('settings.set', { id: id, value: value });
+      },
+    },
+
+    clipboard: clipboard,
+
+    events: events,
+
+    disposables: {
+      add: disposables.add,
+      size: disposables.size,
     },
   };
 

@@ -413,6 +413,100 @@ pub async fn plugin_data_usage(state: State<'_, PluginState>, id: String) -> Res
     manager.data_usage(&id).map_err(to_msg)
 }
 
+/// 列一个目录。`rel` 为空表示插件的**数据根**。
+#[tauri::command]
+pub async fn plugin_data_list(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<Vec<super::data_dir::DataEntry>, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_list(&id, &rel).map_err(to_msg)
+}
+
+/// 取一个路径的元信息。不存在时返回 `null`（不是错误）。
+#[tauri::command]
+pub async fn plugin_data_stat(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<Option<super::data_dir::DataStat>, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_stat(&id, &rel).map_err(to_msg)
+}
+
+/// 读一个文件，返回 **base64**。
+///
+/// 为什么是 base64 而不是原始字节：`invoke` 的参数走 JSON，JSON 里放不下二进制。
+/// 代价是 33% 的体积与一次字符串拷贝 —— 对配置、缩略图、几 MB 的文档可以接受，
+/// 对几百 MB 的文件不行。**原始字节的通道是下一步**（Tauri 的 `invoke` 支持把
+/// `Uint8Array` 直接作为请求体，那样没有转义开销）。
+///
+/// 这一条与 `ctx.storage` 的区别不在这里，而在有没有上限：
+/// 存储的单值是 1 MB，这里是 256 MB。
+#[tauri::command]
+pub async fn plugin_data_read(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    let manager = state.inner().0.read().await;
+    let bytes = manager.data_read(&id, &rel).map_err(to_msg)?;
+    Ok(BASE64.encode(bytes))
+}
+
+/// 写一个文件（覆盖）。内容同样以 base64 传入。
+#[tauri::command]
+pub async fn plugin_data_write(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+    content: String,
+) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    let bytes = BASE64
+        .decode(content)
+        .map_err(|e| format!("内容不是合法的 base64：{e}"))?;
+
+    let manager = state.inner().0.read().await;
+    manager.data_write(&id, &rel, &bytes).map_err(to_msg)
+}
+
+/// 建一个目录（含中间层）。
+#[tauri::command]
+pub async fn plugin_data_mkdir(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<(), String> {
+    let manager = state.inner().0.read().await;
+    manager.data_mkdir(&id, &rel).map_err(to_msg)
+}
+
+/// 删除一个文件或一棵目录树。
+#[tauri::command]
+pub async fn plugin_data_remove(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<(), String> {
+    let manager = state.inner().0.read().await;
+    manager.data_remove(&id, &rel).map_err(to_msg)
+}
+
+/// 这个插件的数据目录当前占了多少字节。
+#[tauri::command]
+pub async fn plugin_data_used(
+    state: State<'_, PluginState>,
+    id: String,
+) -> Result<u64, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_used(&id).map_err(to_msg)
+}
+
 /// 列出已卸载插件的残留数据（id 与占用字节数，按占用从大到小）。
 ///
 /// 卸载保留数据之后必须有这一条：没有它，那些目录既占着空间、又没有任何界面

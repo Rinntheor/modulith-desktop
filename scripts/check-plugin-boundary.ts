@@ -377,6 +377,7 @@ section('能力方法');
     { member: 'audio', factory: 'pluginAudio', path: ['return'] },
     { member: 'clipboard', factory: 'pluginClipboard', path: ['return'] },
     { member: 'settings', factory: 'pluginSettingsAPI', path: ['return'] },
+    { member: 'dataDir', factory: 'pluginDataDir', path: ['return'] },
     // 唯一一个没有独立工厂的：它是在上下文工厂的返回对象里直接写出来的字面量
     { member: 'disposables', factory: 'createContextFor', path: ['return', 'disposables'] },
   ];
@@ -509,8 +510,8 @@ section('迁移面');
     `ctx 上没有函数形态的**成员**（当前 ${contextCallables.length} 个）`
   );
   check(
-    contextHandles.length === 13,
-    `ctx 上有 13 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
+    contextHandles.length === 14,
+    `ctx 上有 14 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
   );
   // 这一条是 v1.5 最该被看见的数字：方法层面的真实工作量。
   check(

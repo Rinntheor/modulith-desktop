@@ -1400,6 +1400,148 @@ function createContext() {
   return createContextFor(pluginId, manifest, activationReasons.get(pluginId) ?? 'legacy');
 }
 
+/**
+ * 插件数据目录（`ctx.dataDir`）。
+ *
+ * ============================================================
+ * 它是什么，与 `ctx.storage` 差在哪
+ * ============================================================
+ *
+ * `ctx.storage` 是一键一个 JSON 文件，单值 1 MB、总量 8 MB、最多 2000 个键。
+ * 那个额度是为**配置与小状态**定的，装不下笔记、文档、图片。
+ *
+ * `ctx.dataDir` 是插件**自己的一个目录**：能建子目录、能存二进制、单文件上限
+ * 256 MB、目录总量 1 GiB。边界不是"随便写"，而是"只在这个目录之内" ——
+ * 路径里的 `..`、盘符、以及指向外面的符号链接都会被宿主拒绝。
+ *
+ * ============================================================
+ * 需要 `plugin-data` 权限
+ * ============================================================
+ *
+ * 未声明时**降级为空实现并只提示一次**，与 `notifications` / `clipboard` 一致：
+ * 抛错会让一个可选的持久化路径把整个插件打断，而"没声明权限"是作者该看到的一条
+ * 提示，不是一次故障。
+ *
+ * ============================================================
+ * 二进制走 base64，这是**已知代价**而不是设计
+ * ============================================================
+ *
+ * `invoke` 的参数走 JSON，JSON 里放不下二进制。代价是 33% 的体积与一次字符串
+ * 拷贝 —— 对配置、缩略图、几 MB 的文档可以接受，对几百 MB 的文件不行。
+ * 原始字节通道（Tauri 支持把 `Uint8Array` 直接作为请求体）是下一步。
+ * 把它写在这里而不是藏起来，是因为"这个 API 适合多大的文件"是作者必须知道的。
+ */
+/** 已经为"没声明 plugin-data 却用了 ctx.dataDir"提示过的插件，避免刷屏。 */
+const warnedMissingDataDir = new Set<string>();
+
+function pluginDataDir(pluginId: string, manifest: PluginManifest | undefined) {
+  const allowed = pluginHasPermission(manifest, 'plugin-data');
+
+  if (!allowed) {
+    // 只提示一次：一个高频调用的接口不该把控制台刷满。
+    if (!warnedMissingDataDir.has(pluginId)) {
+      warnedMissingDataDir.add(pluginId);
+      console.warn(
+        `[pluginRuntime] 插件 "${pluginId}" 使用了 ctx.dataDir，但清单里没有声明 ` +
+          `"plugin-data" 权限，调用被忽略（后续同类调用不再重复提示）`
+      );
+    }
+    // 降级成一个**处处失败**的空实现：返回空列表、读不到东西、写入直接拒绝。
+    // 不静默假装成功 —— 那会让插件以为存好了，而东西根本没落盘。
+    const denied = async (): Promise<never> => {
+      throw new Error('插件未声明 "plugin-data" 权限，无法访问数据目录');
+    };
+    return {
+      available: async (): Promise<boolean> => false,
+      list: async (): Promise<DataEntry[]> => [],
+      stat: async (): Promise<DataStat | null> => null,
+      read: denied,
+      readText: denied,
+      write: denied,
+      writeText: denied,
+      mkdir: denied,
+      remove: denied,
+      used: async (): Promise<number> => 0,
+    };
+  }
+
+  const call = <T>(command: string, args: Record<string, unknown>): Promise<T> =>
+    invoke<T>(command, { id: pluginId, ...args });
+
+  /** `Uint8Array` → base64。分块是为了不把整个文件展开成一个巨大的参数列表。 */
+  const toBase64 = (bytes: Uint8Array): string => {
+    const CHUNK = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  };
+
+  const fromBase64 = (text: string): Uint8Array => {
+    const binary = atob(text);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  return {
+    /**
+     * 宿主那边数据目录现在能不能用。
+     *
+     * **它不是装饰。** 数据放在外置盘/网络盘上时，盘没插就是一个真实状态；
+     * 那时读出来是空的，而"空"与"还没有数据"看起来一模一样。插件应当在写之前
+     * 先问一次，并在为假时**明确告诉用户"数据目录不可用"**，
+     * 而不是让用户以为数据丢了。
+     */
+    available: async (): Promise<boolean> => {
+      try {
+        await call<number>('plugin_data_used', {});
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    list: (rel = '') => call<DataEntry[]>('plugin_data_list', { rel }),
+    stat: (rel: string) => call<DataStat | null>('plugin_data_stat', { rel }),
+
+    read: async (rel: string): Promise<Uint8Array> =>
+      fromBase64(await call<string>('plugin_data_read', { rel })),
+    readText: async (rel: string): Promise<string> => {
+      const bytes = fromBase64(await call<string>('plugin_data_read', { rel }));
+      return decoder.decode(bytes);
+    },
+
+    write: (rel: string, bytes: Uint8Array) =>
+      call<void>('plugin_data_write', { rel, content: toBase64(bytes) }),
+    writeText: (rel: string, text: string) =>
+      call<void>('plugin_data_write', { rel, content: toBase64(encoder.encode(text)) }),
+
+    mkdir: (rel: string) => call<void>('plugin_data_mkdir', { rel }),
+    remove: (rel: string) => call<void>('plugin_data_remove', { rel }),
+    used: () => call<number>('plugin_data_used', {}),
+  };
+}
+
+/** 数据目录里的一个条目 */
+export interface DataEntry {
+  name: string;
+  isDir: boolean;
+  size: number;
+  modified: number;
+}
+
+/** 数据目录里一个路径的元信息 */
+export interface DataStat {
+  isDir: boolean;
+  size: number;
+  modified: number;
+}
+
 /** 上下文工厂。插件身份是**显式参数** —— 这是 `api: 2` 能成立的原因 */
 function createContextFor(
   pluginId: string,
@@ -1421,6 +1563,8 @@ function createContextFor(
      */
     activationEvent: event,
     storage: pluginStorage(pluginId),
+    /** 插件私有文件目录。配置与小状态用 `storage`，文件用这个。 */
+    dataDir: pluginDataDir(pluginId, manifest),
     http: pluginHttp(pluginId),
     logger: pluginLogger(pluginId),
     notifications: pluginNotifications(pluginId, manifest),

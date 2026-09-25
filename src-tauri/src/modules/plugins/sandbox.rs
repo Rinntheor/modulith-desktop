@@ -175,6 +175,24 @@ impl SandboxSurfaces {
             .unwrap_or_else(|e| e.into_inner())
             .remove(label);
     }
+
+    /// 当前全部界面：`(标签, 插件 id)`。
+    ///
+    /// 给**跨插件事件**用：一条事件要送到每一个还活着的界面，由各自的桥接层
+    /// 决定有没有人订阅它。
+    ///
+    /// 为什么是"推给所有界面"而不是"宿主先问谁订阅了"：后者需要多一套
+    /// 订阅登记的协议与状态（注册 / 注销 / 界面销毁时清理），而活着的界面
+    /// 受驻留上限约束（默认 3 个），推一圈的代价是有界的。**用一个有界的代价
+    /// 换掉一整套会漂的状态**，在这里是划算的。
+    pub(super) fn live(&self) -> Vec<(String, String)> {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(label, plugin)| (label.clone(), plugin.clone()))
+            .collect()
+    }
 }
 
 /// 从插件 id 得到 webview 标签。
@@ -285,11 +303,29 @@ async fn handle<R: Runtime>(
         //
         // 每次响应都**按身份重新渲染一遍**（`bridge_script`），因此插件在顶层就能
         // 同步读到自己的 id / 名称 / 权限，不必先 await 一次握手。
-        ("GET", Some("bridge.js")) => bridge_script(&view),
+        ("GET", Some("bridge.js")) => bridge_script(app, &view),
 
         ("GET", Some("asset")) => {
             let rel = segments[2..].join("/");
             serve_asset(&view, &rel)
+        }
+
+        // 原始字节通道。**不走 base64** —— 这是几百 MB 的文件唯一能进出的路径。
+        //
+        // 为什么放在协议层而不是 RPC 里：RPC 的请求体是 JSON，二进制进去必须
+        // base64（+33% 体积，外加一次完整的字符串拷贝与一次解码）。而这些
+        // HTTP 消息的请求体/响应体本来就是字节，直接用它们。
+        //
+        // 路径里的 `..` 与前导斜杠由 `data_dir::resolve` 拒绝（chroot 语义），
+        // 因此这里不必再净化一遍 —— 净化规则只有一处，才不会两处漂开。
+        ("GET", Some("data")) => {
+            let rel = segments[2..].join("/");
+            serve_data(app, &view, &rel).await
+        }
+
+        ("PUT", Some("data")) | ("POST", Some("data")) => {
+            let rel = segments[2..].join("/");
+            store_data(app, &view, &rel, request.body()).await
         }
 
         ("POST", Some("rpc")) => {
@@ -385,6 +421,21 @@ fn entry_document(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
     -->
     <link rel="icon" href="data:,">
 {style}
+    <!--
+      文档外壳的重置。**这是宿主的事，不是插件的事。**
+
+      没有这一段时，浏览器给 `<body>` 的默认 `margin: 8px` 会原样生效 ——
+      插件界面的四周因此多出一圈 8px 的背景色缝隙，看起来像"没铺满"。
+      实测就是这样：用户报的"存在留白"里有 8px 是这一行没写。
+
+      `height: 100%` 同理：插件拿到的是一块固定尺寸的原生区域，它的文档必须
+      默认就填满这块区域；否则每个插件都要自己写一遍 html/body 高度 100%，
+      而漏写的那个看起来就像"界面只有一半高"。
+    -->
+    <style>
+      html, body {{ margin: 0; padding: 0; height: 100%; }}
+      #modulith-root {{ min-height: 100%; }}
+    </style>
   </head>
   <body>
     <div id="modulith-root"></div>
@@ -447,15 +498,30 @@ fn page(body: String, script_and_style: &str) -> http::Response<Cow<'static, [u8
 ///   * 插件在**顶层同步**就能读到自己的身份与权限，不必先 await 一次握手 ——
 ///     而"顶层同步可用"正是 v1.5 花一整轮保住的性质；
 ///   * 少一条往返。身份校验照旧在协议处理器里做，这条替换不是安全依据。
-fn bridge_script(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
+fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
     let permissions = serde_json::to_string(&plugin.permissions)
         .unwrap_or_else(|_| "[]".to_string());
+
+    // 数据根目录当前可用与否，**在渲染桥接层时**问一次而不是每一次调用都问：
+    // 插件在顶层就能读到 `Modulith.dataDir.available`，于是它可以决定
+    // "先建目录还是先提示用户配置"。调用本身仍然会各自判一次（那才是强制点）。
+    let data_available = plugin_manager(app)
+        .map(|handle| {
+            handle
+                .try_read()
+                .map(|manager| manager.data_root_status().available)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
 
     let source = BRIDGE_JS
         .replace("'__PLUGIN_ID__'", &js_string(&plugin.id))
         .replace("'__PLUGIN_NAME__'", &js_string(&plugin.name))
         .replace("'__PLUGIN_VERSION__'", &js_string(&plugin.version))
-        .replace("__PLUGIN_PERMISSIONS__", &permissions);
+        .replace("__PLUGIN_PERMISSIONS__", &permissions)
+        .replace("__PLUGIN_DATA_AVAILABLE__", if data_available { "true" } else { "false" })
+        .replace("'__PLUGIN_RUNTIME__'", &js_string(runtime_wire(&plugin.runtime)))
+        .replace("'__PLUGIN_ACTIVATION__'", &js_string("open"));
 
     // 占位符没被替换掉 = 桥接层与这里的约定漂了。那时交给插件的会是一段
     // 字面量 `'__PLUGIN_ID__'`，症状是"插件的 id 变成了这个怪字符串" ——
@@ -464,18 +530,37 @@ fn bridge_script(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
         !source.contains("__PLUGIN_ID__")
             && !source.contains("__PLUGIN_NAME__")
             && !source.contains("__PLUGIN_VERSION__")
-            && !source.contains("__PLUGIN_PERMISSIONS__"),
+            && !source.contains("__PLUGIN_PERMISSIONS__")
+            && !source.contains("__PLUGIN_DATA_AVAILABLE__")
+            && !source.contains("__PLUGIN_RUNTIME__")
+            && !source.contains("__PLUGIN_ACTIVATION__"),
         "桥接脚本里的占位符没有被全部替换 —— sandbox-bridge.js 与 bridge_script 的约定漂了"
     );
 
     script(&source)
 }
 
+/// 运行位置在桥接层里的写法。
+///
+/// 沙箱文档**只可能**由 `Sandboxed` 的插件产生（`handle` 只服务沙箱界面），
+/// 因此这一条实际上是常量。写成一个函数是为了让"插件读到的值来自清单"这件事
+/// 有唯一一处实现 —— 直接写死 `'sandboxed'` 会在将来加第三种运行位置时
+/// 变成一句谎话。
+fn runtime_wire(runtime: &super::types::PluginRuntime) -> &'static str {
+    match runtime {
+        super::types::PluginRuntime::Sandboxed => "sandboxed",
+        super::types::PluginRuntime::InProcess => "in-process",
+    }
+}
+
 /// 把一个字符串变成合法的 JS 字符串字面量。
 ///
 /// 用 `serde_json` 而不是手写转义：它已经处理了引号、反斜杠与控制字符，
 /// 而手写的那份总会在某个不常见字符上出错 —— 而出错的方向是"注入"。
-fn js_string(value: &str) -> String {
+///
+/// `pub(super)`：`rpc.rs` 拼推送脚本时也要用它。两处各写一份转义，等于把
+/// "注入"这件事的风险翻倍。
+pub(super) fn js_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
@@ -564,12 +649,92 @@ fn content_type_of(path: &Path) -> &'static str {
 }
 
 // ============================================================
+// 原始字节通道（插件数据目录）
+// ============================================================
+//
+// 为什么单独一条通道：RPC 的消息体是 JSON，二进制进去必须 base64。对一个
+// 几十 KB 的缩略图那无所谓，对文档/图库插件里几百 MB 的文件则是：体积 +33%、
+// 一次完整字符串拷贝、一次解码，而且**全程驻留在 JS 堆里**。
+//
+// 这两条走 HTTP 的原始字节：请求体就是文件内容，响应体就是文件内容。
+// 浏览器侧的 `fetch(...).then(r => r.arrayBuffer())` 直接拿到 `ArrayBuffer`。
+
+/// 读一个数据文件，原样返回字节。
+async fn serve_data<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin: &SandboxView,
+    rel: &str,
+) -> http::Response<Cow<'static, [u8]>> {
+    let manager = match plugin_manager(app) {
+        None => return text(503, "插件系统尚未就绪"),
+        Some(handle) => handle,
+    };
+    let guard = manager.read().await;
+
+    match guard.data_read(&plugin.id, rel) {
+        Ok(bytes) => {
+            // Content-Type 按扩展名给。猜错的方向是"把内容当成别的东西解析"，
+            // 因此不认识的一律 octet-stream（与资源服务同一条规则）。
+            let content_type = content_type_of(Path::new(rel));
+            binary(content_type, bytes)
+        }
+        Err(e) => {
+            // 404 而不是 500：**不存在是最常见的一种结果**（插件问"这个文件在不在"），
+            // 把它当成服务端错误会让调用方以为是宿主坏了。
+            log::debug!("[sandbox] 读不到数据文件 {rel}：{e}");
+            text(404, "找不到这个文件")
+        }
+    }
+}
+
+/// 写入一个数据文件，覆盖。请求体就是文件内容。
+async fn store_data<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin: &SandboxView,
+    rel: &str,
+    body: &[u8],
+) -> http::Response<Cow<'static, [u8]>> {
+    if rel.is_empty() {
+        return text(400, "缺少文件路径");
+    }
+
+    let manager = match plugin_manager(app) {
+        None => return text(503, "插件系统尚未就绪"),
+        Some(handle) => handle,
+    };
+    let guard = manager.read().await;
+
+    match guard.data_write(&plugin.id, rel, body) {
+        // 响应体回写入了多少字节：这是唯一能让调用方确认"整份都到了"的信号。
+        Ok(()) => json(&format!(r#"{{"ok":true,"bytes":{}}}"#, body.len())),
+        Err(e) => {
+            log::warn!("[sandbox] 写数据文件 {rel} 失败：{e}");
+            text(400, &e.to_string())
+        }
+    }
+}
+
+// ============================================================
 // RPC
 // ============================================================
 //
-// 插件调 `ctx.*` 就是往这里发一条请求。**权限判定不在这里重写** ——
-// `PluginManager` 的存储方法自己会走 `require_permission`，配额也仍在同一条路径上。
-// 沙箱这一层只负责"这是谁发的"，不负责"他能不能"。
+// 插件调 `ctx.*` 就是往这里发一条请求。**传输与语义是分开的**：
+//
+//   · 这一层只做**传输** —— 把 HTTP 请求体交给 `super::rpc`，再把它的结果
+//     包回一个 JSON 响应；
+//   · **语义**（这个方法该做什么、权限谁判、配额怎么算）在 `super::rpc` 里，
+//     与 Node 后台插件那条路径**共用同一份实现**。
+//
+// 拆开而不是各写一份的理由见 `rpc.rs` 的文件头：同一个 `ctx` 有两个调用方，
+// 而两套实现一定会漂 —— 漂开的方向是"某个成员在一种运行位置下能用、
+// 在另一种下静默不生效"，那是最难被发现的一类缺陷。
+
+/// 插件系统状态里的管理器。没有它说明插件模块还没起来。
+fn plugin_manager<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Option<std::sync::Arc<tokio::sync::RwLock<super::manager::PluginManager>>> {
+    app.try_state::<super::PluginState>().map(|s| s.0.clone())
+}
 
 async fn dispatch_rpc<R: Runtime>(
     app: &AppHandle<R>,
@@ -586,92 +751,17 @@ async fn dispatch_rpc<R: Runtime>(
         }
     };
 
-    match method {
-        "log" => {
-            let level = args.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-            let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            match level {
-                "debug" => log::debug!("[plugin:{}] {message}", plugin.id),
-                "warn" => log::warn!("[plugin:{}] {message}", plugin.id),
-                "error" => log::error!("[plugin:{}] {message}", plugin.id),
-                _ => log::info!("[plugin:{}] {message}", plugin.id),
-            }
-            json(r#"{"ok":true}"#)
-        }
-
-        "storage.get" => {
-            let Some(key) = args.get("key").and_then(|v| v.as_str()) else {
-                return rpc_error("缺少 key");
-            };
-            match storage_manager(app) {
-                None => rpc_error("插件系统尚未就绪"),
-                Some(manager) => {
-                    let manager = manager.read().await;
-                    match manager.storage_get(&plugin.id, key) {
-                        Ok(value) => json_value(&serde_json::json!({ "ok": true, "value": value })),
-                        Err(e) => rpc_error(&e.to_string()),
-                    }
-                }
-            }
-        }
-
-        "storage.set" => {
-            let (Some(key), Some(value)) = (
-                args.get("key").and_then(|v| v.as_str()),
-                args.get("value").and_then(|v| v.as_str()),
-            ) else {
-                return rpc_error("缺少 key 或 value");
-            };
-            match storage_manager(app) {
-                None => rpc_error("插件系统尚未就绪"),
-                Some(manager) => {
-                    let manager = manager.read().await;
-                    match manager.storage_set(&plugin.id, key, value) {
-                        Ok(()) => json(r#"{"ok":true}"#),
-                        // 配额拒绝的消息里带着"哪一档、上限多少、已用多少、本次多少"
-                        // 四个数字，原样回给插件 —— 它需要那些数字才能自救。
-                        Err(e) => rpc_error(&e.to_string()),
-                    }
-                }
-            }
-        }
-
-        "storage.delete" => {
-            let Some(key) = args.get("key").and_then(|v| v.as_str()) else {
-                return rpc_error("缺少 key");
-            };
-            match storage_manager(app) {
-                None => rpc_error("插件系统尚未就绪"),
-                Some(manager) => {
-                    let manager = manager.read().await;
-                    match manager.storage_delete(&plugin.id, key) {
-                        Ok(()) => json(r#"{"ok":true}"#),
-                        Err(e) => rpc_error(&e.to_string()),
-                    }
-                }
-            }
-        }
-
-        "storage.keys" => match storage_manager(app) {
-            None => rpc_error("插件系统尚未就绪"),
-            Some(manager) => {
-                let manager = manager.read().await;
-                match manager.storage_keys(&plugin.id) {
-                    Ok(keys) => json_value(&serde_json::json!({ "ok": true, "value": keys })),
-                    Err(e) => rpc_error(&e.to_string()),
-                }
-            }
-        },
-
-        _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
+    // 语义在 \`super::rpc\` 里，这里只做**传输**上的翻译（HTTP ↔ Result）。
+    // 沙箱与 Node 后台两条路径共用同一份 ctx 实现 —— 见 rpc.rs 的文件头。
+    match super::rpc::dispatch(app, &plugin.id, method, &args).await {
+        Ok(value) => json_value(&serde_json::json!({ "ok": true, "value": value })),
+        Err(message) => rpc_error(&message),
     }
 }
 
-fn storage_manager<R: Runtime>(
-    app: &AppHandle<R>,
-) -> Option<std::sync::Arc<tokio::sync::RwLock<super::manager::PluginManager>>> {
-    app.try_state::<super::PluginState>().map(|s| s.0.clone())
-}
+/// 插件设置的存储键前缀。**必须与 `pluginContributions.ts::settingStorageKey` 一致。**
+///
+/// 两处不一致的表现是：用户在设置界面改了值，插件读到的还是旧值（或反过来），
 
 // ============================================================
 // 响应构造

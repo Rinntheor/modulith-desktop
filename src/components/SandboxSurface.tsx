@@ -103,14 +103,16 @@ interface SandboxSurfaceProps {
 const PANEL_SELECTOR = '.lc-tab-panel';
 
 /**
- * 算出插件界面该占的矩形：**内容视口减去内容区的外边距**。
+ * 算出插件界面该占的矩形：**内容视口的整块**。
  *
- * 减去内边距是为了与其它模块看起来一致 —— 它们都被 `p-8` 内缩了 2rem。
- * 不这么做的话，沙箱插件会贴到面板边缘，而别的模块不会。
+ * **不内缩。** 这里原来会减掉父级 `p-8` 的 2rem 内边距，为的是"与同屏的其它模块
+ * 看起来一致"。那个意图是错的：其它模块是一张卡片，四周留白是设计；而插件界面是
+ * **一个应用**，它该占满自己那一块，留白由插件自己决定。
+ *
+ * 实测正是如此：用户报的"存在留白、未全屏"里，40px 来自两个地方 ——
+ * 这里的 2rem，加上宿主合成文档里 `<body>` 的默认 8px（那一处已修）。
  *
  * 量不到视口时返回 `null`：**宁可什么都不建，也不要建一个尺寸错误的界面。**
- * 上一次的错误做法就是让 0 高度走到 `sanitized()` 被夹成 1，于是"看起来
- * 像是插件坏了"。
  */
 function measureSurface(element: HTMLElement): SurfaceBounds | null {
   const panel = element.closest(PANEL_SELECTOR) as HTMLElement | null;
@@ -119,29 +121,11 @@ function measureSurface(element: HTMLElement): SurfaceBounds | null {
   const rect = panel.getBoundingClientRect();
   if (rect.width < 1 || rect.height < 1) return null;
 
-  // 内边距从**直接父级**读，而不是写死 2rem：写死的话，哪天 `p-8` 改成
-  // `p-6`，沙箱界面就会与同屏的其它模块错开，而且没人会想到是这里。
-  const style = element.parentElement ? window.getComputedStyle(element.parentElement) : null;
-  const px = (value: string | undefined): number => {
-    const parsed = Number.parseFloat(value ?? '');
-    return Number.isFinite(parsed) ? parsed : 0;
-  };
-
-  const left = px(style?.paddingLeft);
-  const right = px(style?.paddingRight);
-  const top = px(style?.paddingTop);
-  const bottom = px(style?.paddingBottom);
-
-  const width = rect.width - left - right;
-  const height = rect.height - top - bottom;
-
-  if (width < 1 || height < 1) return null;
-
   return {
-    x: rect.left + left,
-    y: rect.top + top,
-    width,
-    height,
+    x: rect.left,
+    y: rect.top,
+    width: rect.width,
+    height: rect.height,
   };
 }
 

@@ -2,12 +2,14 @@
 // 运行时插件系统模块
 
 pub mod commands;
+pub mod background_manifest;
 pub mod data_dir;
 pub mod data_root;
 pub mod icon;
 pub mod manager;
 pub mod permissions;
 pub mod quota;
+pub mod rpc;
 pub mod sandbox;
 pub mod signature;
 pub mod surface;
