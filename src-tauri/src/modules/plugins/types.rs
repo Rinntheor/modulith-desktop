@@ -340,7 +340,7 @@ pub struct PluginRepository {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginEngines {
     #[serde(default = "default_engine_range")]
-    pub loopcore: String,
+    pub modulith: String,
 }
 
 /// 插件代码运行在哪里。
@@ -385,7 +385,7 @@ pub fn default_engine_range() -> String {
 impl Default for PluginEngines {
     fn default() -> Self {
         Self {
-            loopcore: default_engine_range(),
+            modulith: default_engine_range(),
         }
     }
 }
@@ -529,8 +529,8 @@ impl PluginManifest {
         if self.main.trim().is_empty() {
             self.main = default_main_entry();
         }
-        if self.engines.loopcore.trim().is_empty() {
-            self.engines.loopcore = default_engine_range();
+        if self.engines.modulith.trim().is_empty() {
+            self.engines.modulith = default_engine_range();
         }
     }
 }
@@ -550,7 +550,7 @@ pub enum PluginStatus {
 
 /// 引擎兼容性提示（不阻止安装与加载）
 ///
-/// 背景：`engines.loopcore` 曾经是**高度脆弱**的约束。在 0.x 阶段，
+/// 背景：`engines.modulith` 曾经是**高度脆弱**的约束。在 0.x 阶段，
 /// `^0.2.0` 按 semver 的 caret 规则（见 `VersionRequirement::matches`，
 /// 与 npm 一致）等价于 `>=0.2.0 <0.3.0` —— 宿主只要升一个小版本，
 /// 所有写了 `^0.2.x` 的插件就都不再满足声明范围。

@@ -16,7 +16,7 @@
   "categories": ["示例"],
   "keywords": ["sample", "reference", "api", "demo"],
   "engines": {
-    "loopcore": ">=1.0.0"
+    "modulith": ">=1.6.0"
   },
   "main": "index.js",
   "style": "index.css",

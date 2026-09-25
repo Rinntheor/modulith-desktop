@@ -521,7 +521,7 @@ const MarketDetailDrawer: React.FC<{
             <div className="rounded-xl border border-gray-100 divide-y divide-gray-100">
               <DetailRow label="版本" value={version.version} mono />
               <DetailRow label="仓库 tag" value={version.tag} mono />
-              <DetailRow label="需要宿主" value={version.engines.loopcore} mono />
+              <DetailRow label="需要宿主" value={version.engines.modulith} mono />
               <DetailRow label="包体积" value={formatBytes(version.package.size)} />
               <DetailRow label="SHA-256" value={version.package.sha256} mono />
               <DetailRow label="作者" value={plugin.author.name || '未知作者'} />
@@ -1005,7 +1005,7 @@ const PluginMarket: React.FC = () => {
                       <div className="mt-2 flex items-center gap-3 flex-wrap">
                         <PermissionChips permissions={version.permissions} max={5} />
                         <span className="text-[11px] text-gray-400">
-                          需要宿主 {version.engines.loopcore}
+                          需要宿主 {version.engines.modulith}
                         </span>
                       </div>
 

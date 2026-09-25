@@ -5,7 +5,7 @@
   "description": "稳定性夹具：旧式插件且不注册任何模块，应当被判为加载失败",
   "author": { "name": "harness" },
   "license": "MIT",
-  "engines": { "loopcore": ">=1.0.0" },
+  "engines": { "modulith": ">=1.6.0" },
   "main": "index.js",
   "icon": "Package"
 }

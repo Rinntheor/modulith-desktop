@@ -100,7 +100,7 @@ export interface PluginRepository {
  * 插件引擎要求
  */
 export interface PluginEngines {
-  loopcore: string;  // 语义化版本范围
+  modulith: string;  // 语义化版本范围
 }
 
 /**
@@ -699,7 +699,7 @@ export interface PluginMenuAPI {
  * 宿主能力表（`Modulith.capabilities`）的**实际**签名。
  *
  * 用途：插件在运行时判断宿主有没有某个能力，而不是靠 `Modulith.version` 做字符串
- * 比较。`engines.loopcore` 只表达「我要求宿主至少多新」，而且它**只提示、不阻断**；
+ * 比较。`engines.modulith` 只表达「我要求宿主至少多新」，而且它**只提示、不阻断**；
  * 真正决定一段代码能不能跑的，是这里列出的东西。
  *
  * 典型用法：

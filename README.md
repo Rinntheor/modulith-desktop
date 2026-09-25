@@ -183,7 +183,7 @@ modulith-desktop/
 | `pnpm check:sounds` | 提示音音色表、包络形状与峰值归一化（用桩音频上下文真跑一遍），以及打包音效的资产与播放分支 |
 | `pnpm check:backup` | 备份的命令接线、恢复门槛与敏感数据两道门 |
 | `pnpm check:markdown` | Markdown 解析的边界（内容不丢、标识符不被当成斜体、危险协议不生成链接），以及两份发布说明的分工 |
-| `pnpm check:contributions` | 贡献模型：清单字段的规范化、激活事件与加载契约 |
+| `pnpm check:contributions` | 贡献模型：清单字段的规范化、激活事件与加载契约，以及 `engines` 的键名与下限（宿主 ↔ 清单 ↔ 类型包不许漂） |
 | `pnpm check:plugin-runtime` | 插件运行时：真实跑一遍 `pluginRuntime`，用合成插件撞边界 |
 | `pnpm check:net-guard` | WebView 侧出站门面与后端判定的一致性 |
 
@@ -230,7 +230,12 @@ pnpm check:contributions && pnpm check:plugin-runtime && pnpm check:net-guard
 | npm / Cargo 包名 | `modulith-desktop` | 构建产物，不面向用户 |
 | 应用标识符 | `com.rinntheor.modulith` | **决定用户数据目录路径**，不可随意变动。只允许字母数字、连字符与句点 |
 | 宿主接口对象 | `window.Modulith` | 插件读取的全局对象 |
-| 插件兼容性字段 | `engines.loopcore` | 插件清单的**契约字段**，为兼容既有插件保持不变 |
+| 插件兼容性字段 | `engines.modulith` | 插件清单的**契约字段**，声明所需的宿主版本下限 |
+
+> 1.6.0 之前这个字段叫 `engines.loopcore` —— 改名迁移时漏下的旧产品名。它已经
+> 一并改成 `engines.modulith`：`PluginEngines` 没有 `deny_unknown_fields`，因此
+> 老清单里的 `engines.loopcore` 会被静默忽略（等价于"没有声明引擎范围"，
+> 而不匹配本来也只提示、不阻断）。
 
 产品名与展示名来自 `src/config/appInfo.ts` 与 `version.toml`，两者必须与 `tauri.conf.json` 的 `productName` 一致，`pnpm ver check` 会校验。
 

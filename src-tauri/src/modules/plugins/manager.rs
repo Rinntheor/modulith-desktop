@@ -2960,7 +2960,7 @@ mod tests {
             // 真实形状的清单：组 B 要真的解析它，`"{}"` 解析不出来，那一组的数字
             // 就会变成一个假的"很快"
             let manifest = format!(
-                r#"{{"name":"com.example.plugin{index}","displayName":"插件 {index}","version":"1.0.0","description":"规模基线","author":{{"name":"harness"}},"license":"MIT","engines":{{"loopcore":">=1.0.0"}},"main":"index.js","icon":"icon.svg"}}"#
+                r#"{{"name":"com.example.plugin{index}","displayName":"插件 {index}","version":"1.0.0","description":"规模基线","author":{{"name":"harness"}},"license":"MIT","engines":{{"modulith":">=1.6.0"}},"main":"index.js","icon":"icon.svg"}}"#
             );
             std::fs::write(dir.join("manifest.json"), manifest).unwrap();
             std::fs::write(dir.join("index.js"), "x".repeat(JS_KB * 1024)).unwrap();

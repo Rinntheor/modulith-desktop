@@ -94,14 +94,14 @@ pub fn resolve_within(root: &Path, rel: &str) -> PluginResult<PathBuf> {
 /// | 范围语法非法 | `Err(...)` | **硬错误**：连解析都做不到，说明清单确实写错了 |
 /// | 语法正确但不匹配 | `Ok(Some(advisory))` | **仅提示**，安装与加载照常 |
 ///
-/// 第三种情况刻意不阻止安装。`engines.loopcore` 在 0.x 阶段极其脆弱：
+/// 第三种情况刻意不阻止安装。`engines.modulith` 在 0.x 阶段极其脆弱：
 /// `^0.2.0` 等价于 `>=0.2.0 <0.3.0`，宿主升一个小版本就会让所有
 /// 写 `^0.2.x` 的插件"声明不匹配"，而这并不代表插件真的不能运行。
 /// 早先的实现把它当硬错误，直接导致用户升级应用后无法再安装任何旧插件。
 ///
 /// 因此这里的判断标准是：**语法错误是错误，兼容性猜测不是**。
 pub fn evaluate_engine(manifest: &PluginManifest) -> PluginResult<Option<EngineAdvisory>> {
-    let range = manifest.engines.loopcore.trim();
+    let range = manifest.engines.modulith.trim();
     if range.is_empty() || range == "*" {
         return Ok(None);
     }
@@ -111,7 +111,7 @@ pub fn evaluate_engine(manifest: &PluginManifest) -> PluginResult<Option<EngineA
         .map_err(|e| PluginError::InvalidManifest(format!("本程序版本号非法: {}", e)))?;
 
     let requirement = VersionRequirement::parse(range)
-        .map_err(|e| PluginError::InvalidManifest(format!("engines.loopcore 非法: {}", e)))?;
+        .map_err(|e| PluginError::InvalidManifest(format!("engines.modulith 非法: {}", e)))?;
 
     if requirement.matches(&host) {
         return Ok(None);
@@ -130,7 +130,7 @@ pub fn evaluate_engine(manifest: &PluginManifest) -> PluginResult<Option<EngineA
 ///
 /// - `name` 合法
 /// - `version` 可解析
-/// - `engines.loopcore` 语法合法（**不匹配不阻止安装**，见 `evaluate_engine`）
+/// - `engines.modulith` 语法合法（**不匹配不阻止安装**，见 `evaluate_engine`）
 /// - `main` 为安全的相对路径且真实存在于 `plugin_root` 下
 /// - `style` / `icon` 缺失只警告，不失败
 pub fn validate_manifest(manifest: &PluginManifest, plugin_root: &Path) -> PluginResult<()> {
@@ -265,7 +265,7 @@ mod tests {
 
     fn manifest_with_engine(range: &str) -> PluginManifest {
         let mut manifest = PluginManifest::fallback("com.example.test", "1.0.0");
-        manifest.engines.loopcore = range.to_string();
+        manifest.engines.modulith = range.to_string();
         manifest
     }
 

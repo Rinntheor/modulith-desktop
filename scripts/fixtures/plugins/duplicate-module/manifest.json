@@ -5,7 +5,7 @@
   "description": "稳定性夹具：注册别的插件已声明的模块 ID，必须被拒绝",
   "author": { "name": "harness" },
   "license": "MIT",
-  "engines": { "loopcore": ">=1.0.0" },
+  "engines": { "modulith": ">=1.6.0" },
   "main": "index.js",
   "icon": "Package",
   "contributes": { "modules": [{ "id": "shadow-panel", "name": "影子面板" }] },

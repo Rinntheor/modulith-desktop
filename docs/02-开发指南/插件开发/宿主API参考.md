@@ -730,7 +730,7 @@ try {
   "displayName": "我的插件",
   "version": "1.0.0",
   "description": "示例插件",
-  "engines": { "loopcore": ">=1.0.0" },
+  "engines": { "modulith": ">=1.6.0" },
   "main": "dist/index.js"
 }
 ```

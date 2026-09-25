@@ -5,7 +5,7 @@
   "description": "稳定性夹具：没有任何界面，只在后台跑并对资源登记收尾",
   "author": { "name": "harness" },
   "license": "MIT",
-  "engines": { "loopcore": ">=1.0.0" },
+  "engines": { "modulith": ">=1.6.0" },
   "main": "index.js",
   "icon": "Package",
   "contributes": {},

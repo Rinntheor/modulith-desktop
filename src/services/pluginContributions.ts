@@ -90,7 +90,7 @@ const LOCAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
  *     放进去就意味着 `scripts/check-contributions.ts` 没法断言它。
  *
  * 插件用它做**特性探测**，而不是拿 `Modulith.version` 做字符串比较：
- * `engines.loopcore` 只表达「我要求宿主至少多新」，而且它只提示、不阻断；
+ * `engines.modulith` 只表达「我要求宿主至少多新」，而且它只提示、不阻断；
  * 真正决定一段代码能不能跑的，是这里列出的东西。
  *
  * `api` 是这张表自身的版本，字段集变化时 +1。
@@ -128,7 +128,7 @@ export interface NormalizedContributions {
  * 一条清单问题。
  *
  * `level` 只区分「这个插件不能按你写的那样工作」与「它能工作，但你可能没意识到
- * 自己依赖了什么」。**两类都不会阻止安装** —— 与 `engines.loopcore` 一样，
+ * 自己依赖了什么」。**两类都不会阻止安装** —— 与 `engines.modulith` 一样，
  * 清单问题只提示、不阻断；真正阻断的是后端解析失败（未知权限名那种）。
  */
 export interface ContributionIssue {

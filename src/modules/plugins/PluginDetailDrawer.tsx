@@ -411,8 +411,8 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                         </a>
                       </Row>
                     )}
-                    {plugin.manifest.engines?.loopcore && (
-                      <Row label="引擎要求">Modulith {plugin.manifest.engines.loopcore}</Row>
+                    {plugin.manifest.engines?.modulith && (
+                      <Row label="引擎要求">Modulith {plugin.manifest.engines.modulith}</Row>
                     )}
                     <Row label="入口文件">
                       <code className="font-mono">{plugin.manifest.main}</code>

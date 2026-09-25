@@ -57,7 +57,7 @@ export interface MarketPackage {
 export interface MarketVersion {
   version: string;
   tag: string;
-  engines: { loopcore: string };
+  engines: { modulith: string };
   permissions: string[];
   package: MarketPackage;
   /**
@@ -155,7 +155,7 @@ function parseVersion(raw: unknown, where: string): MarketVersion {
       : undefined,
     background: item.background === true ? true : undefined,
     engines: {
-      loopcore: asString((engines as Record<string, unknown>).loopcore, `${where}.engines.loopcore`),
+      modulith: asString((engines as Record<string, unknown>).modulith, `${where}.engines.modulith`),
     },
     permissions: permissions.map((entry, index) =>
       asString(entry, `${where}.permissions[${index}]`)

@@ -101,7 +101,7 @@ let resolvedVersion = MODULITH_VERSION;
  *
  * 后端返回的是 `env!("CARGO_PKG_VERSION")`，与插件校验器
  * `validator.rs` 使用的版本源完全相同，因此前端显示、插件读取到的
- * `window.Modulith.version`、以及 `engines.loopcore` 的校验基准
+ * `window.Modulith.version`、以及 `engines.modulith` 的校验基准
  * 三者不可能出现不一致。
  *
  * 失败时静默保留兜底值 —— 版本号显示不该让应用启动失败。
@@ -144,7 +144,7 @@ export interface PluginRepository {
 }
 
 export interface PluginEngines {
-  loopcore: string;
+  modulith: string;
 }
 
 export interface PluginManifest {
@@ -222,7 +222,7 @@ export interface InstalledPlugin {
   /**
    * 引擎范围不匹配时的提示。
    *
-   * 注意它**不表示插件不可用**：`engines.loopcore` 在 0.x 阶段很脆弱
+   * 注意它**不表示插件不可用**：`engines.modulith` 在 0.x 阶段很脆弱
    * （`^0.2.0` 等价于 `>=0.2.0 <0.3.0`，宿主升一个小版本就会不匹配）；
    * 1.0 之后 caret 语义恢复正常，但提示机制保留 ——
    * 因此后端只把它当提示，不阻止安装与加载。界面应当照此表述，
@@ -2060,7 +2060,7 @@ export interface ModulithHost {
   useModuleActive: typeof useModuleActive;
   /**
    * 宿主能力表。插件用它做**特性探测**，而不是拿 `Modulith.version` 做字符串比较：
-   * `engines.loopcore` 只表达「我要求宿主至少多新」，而且它只提示、不阻断；
+   * `engines.modulith` 只表达「我要求宿主至少多新」，而且它只提示、不阻断；
    * 真正决定一段代码能不能跑的，是这里列出的东西。
    */
   capabilities: ModulithCapabilities;
