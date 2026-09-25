@@ -8,6 +8,7 @@ pub mod permissions;
 pub mod quota;
 pub mod sandbox;
 pub mod signature;
+pub mod surface;
 pub mod types;
 pub mod validator;
 

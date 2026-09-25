@@ -32,34 +32,65 @@ fn to_msg<E: std::fmt::Display>(err: E) -> String {
 // 真正的隔离（见 docs/08-规划/插件沙箱与数据-v2.0范围.md §2.3）。
 // 代价是它盖在 DOM 之上，位置只能由宿主摆 —— 于是有了这三条命令。
 
-/// 打开一个沙箱插件的界面。
+/// 显示一个沙箱插件的界面（不存在就建），并摆到给定矩形。
 ///
 /// 只对清单里写了 `runtime: "sandboxed"` 的**已安装**插件有效；其余一律拒绝
 /// （理由见 `sandbox::open_surface_at`）。
+///
+/// **这三条命令必须是 `async`。** 同步命令的函数体在 IPC 线程（也就是主线程）
+/// 上就地执行，而它们最终会创建 / 摆弄 / 销毁真实 webview —— 那正是不能在主线程
+/// 上做的事。把它写回同步的，就是那次整机假死。完整推导见 `surface.rs` 文件头。
 #[tauri::command]
-pub fn sandbox_surface_open(
+pub async fn sandbox_surface_open(
     app: AppHandle,
     plugin_id: String,
-    bounds: super::sandbox::SurfaceBounds,
+    bounds: super::surface::SurfaceBounds,
 ) -> Result<(), String> {
-    super::sandbox::open_surface_at(&app, &plugin_id, bounds)
+    super::sandbox::open_surface_at(&app, &plugin_id, bounds).await
 }
 
-/// 关闭一个沙箱插件的界面。没开着时是**静默成功** ——
+/// 隐藏界面但**不销毁**。切标签、宿主浮层盖上来、窗口被收起时走它。
+///
+/// 与 `close` 分开是有意的：下一节要付的代价差一个数量级 —— 隐藏是即时的，
+/// 而重新创建要重走一遍 WebView2 控制器创建（几百毫秒），插件自己的界面状态
+/// 也会一起丢掉。
+#[tauri::command]
+pub async fn sandbox_surface_hide(app: AppHandle, plugin_id: String) -> Result<(), String> {
+    super::sandbox::hide_surface(&app, &plugin_id).await
+}
+
+/// 关闭并销毁一个沙箱插件的界面。没开着时是**静默成功** ——
 /// 前端在卸载时无条件调用它，把"本来就没开"当成错误只会在日志里堆噪声。
 #[tauri::command]
-pub fn sandbox_surface_close(app: AppHandle, plugin_id: String) -> Result<(), String> {
-    super::sandbox::close_surface(&app, &plugin_id)
+pub async fn sandbox_surface_close(app: AppHandle, plugin_id: String) -> Result<(), String> {
+    super::sandbox::close_surface(&app, &plugin_id).await
 }
 
-/// 重新摆放一个沙箱插件的界面。窗口缩放、侧边栏折叠、分屏比例变化都走它。
+/// 重新摆放一个沙箱插件的界面。
+///
+/// 窗口缩放、侧边栏折叠、分屏比例变化、以及**宿主内容滚动**都走它 ——
+/// 原生 webview 不跟着 DOM 走，位置只能由前端量出来再告诉我们。
 #[tauri::command]
-pub fn sandbox_surface_bounds(
+pub async fn sandbox_surface_bounds(
     app: AppHandle,
     plugin_id: String,
-    bounds: super::sandbox::SurfaceBounds,
+    bounds: super::surface::SurfaceBounds,
 ) -> Result<(), String> {
-    super::sandbox::set_surface_bounds(&app, &plugin_id, bounds)
+    super::sandbox::set_surface_bounds(&app, &plugin_id, bounds).await
+}
+
+/// 运行沙箱自检（诊断用）。**由人显式触发。**
+///
+/// 它打开一块面板，在一个**真实**的插件 webview 里把四条边界各跑一次：ACL 是否
+/// 真的拒绝、身份是否真的来自浏览器引擎、自定义协议是否可用、CSP 是否真的生效。
+/// 结果同时画在面板上并写进日志。
+///
+/// 它**不再随应用启动自动运行** —— 每次启动都弹一块面板去验一件大多数时候都成立的
+/// 事，代价是一个每天都会遇到的打扰。为什么保留它、以及不再自动跑的理由，
+/// 见 `sandbox::open_selftest`。
+#[tauri::command]
+pub async fn sandbox_self_test(app: AppHandle) -> Result<(), String> {
+    super::sandbox::open_selftest(&app).await
 }
 
 #[tauri::command]

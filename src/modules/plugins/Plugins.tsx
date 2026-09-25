@@ -24,6 +24,7 @@ import {
   Puzzle,
   Box,
   Trash2,
+  ShieldCheck,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { moduleManager } from '../../services/moduleManager';
@@ -57,6 +58,7 @@ import DevGuide from './DevGuide';
 import IconPlate from '../../components/icons/IconPlate';
 import { subscribeFileDrop, isFileDropAvailable } from '../../services/fileDrop';
 import { useModuleActive } from '../../hooks/useModuleActive';
+import { runSandboxSelfTest } from '../../services/sandboxSurface';
 
 type FilterTab = 'all' | 'enabled' | 'disabled' | 'error';
 type SortMode = 'name' | 'version' | 'installed' | 'status';
@@ -360,11 +362,31 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const [installBusy, setInstallBusy] = useState(false);
   /** 有文件正被拖到窗口上方（控制拖放提示层的显隐） */
   const [dropActive, setDropActive] = useState(false);
+  /** 沙箱自检面板正在打开（防连点） */
+  const [selfTestBusy, setSelfTestBusy] = useState(false);
 
   const flash = useCallback((kind: Feedback['kind'], message: string, ms = 5000) => {
     setFeedback({ kind, message });
     setTimeout(() => setFeedback(null), ms);
   }, []);
+
+  /**
+   * 打开沙箱自检面板。
+   *
+   * 只有两件事会失败：界面线程还没起来，或者找不到主窗口。两种都由后端给出可读的
+   * 原因，这里原样转达 —— 自检本身就是拿来排查问题的，把它的失败藏起来毫无意义。
+   */
+  const handleSelfTest = useCallback(async () => {
+    setSelfTestBusy(true);
+    try {
+      await runSandboxSelfTest();
+      flash('success', '自检面板已打开：四项检查会在那个面板里各跑一次，结果同时写进日志。');
+    } catch (error) {
+      flash('error', `沙箱自检打不开：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSelfTestBusy(false);
+    }
+  }, [flash]);
 
   const sync = useCallback(() => {
     setPlugins([...getInstalledPlugins()]);
@@ -755,6 +777,26 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
           )}
 
           <div className={`flex items-center gap-2 ${embedded ? 'ml-auto' : ''}`}>
+            {/*
+              沙箱自检。**它是唯一的"边界本身"验证入口。**
+
+              它曾经随应用启动自动运行，但那意味着每次启动都多一块挡在界面上的面板，
+              去验一件绝大多数时候都成立的事 —— 用户的反馈是"它很打扰"。改的是
+              什么时候跑，不是跑不跑：它验的四件事（ACL 真的拒绝、身份真的来自浏览器
+              引擎、自定义协议通道可用、CSP 真的生效）没有别的触发点，自检页也是仓库里
+              唯一会去**故意违规**的地方。
+
+              结果画在自检面板上，同时写进日志 —— 面板不会自己关掉，结论需要一个出口。
+            */}
+            <button
+              onClick={handleSelfTest}
+              disabled={selfTestBusy}
+              title="在一个独立的插件 webview 里验证沙箱的四条边界：ACL 拒绝、身份识别、协议通道、CSP。结果同时写进日志。"
+              className="flex items-center gap-2 px-3.5 py-2 bg-white border border-gray-200 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors disabled:opacity-50"
+            >
+              <ShieldCheck className="w-4 h-4" />
+              <span>沙箱自检</span>
+            </button>
             <button
               onClick={() => setDevGuideOpen(true)}
               className="flex items-center gap-2 px-3.5 py-2 bg-white border border-gray-200 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors"

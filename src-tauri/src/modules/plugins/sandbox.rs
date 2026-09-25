@@ -80,6 +80,7 @@ use std::sync::RwLock;
 use tauri::{http, AppHandle, Manager, Runtime};
 
 use super::manager::SandboxView;
+use super::surface::SurfaceBounds;
 
 /// 承载插件界面的自定义协议名。
 ///
@@ -161,11 +162,14 @@ impl SandboxSurfaces {
             .cloned()
     }
 
-    /// 忘掉一条占位。界面被关掉、或建失败回滚时调用。
+    /// 忘掉一条占位。界面被关掉、被驻留淘汰、或建失败回滚时调用。
     ///
-    /// 它与"关掉 webview"必须**成对**发生：只关 webview 而留着占位，下一次建界面时
+    /// 它与"销毁 webview"必须**成对**发生：只关 webview 而留着占位，下一次建界面时
     /// 会以为"已经建过了"，而 webview 其实已经不在了。
-    fn forget(&self, label: &str) {
+    ///
+    /// `pub(super)` 而不是私有：驻留淘汰发生在 `surface.rs` 的所有者线程上，
+    /// 那里同样要撤占位。
+    pub(super) fn forget(&self, label: &str) {
         self.0
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -325,7 +329,11 @@ async fn handle_selftest<R: Runtime>(
         },
         ("POST", Some("rpc")) => {
             if segments.get(2).copied() == Some("close") {
-                close_off_main_thread(app, &label_for(SELFTEST_ID));
+                // 走所有者线程销毁，而不是就地从协议处理器里关 —— 这里正跑在
+                // 引擎的请求路径上（主线程）。理由见 surface.rs 的文件头。
+                if let Err(e) = close_surface(app, SELFTEST_ID).await {
+                    log::warn!("[sandbox自检] 关闭界面失败：{e}");
+                }
                 return json(r#"{"ok":true}"#);
             }
 
@@ -335,24 +343,6 @@ async fn handle_selftest<R: Runtime>(
         }
         _ => text(404, "没有这条路径"),
     }
-}
-
-/// 关掉一个沙箱 webview。
-///
-/// **不在协议处理器里直接 `close()`。** 处理器跑在引擎的请求路径上，而销毁一个
-/// webview 会走 `DestroyWindow` 一类的窗口操作 —— 在 Windows 上从窗口消息的
-/// 处理链里做这件事有明确的死锁面。丢给一个独立线程，代价是一次线程创建。
-fn close_off_main_thread<R: Runtime>(app: &AppHandle<R>, label: &str) {
-    let app = app.clone();
-    let label = label.to_string();
-    std::thread::spawn(move || {
-        if let Some(webview) = app.get_webview(&label) {
-            match webview.close() {
-                Ok(()) => log::info!("[sandbox] 已关闭 {label}"),
-                Err(e) => log::warn!("[sandbox] 关闭 {label} 失败：{e}"),
-            }
-        }
-    });
 }
 
 // ============================================================
@@ -795,71 +785,43 @@ fn log_selftest_report(body: &str) {
 }
 
 
-/// 注册自检与演示插件，并建它们的 webview。**只在 debug 构建里存在**。
+/// 打开沙箱自检面板。**由人显式触发，不再随应用启动自动运行。**
 ///
-/// 为什么在一个独立线程里、还要先 sleep：`add_child` 在 Windows 上从同步命令或
-/// 事件处理器里调用会死锁（Tauri 官方记录的已知问题）。这里既不在主线程、
-/// 又让主窗口先把自身建完。
+/// ============================================================
+/// 为什么不再自动跑
+/// ============================================================
+//
+// 它原先在 setup 阶段起一个 4 秒后的异步任务，无条件弹出一块 560×420 的面板。
+// 那样做的理由是"给自检一个不需要人配合的触发点"，但代价是**每一次启动**都多出
+// 一块挡在界面上的面板，去验一件绝大多数时候都成立的事。用户的原话是"它很打扰"。
+//
+// ============================================================
+// 为什么**保留**这个能力，而不是删掉
+// ============================================================
+//
+// 它验的是**边界本身**：ACL 真的拒绝、身份真的来自浏览器引擎而不是插件自报、
+// 自定义协议通道真的可用、CSP 真的由引擎执行。这四件事没有别的触发点 ——
+// 自检页是仓库里唯一会去**故意违规**的地方。
+//
+// 删掉它，这条边界就再也没有任何东西会去验一次了。所以改的是**什么时候跑**，
+// 不是**跑不跑**：现在由「插件」页上的一个按钮触发。
 ///
-/// 整个函数带 `cfg(debug_assertions)`：它建的两个 webview 是验证工具，不是功能，
-/// 装进 release 会让每个用户平白多两个渲染进程。
-#[cfg(debug_assertions)]
-pub fn spawn_debug_harness<R: Runtime>(app: AppHandle<R>) {
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(4));
+/// 位置与尺寸写死：它是一次性的诊断面板，不参与布局。
+/// 四项跑完之后面板会显示一个关闭按钮；全部通过时也会留着，由人来关。
+pub async fn open_selftest<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let bounds = SurfaceBounds {
+        x: 24.0,
+        y: 24.0,
+        width: 560.0,
+        height: 420.0,
+    };
 
-        // 自检 webview 不走界面表（它没有插件目录），因此这里不必登记它。
-        // 位置尺寸写死：这是一次性的验证面板，不参与布局，而且四项全过之后会自己关掉。
-        let bounds = SurfaceBounds {
-            x: 24.0,
-            y: 24.0,
-            width: 560.0,
-            height: 420.0,
-        };
-        if let Err(e) = open_surface(&app, &label_for(SELFTEST_ID), SELFTEST_ID, bounds) {
-            log::warn!("[sandbox自检] 自检界面建不出来：{e}");
-            return;
-        }
-
-        // **刻意不再自动给插件建界面。**
-        //
-        // 这里曾经无条件地给"第一个声明了 sandboxed 的已安装插件"开一块面板，
-        // 用来验证真插件那一半。第一次真机运行证明那样做是错的：用户没打开任何插件，
-        // 界面上却多出一块挡在那里的面板，而且**没有任何方式关掉它**。
-        //
-        // 真插件那一半现在走**真实路径**：用户在侧边栏打开模块时，前端量出内容区
-        // 矩形并调用 `sandbox_surface_open`。自检页留着，因为它验的是**边界本身**，
-        // 而那件事没有别的触发点；它还会在四项全过之后自己关掉。
-    });
+    actor(app)?
+        .show(&label_for(SELFTEST_ID), SELFTEST_ID, bounds)
+        .await
 }
 
-/// 沙箱界面在窗口里的位置与尺寸（**逻辑像素**，相对窗口客户区左上角）。
-///
-/// 由**前端**量出来传进来，宿主不自己算：只有前端知道标签栏、分屏、侧边栏当前
-/// 各占多少。
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SurfaceBounds {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-impl SurfaceBounds {
-    /// 夹到至少 1×1。WebView2 不接受 0 尺寸的控件，而"内容区被折叠到 0 宽"
-    /// 是一个真实会出现的状态（侧边栏展开动画的第一帧）。
-    fn sanitized(self) -> Self {
-        Self {
-            x: self.x,
-            y: self.y,
-            width: self.width.max(1.0),
-            height: self.height.max(1.0),
-        }
-    }
-}
-
-/// 给一个**已安装**的插件建沙箱界面。这是真插件唯一的入口。
+/// 给一个**已安装**的插件显示沙箱界面。这是真插件唯一的入口。
 ///
 /// 三步的顺序是有意的，每一步都在为一个失效方式兜底：
 ///
@@ -867,8 +829,12 @@ impl SurfaceBounds {
 ///      —— 拿不到就**什么都不建**。没安装的插件因此构造上就不可能拿到界面；
 ///   2. 再在界面表里占位。**先占位再建 webview**：反过来的话，webview 起来了而
 ///      协议请求先到，那一刻表里还没有这条记录，请求会被判成"不是插件界面"；
-///   3. 最后建 webview。建失败就撤销占位，免得留下一条指向不存在界面的记录。
-pub fn open_surface_at<R: Runtime>(
+///   3. 最后交给所有者线程去建。建失败就撤销占位，免得留下一条指向不存在界面的记录。
+///
+/// **它是 `async` 的，这一点是承重的。** 同步命令的函数体在 IPC 线程（也就是主
+/// 线程）上就地执行，而创建 webview 恰好不能在那里做 —— 完整推导见 `surface.rs`
+/// 的文件头。把这三条命令写成同步的，就是那次整机假死。
+pub async fn open_surface_at<R: Runtime>(
     app: &AppHandle<R>,
     plugin_id: &str,
     bounds: SurfaceBounds,
@@ -877,7 +843,9 @@ pub fn open_surface_at<R: Runtime>(
         let Some(state) = app.try_state::<super::PluginState>() else {
             return Err("插件系统尚未就绪".to_string());
         };
-        let manager = tauri::async_runtime::block_on(async { state.0.read().await });
+        // `.await` 而不是 `block_on`：后者会把调用线程钉在这里，而调用线程不该
+        // 被钉住 —— 它可能是主线程。锁在读完之后立刻放掉，不跨到下面去。
+        let manager = state.0.read().await;
         manager.sandbox_view(plugin_id).map_err(|e| e.to_string())?
     };
 
@@ -894,7 +862,7 @@ pub fn open_surface_at<R: Runtime>(
     };
     let label = surfaces.claim(&view.id)?;
 
-    match open_surface(app, &label, &view.id, bounds) {
+    match actor(app)?.show(&label, &view.id, bounds).await {
         Ok(()) => Ok(()),
         Err(e) => {
             // 建失败就把占位撤掉：留一条指向不存在界面的记录，会让下一次
@@ -905,91 +873,47 @@ pub fn open_surface_at<R: Runtime>(
     }
 }
 
+/// 隐藏一个插件的沙箱界面。**不销毁。**
+///
+/// 切标签、宿主浮层盖上来、窗口被收起时走这条。留着 webview 是有意的：下一次
+/// 显示时不必再付一次控制器创建（那是几百毫秒），插件自己的界面状态也还在。
+/// 真正不再需要的界面由 `close_surface` 销毁。
+pub async fn hide_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
+    actor(app)?.set_visible(&label_for(plugin_id), false).await
+}
+
 /// 关掉一个插件的沙箱界面，并撤销它的占位。
 ///
 /// 关掉之后同一个插件可以再建一次（用户切走标签再切回来）。因此这一步必须
 /// **同时**清掉界面表里的那条记录 —— 只关 webview 而留着记录，下一次建的时候
-/// `claim` 会成功返回旧标签，但 `open_surface` 里"已存在就跳过"的判断会发现
-/// webview 已经没了……于是建不出来。两处状态必须一起动。
-pub fn close_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
+/// `claim` 会成功返回旧标签，而 webview 其实已经不在了。两处状态必须一起动。
+pub async fn close_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
     let label = label_for(plugin_id);
 
     if let Some(surfaces) = app.try_state::<SandboxSurfaces>() {
         surfaces.forget(&label);
     }
 
-    if let Some(webview) = app.get_webview(&label) {
-        webview.close().map_err(|e| format!("关闭 {label} 失败：{e}"))?;
-        log::info!("[sandbox] 已关闭 {label}");
-    }
-
-    Ok(())
+    actor(app)?.close(&label).await
 }
 
 /// 重新摆放一个插件的沙箱界面。界面不存在时**什么都不做**（返回 `Ok`）——
 /// 前端在布局变化时无条件调用它，把"还没打开"当成错误会让每次缩放都报一次。
-pub fn set_surface_bounds<R: Runtime>(
+pub async fn set_surface_bounds<R: Runtime>(
     app: &AppHandle<R>,
     plugin_id: &str,
     bounds: SurfaceBounds,
 ) -> Result<(), String> {
-    let Some(webview) = app.get_webview(&label_for(plugin_id)) else {
-        return Ok(());
-    };
-
-    let bounds = bounds.sanitized();
-    webview
-        .set_position(tauri::LogicalPosition::new(bounds.x, bounds.y))
-        .map_err(|e| format!("移动界面失败：{e}"))?;
-    webview
-        .set_size(tauri::LogicalSize::new(bounds.width, bounds.height))
-        .map_err(|e| format!("调整界面失败：{e}"))?;
-
-    Ok(())
+    actor(app)?.place(&label_for(plugin_id), bounds).await
 }
 
-/// 在指定位置开一个沙箱 webview。
+/// 取界面所有者线程的句柄。
 ///
-/// `label` 与 `plugin_id` 分开传：标签是界面表给的**名字**，插件 id 是**身份**，
-/// 两者不保证能互相推出（见文件头"标签不是身份"）。
-fn open_surface<R: Runtime>(
+/// 它在 setup 阶段被托管。拿不到只有一个解释：应用还没走到那一步，
+/// 而那是一个应该被说出来的状态，不是一个可以忽略的 `None`。
+pub(crate) fn actor<R: Runtime>(
     app: &AppHandle<R>,
-    label: &str,
-    plugin_id: &str,
-    bounds: SurfaceBounds,
-) -> Result<(), String> {
-    if app.get_webview(label).is_some() {
-        // 已经开着：当成一次"重新摆放"，而不是失败。用户切标签回来时会走到这里。
-        return set_surface_bounds(app, plugin_id, bounds);
-    }
-
-    // 注意这里用 `get_window` 而不是 `get_webview_window`：后者内部的
-    // `is_webview_window()` 会在一个窗口拥有多个 webview 之后变成 false，
-    // 于是"窗口明明在，却拿不到" —— 这是多 webview 模式下的第一个坑。
-    let Some(window) = app.get_window("main") else {
-        return Err("找不到主窗口".to_string());
-    };
-
-    let url = tauri::Url::parse(&format!("{ORIGIN}/{plugin_id}/"))
-        .map_err(|e| format!("{plugin_id} 的地址不合法：{e}"))?;
-
-    let builder = tauri::webview::WebviewBuilder::new(label, tauri::WebviewUrl::External(url));
-    let bounds = bounds.sanitized();
-
-    window
-        .add_child(
-            builder,
-            tauri::LogicalPosition::new(bounds.x, bounds.y),
-            tauri::LogicalSize::new(bounds.width, bounds.height),
-        )
-        .map_err(|e| format!("创建 webview {label} 失败：{e}"))?;
-
-    log::info!(
-        "[sandbox] 已创建 webview {label}（{}×{} @ {},{})",
-        bounds.width,
-        bounds.height,
-        bounds.x,
-        bounds.y
-    );
-    Ok(())
+) -> Result<tauri::State<'_, super::surface::SurfaceActor>, String> {
+    app.try_state::<super::surface::SurfaceActor>()
+        .ok_or_else(|| "沙箱界面线程尚未就绪".to_string())
 }

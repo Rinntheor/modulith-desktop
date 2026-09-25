@@ -273,9 +273,46 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                     <ShieldCheck className="w-3.5 h-3.5" />
                     权限
                   </h3>
+
+                  {/*
+                    执行模式必须与权限**并列**出现，而且必须排在列表之前。
+
+                    理由是这份列表的效力完全取决于它：插件跑在宿主的 webview 里时，
+                    列表只是它自己的声明 —— 宿主没有任何手段核实，也拦不住越界的调用；
+                    跑在独立 webview 里时，越出列表的调用会在 IPC 层被拒。
+                    同样一份列表，两种情况下含义完全不同。
+
+                    以前这里只有列表，于是它对每一个 in-process 插件都在说一句
+                    **不成立的话**：用户读到"未申请权限 = 无法访问网络/文件/存储"，
+                    而那个插件其实能用到宿主的一切能力。这一条属于"列表要说真话"，
+                    不是措辞问题。
+                  */}
+                  {plugin.manifest.runtime === 'sandboxed' ? (
+                    <div className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2">
+                      <p className="text-[11px] text-emerald-800 leading-relaxed">
+                        <span className="font-medium">已隔离。</span>
+                        这个插件跑在它自己的 webview 里，而那个 webview
+                        <span className="font-medium">不匹配任何宿主授权</span>
+                        —— 因此下面这份列表是<b>有执行者的</b>：越出列表的调用会在
+                        宿主那一层被拒绝。
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                      <p className="text-[11px] text-amber-800 leading-relaxed">
+                        <span className="font-medium">未隔离。</span>
+                        这个插件与宿主跑在同一个上下文里，因此下面这份列表
+                        <span className="font-medium">是它的声明，不是对它的约束</span>
+                        —— 它实际能触达宿主的一切能力，而宿主无法核实它是否如实申报。
+                      </p>
+                    </div>
+                  )}
+
                   {(plugin.manifest.permissions ?? []).length === 0 ? (
                     <p className="text-xs text-gray-500">
-                      该插件未申请任何权限，无法访问网络、文件或存储。
+                      {plugin.manifest.runtime === 'sandboxed'
+                        ? '该插件未申请任何权限，因此它在宿主这一侧什么也调不动。'
+                        : '该插件未申请任何权限。注意这只表示它没有申报 —— 在没有隔离的情况下，它并不因此被限制。'}
                     </p>
                   ) : (
                     <div className="space-y-2">

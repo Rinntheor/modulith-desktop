@@ -101,13 +101,29 @@ pub fn run() -> Result<(), tauri::Error> {
 
         app.manage(registry);
 
-        // 沙箱自检：建**真的**沙箱 webview，让它们自己跑检查并把结果投回日志
-        // （自检页在 resources/sandbox-selftest.html，演示插件在 resources/sandbox-demo/）。
+        // 沙箱界面的**所有者线程**。
         //
-        // 只在 debug 构建里装：它是验证工具，不是功能。装在 release 里会让每个用户
-        // 平白多两个 webview —— 与"内存是目标"直接冲突。
+        // 全宿主只有它能创建 / 摆放 / 显示 / 销毁沙箱 webview；命令那边只投作业、
+        // 等回话。这不是"顺手优化"：从 IPC 线程（主线程）创建 webview 会让整个
+        // 应用假死 —— 窗口按钮、托盘、其余插件一起失去响应，而且**一处错误都不报**。
+        // 完整推导见 modules/plugins/surface.rs 的文件头。
+        app.manage(modules::plugins::surface::SurfaceActor::spawn(handle.clone()));
+
+        // 沙箱自检**不在启动路径上**。
+        //
+        // 它曾经在这里起一个 4 秒后的异步任务，无条件弹出一块 560×420 的诊断面板。
+        // 每次启动都多一块挡在界面上的面板，去验一件绝大多数时候都成立的事 ——
+        // 用户的原话是"它很打扰"。现在它由「插件」页上的一个按钮显式触发，
+        // 走命令 sandbox_self_test。
+        //
+        // 能力本身**刻意保留**：它验的是边界本身（ACL 拒绝、身份来自引擎、通道可用、
+        // CSP 生效），而自检页是仓库里唯一会去故意违规的地方。见
+        // modules/plugins/sandbox.rs 的 open_selftest。
+
+        // 主线程停滞看门狗。同样只在 debug 构建里 —— 它对用户没有价值，
+        // 却会在每一次正常的长任务上往日志里写 ERROR。见 core/watchdog.rs。
         #[cfg(debug_assertions)]
-        modules::plugins::sandbox::spawn_debug_harness(handle.clone());
+        crate::core::watchdog::spawn_main_thread_watchdog(handle.clone());
 
         Ok(())
     });
@@ -167,8 +183,10 @@ pub fn run() -> Result<(), tauri::Error> {
         clear_notifications,
         get_notification_summary,
         sandbox_surface_open,
+        sandbox_surface_hide,
         sandbox_surface_close,
         sandbox_surface_bounds,
+        sandbox_self_test,
         list_plugins,
         get_plugin,
         list_plugin_permissions,
