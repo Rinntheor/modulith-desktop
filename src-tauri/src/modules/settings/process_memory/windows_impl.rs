@@ -423,12 +423,26 @@ mod live_tests {
     ///
     /// 用 `cmd.exe /c ping` 而不是改造成 WebView2：WebView2 的子进程不是测试能
     /// 按需拉起的，而这个测试要验证的是**父子链路**，与子进程是什么无关。
+    ///
+    /// ============================================================
+    /// 曾经的弯路：给子进程定了一个"够宽裕"的寿命
+    /// ============================================================
+    ///
+    /// 这里原先用 `ping -n 6`（约 5 秒），再轮询 20 次 × 100 ms —— 于是这条测试
+    /// 自带一个**挂钟截止时间**：慢机器上、或整套测试并行跑的时候，20 次轮询
+    /// 摊开之后可能已经越过子进程的寿命。实测在里面撞到过一次
+    /// "拉起的子进程 2448 必须出现在进程树里"，而那时遍历本身是好的。
+    ///
+    /// 现在的问题不是"再宽裕一点"（那只是把同一个假设往后挪），而是**这条测试
+    /// 根本不需要子进程会自己死**：改成 `ping -n 60` 让它一直活着，由测试自己
+    /// 在结束时杀掉。这样一来轮询窗口与子进程寿命解耦，唯一还能失败的原因是
+    /// 遍历真的坏了。
     #[test]
     fn live_snapshot_includes_a_real_child_process() {
         use std::process::{Command, Stdio};
 
         let mut child = match Command::new("cmd.exe")
-            .args(["/c", "ping", "-n", "6", "127.0.0.1"])
+            .args(["/c", "ping", "-n", "60", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -439,13 +453,27 @@ mod live_tests {
             Err(_) => return,
         };
 
-        // 给子进程一点时间真正起来。ping -n 6 大约持续 5 秒，足够宽裕。
-        // 轮询而不是固定 sleep：慢机器上固定等待会偶发失败。
         let child_pid = child.id();
+
+        // 记录失败时的现场，让这条断言在打红时能直接指出是"遍历坏了"
+        // 还是"快照根本没拿到" —— 一句"必须出现在进程树里"说明不了任何事。
+        let mut polls = 0usize;
+        let mut unsupported_polls = 0usize;
+        let mut unreadable_last = 0u32;
         let mut found = false;
-        for _ in 0..20 {
+
+        // 100 次 × 100 ms = 上限 10 秒。子进程是长命的，所以这里等的是
+        // "系统快照何时反映出来"，不是"子进程还活着没有"。
+        for _ in 0..100 {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            polls += 1;
+
             let snapshot = collect();
+            if !snapshot.supported {
+                unsupported_polls += 1;
+            }
+            unreadable_last = snapshot.unreadable;
+
             if let Some(entry) = snapshot.processes.iter().find(|p| p.pid == child_pid) {
                 // 真实读到了内存：0 说明内存读取那条路没走通。
                 assert!(
@@ -456,11 +484,27 @@ mod live_tests {
                 found = true;
                 break;
             }
+
+            // 子进程自己先没了（`ping` 不可用、或`cmd.exe`立刻退出）：
+            // 那是**前提条件不成立**，不是遍历坏了。此时如实跳过，
+            // 而不是把环境问题报成一条假红。
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.wait();
+                eprintln!(
+                    "跳过 live_snapshot_includes_a_real_child_process：子进程 {child_pid} 在 \
+                     {polls} 次轮询内自行退出，无法作为遍历的观测对象"
+                );
+                return;
+            }
         }
 
         let _ = child.kill();
         let _ = child.wait();
 
-        assert!(found, "拉起的子进程 {child_pid} 必须出现在进程树里");
+        assert!(
+            found,
+            "拉起的子进程 {child_pid} 必须出现在进程树里（轮询 {polls} 次；其中 \
+             {unsupported_polls} 次连进程快照都没拿到；最后一次 unreadable={unreadable_last}）"
+        );
     }
 }
