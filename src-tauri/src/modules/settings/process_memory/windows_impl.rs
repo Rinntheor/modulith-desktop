@@ -51,13 +51,28 @@ const COMMAND_LINE_INITIAL_BYTES: u32 = 2048;
 const COMMAND_LINE_MAX_BYTES: u32 = 64 * 1024;
 
 pub(super) fn collect() -> MemorySnapshot {
+    collect_with_table().0
+}
+
+/// 采集一次，并把**产生这份结果的那张父关系表**一并交出来。
+///
+/// 它存在的唯一理由是测试。`live_snapshot_excludes_unrelated_processes` 的
+/// 断言方式是反证：结果里除宿主外的每个 pid，都必须能沿父关系回溯到本进程。
+/// 如果那条测试自己去再拍一次进程表，两次快照之间系统里的进程会生灭 ——
+/// 于是它会偶发地红，而红的原因与它要断言的东西毫无关系（实测撞到过一次，
+/// 且只在整套测试并行跑时出现）。
+///
+/// 让反证对着**同一份数据**做，这条竞争就从根上不存在了。用同一个函数返回
+/// 而不是在测试里重算，是为了保证"被断言的那张表"与"筛出结果的那张表"
+/// 在字面上就是同一个值 —— 复制一份就又会分叉。
+pub(super) fn collect_with_table() -> (MemorySnapshot, HashMap<u32, u32>) {
     let root_pid = std::process::id();
 
     let Some((parent_of, names)) = snapshot_processes() else {
         // 连快照都拿不到：给出诚实的空结果 + 标记不支持，而不是假装成功。
         let mut empty = MemorySnapshot::unsupported();
         empty.root_pid = root_pid;
-        return empty;
+        return (empty, HashMap::new());
     };
 
     let (pids, entries) = descendants_of(root_pid, &parent_of, &names);
@@ -101,15 +116,18 @@ pub(super) fn collect() -> MemorySnapshot {
     let total_private_bytes = processes.iter().map(|p| p.private_bytes).sum();
     let total_working_set = processes.iter().map(|p| p.working_set).sum();
 
-    MemorySnapshot {
-        sampled_at: now_millis(),
-        root_pid,
-        processes,
-        total_private_bytes,
-        total_working_set,
-        unreadable,
-        supported: true,
-    }
+    (
+        MemorySnapshot {
+            sampled_at: now_millis(),
+            root_pid,
+            processes,
+            total_private_bytes,
+            total_working_set,
+            unreadable,
+            supported: true,
+        },
+        parent_of,
+    )
 }
 
 /// 本应用进程树里的全部 pid，**含宿主进程自己**。
@@ -351,13 +369,30 @@ mod live_tests {
     /// 数字会虚高一倍（本机实测有 13 个 msedgewebview2 进程分属两个应用）。
     /// 断言方式是反证：结果里除宿主外的每个 pid，都必须在父关系表里
     /// 能一路回溯到本进程。
+    ///
+    /// ============================================================
+    /// 曾经的弯路：自己去再拍一次进程表
+    /// ============================================================
+    ///
+    /// 这条测试原先自己调 `snapshot_processes()` 拿父关系表，于是它跑的是
+    /// **活的进程表**：`collect()` 枚举出一棵树之后，测试再拍一次。中间的几毫秒里
+    /// 一个进程完全可能已经退出 —— 于是它在前一份里、不在后一份里，测试报
+    /// "pid 14396 回溯不到本进程"，而这是**测试自己的竞争**，不是被测代码有问题。
+    /// 它只在整套测试并行跑时出现（并行度越高，两次快照间隔越长），
+    /// 后来又在 `if !process_is_alive(pid) { continue }` 上打补丁 ——
+    /// 补丁本身也有竞争：进程刚退出但进程对象还被引用时，`OpenProcess` 仍然成功。
+    ///
+    /// 现在改成对着 `collect_with_table()` 交出的**那一张**父关系表反证。
+    /// 同一个快照里，结果中的每个 pid 都由这张表筛出来，因此回溯必然成立 ——
+    /// 反证对"把无关进程硬拽进来"这种改动依然会打红（那种 pid 向上会走到
+    /// 一个不在表里的父进程，或走到 pid 0）。
     #[test]
     fn live_snapshot_excludes_unrelated_processes() {
-        let snapshot = collect();
-        let Some((parent_of, _names)) = snapshot_processes() else {
+        let (snapshot, parent_of) = collect_with_table();
+        if parent_of.is_empty() {
             // 连系统快照都拿不到时不算失败：这条测试是反证，前提条件不成立就直接跳过。
             return;
-        };
+        }
 
         for process in &snapshot.processes {
             if process.pid == snapshot.root_pid {
