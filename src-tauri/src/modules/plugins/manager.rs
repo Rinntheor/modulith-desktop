@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 
+use super::data_dir;
+use super::data_root;
 use super::icon;
 use super::quota;
 use super::types::{
@@ -350,6 +352,11 @@ pub struct PluginManager {
     app: AppHandle,
     plugins_dir: PathBuf,
     data_dir: PathBuf,
+    /// 数据根**现在能不能用**。不可用时所有插件数据操作都必须拒绝。
+    ///
+    /// 存在这里而不是每次现算：判定要写一个探针文件（磁盘 IO），而它会被每一次
+    /// 数据读取问到。启动时算一次，之后由"改数据位置"那条路径重算。
+    data_root_status: data_root::DataRootStatus,
     registry: HashMap<String, RegistryEntry>,
     /// 出站门面。**没有裸 `reqwest::Client` 字段** —— 理由见 `net/client.rs`：
     /// 上一版正是靠"每个调用点各自记得判定"，结果市场索引那条路漏掉了。
@@ -372,10 +379,26 @@ impl PluginManager {
             )))?;
 
         let plugins_dir = app_data.join("plugins");
-        let data_dir = app_data.join("plugin_data");
+
+        // 数据根目录**不再是 `app_data` 下的一个固定子目录**。
+        //
+        // 它现在由 `data_root` 解析：默认落在 `%LOCALAPPDATA%`（大数据不该进漫游配置），
+        // 用户配置时用用户给的位置，并且**带上"它现在能不能用"这个状态**。
+        //
+        // `ctx.storage` 与已有插件的数据**原地不动**：默认根换了名字但 `plugin_data`
+        // 这个名字没变，只是换到了 Local。旧数据留在 Roaming 里 —— 那是下一节
+        // （显式迁移）的事，而"不静默搬用户的文件"是这里的默认。
+        let (data_dir, data_root_status) = data_root::resolve(&app);
 
         std::fs::create_dir_all(&plugins_dir)?;
-        std::fs::create_dir_all(&data_dir)?;
+
+        if !data_root_status.available {
+            log::error!(
+                "插件数据目录不可用：{}（路径 {}）。插件的数据操作会被拒绝，而不是读到一份空数据。",
+                data_root_status.reason.as_deref().unwrap_or("未知原因"),
+                data_root_status.path
+            );
+        }
 
         // 30 秒是**下载整包**用的超时，不是诊断用的短超时 —— 门面按调用方给的值构造，
         // 因为"慢"与"坏"在这里是两件不同的事。
@@ -386,6 +409,7 @@ impl PluginManager {
             app,
             plugins_dir,
             data_dir,
+            data_root_status,
             registry: HashMap::new(),
             net,
         };
@@ -1334,6 +1358,31 @@ impl PluginManager {
 // ============================================================
 
 impl PluginManager {
+    /// 数据根目录的当前状态（能不能用、在哪、是默认还是用户配置的）。
+    pub fn data_root_status(&self) -> &data_root::DataRootStatus {
+        &self.data_root_status
+    }
+
+    /// 数据根不可用时**拒绝**，而不是返回一份空数据。
+    ///
+    /// 这是整个数据层里最危险的一条的落地：移动硬盘没插、网络盘断开时，如果宿主
+    /// "没找到就当成空的"，插件读到的就是一个空数据目录 —— 而它与"这个插件还没有
+    /// 数据"一模一样。用户会以为数据没了，然后开始重建。
+    ///
+    /// 因此这里返回的是**错误**，而错误会被一路传到界面上（"数据目录不可用：…"）。
+    fn require_data_root(&self) -> PluginResult<()> {
+        if self.data_root_status.available {
+            return Ok(());
+        }
+        Err(PluginError::DataRootUnavailable(format!(
+            "插件数据目录不可用：{}",
+            self.data_root_status
+                .reason
+                .as_deref()
+                .unwrap_or("原因未知")
+        )))
+    }
+
     /// 取该插件的存储目录，并强制 `storage` 权限。
     ///
     /// 五个存储方法（`storage_get` / `set` / `delete` / `keys` / `clear`）全都
@@ -1341,11 +1390,82 @@ impl PluginManager {
     /// 因此 `storage` 权限检查只有这一个执行点。
     ///
     /// 与 `plugin_data_dir` 的分工：那个只保证「ID 合法」，这个额外要求
-    /// 「清单已声明 storage」。卸载等内部流程仍直接使用 `plugin_data_dir`，
-    /// 它们不该受插件的权限声明约束。
+    /// 「清单已声明 storage」与「数据根可用」。卸载等内部流程仍直接使用
+    /// `plugin_data_dir`，它们不该受插件的权限声明约束 —— 而且**在数据根不可用时
+    /// 它们仍然该能工作**（"告诉用户数据在哪、占了多少"这件事不该因为盘没插而失效）。
     fn checked_storage_dir(&self, id: &str) -> PluginResult<PathBuf> {
         self.require_permission(id, PluginPermission::Storage)?;
+        self.require_data_root()?;
         self.plugin_data_dir(id)
+    }
+
+    /// 取该插件的数据目录，并强制 `plugin-data` 权限与数据根可用。
+    ///
+    /// 与 `checked_storage_dir` 并列而不是合并：两者是**两条独立的权限**。
+    /// 合并的话，一个只想要键值存储的插件会顺带拿到整个文件目录 ——
+    /// 权限列表就不再是"它能做什么"的如实描述。
+    fn checked_data_dir(&self, id: &str) -> PluginResult<PathBuf> {
+        self.require_permission(id, PluginPermission::PluginData)?;
+        self.require_data_root()?;
+        self.plugin_data_dir(id)
+    }
+
+    // ============================================================
+    // `ctx.dataDir`：插件私有目录的有界文件操作
+    // ============================================================
+    //
+    // 每一个操作都先取**经过权限与可用性检查的**目录，再把相对路径交给
+    // `data_dir` 那一层做路径校验与 IO。安全判据集中在 `data_dir::resolve`
+    // 一处 —— 散开的话，漏掉任意一个调用点就等于没有边界。
+
+    /// 列一个目录。`rel` 为空表示数据根。
+    pub fn data_list(&self, id: &str, rel: &str) -> PluginResult<Vec<data_dir::DataEntry>> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::list(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 取一个路径的元信息。不存在时 `None`。
+    pub fn data_stat(&self, id: &str, rel: &str) -> PluginResult<Option<data_dir::DataStat>> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::stat(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 读一个文件。
+    pub fn data_read(&self, id: &str, rel: &str) -> PluginResult<Vec<u8>> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::read(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 写一个文件（覆盖）。
+    pub fn data_write(&self, id: &str, rel: &str, bytes: &[u8]) -> PluginResult<()> {
+        let root = self.checked_data_dir(id)?;
+        // 配额用的是**整个数据目录**的当前占用，而不是 `ctx.storage` 那份。
+        // 两者是两个不同的门：一个管键值，一个管文件。
+        let used = data_dir::used_bytes(&root);
+        data_dir::write(&root, rel, bytes, used).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 建一个目录（含中间层）。
+    pub fn data_mkdir(&self, id: &str, rel: &str) -> PluginResult<()> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::mkdir(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 删除一个文件或一棵目录树。
+    pub fn data_remove(&self, id: &str, rel: &str) -> PluginResult<()> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::remove(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 这个插件的数据目录当前占了多少字节。
+    ///
+    /// **不走权限检查**：它是给人看的数字（界面上显示"这个插件占了多少"），
+    /// 而不是插件能动的东西。与 `data_usage` 的区别是那个用 ID 形状的目录名统计
+    /// （卸载之后也算得出来），这个走 `checked_data_dir`，因此能反映"权限都齐了
+    /// 之后它实际能用多少"。
+    pub fn data_used(&self, id: &str) -> PluginResult<u64> {
+        let root = self.checked_data_dir(id)?;
+        Ok(data_dir::used_bytes(&root))
     }
 
     /// 校验存储 key

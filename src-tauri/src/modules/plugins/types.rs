@@ -246,6 +246,13 @@ impl VersionRequirement {
 #[serde(rename_all = "kebab-case")]
 pub enum PluginPermission {
     Storage,
+    /// 读写插件**自己的数据目录**（`ctx.dataDir`）：文件、图片、文档。
+    ///
+    /// 与 `storage` 分开而不是合并，尽管两者的作用域都是"插件自己"：合并的话，
+    /// 一个只想要几个键值配置的插件会顺带拿到一整个可写目录 —— 而权限列表就不再是
+    /// "它能做什么"的如实描述。这一条的边界是**目录之内**，不是"任意写"
+    /// （`filesystem-write` 仍然是拒绝的，见规划 §8）。
+    PluginData,
     Network,
     NetworkExternal,
     Notification,
@@ -269,6 +276,7 @@ impl PluginPermission {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Storage => "storage",
+            Self::PluginData => "plugin-data",
             Self::Network => "network",
             Self::NetworkExternal => "network-external",
             Self::Notification => "notification",
@@ -287,8 +295,9 @@ impl PluginPermission {
     ///
     /// 新增枚举值时必须一并加入 —— 否则上面那个一致性测试覆盖不到新值，
     /// 而"测试通过"会给人已经覆盖了的错觉。
-    pub const ALL: [PluginPermission; 12] = [
+    pub const ALL: [PluginPermission; 13] = [
         Self::Storage,
+        Self::PluginData,
         Self::Network,
         Self::NetworkExternal,
         Self::Notification,
@@ -711,6 +720,22 @@ pub enum PluginError {
 
     #[error("沙箱限制: {0}")]
     SandboxViolation(String),
+
+    /// 数据根目录当前不可用（外置盘没插、网络盘断开、路径被删…）。
+    ///
+    /// **单独一个变体，而且是错误而不是"空数据"。** 这是整个数据层里最危险的一条的
+    /// 落地：如果这时返回一个空的目录，插件与用户都会把它读成"这个插件还没有数据"，
+    /// 然后开始重建 —— 而真正的数据只是在另一块没插上的盘里。界面上必须显示这个原因。
+    #[error("{0}")]
+    DataRootUnavailable(String),
+
+    /// `ctx.dataDir` 的路径越界或名字非法。
+    ///
+    /// 与 `SandboxViolation` 分开：后者是"插件碰了插件系统之外的东西"，
+    /// 这里是"插件在自己那一亩地里写了一个不合法/越界的路径" —— 对一个正在写文件
+    /// 的插件来说，这两句话给出的下一步动作完全不同。
+    #[error("数据目录限制: {0}")]
+    DataDirViolation(String),
 
     /// 超出该插件的资源配额（存储用量、单键大小、键数量）。
     ///

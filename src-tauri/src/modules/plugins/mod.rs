@@ -2,6 +2,8 @@
 // 运行时插件系统模块
 
 pub mod commands;
+pub mod data_dir;
+pub mod data_root;
 pub mod icon;
 pub mod manager;
 pub mod permissions;
