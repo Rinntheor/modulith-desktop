@@ -888,7 +888,156 @@
   // 对外的那一个对象
   // ============================================================
 
+
+    // ============================================================
+    // 结构化数据：每插件一个 SQLite 文件
+    // ============================================================
+    //
+    // ============================================================
+    // 为什么需要第三层
+    // ============================================================
+    //
+    // `storage` 是一个小键值表，`dataDir` 是一个有界的文件目录 —— 它们装得下
+    // 笔记正文与图片，但装不下**查询**：一个笔记插件要"按标签筛、按更新时间排、
+    // 取第 3 页"时，前两层能做的只有把所有数据拉进 JS 自己过滤，而那正是
+    // "一千条以后就开始卡"的来源。
+    //
+    // ============================================================
+    // 边界在引擎里，这一层看不到它
+    // ============================================================
+    //
+    // `ATTACH`、危险的 PRAGMA、`load_extension` 全部由宿主侧的 SQLite authorizer
+    // 拒绝（见 `db.rs` 的文件头）。这里**不做**任何 SQL 文本过滤 —— 做了也只是
+    // 一套会漂的规则，而文本过滤本来就挡不住注释、大小写与字符串字面量。
+
+    /**
+     * 值能不能跨 IPC。
+     *
+     * `BigInt` 明确不支持：宿主收的是 JSON，没有 int64 那种类型，而悄悄截断
+     * 会让一个 id 变成另一个 id —— 那种错误要到很后面才会被发现。
+     */
+    function dbValue(value) {
+      if (value === undefined) return null;
+      if (typeof value === 'bigint') {
+        throw new Error('ctx.db 不支持 BigInt，请先转成字符串或 Number');
+      }
+      return value;
+    }
+
+    /** 参数一律折成数组；`undefined` → `null`（宿主侧两者是同一件事）。 */
+    function dbParams(params) {
+      if (params === undefined || params === null) return [];
+      var list = Array.isArray(params) ? params : [params];
+      return list.map(dbValue);
+    }
+
+    /**
+     * 把 `{columns, rows}` 拼成一组对象。
+     *
+     * 宿主**刻意**返回列与行分开的形状（见 `db.rs::QueryResult`）：SQL 允许重名
+     * 列，而一个对象在那种情况下只能保留一个 —— 插件拿到的是一个悄悄少了东西的
+     * 结果。绝大多数查询没有重名列，因此这一层替它们拼好；拼不了的用 `queryRaw`。
+     *
+     * 重名列时**后者覆盖前者**，并且**只警告一次** —— 那种查询本来就该改写成带
+     * 别名的，而每次调用都刷一条日志会把真正的问题淹掉。
+     */
+    var duplicateColumnWarned = false;
+
+    function rowsToObjects(result) {
+      var columns = (result && result.columns) || [];
+      var rows = (result && result.rows) || [];
+
+      var seen = Object.create(null);
+      var duplicated = false;
+      for (var i = 0; i < columns.length; i += 1) {
+        if (seen[columns[i]]) duplicated = true;
+        seen[columns[i]] = true;
+      }
+      if (duplicated && !duplicateColumnWarned) {
+        duplicateColumnWarned = true;
+        console.warn(
+          '[Modulith] 这次查询里有重名列 —— 对象形式只保留最后一个。' +
+            '需要全部取值请用 ctx.db.queryRaw()，或给列起别名。'
+        );
+      }
+
+      return rows.map(function (row) {
+        var object = {};
+        for (var index = 0; index < columns.length; index += 1) {
+          object[columns[index]] = row[index];
+        }
+        return object;
+      });
+    }
+
+    var db = {
+      /**
+       * 查询。返回**对象数组**（重名列只保留最后一个，需要全部用 `queryRaw`）。
+       *
+       * 参数用 `?1` / `?2` 占位，按数组顺序绑定 —— 不要自己拼字符串：那既是
+       * 注入面，也会让语句无法被 SQLite 的语句缓存复用。
+       */
+      query: function (sql, params) {
+        return rpc('db.query', { sql: String(sql), params: dbParams(params) }).then(rowsToObjects);
+      },
+
+      /**
+       * 查询，返回**原始形状** `{ columns: [...], rows: [[...]] }`。
+       *
+       * 重名列、或者你只是想要数组时用它。
+       */
+      queryRaw: function (sql, params) {
+        return rpc('db.query', { sql: String(sql), params: dbParams(params) });
+      },
+
+      /**
+       * 执行一条写入 / DDL。返回 `{ changes, lastInsertRowId }`。
+       *
+       * **一次调用只能有一条语句**（多条会被宿主拒绝）。要一起成功或一起失败，
+       * 用 `transaction`。
+       */
+      exec: function (sql, params) {
+        return rpc('db.exec', { sql: String(sql), params: dbParams(params) });
+      },
+
+      /**
+       * 一批语句，**全成功或全回滚**。
+       *
+       *   await Modulith.db.transaction([
+       *     { sql: 'INSERT INTO notes (title) VALUES (?1)', params: ['一'] },
+       *     { sql: 'INSERT INTO notes (title) VALUES (?1)', params: ['二'] },
+       *   ]);
+       *
+       * 返回每条语句的 `{ changes, lastInsertRowId }`。
+       *
+       * ============================================================
+       * 为什么没有 `begin()` / `commit()`
+       * ============================================================
+       *
+       * 跨调用的显式事务是**会泄漏的状态**：插件在 `begin` 之后崩溃、被卸载、
+       * 或者只是忘了 `commit`，那条写事务就一直挂着，而这个连接会被下一个打开
+       * 数据库的实例继续用 —— 于是"我什么都没干，它却说数据库被锁住了"。
+       *
+       * 更要命的是没有 `finally`：插件那一侧拿不到一个"无论发生什么都会执行"的
+       * 钩子（它的界面可能只是被隐藏，也可能整个文档已经被销毁）。因此事务的
+       * 边界必须落在**这一次**调用里。
+       */
+      transaction: function (statements) {
+        if (!Array.isArray(statements)) {
+          return Promise.reject(new Error('ctx.db.transaction 需要一个语句数组'));
+        }
+        return rpc('db.transaction', {
+          statements: statements.map(function (statement) {
+            var item = statement || {};
+            return { sql: String(item.sql), params: dbParams(item.params) };
+          }),
+        });
+      },
+    };
+
   var Modulith = {
+    dataDir: dataDir,
+     db: db,
     /** 沙箱插件的身份。**宿主给出的**，不是插件自报的。 */
     plugin: {
       id: PLUGIN_ID,
@@ -988,7 +1137,6 @@
       },
     },
 
-    dataDir: dataDir,
 
     http: {
       /**

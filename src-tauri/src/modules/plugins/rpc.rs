@@ -855,6 +855,85 @@ pub async fn dispatch<R: Runtime>(
             emit_ui_with(app, plugin_id, surface, "splash", value, auto)
         }
 
+        // ---- 结构化数据（ctx.db）---------------------------------------------
+        //
+        // ============================================================
+        // 为什么这一层看不到"能不能做"的判定
+        // ============================================================
+        //
+        // 权限（`plugin-data`）与"数据根可用"由 `PluginManager::database_path`
+        // 判，而它是打开连接的那一步。这里的三条只是**取连接、跑 SQL、回结果**。
+        //
+        // ============================================================
+        // 边界在 `db.rs` 里，不在这些参数上
+        // ============================================================
+        //
+        // `ATTACH`、危险的 PRAGMA、`load_extension` 全部由 SQLite 自己的
+        // authorizer 拒绝（见 `db.rs` 的文件头）。这一层因此**不做**任何
+        // SQL 文本检查 —— 做的话就是第二套会漂的规则，而它的失效方式是
+        // "看起来拦住了，实际没拦住"。
+
+        "db.query" | "db.exec" | "db.transaction" => {
+            let Some(sql) = arg_str(args, "sql") else {
+                // `transaction` 没有 `sql`，它带的是 `statements`。
+                if method == "db.transaction" {
+                    let statements: Vec<super::db::Statement> = match arg(args, "statements") {
+                        Some(value) => match serde_json::from_value(value.clone()) {
+                            Ok(statements) => statements,
+                            Err(e) => {
+                                return rpc_error(&format!(
+                                    "statements 必须是 [{{sql, params?}}] 形状：{e}"
+                                ))
+                            }
+                        },
+                        None => return rpc_error("缺少 statements"),
+                    };
+
+                    let Some(databases) = app.try_state::<super::db::PluginDatabases>() else {
+                        return rpc_error("插件数据库尚未就绪");
+                    };
+                    return match databases.transaction(app, plugin_id, statements).await {
+                        Ok(results) => json_value(serde_json::json!(results)),
+                        Err(e) => rpc_error(&e),
+                    };
+                }
+
+                return rpc_error("缺少 sql");
+            };
+
+            // 参数缺省是空数组。`null` 与"没给"在这里是同一件事（见 `arg` 的说明）。
+            let params: Vec<Value> = arg(args, "params")
+                .map(|value| {
+                    if value.is_array() {
+                        value.as_array().cloned().unwrap_or_default()
+                    } else {
+                        vec![value.clone()]
+                    }
+                })
+                .unwrap_or_default();
+
+            let Some(databases) = app.try_state::<super::db::PluginDatabases>() else {
+                return rpc_error("插件数据库尚未就绪");
+            };
+
+            let outcome = if method == "db.query" {
+                databases
+                    .query(app, plugin_id, sql, &params)
+                    .await
+                    .map(|result| serde_json::json!(result))
+            } else {
+                databases
+                    .exec(app, plugin_id, sql, &params)
+                    .await
+                    .map(|result| serde_json::json!(result))
+            };
+
+            match outcome {
+                Ok(value) => json_value(value),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
         // ---- 多界面（api: 3）-------------------------------------------------
         //
         // ============================================================

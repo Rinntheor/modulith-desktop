@@ -75,6 +75,19 @@ tauri-plugin-updater = "2.11.0"
 # 这种组合出现，而那种现象极难归因。
 minisign-verify = "0.2.5"
 
+# ---- 插件数据层：每插件一个 SQLite（src/modules/plugins/db.rs）----
+#
+# `bundled` 把 SQLite 的源码一起编进来，因此**用户机器上不需要任何前置条件**。
+# 系统自带的 sqlite3.dll 在 Windows 上不保证存在，也不保证版本一致 —— 而一个
+# "插件数据库打不开"的失败如果取决于用户的系统里恰好有没有那个 DLL，它就无法被支持。
+# 代价是编译时间与二进制体积，这个项目接受它。
+#
+# `hooks` 提供 `Connection::authorizer` —— 那是**引擎级**拒绝 `ATTACH` /
+# `DETACH` / 危险 PRAGMA 的唯一入口。对 SQL 文本做字符串过滤做不到这件事
+# （注释、大小写、字符串字面量都能绕过），因此这一层不是"顺手加的检查"，
+# 它就是那条边界。
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+
 # ---- Windows 平台专属：提取可执行文件图标（src/modules/plugins/icon.rs）----
 # 用 windows-sys 而不是 windows：这里只需要几个 Win32 函数的裸声明，
 # 不需要 COM 包装与 Result 化，编译时间与体积都小得多。

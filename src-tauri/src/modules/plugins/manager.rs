@@ -716,6 +716,19 @@ impl PluginManager {
             .collect())
     }
 
+    /// 该插件的 **SQLite 文件**路径（`ctx.db`）。
+    ///
+    /// 走 `checked_data_dir`，因此它顺带强制了两件事：`plugin-data` 权限，
+    /// 以及"数据根可用"。数据库是插件数据的一部分，没有理由给它另一套门。
+    ///
+    /// 路径**由宿主拼**（目录 + 常量文件名），不是一个相对路径 —— 插件因此
+    /// 没有机会决定库文件叫什么、放在哪。这与 `data_dir::resolve` 的 chroot
+    /// 语义是同一条思路：能影响"打开哪个文件"的输入越少越好。
+    pub fn database_path(&self, id: &str) -> PluginResult<PathBuf> {
+        let root = self.checked_data_dir(id)?;
+        Ok(super::db::database_file(&root))
+    }
+
     /// 一个后台（无界面）插件启动所需的事实。
     /// 返回 `Ok(None)` 表示**这个插件没有后台声明**，因此不该被拉起 ——
     /// 与"声明了但有问题"（`Err`）分开：前者是常态，后者要能被界面说出来。
@@ -1639,6 +1652,7 @@ impl PluginManager {
 
     /// 写一个文件（覆盖）。
     pub fn data_write(&self, id: &str, rel: &str, bytes: &[u8]) -> PluginResult<()> {
+        self.reject_reserved_data_path(rel)?;
         let root = self.checked_data_dir(id)?;
         // 配额用的是**整个数据目录**的当前占用，而不是 `ctx.storage` 那份。
         // 两者是两个不同的门：一个管键值，一个管文件。
@@ -1654,8 +1668,26 @@ impl PluginManager {
 
     /// 删除一个文件或一棵目录树。
     pub fn data_remove(&self, id: &str, rel: &str) -> PluginResult<()> {
+        self.reject_reserved_data_path(rel)?;
         let root = self.checked_data_dir(id)?;
         data_dir::remove(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 拒绝用 `ctx.dataDir` 覆盖或删掉 **`ctx.db` 的数据库文件**。
+    ///
+    /// 判据本身在 `db::is_reserved_data_path`（那一条有单元测试，因为它是一条
+    /// 纯函数）。这里只负责把"是保留名"翻成一句能指路的错误 —— **读不拦**：
+    /// 把 `plugin.db` 复制出去做备份是合理用法。
+    fn reject_reserved_data_path(&self, rel: &str) -> PluginResult<()> {
+        if super::db::is_reserved_data_path(rel) {
+            return Err(PluginError::DataDirViolation(format!(
+                "{} 是 ctx.db 的数据库文件，不能用 ctx.dataDir 覆盖或删除。\
+                 要备份它请用 read / readText，要清空它请用 ctx.db 里的 SQL。",
+                super::db::DB_FILE_NAME
+            )));
+        }
+
+        Ok(())
     }
 
     /// 这个插件的数据目录当前占了多少字节。

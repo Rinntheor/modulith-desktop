@@ -967,6 +967,12 @@ section('完整 API 表面');
       ['dataDir.remove', isFunction],
       ['dataDir.used', isFunction],
 
+      // 3.2 数据 · 结构化（ctx.db）
+      ['db.query', isFunction],
+      ['db.queryRaw', isFunction],
+      ['db.exec', isFunction],
+      ['db.transaction', isFunction],
+
       // 3.3 网络
       ['http.fetch', isFunction],
 
@@ -1058,17 +1064,25 @@ section('完整 API 表面');
     const dispatch = dispatchStart > 0 && dispatchEnd > dispatchStart
       ? rpcRs.slice(dispatchStart, dispatchEnd)
       : '';
-    const handled = new Set(
-      // 只认**外层** match 的分支：它们的缩进是 8 个空格。不锚定缩进的话，
-      // `"log"` 处理分支内部的日志级别分支（`"debug" =>` 等，缩进 16）会被
-      // 当成三个不存在的 RPC 方法，于是这条断言自己制造三个假缺陷。
-      //
-      // 方法名带着点号（`storage.get`），但有几个是单词（`log`、`notify`），
-      // 因此点号那段是可选的。
-      [...dispatch.matchAll(/^ {8}"([a-zA-Z]+(?:\.[a-zA-Z]+)?)"\s*=>/gm)].map(
-        (match) => match[1]
-      )
-    );
+    // 分支头可能是**或模式**（`"db.query" | "db.exec" => …`），因此这里先抓整行
+    // 分支头，再从里面逐个取方法名。
+    //
+    // 只认**外层** match 的分支：它们的缩进是 8 个空格。不锚定缩进的话，
+    // `"log"` 处理分支内部的日志级别分支（`"debug" =>` 等，缩进 16）会被
+    // 当成三个不存在的 RPC 方法，于是这条断言自己制造三个假缺陷。
+    //
+    // 只看"整行都是字符串字面量与 `|`"的分支头 —— 这一条把 `_ => …` 与
+    // 带其它模式的分支排除在外，而不是靠"第一个引号里是什么"去猜。
+    const handled = new Set<string>();
+    for (const arm of dispatch.matchAll(/^ {8}([^\n]+?)\s*=>/gm)) {
+      const head = arm[1];
+      if (!/^(?:"[a-zA-Z]+(?:\.[a-zA-Z]+)?"\s*\|\s*)*"[a-zA-Z]+(?:\.[a-zA-Z]+)?"\s*$/.test(head)) {
+        continue;
+      }
+      for (const name of head.matchAll(/"([a-zA-Z]+(?:\.[a-zA-Z]+)?)"/g)) {
+        handled.add(name[1]);
+      }
+    }
 
     // 沙箱必须**转发**给共用实现，而不是自己再实现一遍。
     check(
@@ -1946,6 +1960,241 @@ section('宿主渲染的状态指示与命令');
     ),
     '桥接层把 includeDeclared 的缺省也说成 true（与宿主一致）'
   );
+}
+
+
+
+
+// ============================================================
+// 17. `ctx.db`：每插件一个 SQLite，边界在引擎里
+// ============================================================
+//
+// 这一节守的是**"边界没有被搬到 SQL 文本上"**。那是一个很自然的退化方向：
+// 谁都想在 RPC 那一层加一句 `if sql.contains("ATTACH")` —— 而它挡不住注释、
+// 大小写与字符串字面量，同时会让人以为已经拦住了。
+//
+// 因此这里断言的几乎全是"**引擎层那几件东西还在**"：
+// authorizer 装了、`ATTACH` 被拒、危险 PRAGMA 被拒、页数上限由引擎执行、
+// 一次调用只编译一条语句。行为层的另一半由 `db.rs` 自己的单元测试守
+// （12 个，其中 3 个是直接向引擎发难的那种）。
+
+section('插件数据库（ctx.db）');
+
+{
+  const dbRs = read('../src-tauri/src/modules/plugins/db.rs');
+  const managerForDb = read('../src-tauri/src/modules/plugins/manager.rs');
+  const rpcForDb = read('../src-tauri/src/modules/plugins/rpc.rs');
+  const pluginCommandsForDb = read('../src-tauri/src/modules/plugins/commands.rs');
+  const cargoToml = read('../src-tauri/Cargo.toml');
+  const runtimeForDb = read('../src/services/pluginRuntime.ts');
+
+  // ---- 依赖：bundled 与 hooks 各是为什么 ----
+  check(
+    /rusqlite = \{ version = "[^"]+", features = \["bundled", "hooks"\] \}/.test(cargoToml),
+    'rusqlite 带 bundled（用户机器上不需要任何前置条件）与 hooks（authorizer 的前提）'
+  );
+
+  // ---- 边界：引擎级，不是文本级 ----
+  check(
+    /fn install_authorizer/.test(dbRs) && /\.authorizer\(Some\(/.test(dbRs),
+    '连接上真的装了 authorizer'
+  );
+  check(
+    /AuthAction::Attach \{ \.\. \} \| AuthAction::Detach \{ \.\. \} => Authorization::Deny/.test(dbRs),
+    'ATTACH / DETACH 由引擎拒绝（文本过滤挡不住注释、大小写与字符串字面量）'
+  );
+  check(
+    /fn is_reserved_pragma/.test(dbRs) && /if pragma_value\.is_some\(\) && is_reserved_pragma/.test(dbRs),
+    '保留的 PRAGMA 只在**设值**时被拒（拦掉读取会让插件问一下页大小就失败）'
+  );
+  // 这几条**必须圈到函数体里**。全文件找的话，文件里的说明文字与单元测试里的
+  // 字符串字面量都会命中 —— 而它们在被改坏之后**照样在**，于是断言恒为真。
+  // 第一轮变异验证里，这一节有五条断言正是这么假绿的。
+  const budgetFn = /fn budget_bytes\(\) -> u64 \{[\s\S]*?\n\}/.exec(dbRs)?.[0] ?? '';
+  check(
+    /const DB_BUDGET_SHARE: u64 = 2;/.test(dbRs) &&
+      /super::data_dir::MAX_TOTAL_BYTES \/ DB_BUDGET_SHARE/.test(budgetFn),
+    '数据库预算取数据目录配额的一份，而不是另起一个数字'
+  );
+  const limitsFn = /fn apply_limits\([\s\S]*?\n\}/.exec(dbRs)?.[0] ?? '';
+  check(
+    /PRAGMA max_page_count = \{max_pages\};/.test(limitsFn) && /div_ceil\(page_size\)/.test(limitsFn),
+    '页数上限交给引擎执行（写满时 SQLITE_FULL，而不是先写满磁盘）'
+  );
+  // 顺序：先设限制再装规则。反过来宿主自己那句 `PRAGMA max_page_count=` 会被自己的规则拦下。
+  check(
+    /apply_limits\(&connection, budget_bytes\)\?;\s*\n\s*install_authorizer\(&connection\)\?;/.test(dbRs),
+    '先设限制、再装规则（顺序反了数据库根本打不开）'
+  );
+  check(
+    /execute_batch\("PRAGMA foreign_keys = ON;"\)/.test(limitsFn),
+    '外键默认打开（SQLite 的历史缺省是关，而"删了父行子行还在"看起来像数据库不守规矩）'
+  );
+  // `writable_schema` 在保留名单里，因此那条"拒绝写 sqlite_master"的规则是多余的 ——
+  // 而它**有害**：SQLite 自己的 CREATE TABLE 也以 sqlite_master 的 UPDATE 上报，
+  // 按动作类型区分不了，于是它把整个数据库变成只读的。
+  check(
+    /"writable_schema"/.test(dbRs) && !/eq_ignore_ascii_case\("sqlite_master"\)/.test(dbRs),
+    '靠保留 writable_schema 挡住改表结构，而不是"拒绝所有 sqlite_master 写入"'
+  );
+  const authorizerFn = /fn install_authorizer\([\s\S]*?\n\}/.exec(dbRs)?.[0] ?? '';
+  check(
+    /eq_ignore_ascii_case\("load_extension"\)/.test(authorizerFn),
+    'load_extension 被拒绝（它在插件里再开一个没有边界的洞）'
+  );
+
+  // ---- 一次调用只编译一条语句 ----
+  check(
+    /prepare\(sql\)\.map_err\(\|e\| sql_error\("编译", sql, e\)\)/.test(dbRs),
+    '一次调用只 prepare 一条语句（多条由 rusqlite 报 MultipleStatement）'
+  );
+
+  // ---- 阻塞调用不许落在异步线程上 ----
+  const runFn = /async fn run<T, F>\([\s\S]*?\n    \}/.exec(dbRs)?.[0] ?? '';
+  check(
+    /tokio::task::spawn_blocking\(move \|\| \{/.test(runFn),
+    'SQLite 调用走 spawn_blocking（直接在异步线程上会把整个宿主的调度钉住）'
+  );
+  check(
+    /let mut guard = connection\.lock\(\)\.unwrap_or_else\(\|e\| e\.into_inner\(\)\);/.test(dbRs),
+    '锁在阻塞线程里拿，且不因为一次 panic 让这个插件的数据库永久不可用'
+  );
+
+  // ---- 事务：边界必须在一次调用之内 ----
+  const transactionFn = /fn run_transaction\([\s\S]*?\n\}/.exec(dbRs)?.[0] ?? '';
+  check(
+    /\.commit\(\)/.test(transactionFn) && /\.transaction\(\)/.test(transactionFn),
+    'transaction 在一次调用里 commit（Drop 会回滚，因此中途失败自动全回滚）'
+  );
+  check(
+    !/pub async fn begin\(/.test(dbRs) && !/pub async fn commit\(/.test(dbRs),
+    '没有跨调用的 begin/commit —— 那是会泄漏的写事务状态'
+  );
+
+  // ---- 文件在插件自己的数据目录里 ----
+  check(
+    /pub fn database_path\(&self, id: &str\) -> PluginResult<PathBuf>/.test(managerForDb) &&
+      /self\.checked_data_dir\(id\)\?/.test(
+        /pub fn database_path\(&self, id: &str\) -> PluginResult<PathBuf> \{[\s\S]*?\n    \}/.exec(
+          managerForDb
+        )?.[0] ?? ''
+      ),
+    '数据库文件路径经 checked_data_dir（顺带强制 plugin-data 权限与数据根可用）'
+  );
+  // 判据落在**代码**上，不是注释上：文件里刻意写了一段"为什么不用 URI"的说明，
+  // 而只查 `!/SQLITE_OPEN_URI/` 会把那句说明当成违规。
+  check(
+    /OpenFlags::SQLITE_OPEN_READ_WRITE \| OpenFlags::SQLITE_OPEN_CREATE/.test(dbRs) &&
+      !/OpenFlags::SQLITE_OPEN_URI/.test(dbRs),
+    '打开连接不带 URI 语义（路径是宿主拼的，不该有再解释一次的余地）'
+  );
+
+  // ---- 一条实现，两个调用方 ----
+  check(
+    /super::db::PluginDatabases/.test(rpcForDb) && /super::db::PluginDatabases/.test(pluginCommandsForDb),
+    '沙箱协议与 Tauri 命令都转给同一个 PluginDatabases'
+  );
+  check(
+    !/rusqlite/.test(rpcForDb) && !/rusqlite/.test(pluginCommandsForDb),
+    'rpc.rs 与 commands.rs 里没有第二份 SQLite 用法（边界只有 db.rs 一处）'
+  );
+  check(
+    /pub async fn plugin_db_query\(/.test(pluginCommandsForDb) &&
+      /pub async fn plugin_db_exec\(/.test(pluginCommandsForDb) &&
+      /pub async fn plugin_db_transaction\(/.test(pluginCommandsForDb),
+    'in-process 插件那三条命令存在'
+  );
+  const buildForDb = read('../src-tauri/build.rs');
+  const capabilityForDb = read('../src-tauri/capabilities/app-commands.json');
+  check(
+    buildForDb.includes('"plugin_db_query"') &&
+      buildForDb.includes('"plugin_db_exec"') &&
+      buildForDb.includes('"plugin_db_transaction"') &&
+      capabilityForDb.includes('"allow-plugin-db-query"'),
+    '三条命令进了应用级 ACL 清单并被授权'
+  );
+
+  // ---- 停用 / 卸载：放掉连接，但**不删文件** ----
+  check(
+    /fn close_database\(app: &AppHandle, id: &str\)/.test(pluginCommandsForDb) &&
+      /databases\.close\(id\)/.test(pluginCommandsForDb),
+    '停用 / 卸载时放掉数据库连接'
+  );
+  check(
+    !/remove_dir_all/.test(
+      /fn close_database\(app: &AppHandle, id: &str\)[\s\S]*?\n\}/.exec(pluginCommandsForDb)?.[0] ?? ''
+    ),
+    'close_database 只关连接、不删文件（§6：卸载删代码、保留数据）'
+  );
+
+  // ---- 数据库文件是**保留名**：不能穿过 ctx.dataDir 覆盖或删掉它 ----
+  //
+  // 那个文件是引擎掌握的：写一段普通内容进去会让整个库变成 "file is not a
+  // database"，而插件自己一点数据都取不回来 —— 那是不可逆的。
+  // 判据是 `db::is_reserved_data_path` 这条纯函数（它有单元测试），
+  // 而 `manager` 只负责把"是保留名"翻成一句能指路的话。
+  const rejectFn =
+    /fn reject_reserved_data_path\([\s\S]*?\n    \}/.exec(managerForDb)?.[0] ?? '';
+  check(
+    /super::db::is_reserved_data_path\(rel\)/.test(rejectFn),
+    '保留名判定复用 db.rs 里那一条（两份实现一定会漂）'
+  );
+  check(
+    /fn is_reserved_data_path\(rel: &str\) -> bool \{[\s\S]{0,400}?eq_ignore_ascii_case\(DB_FILE_NAME\)/.test(
+      dbRs
+    ),
+    '保留名判定按大小写不敏感比较（Windows 上 plugin.DB 打开的是同一个文件）'
+  );
+  check(
+    /trim_end_matches\(\[' ', '\.'\]\)/.test(dbRs),
+    '保留名判定把末尾的空格与点去掉（Windows 会静默丢掉它们）'
+  );
+  const writeFn = /pub fn data_write\([\s\S]*?\n    \}/.exec(managerForDb)?.[0] ?? '';
+  const removeFn = /pub fn data_remove\([\s\S]*?\n    \}/.exec(managerForDb)?.[0] ?? '';
+  check(
+    /self\.reject_reserved_data_path\(rel\)\?;/.test(writeFn) &&
+      /self\.reject_reserved_data_path\(rel\)\?;/.test(removeFn),
+    'data_write 与 data_remove 都拒绝保留名'
+  );
+  check(
+    !/self\.reject_reserved_data_path/.test(
+      /pub fn data_read\([\s\S]*?\n    \}/.exec(managerForDb)?.[0] ?? ''
+    ),
+    'data_read 不拒绝保留名（备份数据库应当在损坏之前就能做）'
+  );
+
+  // ---- 两侧的成员名必须一致 ----
+  //
+  // 同一个插件应该能在 in-process 与 sandboxed 之间切换而不改一行代码。
+  //
+  // 判据先**把两侧的实现各自圈出来**再找方法名：全文件找 `query` 那种写法会
+  // 被 `plugin_db_query`（命令名里就有 query）之类的东西命中，于是断言恒为真。
+  const inProcessDb = /function pluginDatabase\([\s\S]*?\n\}/.exec(runtimeForDb)?.[0] ?? '';
+  const sandboxDb = /var db = \{[\s\S]*?\n    \};/.exec(bridgeJs)?.[0] ?? '';
+  check(inProcessDb.length > 0 && sandboxDb.length > 0, '两侧的 db 实现都能被定位到');
+  for (const method of ['query', 'queryRaw', 'exec', 'transaction']) {
+    check(
+      new RegExp(`\\b${method}\\s*[<(:]`).test(inProcessDb) &&
+        new RegExp(`\\b${method}: function`).test(sandboxDb),
+      `db.${method} 在 in-process 与沙箱两侧都有同名成员`
+    );
+  }
+
+  // ---- 行为层的覆盖在单元测试里，这一条只是确认它们还在 ----
+  for (const test of [
+    'attach_and_detach_are_refused_by_the_engine',
+    'pragmas_that_defeat_the_budget_are_refused',
+    'the_page_limit_is_enforced_by_the_engine',
+    'a_second_statement_in_one_call_is_refused',
+    'a_failed_transaction_leaves_nothing_behind',
+    'values_round_trip_and_blobs_stay_distinguishable',
+    'schema_editing_is_refused_by_sqlite_itself',
+  ]) {
+    check(
+      dbRs.includes(`fn ${test}(`),
+      `db.rs 里有行为层测试 ${test}`
+    );
+  }
 }
 
 

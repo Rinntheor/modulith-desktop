@@ -148,6 +148,9 @@
     "allow-sandbox-surface-close",
     "allow-sandbox-surface-bounds",
     "allow-sandbox-self-test",
-    "allow-plugin-surfaces"
+    "allow-plugin-surfaces",
+    "allow-plugin-db-query",
+    "allow-plugin-db-exec",
+    "allow-plugin-db-transaction"
   ]
 }

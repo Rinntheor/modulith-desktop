@@ -1518,6 +1518,82 @@ function createContext() {
 /** 已经为"没声明 plugin-data 却用了 ctx.dataDir"提示过的插件，避免刷屏。 */
 const warnedMissingDataDir = new Set<string>();
 
+/**
+ * `ctx.db`：把调用转给 Rust 的 `PluginDatabases`。
+ *
+ * ============================================================
+ * 这一层**不做任何判断**
+ * ============================================================
+ *
+ * 权限与"数据根可用"由 `PluginManager::database_path` 判（打开连接的那一步），
+ * SQL 的边界由 SQLite 的 authorizer 判。这里只是三次 `invoke` ——
+ * 加一层 JS 侧的检查只会变成第二套会漂的规则。
+ *
+ * 形状与沙箱桥接层**逐字一致**（`query` / `queryRaw` / `exec` / `transaction`），
+ * 因为同一个插件应该能在 `in-process` 与 `sandboxed` 之间切换而不改一行代码。
+ * `check:sandbox` 有断言盯着这份一致性。
+ */
+function pluginDatabase(pluginId: string) {
+  /** 参数一律折成数组；`undefined` → `null`（Rust 侧两者是同一件事）。 */
+  const normalize = (params: unknown): unknown[] => {
+    if (params === undefined || params === null) return [];
+    const list = Array.isArray(params) ? params : [params];
+    return list.map((value) => (value === undefined ? null : value));
+  };
+
+  /** `{columns, rows}` → 对象数组（重名列只保留最后一个）。 */
+  const toObjects = <T>(result: { columns: string[]; rows: unknown[][] }): T[] =>
+    result.rows.map((row) => {
+      const object: Record<string, unknown> = {};
+      result.columns.forEach((column, index) => {
+        object[column] = row[index];
+      });
+      return object as T;
+    });
+
+  return {
+    async query<T = Record<string, unknown>>(sql: string, params?: unknown): Promise<T[]> {
+      const result = await invoke<{ columns: string[]; rows: unknown[][] }>('plugin_db_query', {
+        id: pluginId,
+        sql,
+        params: normalize(params),
+      });
+      return toObjects<T>(result);
+    },
+
+    /** 原始形状 `{ columns, rows }`。重名列、或者你只是想要数组时用它。 */
+    queryRaw(sql: string, params?: unknown): Promise<{ columns: string[]; rows: unknown[][] }> {
+      return invoke('plugin_db_query', { id: pluginId, sql, params: normalize(params) });
+    },
+
+    exec(
+      sql: string,
+      params?: unknown
+    ): Promise<{ changes: number; lastInsertRowId: number }> {
+      return invoke('plugin_db_exec', { id: pluginId, sql, params: normalize(params) });
+    },
+
+    /**
+     * 一批语句，**全成功或全回滚**。
+     *
+     * 没有 `begin()` / `commit()`：跨调用的显式事务是**会泄漏的状态**
+     * （插件崩溃、被卸载、或忘了提交，那条写事务就一直挂着），而插件那一侧
+     * 拿不到一个"无论发生什么都会执行"的 `finally`。完整推导见 `db.rs`。
+     */
+    transaction(
+      statements: Array<{ sql: string; params?: unknown }>
+    ): Promise<Array<{ changes: number; lastInsertRowId: number }>> {
+      return invoke('plugin_db_transaction', {
+        id: pluginId,
+        statements: statements.map((statement) => ({
+          sql: statement.sql,
+          params: normalize(statement.params),
+        })),
+      });
+    },
+  };
+}
+
 function pluginDataDir(pluginId: string, manifest: PluginManifest | undefined) {
   const allowed = pluginHasPermission(manifest, 'plugin-data');
 
@@ -1649,6 +1725,22 @@ function createContextFor(
     storage: pluginStorage(pluginId),
     /** 插件私有文件目录。配置与小状态用 `storage`，文件用这个。 */
     dataDir: pluginDataDir(pluginId, manifest),
+    /**
+     * 结构化数据：每插件一个 SQLite 文件。
+     *
+     * ============================================================
+     * 它为什么**不是**第二套实现
+     * ============================================================
+     *
+     * 这三条只是把调用转给 Rust 的 `PluginDatabases` —— 也就是沙箱那条协议路径
+     * 用的**同一个**对象、同一些方法。边界（`ATTACH` 被 authorizer 拒绝、
+     * 页数上限、一次调用只编译一条语句）全部在那一侧，因此两条路径不可能漂开。
+     *
+     * 与 `ctx.storage` / `ctx.dataDir` 的分工：那两个装不下**查询**。一个笔记
+     * 插件要"按标签筛、按更新时间排、取第 3 页"时，只有 `db` 能让 SQLite 去做
+     * 这件事，而不是把所有数据拉进 JS 自己过滤。
+     */
+    db: pluginDatabase(pluginId),
     http: pluginHttp(pluginId),
     logger: pluginLogger(pluginId),
     notifications: pluginNotifications(pluginId, manifest),

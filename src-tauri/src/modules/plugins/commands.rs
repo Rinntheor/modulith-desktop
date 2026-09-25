@@ -441,6 +441,10 @@ pub async fn set_plugin_enabled(
         if let Err(error) = super::sandbox::close_all_surfaces(&app, &id).await {
             log::warn!("停用 {id} 时关闭它的界面失败：{error}");
         }
+        // 数据库连接也要放掉。**文件不动**（§6：卸载删代码、保留数据），
+        // 放掉的只是那个文件句柄 —— 它在 Windows 上会让备份与"数据目录被占用"
+        // 的排查变麻烦，而一个被停用的插件本来也不该继续占着它。
+        close_database(&app, &id);
     }
 
     Ok(outcome)
@@ -459,8 +463,20 @@ pub async fn uninstall_plugin(app: AppHandle, state: State<'_, PluginState>, id:
     if let Err(error) = super::sandbox::close_all_surfaces(&app, &id).await {
         log::warn!("卸载 {id} 时关闭它的界面失败：{error}");
     }
+    close_database(&app, &id);
 
     Ok(())
+}
+
+/// 放掉一个插件的数据库连接（停用 / 卸载）。
+///
+/// **不删文件。** §6 的生命周期表写的是"卸载 → 删代码、**保留数据**"，
+/// 而数据库是数据的一部分 —— 删掉它等于把用户的东西一起删了。
+fn close_database(app: &AppHandle, id: &str) {
+    match app.try_state::<super::db::PluginDatabases>() {
+        Some(databases) => databases.close(id),
+        None => log::debug!("插件数据库表尚未就绪，跳过 {id} 的连接清理"),
+    }
 }
 
 #[tauri::command]
@@ -563,6 +579,72 @@ pub async fn plugin_storage_keys(
 ) -> Result<Vec<String>, String> {
     let manager = state.inner().0.read().await;
     manager.storage_keys(&id).map_err(to_msg)
+}
+
+// ============================================================
+// `ctx.db`：in-process 插件那一条路径
+// ============================================================
+//
+// ============================================================
+// 为什么这三条**不是**第二套实现
+// ============================================================
+//
+// 它们只是把调用转给 `PluginDatabases` —— 也就是沙箱那条协议路径用的**同一个**
+// 对象、同一些方法。边界（authorizer、页数上限、一次一条语句）全部在那个对象里，
+// 因此两条路径不可能漂开。
+//
+// 这与 `rpc.rs` 存在的理由是同一个：同一个 `ctx` 有两个调用方，而"能做什么"
+// 必须只有一处定义。区别只在传输 —— 那边是自定义协议，这边是 Tauri 命令。
+//
+// ============================================================
+// `id` 为什么由前端给
+// ============================================================
+//
+// 与 `plugin_storage_*` 完全一样：in-process 插件与宿主在同一个 realm 里，
+// 这条命令**无法**分辨调用者是宿主还是插件。这是 in-process 的固有性质，
+// 已经写进插件开发文档（"权限列表在 in-process 模式下是声明，不是约束"）。
+// 沙箱那条路径不存在这个问题 —— 身份来自 webview 标签。
+
+#[tauri::command]
+pub async fn plugin_db_query(
+    app: AppHandle,
+    id: String,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<super::db::QueryResult, String> {
+    let databases = app
+        .try_state::<super::db::PluginDatabases>()
+        .ok_or_else(|| "插件数据库尚未就绪".to_string())?;
+    databases
+        .query(&app, &id, &sql, &params.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+pub async fn plugin_db_exec(
+    app: AppHandle,
+    id: String,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<super::db::ExecResult, String> {
+    let databases = app
+        .try_state::<super::db::PluginDatabases>()
+        .ok_or_else(|| "插件数据库尚未就绪".to_string())?;
+    databases
+        .exec(&app, &id, &sql, &params.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+pub async fn plugin_db_transaction(
+    app: AppHandle,
+    id: String,
+    statements: Vec<super::db::Statement>,
+) -> Result<Vec<super::db::ExecResult>, String> {
+    let databases = app
+        .try_state::<super::db::PluginDatabases>()
+        .ok_or_else(|| "插件数据库尚未就绪".to_string())?;
+    databases.transaction(&app, &id, statements).await
 }
 
 /// 删除一个插件的数据目录（**不要求它仍然安装**）。不可撤销。

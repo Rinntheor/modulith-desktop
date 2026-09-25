@@ -5,6 +5,7 @@ pub mod commands;
 pub mod background_manifest;
 pub mod data_dir;
 pub mod data_root;
+pub mod db;
 pub mod icon;
 pub mod manager;
 pub mod permissions;
@@ -56,6 +57,9 @@ impl Module for PluginsModule {
             manager.data_dir().display()
         );
         app.manage(PluginState(Arc::new(RwLock::new(manager))));
+        // 插件数据库的连接表由**插件模块**托管（而不是 desktop 那一边）：
+        // 它服务的是 `ctx.db`，而 `ctx` 的语义全部在 `plugins/` 里。
+        app.manage(db::PluginDatabases::new());
         Ok(())
     }
 }
