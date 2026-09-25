@@ -41,6 +41,25 @@
         "dataDirectory": "webview-tray-menu",
         "width": 268,
         "height": 316
+      },
+      {
+        "label": "overlay",
+        "url": "overlay.html",
+        "title": "Modulith Desktop 浮层",
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "focus": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "dataDirectory": "webview-overlay",
+        "width": 420,
+        "height": 220
       }
     ],
     "security": {

@@ -12,6 +12,7 @@
 pub mod background;
 pub mod close_behavior;
 pub mod commands;
+pub mod overlay;
 pub mod tray;
 pub mod tray_menu;
 
@@ -72,6 +73,12 @@ impl Module for DesktopModule {
         // "该起的没起"，而那种失败表现为随机。
         app.manage(background::plugins::BackgroundPlugins::new());
 
+        // 宿主浮层（对话框与右键菜单）的托管状态。
+        //
+        // 与沙箱界面一样，**这里不显示任何东西** —— 托管一个空壳不创建窗口。
+        // 真正的显示发生在插件调用 `ctx.ui.dialog` / `ctx.ui.contextMenu` 时。
+        app.manage(overlay::Overlay::new());
+
         if let Some(state) = app.try_state::<commands::BackgroundState>() {
             // 把用户在设置里指定的 Node 路径交给后台宿主。
             //
@@ -94,6 +101,13 @@ impl Module for DesktopModule {
         // 挡住别的东西，用户唯一的办法是再点一次托盘图标（而那时它又会重新
         // 显示在同一个地方，看起来像是"点了没反应"）。
         tray_menu::install(app);
+
+        // 宿主浮层"失去焦点就收起来"的行为。
+        //
+        // 与托盘菜单同一套理由：没有它，用户点了别处之后浮层还挂在屏幕上挡着
+        // 东西，而它看起来像"卡住了"。顺带把还在等的插件调用撤掉 ——
+        // 它们已经不可能有回答了。
+        overlay::install(app);
 
         // 托盘装不上不能拖垮启动：它在部分环境里会失败（例如没有桌面会话、
         // 或被系统策略禁用）。失败只记警告，应用照常可用 ——

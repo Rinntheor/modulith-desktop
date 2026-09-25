@@ -248,25 +248,47 @@ const appCommandCapability = capabilityFiles.find((c) => c.identifier === 'app-c
 check(appCommandCapability !== undefined, '存在 app-commands capability');
 
 if (appCommandCapability) {
-  const granted = appPermissions(appCommandCapability);
   const expected = manifestCommands.map((c) => `allow-${slug(c)}`);
-
-  check(
-    granted.length === expected.length,
-    `授权条数与命令数一致（授权 ${granted.length} 条，命令 ${expected.length} 条）`
-  );
-
-  const grantedSet = new Set(granted);
   const expectedSet = new Set(expected);
 
-  const underGranted = expected.filter((id) => !grantedSet.has(id));
-  const overGranted = granted.filter((id) => !expectedSet.has(id));
+  // ============================================================
+  // 命令的授权是**全部 capability 的并集**
+  // ============================================================
+  //
+  // 这里原来只数 `app-commands` 的文件权限条数，于是"每条命令都有人能调"
+  // 与"app-commands 装了全部命令"被当成了同一件事。
+  //
+  // 它们**不是**同一件事：浮层窗口（`overlay.json`）那三条命令**只该授权给
+  // 浮层窗口**，而按"全部塞进 app-commands"的写法，主窗口也能调
+  // `overlay_respond` —— 那等于让它能替用户回答一个它没被问过的问题。
+  //
+  // 因此判据改成两层，各自守一件不同的事：
+  //
+  //   · **没有谁都调不动的命令** —— 每条命令至少被一个 capability 授权；
+  //   · **没有指向不存在命令的授权** —— 反过来，任何一条 `allow-*` 都要有主。
+  //
+  // 最小权限仍然由各自的 capability 的 `webviews` 决定，而"插件 webview 零授权"
+  // 是下面单独一节在守的事。
+  const grantedAll = new Set<string>();
+  for (const capability of capabilityFiles) {
+    for (const id of appPermissions(capability)) grantedAll.add(id);
+  }
+
+  const granted = appPermissions(appCommandCapability);
+
+  const underGranted = expected.filter((id) => !grantedAll.has(id));
+  const overGranted = [...grantedAll].filter((id) => !expectedSet.has(id));
+
+  check(
+    expected.every((id) => expectedSet.has(id)),
+    `命令清单里 ${expected.length} 条命令都推导出了授权标识符`
+  );
 
   check(
     underGranted.length === 0,
     underGranted.length === 0
-      ? '每条命令都被授权了（没有"谁都调不动"的命令）'
-      : `这些命令没有被授权：${underGranted.join(', ')}`
+      ? `每条命令都至少被一个 capability 授权（共 ${expected.length} 条）`
+      : `这些命令谁都调不动（没有任何 capability 授权它们）：${underGranted.join(', ')}`
   );
   check(
     overGranted.length === 0,
@@ -279,8 +301,13 @@ if (appCommandCapability) {
   // 这条断言存在的理由是它**不是**显然的：一个写成下划线的 `allow_get_auth_status`
   // 在构建期会被 Tauri 拒绝（未知权限），但只有真的构建才会发现。
   check(
-    granted.every((id) => id === id.toLowerCase() && !id.includes('_')),
+    [...grantedAll].every((id) => id === id.toLowerCase() && !id.includes('_')),
     '授权标识符都是 kebab-case（与 tauri-build 的自动生成规则一致）'
+  );
+
+  check(
+    granted.every((id) => id.startsWith('allow-')),
+    'app-commands 里只有应用自己的命令授权'
   );
 
   check(
@@ -382,10 +409,21 @@ section('窗口标签的覆盖');
 
 const declaredLabels = tauriConf.app.windows.map((w) => w.label).sort();
 
-// 插件 webview 的标签在 v2.0 才会出现，这里先放行这个前缀，但**只放行前缀**：
-// 一个写成 `plugin-*` 通配的 capability 将来才可能是对的，而写成别的标签
-// （例如某个不存在的窗口）应当立刻失败。
-const KNOWN_LABEL_PATTERNS: RegExp[] = [/^main$/, /^tray-menu$/, /^plugin-\*$/];
+// 已知的 webview 标签。
+//
+// 它由**两部分**组成：
+//
+//   · 从 `tauri.conf.json` 读出来的窗口标签 —— 窗口声明了，它的标签就合法；
+//   · 插件 webview 的前缀 `plugin-*`。那条在 v2.0 才会真的出现，因此这里
+//     只放行**前缀本身**：一个写成别的标签的 capability 应当立刻失败。
+//
+// 这里原本是一个写死的 `[/^main$/, /^tray-menu$/]`，而它每加一个窗口都要记得补
+// 一条 —— 漏补的表现是"新窗口的 capability 报了一个看起来像配置错误的错"，
+// 而真正的原因在这份清单里没人会想到去看。读配置就不可能漂。
+const KNOWN_LABEL_PATTERNS: RegExp[] = [
+  ...declaredLabels.map((label) => new RegExp(`^${label}$`)),
+  /^plugin-\*$/,
+];
 
 {
   const unknownTargets: string[] = [];

@@ -602,6 +602,59 @@
   };
 
   // ============================================================
+  // 宿主渲染的浮层
+  // ============================================================
+  //
+  // 这两条**会阻塞到用户做出选择**（宿主的等待上限是 5 分钟），插件那边就是
+  // 一次普通的 await。
+  //
+  // 为什么不能自己画：这个文档跑在一个原生子 webview 里，宿主页面里的浮层会被
+  // 它盖住 —— 那是两套渲染层的顺序问题，z-index 解决不了。而让插件自己在这里
+  // 画一个"像宿主的"对话框，等于让它**冒充宿主界面**。
+
+  var ui = {
+    /**
+     * 一个**由宿主渲染**的对话框。
+     *
+     * 返回 `{ confirmed, selected, dismissed }`：
+     *   · `confirmed` —— 用户点了确定；
+     *   · `dismissed` —— 用户直接关掉了（点了别处 / Esc）。它与"点了取消"
+     *     不同：取消是一个明确的回答，而这个是**没回答**。
+     *
+     * 选项 `{ tone, title, message, confirmLabel, cancelLabel }`，
+     * 其中 tone 取 info / question / warning / error。
+     * 不给 cancelLabel 时只有一个确定按钮。
+     */
+    dialog: function (options) {
+      var options0 = options || {};
+      return rpc('ui.dialog', {
+        tone: options0.tone === undefined ? 'info' : options0.tone,
+        title: options0.title,
+        message: options0.message === undefined ? '' : options0.message,
+        confirmLabel: options0.confirmLabel === undefined ? '确定' : options0.confirmLabel,
+        cancelLabel: options0.cancelLabel === undefined ? null : options0.cancelLabel,
+      });
+    },
+
+    /**
+     * 宿主渲染的右键菜单。
+     *
+     * items 是 `[{ id, label, accelerator?, separator?, disabled? }]`，
+     * 返回 `{ selected, dismissed }` —— selected 是被选中项的 id。
+     *
+     * **由宿主渲染**的理由与 dialog 一样，另外还有一条：宿主自己的右键菜单
+     * 也走这个窗口，因此插件贡献的菜单项与宿主的菜单**长成同一个样子**。
+     */
+    contextMenu: function (options) {
+      var options0 = options || {};
+      return rpc('ui.contextMenu', {
+        title: options0.title === undefined ? null : options0.title,
+        items: options0.items || [],
+      });
+    },
+  };
+
+  // ============================================================
   // 对外的那一个对象
   // ============================================================
 
@@ -781,6 +834,8 @@
     theme: theme,
 
     shortcuts: shortcuts,
+
+    ui: ui,
 
     disposables: {
       add: disposables.add,

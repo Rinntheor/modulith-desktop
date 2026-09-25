@@ -646,7 +646,77 @@ pub async fn dispatch<R: Runtime>(
             json_ok()
         }
 
+        // ---- 宿主渲染的浮层 --------------------------------------------------
+        //
+        // 这两条**会阻塞到用户做出选择**，等待上限是 `overlay.rs` 里那个 5 分钟。
+        // 插件那边就是一次普通的 await。
+        //
+        // 为什么必须由宿主渲染而不是插件自己画：见 `overlay.rs` 的文件头。
+        // 一句话 —— 沙箱插件的界面是原生子 webview，它盖得住宿主的 DOM；
+        // 而让插件自己画对话框等于让它冒充宿主界面。
+
+        "ui.dialog" => {
+            let Some(title) = arg_str(args, "title") else {
+                return rpc_error("缺少 title");
+            };
+
+            let request = crate::modules::desktop::overlay::OverlayRequest::Dialog {
+                // 由 overlay 分配：配对用的 id 只能有一个来源，两个调用方各自
+                // 生成就有可能撞上，而撞上的表现是"回答给了另一次请求"。
+                id: 0,
+                tone: arg_str(args, "tone").unwrap_or("info").to_string(),
+                title: title.to_string(),
+                message: arg_str(args, "message").unwrap_or("").to_string(),
+                confirm_label: arg_str(args, "confirmLabel").unwrap_or("确定").to_string(),
+                cancel_label: arg_str(args, "cancelLabel").map(str::to_string),
+            };
+
+            ask_overlay(app, request).await
+        }
+
+        "ui.contextMenu" => {
+            let items: Vec<crate::modules::desktop::overlay::MenuItem> = arg(args, "items")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+
+            if items.is_empty() {
+                return rpc_error("菜单一个可选项都没有");
+            }
+
+            let request = crate::modules::desktop::overlay::OverlayRequest::Menu {
+                id: 0,
+                title: arg_str(args, "title").map(str::to_string),
+                items,
+            };
+
+            ask_overlay(app, request).await
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
+    }
+}
+
+/// 显示一次浮层并把它转成 RPC 的结果。
+///
+/// 两个成员共用它：**配对、超时、错误翻译**这三件事只该有一份实现，
+/// 而它们的差别只有请求里的 `kind`。
+async fn ask_overlay<R: Runtime>(
+    app: &AppHandle<R>,
+    request: crate::modules::desktop::overlay::OverlayRequest,
+) -> Result<Value, String> {
+    let Some(state) = app.try_state::<crate::modules::desktop::overlay::Overlay>() else {
+        return rpc_error("浮层尚未就绪");
+    };
+
+    // 浮层窗口是**具体运行时**上声明的那个（`tauri.conf.json`），
+    // 而 `Overlay` 的方法本身是泛型的 —— 因此这里不需要任何转换。
+    match state.ask(app, request).await {
+        Ok(response) => json_value(serde_json::json!({
+            "confirmed": response.confirmed,
+            "selected": response.selected,
+            "dismissed": response.dismissed,
+        })),
+        Err(message) => rpc_error(&message),
     }
 }
 

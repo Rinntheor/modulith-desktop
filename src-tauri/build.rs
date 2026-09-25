@@ -171,6 +171,9 @@ fn main() {
                 "get_plugin_theme",
                 "set_plugin_shortcuts",
                 "get_plugin_shortcuts",
+                "overlay_respond",
+                "overlay_resize",
+                "overlay_hide",
             ]),
         ),
     )

@@ -252,6 +252,62 @@ pub async fn background_plugin_stop(
     state.inner().stop(&id).await
 }
 
+// ============================================================
+// 宿主浮层（对话框与右键菜单）
+// ============================================================
+//
+// 这三条只有浮层窗口用得到（`capabilities/overlay.json` 只授权给它）。
+// 它们是那个窗口**全部**的能力 —— 它不知道是哪个插件在问，也不需要知道。
+//
+// 它们写在这里而不是 `overlay.rs` 里：命令生成器只扫每个模块的 `commands.rs`。
+
+/// 浮层窗口回答一次询问。
+#[tauri::command]
+pub fn overlay_respond(
+    app: AppHandle,
+    state: State<'_, super::overlay::Overlay>,
+    response: super::overlay::OverlayResponse,
+) -> Result<bool, String> {
+    let delivered = state.inner().respond(response);
+
+    if !delivered {
+        // 迟到的回答（用户先按了 Esc，等待已经被撤）。**不是错误** ——
+        // 记 debug 而不是 warn：它真的会发生，而且每次都正常收尾。
+        log::debug!("浮层收到一个没有等待者的回答（多半是超时或失焦之后的迟到响应）");
+    }
+
+    // 回答之后**立即隐藏**。让前端自己再发一条 hide 会多一次往返，
+    // 而中间那一小段时间里浮层还挂在屏幕上。
+    super::overlay::hide(&app);
+    Ok(delivered)
+}
+
+/// 浮层窗口请宿主按内容调整窗口尺寸。
+///
+/// 尺寸**只有浮层自己知道**（一段说明折行之后有多高取决于字号与字体），
+/// 因此由它量、由宿主设 —— 与沙箱界面那条"量的那一侧量、摆的那一侧摆"一致。
+#[tauri::command]
+pub fn overlay_resize(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
+    super::overlay::resize(&app, width, height)
+}
+
+/// 浮层窗口主动收起自己（点别处、Esc）。
+#[tauri::command]
+pub fn overlay_hide(
+    app: AppHandle,
+    state: State<'_, super::overlay::Overlay>,
+) -> Result<(), String> {
+    // 主动收起 = 用户没回答。把等待撤掉，让插件的 await 立刻以"被放弃"结束，
+    // 而不是挂到 5 分钟超时 —— 那多出来的几分钟里插件什么都做不了。
+    let dropped = state.inner().cancel_all();
+    if dropped > 0 {
+        log::debug!("浮层被主动收起，{dropped} 次等待被放弃");
+    }
+
+    super::overlay::hide(&app);
+    Ok(())
+}
+
 /// 一个插件有没有声明后台入口（界面据此决定显示不显示"后台"那一节）。
 ///
 /// 做成独立命令而不是让前端去解析清单：`contributes.background` 的合法形状由

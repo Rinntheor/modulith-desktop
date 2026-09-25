@@ -891,6 +891,10 @@ section('完整 API 表面');
       ['events.emit', isFunction],
       ['events.on', isFunction],
 
+      // 3.4 界面 · 宿主渲染的浮层
+      ['ui.dialog', isFunction],
+      ['ui.contextMenu', isFunction],
+
       // 3.4 界面 · 主题
       ['theme.current', isFunction],
       ['theme.tokens', isFunction],
@@ -1196,6 +1200,110 @@ section('快捷键链路');
     '快捷键表有长度上限（它会被注入每一个插件文档）'
   );
 }
+
+// ============================================================
+// 14. 宿主浮层：对话框与菜单必须由**窗口**渲染
+// ============================================================
+//
+// 沙箱插件的界面是一个原生子 webview，层级高于宿主文档的任何元素。宿主页面
+// 里画出来的浮层会被它整个盖住 —— z-index 写多大都没用，那是两套渲染层的
+// 顺序问题。因此浮层必须是一个独立的窗口。
+
+section('宿主浮层');
+
+{
+  const viteConf = read('../vite.config.ts');
+  const rpcRs = read('../src-tauri/src/modules/plugins/rpc.rs');
+  const overlayRs = read('../src-tauri/src/modules/desktop/overlay.rs');
+  const commandsRs = read('../src-tauri/src/modules/desktop/commands.rs');
+  const overlayRoot = read('../src/overlay/OverlayRoot.tsx');
+  const overlayHtmlExists = exists('../overlay.html');
+
+  // 独立入口必须登记进 Vite 的多入口配置。
+  //
+  // 漏登记时**开发模式一切正常**（Vite 按 URL 提供任意 HTML），而发布版里
+  // 这个窗口是空白的 —— 那正是托盘菜单曾经踩过的坑，注释里写着。
+  check(overlayHtmlExists, 'overlay.html 存在（浮层是独立入口）');
+  check(
+    /overlay: path\.resolve\(__dirname, 'overlay\.html'\)/.test(viteConf),
+    'overlay.html 登记进了 vite 的多入口（漏了的话发布版里这个窗口是空白的）'
+  );
+
+  // 请求/回答的配对与超时只有一份实现。
+  check(
+    /async fn ask_overlay/.test(rpcRs) &&
+      /"ui\.dialog"[\s\S]{0,1200}?ask_overlay\(app, request\)\.await/.test(rpcRs) &&
+      /"ui\.contextMenu"[\s\S]{0,1200}?ask_overlay\(app, request\)\.await/.test(rpcRs),
+    '对话框与菜单走同一条配对/超时路径（两份实现会各自漂）'
+  );
+
+  // **必须有超时**：浮层没显示出来时，那条 await 会永远挂着 ——
+  // 而插件作者看到的是"我的代码没问题，就是没反应"。
+  check(
+    /RESPONSE_TIMEOUT/.test(overlayRs) && /tokio::time::timeout\(RESPONSE_TIMEOUT/.test(overlayRs),
+    '等待回答有超时（否则插件会永远挂着）'
+  );
+
+  // 显示失败必须**把登记撤掉**，否则那条等待只能靠超时结束。
+  check(
+    /if let Err\(error\) = show\(app, &request\)[\s\S]{0,400}?\.remove\(&id\)/.test(overlayRs),
+    '浮层显示失败时撤销登记（否则等待只能靠超时结束）'
+  );
+
+  // 配对用的 id **由 overlay 分配**，不由调用方传。
+  //
+  // 两个调用方各自生成就有可能撞上，而撞上的表现是"回答给了另一次请求"——
+  // 那比没有回答更糟：插件会拿到一个它没问过的结果。
+  check(
+    /self\.next_id\.fetch_add\(1, Ordering::SeqCst\)/.test(overlayRs) &&
+      /match &mut request \{[\s\S]{0,300}?\*slot = id/.test(overlayRs),
+    '配对 id 由 overlay 统一分配（两个来源会撞号）'
+  );
+
+  // 前端必须**先回答、后隐藏**。
+  //
+  // 反过来的话，隐藏会触发 `Focused(false)`，宿主在那条路径上把这次等待当成
+  // "用户没回答"（dismissed）—— 于是用户点了「确定」，插件收到的却是"被放弃"。
+  const answerFn = /async function answer\([\s\S]*?\n\}/.exec(overlayRoot);
+  check(answerFn !== null, 'OverlayRoot 里有统一的上报入口');
+  if (answerFn) {
+    const reported = answerFn[0].indexOf("invoke('overlay_respond'");
+    const dismissed = answerFn[0].indexOf("invoke('overlay_hide'");
+    check(
+      reported !== -1 && dismissed !== -1 && reported < dismissed,
+      '先回答再隐藏（顺序反了会让「确定」被当成「被放弃」）'
+    );
+  }
+
+  // 尺寸由**量的那一侧**量、由宿主设，且宿主会钳制。
+  check(
+    /invoke\('overlay_resize'/.test(overlayRoot) &&
+      /width\.clamp\(MIN_WIDTH, MAX_WIDTH\)/.test(overlayRs),
+    '尺寸由内容量、由宿主钳制（一个量错的尺寸不该让窗口消失或铺满屏幕）'
+  );
+
+  // 失焦必须收起，并把等待撤掉。
+  check(
+    /WindowEvent::Focused\(false\)/.test(overlayRs) && /cancel_all\(\)/.test(overlayRs),
+    '浮层失焦时收起并撤销等待（否则它一直挡着，而等待只能靠超时结束）'
+  );
+
+  // 那三条命令必须在 `commands.rs` 里 —— 生成器只扫那个文件。
+  //
+  // 写在 `overlay.rs` 里会被 `AppManifest::commands` 收进去、却不会被
+  // `generate_handler!` 注册，于是它在运行期表现为"调用了不存在的命令"。
+  for (const command of ['overlay_respond', 'overlay_resize', 'overlay_hide']) {
+    check(
+      commandsRs.includes(`pub fn ${command}(`),
+      `${command} 写在 desktop/commands.rs 里（生成器只扫那个文件）`
+    );
+    check(
+      !overlayRs.includes(`pub fn ${command}(`),
+      `${command} 没有同时留在 overlay.rs 里（两份会被生成器漏掉一份）`
+    );
+  }
+}
+
 
 
 // ============================================================

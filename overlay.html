@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Modulith Desktop</title>
+
+    <!--
+      浮层窗口：**由宿主渲染**的对话框与右键菜单。
+
+      为什么必须是独立窗口而不是主窗口里的一段 DOM ——
+
+        · 沙箱插件的界面是一个**原生子 webview**，层级高于宿主文档的任何元素。
+          宿主页面里画出来的浮层会被它整个盖住，z-index 写多大都没用。
+          那不是样式问题，是两套渲染层的顺序问题；
+        · 让插件自己画对话框等于让它**冒充宿主界面**（一个长得和系统确认框
+          一模一样的提示框，用来骗用户点"允许"）。由宿主渲染之后，插件能决定的
+          只有「问什么」，不能决定「长什么样」。
+
+      它与托盘菜单遇到的是同一个问题、用的是同一个解法（自绘、无边框、透明、
+      置顶），因此这里的结构与 tray-menu.html 一致。
+
+      这里**只有**最小的一份预置：把当前主题写到 html 上，避免首帧用错底色。
+      完整的主题与配色由入口脚本调用宿主自己的 services 装上 —— 手上再抄一份
+      配色算法，就又多了一处会与宿主漂开的地方（tray-menu.html 里那份已经是
+      第二份了）。
+    -->
+    <script>
+      (function () {
+        var root = document.documentElement;
+        try {
+          var theme = localStorage.getItem('modulith.theme');
+          var prefersDark =
+            theme === 'dark' ||
+            (theme !== 'light' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          root.dataset.theme = theme || 'system';
+          root.dataset.resolvedTheme = prefersDark ? 'dark' : 'light';
+          if (prefersDark) root.classList.add('dark');
+        } catch (error) {
+          // localStorage 不可用时按深色处理（与 index.html 同样的取舍）
+          root.classList.add('dark');
+        }
+      })();
+    </script>
+
+    <style>
+      /*
+       * 透明底：圆角与投影由面板自己画。
+       *
+       * 窗口如果是不透明的，圆角外面会带出一圈窗口底色 —— 那正是"自绘浮层"
+       * 最容易露馅的地方。
+       */
+      :root {
+        background: transparent;
+        color-scheme: dark light;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="overlay-root"></div>
+    <script type="module" src="/src/overlay/main.tsx"></script>
+  </body>
+</html>
