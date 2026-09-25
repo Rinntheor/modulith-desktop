@@ -78,6 +78,20 @@ export interface ModuleDescriptor {
    * 面板（用户能找到并固定出来），而 `hidden` 连那里都不进。
    */
   hidden?: boolean;
+  /**
+   * 徽标的语气（`ctx.ui.badge` 的 `tone`）。
+   *
+   * 只用来选一组颜色类名，**不参与任何判定** —— 它是插件的一句自我描述。
+   * 白名单在 Rust 那一侧；这里认不出来的值一律按 `info` 渲染。
+   */
+  badgeTone?: string;
+  /**
+   * 进度（`ctx.ui.progress`）。`undefined` = 没有进度。
+   *
+   * `value` 为 `null` 表示**不定量**（转圈），而不是"0"。两者在界面上完全不同，
+   * 折成同一个值会让"我在忙"要么一直显示、要么从来不显示。
+   */
+  progress?: { value: number | null; label?: string };
 }
 
 export interface ModuleTomlChild {

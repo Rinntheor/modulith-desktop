@@ -62,9 +62,18 @@ export interface SurfaceBounds {
 export function openSandboxSurface(
   pluginId: string,
   bounds: SurfaceBounds,
-  surface?: string
+  surface?: string,
+  visible?: boolean
 ): Promise<void> {
-  return invoke('sandbox_surface_open', { pluginId, surface: surface ?? null, bounds });
+  return invoke('sandbox_surface_open', {
+    pluginId,
+    surface: surface ?? null,
+    bounds,
+    // `undefined` 而不是 `false`：缺省是"显示"，而显式 `false` 是**启动占位**
+    // 那条路径（webview 建出来但先不显示）。两者必须分得开 —— 把 `undefined`
+    // 折成 `false` 会让每一次正常打开都建出一块看不见的界面。
+    visible: visible,
+  });
 }
 
 /**

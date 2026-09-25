@@ -1148,7 +1148,7 @@ pub async fn open_selftest<R: Runtime>(app: &AppHandle<R>) -> Result<(), String>
     };
 
     actor(app)?
-        .show(&label_for(SELFTEST_ID), SELFTEST_ID, bounds)
+        .show(&label_for(SELFTEST_ID), SELFTEST_ID, bounds, true)
         .await
 }
 
@@ -1186,6 +1186,7 @@ pub async fn open_surface_at<R: Runtime>(
     plugin_id: &str,
     surface: &str,
     bounds: SurfaceBounds,
+    visible: bool,
 ) -> Result<(), String> {
     let view = {
         let Some(state) = app.try_state::<super::PluginState>() else {
@@ -1219,7 +1220,7 @@ pub async fn open_surface_at<R: Runtime>(
     let key = SurfaceKey::new(view.id.clone(), surface);
     let label = surfaces.claim(key)?;
 
-    match actor(app)?.show(&label, &view.id, bounds).await {
+    match actor(app)?.show(&label, &view.id, bounds, visible).await {
         Ok(()) => Ok(()),
         Err(e) => {
             // 建失败就把占位撤掉：留一条指向不存在界面的记录，会让下一次
@@ -1321,6 +1322,69 @@ pub fn live_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Vec<Str
     app.try_state::<SandboxSurfaces>()
         .map(|surfaces| surfaces.surfaces_of(plugin_id))
         .unwrap_or_default()
+}
+
+/// 把一条**命令**送进插件的界面。
+///
+/// ============================================================
+/// 这是跨 realm 的唯一办法，不是绕路
+/// ============================================================
+///
+/// 沙箱插件的代码在它自己的 webview 里，宿主**拿不到它的任何函数** ——
+/// 函数的引用过一次 realm 边界就消失了。因此"执行插件的某条命令"在这里只能是
+/// "告诉它有人点了这条命令"，由它自己在文档里决定做什么。
+///
+/// 桥接层据此挂了 `Modulith.commands.on(id, handler)`；没有注册处理器的命令会被
+/// 静默忽略。这与 in-process 插件不同（那边缺处理器会在命令面板里报错），
+/// 而差别是刻意的：沙箱插件的命令**可以**在它还没加载完时就被点，那时没有处理器
+/// 是正常状态，不是缺陷。
+///
+/// ============================================================
+/// 推给哪几块界面
+/// ============================================================
+///
+/// 默认推给这个插件**全部活着的界面**：命令是插件级的（清单里 `commands[].id`
+/// 不带界面），在哪块界面里响应由插件自己决定。
+///
+/// `only` 给了一个界面名时只推那一块 —— 用在"这次调用是从哪块界面发起的"有意义
+/// 的地方（目前是 `ui.contextMenu`：右键菜单出现在某一块界面上，用户点的那一条
+/// 理应回到那块界面）。
+pub async fn deliver_command<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    command: &str,
+    only: Option<&str>,
+) {
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        return;
+    };
+    let Some(actor) = app.try_state::<super::surface::SurfaceActor>() else {
+        return;
+    };
+
+    // 用 `JSON.parse` 包一层而不是把命令名直接拼进源码：命令名来自清单，而清单是
+    // 外部输入 —— 一个含引号的 id 会把这段脚本拼坏，而那种失败看起来像"宿主推了
+    // 一段坏脚本"，离真正的原因很远。
+    let payload = serde_json::json!({ "command": command }).to_string();
+    let script = format!(
+        "window.__modulithCommand && window.__modulithCommand(JSON.parse({}));",
+        js_string(&payload)
+    );
+
+    for (label, key) in surfaces.live() {
+        if key.plugin_id != plugin_id {
+            continue;
+        }
+        if let Some(only) = only {
+            if key.surface != only {
+                continue;
+            }
+        }
+
+        if let Err(error) = actor.eval(&label, script.clone()).await {
+            log::debug!("向沙箱界面 {label} 推送命令 {command} 失败：{error}");
+        }
+    }
 }
 
 /// 取界面所有者线程的句柄。

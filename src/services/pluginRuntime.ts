@@ -35,6 +35,7 @@ import {
   registerSurfaceModules,
   unregisterSurfaceModules,
 } from './pluginSurfaces';
+import { clearPluginUiState } from './pluginUiState';
 import type {
   ActivationEvent,
   CommandContribution,
@@ -705,6 +706,79 @@ export async function runPluginContextMenuEntry(entry: PluginContextMenuEntry): 
 
   await activatePlugin(entry.pluginId, activationEventForContextMenu(menu.id));
   await runPluginCommand(entry.pluginId, menu.command);
+}
+
+/**
+ * 宿主把一条命令交给 **in-process** 插件执行时走这里。
+ *
+ * ============================================================
+ * 为什么这件事需要一个 Tauri 事件，而不是宿主直接调
+ * ============================================================
+ *
+ * 触发点可能在 Rust 那边：`ctx.ui.contextMenu` 里选中了一条**清单声明**的条目时，
+ * 浮层是由宿主显示并等待回答的（`desktop/overlay.rs`），所以"有人选了哪一条"
+ * 只有 Rust 知道。而 in-process 插件的命令处理器是宿主这个 realm 里的一个函数 ——
+ * Rust 碰不到它。
+ *
+ * 因此 Rust 广播一个事件，这里把它落成一次 `runPluginCommand`。
+ * 沙箱插件**不走这条路**：它的命令由宿主直接推进它的界面
+ * （见 `sandbox.rs::deliver_command`）—— 那条路径更短，而且不需要前端参与。
+ */
+export const PLUGIN_COMMAND = 'modulith://plugin-command';
+
+interface PluginCommandRequest {
+  pluginId: string;
+  command: string;
+}
+
+/**
+ * 装上"宿主请求执行某条插件命令"的监听。返回退订函数。
+ *
+ * 失败只记一条警告：这条通道只服务 in-process 插件的右键菜单项，
+ * 它不可用不该让启动路径抛异常。
+ */
+export function installPluginCommandDispatch(): () => void {
+  let disposed = false;
+  let stop: (() => void) | null = null;
+
+  void (async () => {
+    try {
+      const { listen } = await import('@tauri-apps/api/event');
+      const off = await listen<PluginCommandRequest>(PLUGIN_COMMAND, (event) => {
+        const payload = event.payload;
+        if (!payload?.pluginId || !payload.command) return;
+
+        // 不 await：事件回调不该被一次慢的插件初始化钉住，而且失败了也没有
+        // 人能等它。失败必须自己变成可见的东西 —— 否则用户看到的是"点了没反应"。
+        void runPluginCommand(payload.pluginId, payload.command).catch(async (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(
+            `[pluginRuntime] 插件 "${payload.pluginId}" 的命令 "${payload.command}" 执行失败:`,
+            error
+          );
+          await pushNotification({
+            title: `插件命令执行失败：${payload.command}`,
+            body: message,
+            level: 'error',
+            source: payload.pluginId,
+          }).catch(() => {});
+        });
+      });
+
+      if (disposed) {
+        off();
+        return;
+      }
+      stop = off;
+    } catch (error) {
+      console.warn('[pluginRuntime] 无法订阅插件命令广播（右键菜单项将不可用）:', error);
+    }
+  })();
+
+  return () => {
+    disposed = true;
+    stop?.();
+  };
 }
 
 function notify(): void {
@@ -2199,6 +2273,7 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
   // 声明的模块 —— `contract.declarative` 说的是"这个插件的模块来自清单"，
   // 与"它的界面模块要不要撤"是两件事。
   unregisterSurfaceModules(pluginId);
+  clearPluginUiState(pluginId);
   if (!contract?.declarative) {
     unregisterDynamicModules(pluginId);
   }
@@ -2298,6 +2373,7 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
     cleanupInjected(pluginId);
     cleanupPluginResources(pluginId);
     unregisterSurfaceModules(pluginId);
+    clearPluginUiState(pluginId);
     if (!contract?.declarative) {
       unregisterDynamicModules(pluginId);
     }
@@ -2319,6 +2395,9 @@ export function unloadPlugin(pluginId: string): void {
   cleanupInjected(pluginId);
   cleanupPluginResources(pluginId);
   unregisterSurfaceModules(pluginId);
+  // 徽标/进度/占位都留着的话，一个被卸载的插件会继续在侧边栏上显示"3 条新消息"，
+  // 而那个数字再也没有人会去更新它。
+  clearPluginUiState(pluginId);
   unregisterDynamicModules(pluginId);
   loadStates.delete(pluginId);
 }

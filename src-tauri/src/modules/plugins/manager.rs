@@ -578,6 +578,22 @@ impl SandboxView {
     }
 }
 
+/// 一条**清单声明**的右键菜单条目。
+///
+/// 与前端 `ContextMenuContribution` 逐字对应。它不是 `serde` 反序列化的结果，
+/// 而是从自由形状的 `contributes` 里挑出来的 —— 因此缺字段时是"跳过这一条"，
+/// 而不是整份清单失败。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclaredMenuItem {
+    pub id: String,
+    pub label: String,
+    /// 被执行的命令的**本地** id（与 `contributes.commands[].id` 对齐）
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
 impl PluginManager {
     /// 取一个插件的沙箱视图。
     ///
@@ -639,8 +655,68 @@ impl PluginManager {
         })
     }
 
-    /// 一个后台（无界面）插件启动所需的事实。
+    /// 一个插件声明的右键菜单条目（`contributes.contextMenus`）。
     ///
+    /// ============================================================
+    /// 为什么在这里读，而不是让前端先读好再传进来
+    /// ============================================================
+    ///
+    /// `ctx.ui.contextMenu({ includeDeclared: true })` 要在**宿主渲染的那次浮层**
+    /// 里出现插件声明的条目。而浮层是由 Rust 这一侧显示并等待回答的
+    /// （见 `desktop/overlay.rs`）—— 让前端先读一遍清单再把条目传上来的话，
+    /// 这条路径上就多了一次往返，而且**清单可能在两者之间被改掉**
+    /// （开发链接下这是常态），于是显示出来的条目与实际能执行的对不上。
+    ///
+    /// 形状校验同样只有一处：菜单项的字段缺失/类型不对时**跳过那一条**，而不是
+    /// 整份清单失败 —— 一个写坏的菜单项不该让插件装不上。这与
+    /// `background_manifest::parse` 是同一条取舍。
+    pub fn context_menus(&self, id: &str) -> PluginResult<Vec<DeclaredMenuItem>> {
+        let Some(entry) = self.registry.get(id) else {
+            return Err(PluginError::NotFound(format!("插件不存在: {id}")));
+        };
+        if !entry.enabled {
+            return Ok(Vec::new());
+        }
+
+        let root = self.asset_root(entry);
+        let manifest = read_manifest(&root)?;
+
+        let Some(items) = manifest
+            .contributes
+            .as_ref()
+            .and_then(|value| value.get("contextMenus"))
+            .and_then(|value| value.as_array())
+        else {
+            return Ok(Vec::new());
+        };
+
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let menu_id = item.get("id")?.as_str()?.trim();
+                let label = item.get("label")?.as_str()?.trim();
+                let command = item.get("command")?.as_str()?.trim();
+
+                if menu_id.is_empty() || label.is_empty() || command.is_empty() {
+                    return None;
+                }
+
+                Some(DeclaredMenuItem {
+                    id: menu_id.to_string(),
+                    label: label.to_string(),
+                    command: command.to_string(),
+                    group: item
+                        .get("group")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                })
+            })
+            .collect())
+    }
+
+    /// 一个后台（无界面）插件启动所需的事实。
     /// 返回 `Ok(None)` 表示**这个插件没有后台声明**，因此不该被拉起 ——
     /// 与"声明了但有问题"（`Err`）分开：前者是常态，后者要能被界面说出来。
     ///

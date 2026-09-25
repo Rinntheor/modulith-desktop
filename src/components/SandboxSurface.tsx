@@ -74,6 +74,11 @@ import {
   setSandboxSurfaceBounds,
   type SurfaceBounds,
 } from '../services/sandboxSurface';
+import {
+  beginHostSplash,
+  getPluginSplash,
+  subscribePluginUi,
+} from '../services/pluginUiState';
 
 interface SandboxSurfaceProps {
   pluginId: string;
@@ -170,6 +175,19 @@ const CONFIRMATIONS = 2;
 const POLL_MS = 150;
 
 /**
+ * 启动占位的语气 → 文字颜色。
+ *
+ * 只改文字颜色，不改底色：占位那块底色必须与内容区一致（`bg-white`，深色模式下
+ * 由 `dark-theme.css` 覆盖）—— 换一个底色会让它看起来像一块**弹窗**，
+ * 而它其实只是"这块位置还没准备好"。
+ */
+const SPLASH_TONES: Record<string, string> = {
+  info: 'text-gray-400',
+  warning: 'text-amber-600',
+  error: 'text-rose-600',
+};
+
+/**
  * 同一条警告只说一次。
  *
  * 遮挡轮询每 150ms 跑一次，量不到视口时若每次都写一行，日志会被同一句话淹掉 ——
@@ -192,7 +210,31 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
   // 「宿主浮层是否盖在它上面」。判据见 isCovered。
   const [covered, setCovered] = useState(false);
 
+  // 界面 id 的缺省值。**只有这一处**允许把缺省写出来。
+  //
+  // `SandboxSurface` 是被 `ModuleRenderer` 按描述符渲染的，而描述符来自插件清单 ——
+  // 单界面插件根本不写 `surface`。缺省在**四条命令**里也各有一份（Rust 侧），
+  // 而这里这一份决定了组件"认为自己在哪一块界面"，两边不一致的话
+  // `hide` 会作用在另一块上。
+  const surfaceId = surface ?? 'main';
+
+  // 「这块界面是不是还在启动」。为真时宿主自己画一块占位，并把插件的 webview
+  // 先收起来（原生 webview 盖在 DOM 之上，不让开的话占位根本看不见）。
+  const [splash, setSplash] = useState(() => getPluginSplash(pluginId, surfaceId));
+  useEffect(() => subscribePluginUi(() => setSplash(getPluginSplash(pluginId, surfaceId))), [
+    pluginId,
+    surfaceId,
+  ]);
+
   const visible = active && !covered;
+
+  /**
+   * 这块界面**曾经被建出来过**吗。
+   *
+   * 只用来决定"切标签回来时要不要再立一次启动占位" —— webview 还活着的时候
+   * 再闪一次"正在启动"是错的：插件自己的界面状态都还在，它并没有在启动。
+   */
+  const everOpened = useRef(false);
 
   /**
    * 把矩形交给宿主。
@@ -207,9 +249,12 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
    *
    * 所以这一层永远往"能用"那一侧倒：先打开；如果确实被盖着，轮询会在两次确认
    * 之后（约 300ms）把它收起来。宁可闪一下，不可打不开。
+   *
+   * `withSplash` 是**启动占位**那条路径：webview 照样要建出来（它的文档要开始
+   * 加载，加载完才会把占位撤掉），但先不显示 —— 那块位置这一帧属于宿主画的占位。
    */
   const apply = useCallback(
-    (mode: 'open' | 'bounds') => {
+    (mode: 'open' | 'bounds', withSplash = false) => {
       const element = holder.current;
       if (!element) return;
 
@@ -229,25 +274,60 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
 
       // 失败只记一条日志：界面没建出来不该把整个模块渲染炸掉，
       // 那样用户看到的是一个空白页而不是一条能读的原因。
-      call(pluginId, bounds, surface).catch((error) => {
+      call(pluginId, bounds, surfaceId, withSplash ? false : undefined).catch((error) => {
         console.warn(
           `[sandboxSurface] ${pluginId} 的界面${mode === 'open' ? '打开' : '摆放'}失败`,
           error
         );
       });
     },
-    [pluginId, surface]
+    [pluginId, surfaceId]
   );
 
-  // ---- 可见性：显示或隐藏（不销毁）----
+  // ---- 可见性：显示或隐藏（不销毁），以及启动占位 ----
+  //
+  // ============================================================
+  // 一条规则，两个状态
+  // ============================================================
+  //
+  //   * 有占位 → webview **收起来**（那块位置这一帧属于宿主画的占位；
+  //     原生 webview 盖在 DOM 之上，不让开的话占位根本看不见）；
+  //   * 没占位 → webview **显示出来**并摆正。
+  //
+  // 只有一条规则是有意的。曾经想过"占位只在第一次打开时出现"，然后给"插件后来
+  // 自己立了一块占位"单开一条分支 —— 那条分支的后果是：插件说"我在忙"，而屏幕上
+  // 什么都没有（它的占位被自己的 webview 盖住了）。一条规则让那种状态不可能出现。
+  //
+  // ============================================================
+  // `everOpened` 解决的是什么
+  // ============================================================
+  //
+  // 切标签回来**不该再闪一次"正在启动"**：webview 还活着，插件自己的界面状态
+  // 也还在。因此宿主占位只在**这块界面从来没被建过**时才立。
+  //
+  // 它是 `useRef` 而不是 state：它不影响渲染结果，只影响"下一次该不该立占位"，
+  // 而放进 state 会让这个 effect 因为自己写的东西而再跑一遍。
   useEffect(() => {
     if (!visible) {
       // 不可见：收起来。留着它会让原生 webview 盖在别的标签或宿主浮层上。
-      void hideSandboxSurface(pluginId, surface).catch(() => {});
+      void hideSandboxSurface(pluginId, surfaceId).catch(() => {});
       return;
     }
-    apply('open');
-  }, [visible, apply, pluginId, surface]);
+
+    if (!everOpened.current) {
+      everOpened.current = true;
+      // 先立占位，再建 webview —— 而且建出来就**不显示**。
+      //
+      // 反过来（先建再收）会有一帧 webview 已经显示出来的闪烁，而这一条路径
+      // 每次打开插件都会走到。`beginHostSplash` 是幂等的：布局变化重复调用
+      // 不会把超时重置掉（否则一个真的卡住的插件永远等不到兜底）。
+      beginHostSplash(pluginId, surfaceId);
+      apply('open', true);
+      return;
+    }
+
+    apply('open', splash !== null);
+  }, [visible, splash, apply, pluginId, surfaceId]);
 
   // ---- 几何：尺寸与位置变化，以及宿主滚动 ----
   useEffect(() => {
@@ -332,23 +412,68 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
   // 不销毁的话，切过的每一个沙箱插件都会留下一个渲染进程。
   useEffect(() => {
     return () => {
-      void closeSandboxSurface(pluginId, surface).catch(() => {});
+      void closeSandboxSurface(pluginId, surfaceId).catch(() => {});
     };
   }, [pluginId, surface]);
 
   return (
-    <div
-      ref={holder}
-      // **零尺寸的锚点，刻意不是"占满父容器"。**
-      //
-      // 这里曾经写的是 `h-full w-full`，本意是"占住内容区"。但 `h-full` 是
-      // 父元素高度的 100%，而父级 `div.p-8` 的高度由内容决定 —— 内容是空的，
-      // 于是高度是 0。矩形现在由 `measureSurface` 从内容视口算出来，这个 div
-      // 只负责两件事：把插件界面挂进正确的标签面板（`closest`），
-      // 以及让读屏软件知道这里没有内容。
-      className="h-0 w-0"
-      aria-hidden="true"
-    />
+    <>
+      <div
+        ref={holder}
+        // **零尺寸的锚点，刻意不是"占满父容器"。**
+        //
+        // 这里曾经写的是 `h-full w-full`，本意是"占住内容区"。但 `h-full` 是
+        // 父元素高度的 100%，而父级 `div.p-8` 的高度由内容决定 —— 内容是空的，
+        // 于是高度是 0。矩形现在由 `measureSurface` 从内容视口算出来，这个 div
+        // 只负责两件事：把插件界面挂进正确的标签面板（`closest`），
+        // 以及让读屏软件知道这里没有内容。
+        //
+        // **它必须保持"不定位于"（不带 `relative`）**：下面那块占位用的是
+        // `absolute inset-0`，它要相对 `.lc-tab-panel` 铺满 —— 而那正是
+        // `measureSurface` 量出来的同一块矩形。给锚点加上 `relative` 会让占位
+        // 缩成一个 0×0 的点，症状是"点了插件之后什么都没有"。
+        className="h-0 w-0"
+        aria-hidden="true"
+      />
+
+      {/*
+        启动占位。**由宿主渲染** —— 理由与浮层那三样一样，而且这里还多一条硬的：
+        插件的 webview 已经建出来了（它的文档要开始加载），宿主想在那块位置上画
+        任何东西，就必须先把 webview 收起来。收起来这件事由上面的 effect 做。
+
+        内容刻意极简：一句话 +（有进度时）一条细线。它是**等待**，不是界面 ——
+        长得越像界面，用户越会去点它。
+      */}
+      {visible && splash && (
+        <div
+          className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="flex items-center gap-2">
+            <div className="h-4 w-1 animate-pulse rounded-full bg-indigo-500/50" />
+            <span className={`text-xs ${SPLASH_TONES[splash.tone]}`}>{splash.text}</span>
+          </div>
+
+          {splash.progress !== null && (
+            <div className="h-0.5 w-32 overflow-hidden rounded-full bg-gray-100">
+              <div
+                className="h-full rounded-full bg-indigo-500 transition-[width] duration-200"
+                style={{ width: `${Math.round(splash.progress * 100)}%` }}
+              />
+            </div>
+          )}
+
+          {/* 不定量进度：来回跑的一条细线。它与上面那条的区别是"多久"这件事
+              插件自己也不知道 —— 而画一条永远停在 0% 的定量条会让人以为卡住了。 */}
+          {splash.progress === null && splash.auto === false && (
+            <div className="h-0.5 w-32 overflow-hidden rounded-full bg-gray-100">
+              <div className="h-full w-1/3 animate-pulse rounded-full bg-indigo-500" />
+            </div>
+          )}
+        </div>
+      )}
+    </>
   );
 };
 

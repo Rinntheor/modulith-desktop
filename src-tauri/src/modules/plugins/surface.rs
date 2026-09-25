@@ -125,11 +125,20 @@ type Outcome = Result<(), String>;
 
 /// 交给所有者线程的活。**每一种都会改动真实窗口**，因此只能在那里执行。
 enum Job {
-    /// 建（或复用）并显示，同时摆到给定矩形。
+    /// 建（或复用）并摆到给定矩形，然后按 `visible` 显示或隐藏。
+    ///
+    /// `visible: false` 是**启动占位**那条路径（`ctx.ui.splash`）：宿主自己要
+    /// 在那一块位置上画一块 DOM 占位，而原生 webview 盖在 DOM 之上 ——
+    /// 于是只能把 webview 先建出来但**不显示**。先建出来是必须的：插件文档要
+    /// 开始加载，它加载完才会把自动占位撤掉。
+    ///
+    /// 没有"先 show 再 hide"那种写法：那是一帧肉眼可见的闪烁，而这一条路径
+    /// 每次打开插件都会走到。
     Show {
         label: String,
         plugin_id: String,
         bounds: SurfaceBounds,
+        visible: bool,
         reply: Reply,
     },
     /// 重新摆放。界面不存在时静默成功 —— 布局变化时前端会无条件调用它。
@@ -191,12 +200,13 @@ impl SurfaceActor {
         }
     }
 
-    /// 建（或复用）并显示一个界面，同时摆正。
+    /// 建（或复用）并摆正，按 `visible` 显示或隐藏。
     pub async fn show(
         &self,
         label: &str,
         plugin_id: &str,
         bounds: SurfaceBounds,
+        visible: bool,
     ) -> Outcome {
         let label = label.to_string();
         let plugin_id = plugin_id.to_string();
@@ -204,6 +214,7 @@ impl SurfaceActor {
             label,
             plugin_id,
             bounds,
+            visible,
             reply,
         })
         .await
@@ -286,16 +297,17 @@ fn run(app: AppHandle, jobs: Receiver<Job>) {
                 label,
                 plugin_id,
                 bounds,
+                visible,
                 reply,
             } => {
-                let outcome = show(&app, &label, &plugin_id, bounds);
+                let outcome = show(&app, &label, &plugin_id, bounds, visible);
                 if outcome.is_ok() {
                     residents.insert(
                         label.clone(),
                         Resident {
                             plugin_id,
                             last_used: Instant::now(),
-                            visible: true,
+                            visible,
                         },
                     );
                     enforce_cap(&app, &mut residents);
@@ -473,12 +485,13 @@ fn report(action: &str, label: &str, outcome: Outcome) -> Outcome {
 // 全部**只在所有者线程上**被调用。它们是本仓库里唯一还引用
 // `add_child` / `close` / `set_position` / `set_size` / `show` / `hide` 的地方。
 
-/// 建（或复用）并显示，同时摆正。
+/// 建（或复用）并摆正，按 `visible` 显示或隐藏。
 fn show<R: Runtime>(
     app: &AppHandle<R>,
     label: &str,
     plugin_id: &str,
     bounds: SurfaceBounds,
+    visible: bool,
 ) -> Outcome {
     if app.get_webview(label).is_none() {
         create(app, label, plugin_id, bounds)?;
@@ -490,9 +503,19 @@ fn show<R: Runtime>(
 
     // 复用路径（切标签回来）必须显式 `show` —— 它上一次是被 `hide` 收起来的，
     // 而"摆放"不会把它重新显示出来。
-    webview
-        .show()
-        .map_err(|e| format!("显示 {label} 失败：{e}"))?;
+    //
+    // `visible: false` 那条路径（`ctx.ui.splash` 的启动占位）同样必须显式 `hide`：
+    // 刚刚 `create` 出来的 webview 默认是显示的，不收起的话它会盖住宿主正要画的
+    // 那块占位 —— 而"盖住了"的表现是用户看到一片空白，且不知道为什么。
+    if visible {
+        webview
+            .show()
+            .map_err(|e| format!("显示 {label} 失败：{e}"))?;
+    } else {
+        webview
+            .hide()
+            .map_err(|e| format!("隐藏 {label} 失败：{e}"))?;
+    }
 
     apply_bounds(&webview, label, bounds)
 }

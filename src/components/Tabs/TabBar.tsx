@@ -73,6 +73,29 @@ interface TabContextMenuState {
   y: number;
 }
 
+/**
+ * 插件徽标的语气 → 一组类名。
+ *
+ * **只改颜色。** 形状（圆角、字号、内边距）由调用方统一给出 —— 徽标在标签栏与
+ * 侧边栏里必须长得一样，那是"这个徽标来自宿主"的可见证据；让插件决定形状等于
+ * 让它有机会画一个与宿主其它角标混淆的东西。
+ *
+ * 不认识的语气一律落到 `info`：语气是 Rust 侧白名单过的，这里只是不信任
+ * "将来某个版本多加了一档而忘了同步"。
+ */
+function badgeToneClasses(tone: string | undefined): string {
+  switch (tone) {
+    case 'success':
+      return 'bg-emerald-500 text-white';
+    case 'warning':
+      return 'bg-amber-500 text-white';
+    case 'error':
+      return 'bg-rose-500 text-white';
+    default:
+      return 'bg-indigo-500 text-white';
+  }
+}
+
 const TabItem: React.FC<{
   group: TabGroupId;
   moduleId: string;
@@ -207,6 +230,22 @@ const TabItem: React.FC<{
 
       <span className="min-w-0 flex-1 truncate">{label}</span>
 
+      {/* 插件徽标（`ctx.ui.badge`）。用数字而不是圆点的那条理由在这里同样成立：
+          「有 3 件事」与「有 1 件事」对"要不要现在去点它"的影响很大。
+
+          语气只改颜色，不改形状 —— 它是插件的一句自我描述，而不是宿主需要
+          理解的语义（见 `moduleCatalog.setModuleBadge`）。 */}
+      {descriptor?.badge && (
+        <span
+          className={`shrink-0 rounded-full px-1.5 text-[10px] font-medium leading-4 ${badgeToneClasses(
+            descriptor.badgeTone
+          )}`}
+          title={`来自插件：${descriptor.badge}`}
+        >
+          {descriptor.badge}
+        </span>
+      )}
+
       {/* 未读徽标：模块自己产生的通知数，点击标签即代表去看它 */}
       {unread > 0 && (
         <span
@@ -214,6 +253,30 @@ const TabItem: React.FC<{
           title={`${unread} 条未读通知`}
         >
           {unread > 99 ? '99+' : unread}
+        </span>
+      )}
+
+      {/* 插件进度（`ctx.ui.progress`）。画在标签的**底边**上，与激活指示条同一处 ——
+          它是这个标签的状态，而不是整条标签栏的状态。
+
+          `value === null` 是**不定量**：一条来回跑的短条。它与定量条的区别是
+          "还要多久"这件事插件自己也不知道，而画一条永远停在 0% 的定量条会让
+          人以为它卡住了。 */}
+      {descriptor?.progress && (
+        <span
+          className="pointer-events-none absolute inset-x-0 bottom-0 h-0.5 overflow-hidden bg-indigo-100"
+          title={descriptor.progress.label ?? '插件正在处理'}
+        >
+          <span
+            className={`block h-full bg-indigo-500 ${
+              descriptor.progress.value === null ? 'w-1/3 animate-pulse' : 'transition-[width] duration-200'
+            }`}
+            style={
+              descriptor.progress.value === null
+                ? undefined
+                : { width: `${Math.round(descriptor.progress.value * 100)}%` }
+            }
+          />
         </span>
       )}
 

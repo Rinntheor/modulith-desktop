@@ -734,12 +734,14 @@ section('前端界面协作');
     /invoke\('sandbox_surface_hide'/.test(serviceTs),
     '前端门面暴露了 hide（隐藏而不销毁）'
   );
+  // 界面名走的是组件里的局部变量 `surfaceId`（它把缺省的 `main` 收在一处）。
+  // 断言因此盯的是"那个变量被传下去了"，而不是某个具体的变量名。
   check(
-    /hideSandboxSurface\(pluginId, surface\)/.test(componentTsx),
+    /hideSandboxSurface\(pluginId, surfaceId\)/.test(componentTsx),
     '不可见时调用 hide，而不是 close'
   );
   check(
-    /closeSandboxSurface\(pluginId, surface\)/.test(componentTsx),
+    /closeSandboxSurface\(pluginId, surfaceId\)/.test(componentTsx),
     '卸载时才调用 close'
   );
   // 卸载时**只关自己这一块界面**，不是整个插件。
@@ -763,12 +765,12 @@ section('前端界面协作');
     '打开与摆放走同一条调用路径（只差一个 IPC 名字）'
   );
   check(
-    /call\(pluginId, bounds, surface\)/.test(componentTsx),
+    /call\(pluginId, bounds, surfaceId, /.test(componentTsx),
     '打开/摆放把界面名传给宿主（少了它每个界面都会退化成主界面）'
   );
   for (const fn of ['hideSandboxSurface', 'closeSandboxSurface']) {
     check(
-      new RegExp(`${fn}\\(pluginId, surface\\)`).test(componentTsx),
+      new RegExp(`${fn}\\(pluginId, surfaceId\\)`).test(componentTsx),
       `${fn} 把界面名传给宿主（少了它每个界面都会退化成主界面）`
     );
   }
@@ -987,6 +989,15 @@ section('完整 API 表面');
       ['ui.openSurface', isFunction],
       ['ui.closeSurface', isFunction],
       ['ui.listSurfaces', isFunction],
+
+      // 3.4 界面 · 宿主渲染的状态指示（徽标 / 进度 / 启动占位）
+      ['ui.badge', isFunction],
+      ['ui.progress', isFunction],
+      ['ui.splash', isFunction],
+
+      // 3.6 系统与集成 · 命令（沙箱里是事件驱动的，见桥接层的说明）
+      ['commands.on', isFunction],
+      ['commands.has', isFunction],
 
       // 3.4 界面 · 主题
       ['theme.current', isFunction],
@@ -1325,8 +1336,11 @@ section('宿主浮层');
   // 请求/回答的配对与超时只有一份实现。
   check(
     /async fn ask_overlay/.test(rpcRs) &&
+      // 两条分支各自**在自己的分支体里**调 `ask_overlay`。用"分支起点往后找
+      // N 个字符"那种写法会随着分支里的说明文字变长而失效 —— 而它失效的方向是
+      // 假红（明明没坏却报错），这一条已经因此误报过一次。
       /"ui\.dialog"[\s\S]{0,1200}?ask_overlay\(app, request\)\.await/.test(rpcRs) &&
-      /"ui\.contextMenu"[\s\S]{0,1200}?ask_overlay\(app, request\)\.await/.test(rpcRs),
+      /"ui\.contextMenu" => \{[\s\S]*?ask_overlay\(app, request\)\.await/.test(rpcRs),
     '对话框与菜单走同一条配对/超时路径（两份实现会各自漂）'
   );
 
@@ -1665,6 +1679,275 @@ section('多界面（api: 3）');
     'contributes 仍然是自由形状（surfaces 的形状错误不该让整个插件不可用）'
   );
 }
+
+
+
+
+// ============================================================
+// 16. 宿主渲染的状态指示与命令：徽标 / 进度 / 启动占位 / 声明式菜单项
+// ============================================================
+//
+// 这一节守的是**"插件说的状态真的落到宿主界面上"**这条链。它每一环都能单独
+// 坏掉，而坏掉的表现都是"什么都没发生"：
+//
+//   * 徽标 / 进度画在宿主的侧边栏与标签栏上，插件文档碰不到它们 ——
+//     少接一环的表现是插件以为设了、用户什么都没看见；
+//   * 启动占位要覆盖插件那一块**位置**，而原生 webview 盖在 DOM 之上 ——
+//     少一步"把 webview 收起来"，占位就被自己盖住了，症状是"点了插件一片空白"；
+//   * 清单声明的右键菜单项要经由**命令机制**执行，而沙箱里没有"交出函数"
+//     这回事 —— 少一环的表现是"菜单里看得到、点了没反应"。
+
+section('宿主渲染的状态指示与命令');
+
+{
+  const rpcUiRs = read('../src-tauri/src/modules/plugins/rpc.rs');
+  const surfaceRsForUi = read('../src-tauri/src/modules/plugins/surface.rs');
+  const pluginCommandsForUi = read('../src-tauri/src/modules/plugins/commands.rs');
+  const managerForUi = read('../src-tauri/src/modules/plugins/manager.rs');
+  const surfaceServiceTs = read('../src/services/sandboxSurface.ts');
+  const surfaceTsx = read('../src/components/SandboxSurface.tsx');
+  const uiStateTs = read('../src/services/pluginUiState.ts');
+  const catalogForUi = read('../src/services/moduleCatalog.ts');
+  const tabBarTsx = read('../src/components/Tabs/TabBar.tsx');
+  const sidebarItemTsx = read('../src/components/Sidebar/SidebarItem.tsx');
+  const mainTsxForUi = read('../src/main.tsx');
+  const runtimeForUi = read('../src/services/pluginRuntime.ts');
+
+  // ---- 三条 RPC 都在，且都走同一条广播 ----
+  for (const method of ['ui.badge', 'ui.progress', 'ui.splash']) {
+    check(
+      new RegExp(`"${method.replace('.', '\\.')}" =>`).test(rpcUiRs),
+      `rpc.rs 里有 ${method} 的处理分支`
+    );
+  }
+  check(
+    /pub const PLUGIN_UI: &str = "modulith:\/\/plugin-ui"/.test(rpcUiRs) &&
+      /fn emit_ui_with/.test(rpcUiRs),
+    '三条走同一条广播与同一个事件名（各开一个就要各写一遍校验）'
+  );
+
+  // ---- 进度的取值范围必须在宿主侧被拦下 ----
+  //
+  // 一个把 40 当成百分比写进去的插件会让进度条永远停在满格，而那种错误看起来像
+  // "进度算错了" —— 离真正的原因很远。
+  check(
+    /if !\(0\.0\.\.=1\.0\)\.contains\(&fraction\) \{[\s\S]{0,240}?return rpc_error\(/.test(rpcUiRs),
+    'ui.progress 拒绝落在 0..1 之外的值'
+  );
+  // "清掉"与"不定量"必须分得开。
+  check(
+    /\(None, None\) => Value::Null/.test(rpcUiRs),
+    'ui.progress 把"清掉"与"不定量"分开（前者既没给 value 也没给 label）'
+  );
+
+  // ---- 徽标 / 占位的文本必须**按字符**截断 ----
+  //
+  // 按字节截断会把一个多字节字符切成两半，而那个半截字符在 JSON 里就是乱码 ——
+  // 中文徽标会中招。
+  check(
+    /fn truncate\(value: &str, max_chars: usize\) -> String \{[\s\S]{0,300}?\.chars\(\)\.take\(/.test(
+      rpcUiRs
+    ),
+    '徽标 / 占位文本按字符截断（按字节会切坏中文）'
+  );
+  check(
+    /const MAX_BADGE_CHARS: usize = 28;/.test(rpcUiRs) && /const MAX_SPLASH_CHARS/.test(rpcUiRs),
+    '徽标与占位各有长度上限（徽标过长会把模块名挤掉）'
+  );
+
+  // ---- 语气必须走白名单 ----
+  //
+  // 它会被前端拼进 `className`。
+  check(
+    /fn badge_tone\(args: &Value\) -> &'static str/.test(rpcUiRs) &&
+      /fn splash_tone\(args: &Value\) -> &'static str/.test(rpcUiRs),
+    '徽标与占位的语气各有一份白名单'
+  );
+
+  // ---- 后台插件调这三条必须被拒绝，而不是静默无效 ----
+  //
+  // 后台插件没有标签栏，也没有可覆盖的一块位置。静默成功会让作者以为它生效了。
+  check(
+    /let Some\(surface\) = surface else \{[\s\S]{0,320}?return rpc_error\(/.test(rpcUiRs),
+    '没有界面上下文时（后台插件）三条都报错说清原因'
+  );
+
+  // ---- 启动占位：webview 必须先收起来 ----
+  //
+  // 原生 webview 盖在 DOM 之上。宿主想在那块位置上画占位，就必须先把它收起来 ——
+  // 而"先 show 再 hide"会有一帧肉眼可见的闪烁，且每次打开插件都会走到。
+  // 这两条**必须锚在 `Job::Show` 与 `fn show` 里**，不能全文件找。
+  //
+  // 试过一版全文件找的写法：`Job::Visible` 里也有 `visible: bool,`，
+  // `set_visible` 里也有 `if visible { show() } else { hide() }` ——
+  // 于是把 `Job::Show` 的那一项和 `fn show` 里那段整个删掉之后，门禁照样绿。
+  const showJob = /Show \{[\s\S]*?\n    \},/.exec(surfaceRsForUi)?.[0] ?? '';
+  check(
+    /visible: bool,/.test(showJob),
+    '界面作业带着"显示还是隐藏"这一项'
+  );
+  const showFn = /fn show<R: Runtime>\([\s\S]*?\n\}/.exec(surfaceRsForUi)?.[0] ?? '';
+  check(
+    /if visible \{[\s\S]{0,200}?\.show\(\)[\s\S]{0,200}?\} else \{[\s\S]{0,200}?\.hide\(\)/.test(showFn),
+    '建界面时按 visible 决定显示还是隐藏（而不是先显示再收起）'
+  );
+  check(
+    /visible\.unwrap_or\(true\)/.test(pluginCommandsForUi) &&
+      /open_surface_at\(&app, &plugin_id, &surface, bounds, visible/.test(pluginCommandsForUi),
+    '命令把 visible 一路传到界面线程（缺省是显示）'
+  );
+  check(
+    /visible\?: boolean/.test(surfaceServiceTs) &&
+      /visible: visible/.test(surfaceServiceTs) &&
+      // `undefined` 不能被折成 `false`：那会让每一次正常打开都建出一块看不见的界面。
+      !/visible: visible \?\? false/.test(surfaceServiceTs),
+    '前端门面把 visible 原样传下去（不折成 false）'
+  );
+
+  // ---- 启动占位：前端那一条链 ----
+  check(
+    /beginHostSplash\(pluginId, surfaceId\);[\s\S]{0,200}?apply\('open', true\)/.test(surfaceTsx),
+    '先立占位、再带着"不显示"去建 webview（顺序反了会闪一帧）'
+  );
+  check(
+    /apply\('open', splash !== null\)/.test(surfaceTsx),
+    '占位与否是**唯一**决定 webview 可见性的东西（一条规则，不留第二分支）'
+  );
+  check(
+    /const everOpened = useRef\(false\)/.test(surfaceTsx) &&
+      /if \(!everOpened\.current\)/.test(surfaceTsx),
+    '只有第一次打开才立占位（切标签回来不该再闪一次"正在启动"）'
+  );
+  check(
+    /absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/.test(surfaceTsx),
+    '占位铺满内容视口（`absolute inset-0` 相对的是 `.lc-tab-panel`）'
+  );
+  check(
+    /className="h-0 w-0"/.test(surfaceTsx) && !/className="relative h-0 w-0"/.test(surfaceTsx),
+    '锚点保持"不定位于"（加了 relative 会让占位缩成 0×0）'
+  );
+
+  // ---- 自动清除与超时兜底 ----
+  check(
+    /addEventListener\('load'/.test(bridgeJs) &&
+      /auto: true/.test(bridgeJs) &&
+      /if \(splashClaimed\) return;/.test(bridgeJs),
+    '桥接层在文档加载完后自动撤占位，但**插件接管过就不撤**'
+  );
+  check(
+    /if \(event\.auto\) \{[\s\S]{0,240}?if \(current\?\.auto\) endSplash/.test(uiStateTs),
+    '前端只在占位仍是"自动那一条"时才接受自动清除'
+  );
+  check(
+    /export const SPLASH_TIMEOUT_MS = 8000;/.test(uiStateTs) &&
+      /if \(alive\?\.auto\) endSplash/.test(uiStateTs),
+    '自动占位有超时兜底，且超时同样**只对自动那条**生效'
+  );
+  check(
+    /if \(current && !current\.auto\) return;/.test(uiStateTs),
+    'beginHostSplash 不覆盖插件已经接管的占位'
+  );
+
+  // ---- 徽标 / 进度真的落到目录描述符上 ----
+  //
+  // 侧边栏与标签栏的渲染是**同步**路径，而插件调用是一次异步广播。
+  check(
+    /export function setModuleBadge\(/.test(catalogForUi) &&
+      /export function setModuleProgress\(/.test(catalogForUi),
+    '目录里有徽标与进度的写入点'
+  );
+  check(
+    /for \(const moduleId of getPluginModuleIds\(pluginId\)\)/.test(uiStateTs),
+    '徽标写给这个插件的每一条模块（含次级界面的隐藏模块 —— 它们也是标签）'
+  );
+  check(
+    /function moduleIdsForSurface\(/.test(uiStateTs) &&
+      /surfaceModuleId\(pluginId, surface\)/.test(uiStateTs),
+    '进度按界面查模块（一个界面可以有好几个入口）'
+  );
+  // 判据要落在 **JSX 条件本身**上：只查 `descriptor?.badge` 四个字的话，
+  // `{false && descriptor?.badge && (` 那种"就地停用"照样能过。
+  check(
+    /^      \{descriptor\?\.badge && \($/m.test(tabBarTsx) &&
+      /^      \{descriptor\?\.progress && \($/m.test(tabBarTsx),
+    '标签栏渲染徽标与进度（少一处就等于"插件设了但看不到"）'
+  );
+  check(
+    /^            \{module\.badge && \($/m.test(sidebarItemTsx) &&
+      /^      \{module\.progress && \($/m.test(sidebarItemTsx),
+    '侧边栏渲染徽标与进度'
+  );
+  check(
+    /badgeToneClasses/.test(tabBarTsx) && /badgeToneClasses/.test(sidebarItemTsx),
+    '徽标语气真的影响颜色（否则四档语气没有区别）'
+  );
+  check(
+    /progress\.value === null\s*\? 'w-1\/3 animate-pulse'/.test(tabBarTsx) &&
+      /progress\.value === null[\s\S]{0,200}'w-1\/3 animate-pulse'/.test(sidebarItemTsx),
+    '不定量进度画成来回跑的短条（画一条永远停在 0% 的定量条会让人以为卡住了）'
+  );
+  check(
+    /^installPluginUiState\(\);/m.test(mainTsxForUi),
+    '状态指示的监听真的装在启动路径上'
+  );
+  // 锚在 `unloadPlugin` 里：另外两处（加载失败、禁用）走的是同一条清理，
+  // 只查"文件里有没有"的话，把卸载那条去掉照样能过。
+  check(
+    /export function unloadPlugin\(pluginId: string\): void \{[\s\S]{0,600}?clearPluginUiState\(pluginId\)/.test(
+      runtimeForUi
+    ),
+    '插件卸载时清掉徽标与进度（否则侧边栏会一直显示一个没人更新的数字）'
+  );
+
+  // ---- 清单声明的右键菜单项 ----
+  check(
+    /pub fn context_menus\(&self, id: &str\)/.test(managerForUi) &&
+      /pub struct DeclaredMenuItem/.test(managerForUi),
+    '宿主读得出清单里声明的右键菜单项'
+  );
+  check(
+    /const DECLARED_PREFIX: &str = "declared:";/.test(rpcUiRs) &&
+      /format!\("\{DECLARED_PREFIX\}\{\}", menu\.id\)/.test(rpcUiRs),
+    '声明条目带上专用 id 前缀（不加会与插件临时给的条目撞 id）'
+  );
+  check(
+    /\.unwrap_or\(true\)/.test(
+      /let include_declared = args[\s\S]{0,240}?;/.exec(rpcUiRs)?.[0] ?? ''
+    ),
+    'includeDeclared 缺省是 **true** —— 否则清单里那一块永远用不上'
+  );
+  // 沙箱插件的命令跨不了 realm，只能推给它的界面。
+  check(
+    /pub async fn deliver_command<R: Runtime>/.test(sandboxRs) &&
+      /window\.__modulithCommand && window\.__modulithCommand\(JSON\.parse/.test(sandboxRs),
+    '沙箱插件的命令推给它的界面（函数引用过不了 realm 边界）'
+  );
+  check(
+    /super::sandbox::deliver_command\(app, plugin_id, &command, surface\)/.test(rpcUiRs),
+    '选中声明条目时，沙箱插件走推送、不试图直接调用'
+  );
+  check(
+    /pub const PLUGIN_COMMAND: &str = "modulith:\/\/plugin-command"/.test(rpcUiRs) &&
+      /^installPluginCommandDispatch\(\);/m.test(mainTsxForUi),
+    'in-process 插件的命令走一条广播（Rust 碰不到它 realm 里的函数）'
+  );
+  check(
+    /commands\.on: function|on: function \(id, handler\)/.test(bridgeJs) &&
+      /window\.__modulithCommand = function/.test(bridgeJs),
+    '桥接层给出命令的注册入口'
+  );
+  check(
+    /commands: commands,/.test(bridgeJs),
+    'commands 真的挂在 Modulith 上'
+  );
+  check(
+    /includeDeclared: options0\.includeDeclared === undefined \? true : !!options0\.includeDeclared/.test(
+      bridgeJs
+    ),
+    '桥接层把 includeDeclared 的缺省也说成 true（与宿主一致）'
+  );
+}
+
 
 
 

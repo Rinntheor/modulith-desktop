@@ -689,11 +689,57 @@ pub async fn dispatch<R: Runtime>(
         }
 
         "ui.contextMenu" => {
-            let items: Vec<crate::modules::desktop::overlay::MenuItem> = arg(args, "items")
+            let mut items: Vec<crate::modules::desktop::overlay::MenuItem> = arg(args, "items")
                 .and_then(|value| serde_json::from_value(value.clone()).ok())
                 .unwrap_or_default();
 
-            if items.is_empty() {
+            // ============================================================
+            // 清单声明的菜单项
+            // ============================================================
+            //
+            // 缺省**合并**（`includeDeclared` 缺省是 true）：插件在清单里写下的
+            // 右键菜单条目，与它这一次临时给出的条目，本来就该出现在同一个菜单里 ——
+            // 让作者每次都得把清单里那些再手写一遍，等于让清单那一块永远用不上。
+            //
+            // 它们被冠上 `DECLARED_PREFIX` 的 id 前缀，因为执行方式完全不同：
+            // 临时条目是**这一次调用**的结果，而声明条目要经由插件的命令机制。
+            // 不加前缀的话两者会撞 id —— 而撞上的表现是"点了这一条，执行的是
+            // 插件自己那条"。
+            let include_declared = args
+                .get("includeDeclared")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+
+            if include_declared {
+                let declared = {
+                    let manager = locked!(app);
+                    manager.context_menus(plugin_id).unwrap_or_default()
+                };
+
+                if !declared.is_empty() && !items.is_empty() {
+                    // 分隔线：临时条目在上、清单条目在下。没有它的话两组按钮会
+                    // 连成一片，而用户看不出"上面那几条是这一次的、下面那几条是常驻的"。
+                    items.push(crate::modules::desktop::overlay::MenuItem {
+                        id: String::new(),
+                        label: String::new(),
+                        accelerator: None,
+                        separator: true,
+                        disabled: false,
+                    });
+                }
+
+                for menu in declared {
+                    items.push(crate::modules::desktop::overlay::MenuItem {
+                        id: format!("{DECLARED_PREFIX}{}", menu.id),
+                        label: menu.label,
+                        accelerator: None,
+                        separator: false,
+                        disabled: false,
+                    });
+                }
+            }
+
+            if items.iter().all(|item| item.separator) {
                 return rpc_error("菜单一个可选项都没有");
             }
 
@@ -703,7 +749,110 @@ pub async fn dispatch<R: Runtime>(
                 items,
             };
 
-            ask_overlay(app, request).await
+            let response = ask_overlay(app, request).await?;
+
+            // 选中了清单声明的那一条 → 交给插件的命令机制去执行。
+            //
+            // 这一步**在浮层回答之后**：菜单已经关掉了，用户看到的就是"点了它、
+            // 菜单消失、事情开始做"。等命令执行完再关菜单会让一次慢的初始化把
+            // 菜单挂在屏幕上。
+            if let Some(selected) = response.get("selected").and_then(|value| value.as_str()) {
+                if let Some(menu_id) = selected.strip_prefix(DECLARED_PREFIX) {
+                    run_declared_menu(app, plugin_id, surface, menu_id).await?;
+                }
+            }
+
+            json_value(response)
+        }
+
+        // ---- 宿主渲染的状态指示（徽标 / 进度 / 启动占位）-----------------------
+        //
+        // 这三条的共同点是：**它们要画的地方宿主才画得出**。
+        //
+        //   * `badge` —— 侧边栏与标签栏上的徽标。沙箱插件的文档在它自己的
+        //     webview 里，碰不到宿主的标签栏；
+        //   * `progress` —— 同一条理由；
+        //   * `splash` —— 覆盖插件那一块**位置**的启动占位。原生 webview 盖在
+        //     宿主 DOM 之上，所以要让宿主画出来，必须先把 webview 收起来。
+        //
+        // 三条都只**广播给前端**，不在这里碰任何窗口：徽标与进度是 DOM，
+        // 而占位的显示/隐藏牵动 webview 的可见性 —— 那件事归 `surface.rs`
+        // 的所有者线程，前端会通过 `sandbox_surface_open(visible: false)` 表达。
+        //
+        // 同一个 `ctx` 有两个调用方，而这三条**只在界面插件上有意义**：后台插件
+        // 没有标签栏、也没有可覆盖的一块位置。因此 `surface` 为 `None` 时直接
+        // 拒绝，而不是静默地什么都不做 —— 后者会让后台插件作者以为它生效了。
+
+        "ui.badge" => {
+            let text = arg_str(args, "text")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate(value, MAX_BADGE_CHARS));
+
+            let value = match text {
+                // `null` = 清掉。它必须是**一个明确的取值**，而不是"没给"：
+                // 插件在任务跑完之后要能说"把徽标去掉"。
+                None => Value::Null,
+                Some(text) => serde_json::json!({ "text": text, "tone": badge_tone(args) }),
+            };
+
+            emit_ui(app, plugin_id, surface, "badge", value)
+        }
+
+        "ui.progress" => {
+            // `value` 为 `null` **且**没有 `label` 时是"清掉"；给了 `label` 而没有
+            // `value` 是"不定量进度"（转圈）。这两件事必须分得开：插件说"我在忙"
+            // 与插件说"我不忙了"是两条不同的指令。
+            let label = arg_str(args, "label")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate(value, MAX_BADGE_CHARS));
+
+            let value = match (arg(args, "value"), label) {
+                (None, None) => Value::Null,
+                (value, label) => {
+                    let fraction = value.and_then(|value| value.as_f64());
+                    if let Some(fraction) = fraction {
+                        if !(0.0..=1.0).contains(&fraction) {
+                            return rpc_error(&format!(
+                                "ui.progress 的 value 必须落在 0..1，收到 {fraction}"
+                            ));
+                        }
+                    }
+                    serde_json::json!({ "value": fraction, "label": label })
+                }
+            };
+
+            emit_ui(app, plugin_id, surface, "progress", value)
+        }
+
+        "ui.splash" => {
+            // `auto: true` 是**自动清除**：插件的文档加载完了，如果它没有自己
+            // 接管过占位，就把宿主那块"正在启动"的占位撤掉。
+            //
+            // 没有这条的话默认行为是错的：一个从没调过 `ui.splash` 的插件会让
+            // 那块占位**永远留在屏幕上**，而用户看到的是"这个插件打不开"。
+            // 有它之后默认行为是对的，插件想自己控制再显式调一次。
+            let text = arg_str(args, "text")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate(value, MAX_SPLASH_CHARS));
+
+            let auto = args
+                .get("auto")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+
+            let value = match text {
+                None => Value::Null,
+                Some(text) => serde_json::json!({
+                    "text": text,
+                    "tone": splash_tone(args),
+                    "progress": arg(args, "progress").and_then(|value| value.as_f64()),
+                }),
+            };
+
+            emit_ui_with(app, plugin_id, surface, "splash", value, auto)
         }
 
         // ---- 多界面（api: 3）-------------------------------------------------
@@ -849,8 +998,171 @@ async fn ask_overlay<R: Runtime>(
     }
 }
 
+/// 清单声明的右键菜单项在浮层里的 id 前缀。
+///
+/// 加前缀是因为它们的**执行方式**与临时条目完全不同：临时条目是这一次调用的
+/// 结果（插件自己知道该怎么办），而声明条目要经由插件的命令机制。
+/// 不加前缀的话两者会撞 id —— 撞上的表现是"点了这一条，执行的是插件自己那条"。
+const DECLARED_PREFIX: &str = "declared:";
+
+/// 宿主渲染的菜单里选中了一条**清单声明**的条目 → 执行它的命令。
+///
+/// ============================================================
+/// 两条路径，因为插件有两种运行位置
+/// ============================================================
+///
+/// * **sandboxed** —— 插件的代码在自己的 webview 里，宿主**不能**直接调它的
+///   函数。因此只能把"有人点了这条命令"送进它的界面（走 `SurfaceActor` 的 eval
+///   通道，也就是宿主 → 插件的唯一推送通道），由桥接层交给
+///   `Modulith.commands.on(id, handler)` 注册的处理器。
+///
+///   顺带解决了一件事：沙箱桥接层**没有** `registerCommand` 那种"交出函数"
+///   的接口 —— 它是跨 realm 的，函数交不过去。命令在沙箱里因此必然是
+///   **事件驱动**的，这与 `api: 3` 的整体形态一致。
+///
+/// * **in-process** —— 插件的代码就在宿主这个 realm 里，`runPluginCommand`
+///   直接就能调。走一条 Tauri 事件交给前端（动作的真正实现在前端，
+///   与 `shortcut.trigger` 同一条路子）。
+async fn run_declared_menu<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: Option<&str>,
+    menu_id: &str,
+) -> Result<Value, String> {
+    let (sandboxed, command) = {
+        let manager = locked!(app);
+        let menus = manager.context_menus(plugin_id).map_err(|e| e.to_string())?;
+        let Some(menu) = menus.into_iter().find(|menu| menu.id == menu_id) else {
+            return rpc_error(&format!("清单里没有右键菜单项 {menu_id}"));
+        };
+        let sandboxed = manager
+            .sandbox_view(plugin_id)
+            .map(|view| view.runtime.needs_own_webview())
+            .unwrap_or(false);
+        (sandboxed, menu.command)
+    };
+
+    if sandboxed {
+        super::sandbox::deliver_command(app, plugin_id, &command, surface).await;
+        return json_ok();
+    }
+
+    use tauri::Emitter;
+    if let Err(error) = app.emit(
+        PLUGIN_COMMAND,
+        serde_json::json!({ "pluginId": plugin_id, "command": command }),
+    ) {
+        return rpc_error(&format!("无法把命令交给宿主界面：{error}"));
+    }
+
+    json_ok()
+}
+
+/// 宿主把一条**插件命令**交给 in-process 插件执行时广播的事件名。
+///
+/// 只服务 in-process 插件：沙箱插件的命令直接送进它的界面（见 `run_declared_menu`）。
+pub const PLUGIN_COMMAND: &str = "modulith://plugin-command";
+
 /// 沙箱插件里按下宿主快捷键时，宿主广播的事件名。
 pub const SHORTCUT_TRIGGERED: &str = "modulith://plugin-shortcut";
+
+// ============================================================
+// 宿主渲染的状态指示：徽标 / 进度 / 启动占位
+// ============================================================
+//
+// 三条走**同一条**广播与同一个事件名，只用一个 `kind` 字段区分。
+// 为它们各开一个事件名的话，前端就要装三个监听、各写一遍校验 —— 而它们携带的
+// 是同一类东西（一个插件想说的"我现在是这个状态"）。
+
+/// 插件请求宿主更新它的状态指示（徽标 / 进度 / 启动占位）。
+pub const PLUGIN_UI: &str = "modulith://plugin-ui";
+
+/// 徽标文本的长度上限。
+///
+/// 28 是侧边栏那一行的剩余宽度：再长它会把模块名挤掉，而"徽标把名字挤没了"
+/// 比"徽标被截断"糟得多（前者让用户认不出那是哪个模块）。超长直接截断而不是
+/// 报错 —— 徽标是一句提示，为它失败一次调用不合理。
+const MAX_BADGE_CHARS: usize = 28;
+
+/// 启动占位那句话的长度上限。比徽标宽：它是一整行说明，而不是一个角标。
+const MAX_SPLASH_CHARS: usize = 120;
+
+/// 徽标的语气。白名单而不是原样透出：它会被前端拼进 `className`。
+fn badge_tone(args: &Value) -> &'static str {
+    match arg_str(args, "tone") {
+        Some("success") => "success",
+        Some("warning") => "warning",
+        Some("error") => "error",
+        _ => "info",
+    }
+}
+
+/// 启动占位的语气。没有 `success`：占位说的是"还没好"，而"好了"是用清除表达的。
+fn splash_tone(args: &Value) -> &'static str {
+    match arg_str(args, "tone") {
+        Some("warning") => "warning",
+        Some("error") => "error",
+        _ => "info",
+    }
+}
+
+/// 按字符（不是字节）截断。按字节截断会把一个多字节字符切成两半，而那个
+/// 半截字符在 JSON 里就是一个乱码 —— 中文徽标会中招。
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// 广播一条界面状态。
+fn emit_ui<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: Option<&str>,
+    kind: &str,
+    value: Value,
+) -> Result<Value, String> {
+    emit_ui_with(app, plugin_id, surface, kind, value, false)
+}
+
+/// 广播一条界面状态（带 `auto` 标记）。
+///
+/// `auto` 只对 `splash` 有意义：它说的是"这是桥接层在文档加载完之后自动发的，
+/// 前端**只在占位还是自动那一条时**才该撤掉它"。
+fn emit_ui_with<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: Option<&str>,
+    kind: &str,
+    value: Value,
+    auto: bool,
+) -> Result<Value, String> {
+    let Some(surface) = surface else {
+        return rpc_error(&format!(
+            "ui.{kind} 需要界面上下文 —— 后台插件没有标签栏，也没有可覆盖的一块位置。\
+             请改用 ctx.notifications.notify 或宿主事件。"
+        ));
+    };
+
+    use tauri::Emitter;
+    if let Err(error) = app.emit(
+        PLUGIN_UI,
+        serde_json::json!({
+            "pluginId": plugin_id,
+            "surface": surface,
+            "kind": kind,
+            "value": value,
+            "auto": auto,
+        }),
+    ) {
+        return rpc_error(&format!("无法把 {kind} 交给宿主界面：{error}"));
+    }
+
+    json_ok()
+}
 
 /// 插件请求宿主打开一个界面（`ctx.ui.openSurface`）。
 ///
@@ -953,5 +1265,64 @@ mod tests {
     fn parse_stored_skips_values_that_are_not_json() {
         assert_eq!(parse_stored("{\"a\":1}"), Some(serde_json::json!({ "a": 1 })));
         assert_eq!(parse_stored("不是 JSON"), None);
+    }
+
+    /// 截断必须**按字符**，不能按字节。
+    ///
+    /// 这是一个真的会发生的失败：一个中文徽标按字节截到第 28 个字节，正好切在
+    /// 某个三字节字符的中间 —— 那个半截字符在 JSON 里就是乱码，而症状是
+    /// "徽标末尾有几个方块"，离原因很远。
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        // 每个汉字 3 字节：按字节截 10 会切坏第 4 个字
+        let long = "这是一段相当长的中文徽标文本内容用于测试截断";
+        let cut = truncate(long, 10);
+
+        assert_eq!(cut.chars().count(), 10, "截断之后应当是 10 个字符：{cut:?}");
+        assert!(cut.ends_with('…'));
+        // 没有出现替换字符（按字节切会产出它）
+        assert!(!cut.contains('\u{FFFD}'), "截断切坏了一个字符：{cut:?}");
+
+        // 短的**原样返回**，不加省略号
+        assert_eq!(truncate("短", 10), "短");
+        // 正好等长时也不加
+        assert_eq!(truncate("12345", 5), "12345");
+    }
+
+    /// 语气是白名单：不认识的取值落到 `info`，而不是原样透出。
+    ///
+    /// 它会被前端拼进 `className`，因此"原样透出"等于把一段外部输入放进样式。
+    #[test]
+    fn tones_are_whitelisted() {
+        for (input, expected) in [
+            ("info", "info"),
+            ("success", "success"),
+            ("warning", "warning"),
+            ("error", "error"),
+            ("危险", "info"),
+            ("", "info"),
+        ] {
+            let args = serde_json::json!({ "tone": input });
+            assert_eq!(badge_tone(&args), expected, "badge_tone({input:?})");
+
+            // 占位**没有** `success`：它说的是"还没好"，而"好了"是用清除表达的。
+            let expected_splash = if input == "success" { "info" } else { expected };
+            assert_eq!(splash_tone(&args), expected_splash, "splash_tone({input:?})");
+        }
+
+        // 缺字段时是 info
+        assert_eq!(badge_tone(&serde_json::json!({})), "info");
+        assert_eq!(splash_tone(&serde_json::json!({ "tone": null })), "info");
+    }
+
+    /// 长度上限必须**容得下**一句中文说明。
+    ///
+    /// 一个 8 个字符的上限会把这几种用法全部截成一句废话，而那种失败看起来像
+    /// "宿主把插件的提示吃掉了"。
+    #[test]
+    fn the_length_limits_are_usable_for_chinese() {
+        assert!(MAX_BADGE_CHARS >= 8, "徽标至少要放得下「12 条新消息」");
+        assert!(MAX_SPLASH_CHARS > MAX_BADGE_CHARS, "占位是一整行说明，比徽标宽");
+        assert_eq!(truncate("正在建立索引…", MAX_SPLASH_CHARS), "正在建立索引…");
     }
 }

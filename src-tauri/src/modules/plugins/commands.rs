@@ -49,9 +49,13 @@ pub async fn sandbox_surface_open(
     plugin_id: String,
     surface: Option<String>,
     bounds: super::surface::SurfaceBounds,
+    visible: Option<bool>,
 ) -> Result<(), String> {
     let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
-    super::sandbox::open_surface_at(&app, &plugin_id, &surface, bounds).await
+    // `visible` 缺省是 `true`（正常打开）。传 `false` 是**启动占位**那条路径：
+    // 宿主自己要在那块位置上先画一块 DOM 占位（`ctx.ui.splash`），而原生 webview
+    // 盖在 DOM 之上 —— 因此只能把它建出来但不显示。见 `surface.rs` 的 `Job::Show`。
+    super::sandbox::open_surface_at(&app, &plugin_id, &surface, bounds, visible.unwrap_or(true)).await
 }
 
 /// 隐藏界面但**不销毁**。切标签、宿主浮层盖上来、窗口被收起时走它。

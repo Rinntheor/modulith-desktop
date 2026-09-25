@@ -13,6 +13,8 @@ import { subscribePluginEvents } from './services/backgroundPlugins';
 import { installPluginThemeSync } from './services/pluginThemeSync';
 import { installPluginShortcutSync } from './services/pluginShortcutSync';
 import { installPluginSurfaceRequests } from './services/pluginSurfaces';
+import { installPluginUiState } from './services/pluginUiState';
+import { installPluginCommandDispatch } from './services/pluginRuntime';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
@@ -118,6 +120,29 @@ installPluginShortcutSync();
  * 要哪一个界面。** 见 `pluginSurfaces.ts` 的文件头。
  */
 installPluginSurfaceRequests();
+
+/*
+ * 接住插件说的"我现在是这个状态"：徽标、进度、启动占位。
+ *
+ * 这三样**只能由宿主画**。徽标与进度在宿主的侧边栏 / 标签栏上，插件文档碰不到；
+ * 而启动占位要覆盖插件那一块位置 —— 原生 webview 盖在 DOM 之上，宿主想在那里
+ * 画东西就得先把 webview 收起来（那件事由 `SandboxSurface` 做）。
+ *
+ * 装在最外层：插件可能在界面挂载之前就报出状态（`onStartup` 里跑索引），
+ * 而那时丢掉的那一条会让徽标永远停在旧值。
+ */
+installPluginUiState();
+
+/*
+ * 接住宿主请求执行某条**插件命令**的广播。
+ *
+ * 触发点在 Rust 那边：`ctx.ui.contextMenu` 里选中一条清单声明的条目时，浮层是
+ * 宿主显示并等待回答的，因此"有人选了哪一条"只有 Rust 知道。而 in-process 插件的
+ * 命令处理器是宿主这个 realm 里的函数 —— Rust 碰不到，只能广播回来。
+ *
+ * 沙箱插件不走这条路：它的命令由宿主直接推进它的界面（`sandbox::deliver_command`）。
+ */
+installPluginCommandDispatch();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

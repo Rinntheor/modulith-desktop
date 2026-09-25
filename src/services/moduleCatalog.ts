@@ -293,19 +293,64 @@ export function getCatalogModules(): ModuleDescriptor[] {
  * 补上某个模块的徽标（`ctx.ui.badge` 走它）。
  *
  * 与 `setModuleIconSvg` 同一套路，理由也一样：侧边栏与标签栏渲染徽标是**同步**
- * 路径，而插件调用是一次异步 RPC。把值固化到描述符里，渲染端保持纯同步。
+ * 路径，而插件调用是一次异步广播。把值固化到描述符里，渲染端保持纯同步。
  *
  * 传 `null` 清掉。**返回是否真的变了** —— 调用方据此决定要不要通知订阅者；
  * 插件在每次轮询里都设同一个值是常见的，每次都 `notify` 会让整棵目录树重渲染。
+ *
+ * 语气只用来选一组颜色类名，**不参与任何判定** —— 它是插件的一句自我描述，
+ * 而不是宿主需要理解的语义。白名单在 Rust 那一侧（`rpc.rs::badge_tone`）；
+ * 这一层认不出来的语气一律落到 `info`。
  */
-export function setModuleBadge(moduleId: string, badge: string | null): boolean {
+export function setModuleBadge(
+  moduleId: string,
+  badge: { text: string; tone: string } | null
+): boolean {
   const module = dynamicModules.get(moduleId);
   if (!module) return false;
 
-  const next = badge === null || badge === '' ? undefined : badge;
-  if (module.badge === next) return false;
+  const text = badge === null || badge.text === '' ? undefined : badge.text;
+  const tone = text === undefined ? undefined : badge?.tone ?? 'info';
 
-  dynamicModules.set(moduleId, { ...module, badge: next });
+  if (module.badge === text && module.badgeTone === tone) return false;
+
+  dynamicModules.set(moduleId, { ...module, badge: text, badgeTone: tone });
+  notifyCatalog();
+  return true;
+}
+
+/**
+ * 补上某个模块的进度（`ctx.ui.progress` 走它）。
+ *
+ * 与徽标同一个理由：标签栏与侧边栏的渲染是**同步**路径。
+ *
+ * `value` 为 `null` 是**不定量**（转圈）；整个参数为 `null` 是"清掉"。
+ * 这两种状态必须分得开 —— 它们在界面上的表现完全不同（一条来回跑的条 vs
+ * 什么都没有），折成同一个值会让"我在忙"要么一直显示、要么从来不显示。
+ */
+export function setModuleProgress(
+  moduleId: string,
+  progress: { value: number | null; label?: string } | null
+): boolean {
+  const module = dynamicModules.get(moduleId);
+  if (!module) return false;
+
+  if (progress === null) {
+    if (module.progress === undefined) return false;
+    dynamicModules.set(moduleId, { ...module, progress: undefined });
+    notifyCatalog();
+    return true;
+  }
+
+  const current = module.progress;
+  if (current && current.value === progress.value && current.label === progress.label) {
+    return false;
+  }
+
+  dynamicModules.set(moduleId, {
+    ...module,
+    progress: { value: progress.value, label: progress.label },
+  });
   notifyCatalog();
   return true;
 }

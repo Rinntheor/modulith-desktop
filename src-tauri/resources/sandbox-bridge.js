@@ -646,12 +646,21 @@
      *
      * **由宿主渲染**的理由与 dialog 一样，另外还有一条：宿主自己的右键菜单
      * 也走这个窗口，因此插件贡献的菜单项与宿主的菜单**长成同一个样子**。
+     *
+     * `includeDeclared` 缺省为 **true**：清单里 `contributes.contextMenus` 声明的
+     * 条目会被自动并进来（排在临时条目之后，中间一条分隔线）。选中它们时宿主走的是
+     * 插件的**命令机制** —— 也就是这里 `commands.on(菜单的 command, handler)`
+     * 注册的那个处理器。
+     *
+     * 关掉它（`includeDeclared: false`）只在你**确切知道**这一次不需要清单条目时用；
+     * 不传的话默认行为对绝大多数场景都是对的。
      */
     contextMenu: function (options) {
       var options0 = options || {};
       return rpc('ui.contextMenu', {
         title: options0.title === undefined ? null : options0.title,
         items: options0.items || [],
+        includeDeclared: options0.includeDeclared === undefined ? true : !!options0.includeDeclared,
       });
     },
 
@@ -699,6 +708,179 @@
       return rpc('ui.listSurfaces', {}).then(function (value) {
         return value || [];
       });
+    },
+
+    // ============================================================
+    // 宿主渲染的状态指示（徽标 / 进度 / 启动占位）
+    // ============================================================
+    //
+    // 这三样**只能由宿主画**：徽标与进度在宿主的侧边栏 / 标签栏上，插件的文档
+    // 碰不到；而启动占位要覆盖插件那一块**位置**，原生 webview 盖在宿主 DOM 之上
+    // —— 宿主想在那里画东西，就得先把 webview 收起来（那件事由前端做，插件看不到）。
+
+    /**
+     * 侧边栏 / 标签栏上的徽标。`badge(null)` 清掉。
+     *
+     * `{ text, tone }`，tone 取 info / success / warning / error（缺省 info）。
+     * 文本超过 28 个字符会被宿主截断 —— 再长它会把模块名挤掉。
+     */
+    badge: function (value) {
+      if (value === null || value === undefined) {
+        return rpc('ui.badge', { text: null });
+      }
+      var value0 = typeof value === 'string' ? { text: value } : value;
+      return rpc('ui.badge', {
+        text: value0.text === undefined ? null : String(value0.text),
+        tone: value0.tone === undefined ? null : String(value0.tone),
+      });
+    },
+
+    /**
+     * 进度指示。`progress(null)` 清掉。
+     *
+     *   progress({ value: 0.4, label: '索引中' })  → 定量
+     *   progress({ label: '索引中' })              → 不定量（转圈）
+     *   progress(null)                             → 清掉
+     *
+     * `value` 必须落在 0..1，否则宿主会拒绝这一次调用 —— 一个写着 40（当成百分比）
+     * 的值会让进度条永远停在满格，而那种错误看起来像"进度算错了"。
+     */
+    progress: function (value) {
+      if (value === null || value === undefined) {
+        return rpc('ui.progress', { value: null, label: null });
+      }
+      var value0 = value || {};
+      return rpc('ui.progress', {
+        value: value0.value === undefined ? null : value0.value,
+        label: value0.label === undefined ? null : String(value0.label),
+      });
+    },
+
+    /**
+     * 覆盖插件界面那一块位置的**启动占位**。`splash(null)` 清掉。
+     *
+     * ============================================================
+     * 默认行为是对的，这一点值得说清楚
+     * ============================================================
+     *
+     * 宿主打开一块界面时会立刻把那块位置让给一块"正在启动"的占位，并把插件的
+     * webview 先收起来。占位什么时候撤？
+     *
+     *   * 插件从没调过 `splash()` → 文档加载完之后由桥接层自动撤掉（见下面的
+     *     `load` 监听）。不这样的话，一个从不调它的插件会让占位**永远留在屏幕
+     *     上**，而用户看到的是"这个插件打不开"；
+     *   * 插件调过 `splash(...)` → 它接管了，只有它能撤（`splash(null)`）。
+     *     这样"我正在索引十万条笔记"那块提示不会在文档加载完的一瞬间消失，
+     *     而那时插件其实还在忙。
+     *
+     * 一段很长的启动过程因此可以写成：
+     *
+     *   Modulith.ui.splash({ text: '正在索引…', progress: 0.1 });
+     *   await index();
+     *   Modulith.ui.splash(null);
+     */
+    splash: function (value) {
+      splashClaimed = true;
+      if (value === null || value === undefined) {
+        return rpc('ui.splash', { text: null, auto: false });
+      }
+      var value0 = typeof value === 'string' ? { text: value } : value;
+      return rpc('ui.splash', {
+        text: value0.text === undefined ? null : String(value0.text),
+        tone: value0.tone === undefined ? null : String(value0.tone),
+        progress: value0.progress === undefined ? null : value0.progress,
+        auto: false,
+      });
+    },
+  };
+
+  // ============================================================
+  // 文档加载完之后自动撤掉启动占位
+  // ============================================================
+  //
+  // `load` 在**全部**经典脚本执行完之后才触发，因此走到这里意味着插件的入口
+  // 已经跑完了同步那一段。这正是"该把占位让开了"的时刻。
+  //
+  // 只在插件**没有接管**时撤（`splashClaimed`）：接管了的话那块占位说的是
+  // "我还在忙"，而它与文档加载完没有关系。
+  var splashClaimed = false;
+
+  window.addEventListener('load', function () {
+    if (splashClaimed) return;
+    rpc('ui.splash', { text: null, auto: true }).catch(function () {
+      /* 撤不掉占位不该让插件的逻辑出错；前端那边还有超时兜底 */
+    });
+  });
+
+  // ============================================================
+  // 命令
+  // ============================================================
+  //
+  // ============================================================
+  // 为什么沙箱里的命令是**事件驱动**的，而不是交出函数
+  // ============================================================
+  //
+  // 宿主那一侧的 `Modulith.registerCommand({ id, run })` 交出去的是一个**函数**，
+  // 因为 in-process 插件与宿主在同一个 realm 里。沙箱插件不在 —— 函数的引用过
+  // 一次 realm 边界就消失了。
+  //
+  // 因此在这里，命令的形态只能是"宿主告诉我有这么一条命令被触发了"，由插件
+  // 在这里注册的处理器决定做什么。宿主那边也因此没有别的选择：它执行沙箱插件的
+  // 命令时走的是"推一段脚本进来"，见 `sandbox.rs::deliver_command`。
+  //
+  // 少了处理器的命令被**静默忽略**。这是刻意的：沙箱插件的命令可以在它还没加载完
+  // 时就被点（命令面板里那条条目从读清单时起就存在），那时没有处理器是正常状态。
+
+  var commandHandlers = Object.create(null);
+
+  /**
+   * 宿主推来一条命令时调用的入口。
+   *
+   * 名字以双下划线 modulith 开头是刻意的：插件一眼能看出这是宿主的东西。
+   */
+  window.__modulithCommand = function (payload) {
+    if (!payload || typeof payload.command !== 'string') return;
+
+    var handler = commandHandlers[payload.command];
+    if (typeof handler !== 'function') return;
+
+    try {
+      var outcome = handler();
+      // 处理器返回 Promise 时**不 await**：这条通道的调用方（宿主）不会为它
+      // 等待，而吞掉一个 rejection 会在控制台留下一条无人处理的错误。
+      if (outcome && typeof outcome.catch === 'function') {
+        outcome.catch(function (error) {
+          console.error('[Modulith] 命令处理器抛错（' + payload.command + '）:', error);
+        });
+      }
+    } catch (error) {
+      console.error('[Modulith] 命令处理器抛错（' + payload.command + '）:', error);
+    }
+  };
+
+  var commands = {
+    /**
+     * 注册一条命令的处理器。返回取消注册的函数。
+     *
+     * `id` 必须是清单里 `contributes.commands[].id` **或**
+     * `contributes.contextMenus[].command` 里出现过的那个本地 id ——
+     * 宿主只会在那两种时刻把命令推进来。
+     */
+    on: function (id, handler) {
+      if (typeof handler !== 'function') {
+        throw new Error('ctx.commands.on 需要一个函数');
+      }
+      var key = String(id);
+      commandHandlers[key] = handler;
+
+      return function () {
+        if (commandHandlers[key] === handler) delete commandHandlers[key];
+      };
+    },
+
+    /** 这条命令有没有注册处理器（用于自检与"我这块界面负不负责它"的判断）。 */
+    has: function (id) {
+      return typeof commandHandlers[String(id)] === 'function';
     },
   };
 
@@ -893,6 +1075,8 @@
     clipboard: clipboard,
 
     events: events,
+
+    commands: commands,
 
     theme: theme,
 
