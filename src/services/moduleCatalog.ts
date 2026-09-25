@@ -148,6 +148,31 @@ export function unregisterDynamicModules(pluginId: string): void {
 }
 
 /**
+ * 移除**一个**动态模块。
+ *
+ * 存在的理由是多界面：次级界面模块是按插件登记的，但它们的生命周期与
+ * "清单里声明的模块"**不是同一件事** —— 后者在一个声明式插件被重新加载时
+ * 必须留着（见 `loadPlugin` 里那段"声明式插件的条目来自清单，清掉就再也回不来"），
+ * 而前者是宿主自己造的、随时可以去掉。
+ *
+ * 用 `unregisterDynamicModules(插件)` 来表达"去掉次级界面模块"就会顺手把清单
+ * 里的模块也清掉 —— 而那正是 `check:plugin-runtime` 的"模块 ID 冲突"一节
+ * 抓到的那个回归（`shadow-panel` 从目录里消失了）。
+ *
+ * 返回是否真的移除了。
+ */
+export function unregisterDynamicModule(moduleId: string): boolean {
+  if (!dynamicModules.has(moduleId)) return false;
+  dynamicModules.delete(moduleId);
+  // 归属表也要一起清 —— 留着一条指向不存在模块的归属，会让下一次注册同一个
+  // id 时被判成"已被别的插件占用"而遭到拒绝。
+  const owner = moduleOwner.get(moduleId);
+  if (owner !== undefined) moduleOwner.delete(moduleId);
+  notifyCatalog();
+  return true;
+}
+
+/**
  * 补上某个模块的内联 SVG 图标。
  *
  * 为什么需要「后补」这条路：声明式插件的模块条目在**读清单**时就建立了，
@@ -249,10 +274,40 @@ export function getDynamicModuleCount(): number {
 
 /**
  * 完整模块列表（内置 + 插件），按 priority 升序
+ *
+ * **`hidden` 的模块不在其中。** 它们是插件用 `ctx.ui.openSurface` 打开的次级
+ * 界面：必须能按 id 开成标签，但不该出现在侧边栏、仪表盘或命令面板里 ——
+ * 用户没有从那些地方打开它们的入口，列出来只会让人以为那是一堆独立模块。
+ *
+ * 需要"按 id 找得到"的地方走 `getCatalogFlatMap()`，那一份**不过滤**。
  */
 export function getCatalogModules(): ModuleDescriptor[] {
-  const merged = [...getModuleRegistry(), ...dynamicModules.values()];
+  const merged = [
+    ...getModuleRegistry(),
+    ...[...dynamicModules.values()].filter((mod) => !mod.hidden),
+  ];
   return merged.sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999));
+}
+
+/**
+ * 补上某个模块的徽标（`ctx.ui.badge` 走它）。
+ *
+ * 与 `setModuleIconSvg` 同一套路，理由也一样：侧边栏与标签栏渲染徽标是**同步**
+ * 路径，而插件调用是一次异步 RPC。把值固化到描述符里，渲染端保持纯同步。
+ *
+ * 传 `null` 清掉。**返回是否真的变了** —— 调用方据此决定要不要通知订阅者；
+ * 插件在每次轮询里都设同一个值是常见的，每次都 `notify` 会让整棵目录树重渲染。
+ */
+export function setModuleBadge(moduleId: string, badge: string | null): boolean {
+  const module = dynamicModules.get(moduleId);
+  if (!module) return false;
+
+  const next = badge === null || badge === '' ? undefined : badge;
+  if (module.badge === next) return false;
+
+  dynamicModules.set(moduleId, { ...module, badge: next });
+  notifyCatalog();
+  return true;
 }
 
 /**

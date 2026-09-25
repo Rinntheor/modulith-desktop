@@ -119,10 +119,24 @@ fn parse_stored(raw: &str) -> Option<Value> {
 
 /// 执行一次 ctx 调用。
 ///
-/// 参数与返回都是 \`serde_json::Value\` —— 这一层不认识 HTTP，也不认识 stdio。
+/// 参数与返回都是 `serde_json::Value` —— 这一层不认识 HTTP，也不认识 stdio。
+///
+/// ============================================================
+/// `surface` 为什么是 `Option`
+/// ============================================================
+///
+/// 同一个 `ctx` 有两个调用方，而**只有界面有"我在哪一个界面里"这一说**：
+///
+///   · 沙箱界面插件 —— 标签里带着界面名，因此传 `Some("detail")` 这样的值；
+///   · Node 后台插件 —— 它**没有界面**，传 `None`。
+///
+/// 用 `Option` 而不是"空串表示没有"：后者会让"后台插件调 `ui.closeSurface`
+/// 却传了一个空界面名"与"界面插件调它"变成同一条路径，而它们该有完全不同的
+/// 反应（前者是一个错误，后者是一次正常调用）。
 pub async fn dispatch<R: Runtime>(
     app: &AppHandle<R>,
     plugin_id: &str,
+    surface: Option<&str>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -692,6 +706,121 @@ pub async fn dispatch<R: Runtime>(
             ask_overlay(app, request).await
         }
 
+        // ---- 多界面（api: 3）-------------------------------------------------
+        //
+        // ============================================================
+        // 为什么 `openSurface` 不是"宿主直接建一个 webview"
+        // ============================================================
+        //
+        // 沙箱界面的**位置与尺寸只有前端知道** —— 只有它知道标签栏多高、侧边栏
+        // 是否展开、分屏是不是开着。宿主在这一侧建 webview 就只能自己猜一个矩形，
+        // 而猜出来的界面会漂在某个不对的地方（或者干脆在窗口外）。
+        //
+        // 因此这一条走的是：
+        //
+        //   插件 → ui.openSurface → 宿主广播一个请求 → 前端开一个标签
+        //        → 前端量出矩形 → sandbox_surface_open(插件, 界面, 矩形)
+        //
+        // 也就是**位置由宿主决定，插件只说要哪一个界面**。这与方案 §5 那一行
+        // 注释（`// 宿主决定位置`）是同一条。
+        //
+        // `openSurface` 因此**不等界面建好**：它是一次"我请求了"，不是"它已经在了"。
+        // 想确认的话调 `listSurfaces()` —— 那一条读的是宿主这一侧的真源。
+        "ui.openSurface" => {
+            let Some(id) = arg_str(args, "id") else {
+                return rpc_error("缺少 id");
+            };
+
+            // 界面必须在**当前**清单里。不判的话插件可以要求打开一个不存在的界面，
+            // 而宿主编出来的会是一块服务 404 的空面板 —— 那看起来像宿主坏了。
+            let view = {
+                let manager = locked!(app);
+                match manager.sandbox_view(plugin_id) {
+                    Ok(view) => view,
+                    Err(e) => return rpc_error(&e.to_string()),
+                }
+            };
+
+            if view.surface(id).is_none() {
+                return rpc_error(&format!(
+                    "清单里没有界面 {id}（它声明的是：{}）",
+                    view.surfaces.ids().join("、")
+                ));
+            }
+
+            // 位置信息（如果插件给了）原样带上：前端把它当成"建议矩形"，
+            // 量得出来的话还是以自己的测量为准。它存在的意义是让插件能说
+            // "开一个 480 宽的详情"，而不是决定像素。
+            use tauri::Emitter;
+            if let Err(error) = app.emit(
+                OPEN_SURFACE,
+                serde_json::json!({
+                    "pluginId": plugin_id,
+                    "surface": id,
+                    "source": surface,
+                }),
+            ) {
+                return rpc_error(&format!("无法请求宿主打开界面：{error}"));
+            }
+
+            json_ok()
+        }
+
+        "ui.closeSurface" => {
+            let Some(id) = arg_str(args, "id") else {
+                return rpc_error("缺少 id");
+            };
+
+            use tauri::Emitter;
+            if let Err(error) = app.emit(
+                CLOSE_SURFACE,
+                serde_json::json!({ "pluginId": plugin_id, "surface": id }),
+            ) {
+                return rpc_error(&format!("无法请求宿主关闭界面：{error}"));
+            }
+
+            json_ok()
+        }
+
+        // 读的是**宿主这一侧**的真源（`SandboxSurfaces`），而不是问前端。
+        // 前端那一侧要经过标签状态、渲染时机、React 提交才能回答同一个问题 ——
+        // 两个来源一定会漂，而漂开的方向是"插件以为界面开着，其实早关了"。
+        "ui.listSurfaces" => {
+            let declared = {
+                let manager = locked!(app);
+                match manager.sandbox_view(plugin_id) {
+                    Ok(view) => view,
+                    Err(e) => return rpc_error(&e.to_string()),
+                }
+            };
+
+            let open = super::sandbox::live_surfaces(app, plugin_id);
+
+            // 发起这次调用的界面。清单里已经找不到它时是 `None` —— 那说明界面
+            // 刚被作者从清单里删掉，于是"current"这一项全都是 `false`，
+            // 这正是事实。
+            let current = surface.and_then(|id| declared.surfaces.get(id));
+
+            let list: Vec<Value> = declared
+                .surfaces
+                .all()
+                .iter()
+                .map(|surface| {
+                    serde_json::json!({
+                        "id": surface.id,
+                        "name": surface.name,
+                        "primary": surface.is_primary(),
+                        "open": open.iter().any(|id| id == &surface.id),
+                        // "我这条调用是从哪个界面发出来的"。后台插件（`surface: None`）
+                        // 拿到的全是 `false` —— 它没有界面，这是事实而不是缺省。
+                        "current": current == Some(surface),
+                    })
+                })
+                .collect();
+
+            json_value(serde_json::json!(list))
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
     }
 }
@@ -723,6 +852,16 @@ async fn ask_overlay<R: Runtime>(
 /// 沙箱插件里按下宿主快捷键时，宿主广播的事件名。
 pub const SHORTCUT_TRIGGERED: &str = "modulith://plugin-shortcut";
 
+/// 插件请求宿主打开一个界面（`ctx.ui.openSurface`）。
+///
+/// **方向是反的**：这条事件由插件发起、由前端消费。前端据此开一个标签，
+/// 再由标签里的占位组件量出矩形并调 `sandbox_surface_open`。
+/// 为什么必须绕这一圈：只有前端知道界面该放在哪（见 `dispatch` 里那一节）。
+pub const OPEN_SURFACE: &str = "modulith://open-surface";
+
+/// 插件请求宿主关闭一个界面（`ctx.ui.closeSurface`）。
+pub const CLOSE_SURFACE: &str = "modulith://close-surface";
+
 /// 把一条跨插件事件推给每一个还活着的**沙箱界面**。
 ///
 /// 由各自的桥接层过滤"我订阅了没有" —— 见 `SandboxSurfaces::live` 上关于
@@ -731,6 +870,9 @@ pub const SHORTCUT_TRIGGERED: &str = "modulith://plugin-shortcut";
 /// 推给发起者自己吗？**不推。** 与 DOM 事件一致，而且更实际：一个插件给自己
 /// 发事件时如果又收到自己那条，最直接的后果是"处理函数里再 emit 同一个名字"
 /// 变成无限递归 —— 而递归发生在插件自己的界面里，宿主只会看到一片卡顿。
+///
+/// 排除的粒度是**插件**而不是界面：一个插件开了主列表与详情两块界面，它们属于
+/// 同一次对话，互相收到自己刚发出去的事件同样会递归。
 async fn deliver_to_surfaces<R: Runtime>(
     app: &AppHandle<R>,
     source: &str,
@@ -754,8 +896,8 @@ async fn deliver_to_surfaces<R: Runtime>(
         return;
     };
 
-    for (label, plugin_id) in surfaces.live() {
-        if plugin_id == source {
+    for (label, key) in surfaces.live() {
+        if key.plugin_id == source {
             continue;
         }
         if let Err(error) = actor.eval(&label, script.clone()).await {

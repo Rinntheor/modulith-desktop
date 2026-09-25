@@ -377,20 +377,6 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
 mod tests {
     use super::*;
 
-    fn menu(id: u64) -> OverlayRequest {
-        OverlayRequest::Menu {
-            id,
-            title: None,
-            items: vec![MenuItem {
-                id: "open".to_string(),
-                label: "打开".to_string(),
-                accelerator: None,
-                separator: false,
-                disabled: false,
-            }],
-        }
-    }
-
     /// 回答必须**只**能被交给一次等待。
     ///
     /// 交两次的话，第二次会命中另一次请求 —— 而"回答给了别人"比没有回答更糟：

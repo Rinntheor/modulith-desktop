@@ -265,9 +265,26 @@ section('单一真源');
   );
 
   // 界面表只记身份，不记事实。
+  //
+  // **值从"插件 id"变成了 `SurfaceKey`（插件 + 界面）**，这是多界面那一步带来的：
+  // 同一个插件现在可以有好几个 webview，只记插件 id 会让协议处理器分辨不出
+  // "这个请求来自主界面还是详情界面"，而症状是"详情界面显示的是列表"。
+  // 判据仍然只针对**形状**：它必须是一张字符串到身份的映射，不能长出字段来。
   check(
-    /pub struct SandboxSurfaces\(RwLock<HashMap<String, String>>\)/.test(sandboxRs),
-    'SandboxSurfaces 只映射「标签 → 插件 id」，不存放插件的事实'
+    /pub struct SandboxSurfaces\(RwLock<HashMap<String, SurfaceKey>>\)/.test(sandboxRs),
+    'SandboxSurfaces 只映射「标签 → 界面身份」，不存放插件的事实'
+  );
+  // 反向：它不许长出任何"插件的事实"字段。这两条一起才排得掉"把整份清单塞进去"。
+  const surfacesStruct = /pub struct SandboxSurfaces[\s\S]*?\n}/.exec(sandboxRs);
+  check(
+    surfacesStruct !== null && !/root|entry|permissions|manifest/.test(surfacesStruct[0]),
+    'SandboxSurfaces 里没有根目录/入口/权限这类事实字段'
+  );
+  check(
+    /pub struct SurfaceKey \{\s*\n\s*\/\/\/[^\n]*\n\s*pub plugin_id: String,\s*\n\s*\/\/\/[^\n]*\n\s*pub surface: String,/.test(
+      sandboxRs
+    ),
+    'SurfaceKey 只有「插件 id + 界面 id」两个字段'
   );
 
   // 建界面的第一步必须是核实插件存在。
@@ -391,16 +408,43 @@ section('身份来源');
 
 {
   check(
-    /surfaces\.plugin_of\(label\)/.test(sandboxRs),
-    'handle() 从界面表取插件 id（而不是解析标签前缀）'
+    /surfaces\.key_of\(label\)/.test(sandboxRs),
+    'handle() 从界面表取界面身份（而不是解析标签前缀）'
   );
   check(
     /claimed != view\.id/.test(sandboxRs),
     '路径第一段必须与插件 id 相符'
   );
+  // 界面名同样要经清单核实，而不是从标签里直接切出来用。
+  // 直接切会把"清单里已经删掉的界面"继续服务起来 —— 症状是"改了清单但界面还是旧的"。
+  // 这条同样要锚在控制流上：`.or(Some(prim ary))` 那种"总能拿到一个界面"的
+  // 兜底写法会保留 `view.surface(&key.surface)` 这句文本，却把校验绕过去了。
+  check(
+    /let Some\(surface\) = view\.surface\(&key\.surface\) else \{[\s\S]{0,240}?return text\(404/.test(
+      sandboxRs
+    ),
+    'handle() 用清单核实界面名，找不到就 404'
+  );
   check(
     /fn label_for/.test(sandboxRs) && /LABEL_PREFIX/.test(sandboxRs),
     '标签由 label_for 统一产出'
+  );
+  check(
+    /fn label_for_surface/.test(sandboxRs),
+    '次级界面的标签由 label_for_surface 统一产出（界面名带 # 后缀）'
+  );
+  // 主界面不带后缀 —— 这一条是"已发布单界面插件逐字节不变"的那个保证。
+  check(
+    /if surface == super::surfaces::PRIMARY_SURFACE \{[\s\S]{0,80}format!\("\{LABEL_PREFIX\}\{sanitized\}"\)/.test(
+      sandboxRs
+    ),
+    '主界面的标签仍然是不带 # 的那一条（已发布的单界面插件因此一字不改）'
+  );
+  // 反过来：次级界面**必须**带上界面名。少了它，同一插件的两个界面会抢同一条
+  // 标签，而 `claim` 会把第二个判成冲突 —— 症状是"详情界面永远打不开"。
+  check(
+    /format!\("\{LABEL_PREFIX\}\{sanitized\}#\{surface\}"\)/.test(sandboxRs),
+    '次级界面的标签带上界面名（否则同一插件的两个界面互相冲突）'
   );
   check(
     /标签冲突/.test(sandboxRs),
@@ -691,13 +735,43 @@ section('前端界面协作');
     '前端门面暴露了 hide（隐藏而不销毁）'
   );
   check(
-    /hideSandboxSurface\(pluginId\)/.test(componentTsx),
+    /hideSandboxSurface\(pluginId, surface\)/.test(componentTsx),
     '不可见时调用 hide，而不是 close'
   );
   check(
-    /closeSandboxSurface\(pluginId\)/.test(componentTsx),
+    /closeSandboxSurface\(pluginId, surface\)/.test(componentTsx),
     '卸载时才调用 close'
   );
+  // 卸载时**只关自己这一块界面**，不是整个插件。
+  //
+  // 关掉整个插件在单界面时代是对的，多界面之后会变成一个很糟的 bug：主界面
+  // 的标签被切走时，插件的详情界面被一起销毁 —— 而用户完全不知道它为什么没了。
+  // 真正该"关掉全部"的是插件被停用/卸载那条路径，那时调用方只传插件 id。
+  check(
+    !/closeSandboxSurface\(pluginId\)\.catch/.test(componentTsx),
+    'SandboxSurface 卸载时不关掉整个插件的界面（那会顺手销毁兄弟界面）'
+  );
+  // 四条命令**都必须把界面名传下去**。漏一个的表现是那个操作作用在主界面上，
+  // 而用户动的是详情界面 —— 例如"关掉详情"结果关掉了主列表。
+  //
+  // `open` 与 `bounds` 走的是同一个变量 `call`（它们只差一个 IPC 名字），
+  // 因此这里分两步：先断言那个变量确实指向这两个函数，再断言调用点带着界面名。
+  check(
+    /const call = mode === 'open' \? openSandboxSurface : setSandboxSurfaceBounds;/.test(
+      componentTsx
+    ),
+    '打开与摆放走同一条调用路径（只差一个 IPC 名字）'
+  );
+  check(
+    /call\(pluginId, bounds, surface\)/.test(componentTsx),
+    '打开/摆放把界面名传给宿主（少了它每个界面都会退化成主界面）'
+  );
+  for (const fn of ['hideSandboxSurface', 'closeSandboxSurface']) {
+    check(
+      new RegExp(`${fn}\\(pluginId, surface\\)`).test(componentTsx),
+      `${fn} 把界面名传给宿主（少了它每个界面都会退化成主界面）`
+    );
+  }
 
   // 滚动事件**不冒泡**，且滚动发生在祖先容器而不是 window 上。
   // 只在 window 上监听冒泡阶段等于什么都没听 —— 这条断言盯的就是那个写法。
@@ -793,10 +867,15 @@ section('完整 API 表面');
       .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
       .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
       .replaceAll("'__PLUGIN_VERSION__'", '"1.2.3"')
+      .replaceAll("'__PLUGIN_SURFACE__'", '"detail"')
       .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
       .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
       .replaceAll('__PLUGIN_PERMISSIONS__', '["storage","plugin-data","clipboard"]')
       .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
+      .replaceAll(
+        '__PLUGIN_SURFACES__',
+        '[{"id":"main","name":"列表","primary":true},{"id":"detail","name":"详情","primary":false}]'
+      )
       .replaceAll(
         '__PLUGIN_THEME__',
         '{"resolved":"light","reduceMotion":true,"glass":false,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
@@ -836,6 +915,15 @@ section('完整 API 表面');
     check(api.plugin?.id === 'com.modulith.sandbox-demo', 'plugin.id 来自宿主注入的身份');
     check(api.plugin?.version === '1.2.3', 'plugin.version 来自宿主注入的版本');
     check(api.plugin?.runtime === 'sandboxed', 'plugin.runtime 如实报告运行位置');
+    check(api.plugin?.surface === 'detail', 'plugin.surface 是宿主注入的界面名');
+    check(
+      Array.isArray(api.surfaces) && api.surfaces.length === 2 && api.surfaces[1].id === 'detail',
+      'surfaces 是清单声明的界面的投影（同步可读）'
+    );
+    check(
+      api.surfaces?.[0]?.primary === true && api.surfaces?.[1]?.primary === false,
+      'surfaces 如实标出哪一个是主界面'
+    );
     check(
       Array.isArray(api.plugin?.permissions) && api.plugin.permissions.length === 3,
       'plugin.permissions 来自清单'
@@ -894,6 +982,11 @@ section('完整 API 表面');
       // 3.4 界面 · 宿主渲染的浮层
       ['ui.dialog', isFunction],
       ['ui.contextMenu', isFunction],
+
+      // 3.4 界面 · 多界面（api: 3）
+      ['ui.openSurface', isFunction],
+      ['ui.closeSurface', isFunction],
+      ['ui.listSurfaces', isFunction],
 
       // 3.4 界面 · 主题
       ['theme.current', isFunction],
@@ -1087,7 +1180,7 @@ section('主题链路');
     '主题变了会推给已经打开的插件界面（否则要关掉重开才生效）'
   );
   check(
-    /for \(label, _plugin_id\) in surfaces\.live\(\)/.test(sandboxRs),
+    /for \(label, _key\) in surfaces\.live\(\)/.test(sandboxRs),
     '主题推送遍历全部活着的界面'
   );
 
@@ -1302,6 +1395,275 @@ section('宿主浮层');
       `${command} 没有同时留在 overlay.rs 里（两份会被生成器漏掉一份）`
     );
   }
+}
+
+// ============================================================
+// 15. 多界面（`api: 3`）
+// ============================================================
+//
+// 一个插件可以声明多个界面，每个界面一块自己的 webview。这一节守的是那件事
+// 里**最容易悄悄退化**的几处：
+//
+//   * 主界面的标签**不带** `#` 后缀 —— 那是"已发布单界面插件一字不改"的全部依据；
+//   * 次级界面的标签**必须**带界面名 —— 少了它两个界面会抢同一条标签；
+//   * 打开界面**不由宿主建 webview**，而是广播给前端（只有前端知道摆在哪）；
+//   * 界面表的键是 `SurfaceKey`（插件 + 界面），不是插件 id；
+//   * 次级界面登记成 `hidden` 模块，且**不**出现在任何列表里。
+
+section('多界面（api: 3）');
+
+{
+  const surfacesRs = read('../src-tauri/src/modules/plugins/surfaces.rs');
+  const catalogTs = read('../src/services/moduleCatalog.ts');
+  const surfacesTs = read('../src/services/pluginSurfaces.ts');
+  const moduleRendererTsx = read('../src/components/ModuleRenderer.tsx');
+  const mainTsx = read('../src/main.tsx');
+  const rpcForSurfaces = read('../src-tauri/src/modules/plugins/rpc.rs');
+  const pluginCommandsRs = read('../src-tauri/src/modules/plugins/commands.rs');
+  const buildRs = read('../src-tauri/build.rs');
+  const typesForSurfaces = read('../src-tauri/src/modules/plugins/types.rs');
+  const contributionsTs = read('../src/services/pluginContributions.ts');
+  const pluginRuntimeTs = read('../src/services/pluginRuntime.ts');
+
+  // ---- 清单侧：主界面是必需的，而不是"第一个就是主界面" ----
+  //
+  // 顺序定义主界面的话，调整清单顺序就会改变 webview 标签 —— 而所有关于标签的
+  // 推理（日志、断言、驻留表）都建立在"名字是稳定的"之上。
+  check(
+    /pub const PRIMARY_SURFACE: &str = "main"/.test(surfacesRs),
+    '主界面 id 是一个具名常量，而不是散在代码里的字面量'
+  );
+  // 这两条**必须锚到控制流上**，不能只查"这句代码还在不在"。
+  //
+  // 试过一版只查错误消息文本的写法，结果是：把 `if !…{ return Err(…) }` 改成
+  // `if false && !… { return Err(…) }` 之后，那句错误消息仍然在文件里，门禁
+  // 照样绿 —— 而校验已经彻底失效了。判据因此落在"这个判断真的在 if 里、且
+  // 里面真的返回了错误"上。
+  //
+  // 行为层的覆盖在 `surfaces.rs` 自己的单元测试里
+  // （`a_surface_set_without_a_primary_is_rejected` 等）—— 静态这一条只是
+  // 保证"那段代码没有被绕开"。
+  check(
+    /if !surfaces\.iter\(\)\.any\(SurfaceDecl::is_primary\) \{[\s\S]{0,240}?return Err\(/.test(
+      surfacesRs
+    ),
+    '缺主界面时是**报错**，不是"拿第一个当主界面"'
+  );
+  check(
+    /pub fn is_safe_surface_id/.test(surfacesRs) &&
+      /if !is_safe_surface_id\(id\) \{[\s\S]{0,240}?return Err\(/.test(surfacesRs),
+    '界面 id 有白名单，且该判断真的拦下了非法值'
+  );
+  check(
+    /MAX_SURFACES/.test(surfacesRs) &&
+      /if items\.len\(\) > MAX_SURFACES \{/.test(surfacesRs),
+    '界面数量有上限'
+  );
+  // 入口路径的越界判断**复用**同一份实现。
+  check(
+    /use super::background_manifest::is_safe_relative;/.test(surfacesRs),
+    '界面入口的路径判断复用 background_manifest 那一份（两套一定会漂）'
+  );
+  check(
+    !/fn is_safe_relative/.test(surfacesRs),
+    'surfaces.rs 里没有第二份 is_safe_relative'
+  );
+
+  // ---- 入口文档与桥接层：界面名必须真的传下去 ----
+  check(
+    /fn entry_document<R: Runtime>\([\s\S]{0,120}?surface: &super::surfaces::SurfaceDecl,/.test(
+      sandboxRs
+    ),
+    '入口文档按界面声明渲染（而不是永远用主入口）'
+  );
+  check(
+    /surface\.entry/.test(sandboxRs) && /&plugin\.main/.test(sandboxRs) === false,
+    '入口文档用的是**这个界面**的入口脚本'
+  );
+  check(
+    /'__PLUGIN_SURFACE__'/.test(bridgeJs) &&
+      /__PLUGIN_SURFACES__/.test(bridgeJs) &&
+      /__PLUGIN_SURFACE__/.test(sandboxRs) &&
+      /__PLUGIN_SURFACES__/.test(sandboxRs),
+    '桥接层把"我在哪个界面"与"我声明了哪些界面"同步交给插件'
+  );
+  // 占位符必须出现在 debug_assert 的那份名单里，否则漏替换不会被发现。
+  check(
+    /!source\.contains\("__PLUGIN_SURFACE__"\)/.test(sandboxRs) &&
+      /!source\.contains\("__PLUGIN_SURFACES__"\)/.test(sandboxRs),
+    '两个新占位符也在"替换干净"的断言名单里'
+  );
+  check(
+    /surface: PLUGIN_SURFACE/.test(bridgeJs) && /surfaces: SURFACES/.test(bridgeJs),
+    '插件顶层就能读到 plugin.surface 与 surfaces（不必先 await）'
+  );
+
+  // ---- 打开界面：**不由宿主建 webview** ----
+  //
+  // 只有前端知道界面该摆在哪（标签栏多高、侧边栏是否展开、分屏开没开）。
+  // 宿主在这一侧建就只能自己猜一个矩形，而猜出来的界面会漂在不对的地方。
+  const openBranch = /"ui\.openSurface" => \{[\s\S]*?\n        \}/.exec(rpcForSurfaces);
+  check(openBranch !== null, 'rpc.rs 里有 ui.openSurface 的分支');
+  if (openBranch) {
+    check(
+      /app\.emit\(\s*OPEN_SURFACE/.test(openBranch[0]),
+      'ui.openSurface 广播给前端（位置只有前端知道）'
+    );
+    check(
+      !/open_surface_at/.test(openBranch[0]),
+      'ui.openSurface **不自己建 webview**（那样摆出来的位置是猜的）'
+    );
+    // 界面必须先在**当前**清单里，否则插件能要求打开一个不存在的界面，
+    // 而宿主编出来的会是一块服务 404 的空面板。
+    //
+    // 判据锚在 `if … return rpc_error` 上，而不是"这句调用还在不在"：
+    // 只查文本的话，`if false && view.surface(id).is_none()` 照样能过。
+    check(
+      /if view\.surface\(id\)\.is_none\(\) \{[\s\S]{0,240}?return rpc_error\(/.test(openBranch[0]),
+      'ui.openSurface 先核实界面的确在清单里，不在就拒绝'
+    );
+  }
+  check(
+    /pub const OPEN_SURFACE: &str = "modulith:\/\/open-surface"/.test(rpcForSurfaces) &&
+      /pub const CLOSE_SURFACE: &str = "modulith:\/\/close-surface"/.test(rpcForSurfaces),
+    '打开/关闭界面各有一个具名事件，而不是就地拼字符串'
+  );
+
+  // ---- 前端那一侧 ----
+  check(
+    /listen<SurfaceRequest>\(OPEN_SURFACE/.test(surfacesTs) &&
+      /listen<SurfaceRequest>\(CLOSE_SURFACE/.test(surfacesTs),
+    '前端订阅了两个界面事件'
+  );
+  // 启动路径上的调用必须**真的没被注释掉** —— 只查 `installPluginSurfaceRequests()`
+  // 这四个字的话，`// installPluginSurfaceRequests();` 照样能过。
+  check(
+    /^installPluginSurfaceRequests\(\);/m.test(mainTsx),
+    '界面请求的监听真的装在启动路径上（否则 ui.openSurface 永远没反应）'
+  );
+  check(
+    /openTab\(moduleId\)/.test(surfacesTs),
+    '打开界面走的是标签（"宿主决定位置"就是这么实现的）'
+  );
+
+  // ---- 次级界面的模块 id 形状 ----
+  //
+  // 它必须与清单里声明的模块 id **不可能撞上**：撞上的表现是两个界面互相覆盖。
+  check(
+    /`plugin:\$\{pluginId\}#\$\{surface\}`/.test(surfacesTs),
+    '次级界面模块 id 的形状是 plugin:<插件>#<界面>'
+  );
+  check(
+    /MODULE_ID_RE/.test(contributionsTs) &&
+      /\[A-Za-z0-9\]\[A-Za-z0-9._-\]\{0,63\}/.test(contributionsTs),
+    '清单模块 id 的字符集里没有冒号与 #（这正是上面那条形状撞不上的依据）'
+  );
+
+  // ---- hidden 模块：能开，但不进任何列表 ----
+  check(
+    /hidden: true/.test(surfacesTs),
+    '次级界面登记成 hidden 模块'
+  );
+  check(
+    /filter\(\(mod\) => !mod\.hidden\)/.test(catalogTs),
+    'getCatalogModules 过滤掉 hidden（否则次级界面会进侧边栏）'
+  );
+  check(
+    /export function getCatalogFlatMap[\s\S]*?\n}/.test(catalogTs) &&
+      !/hidden/.test(/export function getCatalogFlatMap[\s\S]*?\n}/.exec(catalogTs)?.[0] ?? ''),
+    'getCatalogFlatMap **不过滤** hidden —— 按 id 打开必须找得到它'
+  );
+  check(
+    /moduleDescriptor\.surface/.test(moduleRendererTsx),
+    'ModuleRenderer 把界面名传给 SandboxSurface（少了它每个界面都会退化成主界面）'
+  );
+
+  // ---- 记账与清理 ----
+  //
+  // 次级界面模块**只能逐个移除**，不能走 `unregisterDynamicModules(插件)`：
+  // 后者会顺手把清单里声明的模块也清掉，而那些在声明式插件重新加载时**必须**
+  // 留着。这个区别是被 `check:plugin-runtime` 的"模块 ID 冲突"一节抓出来的。
+  check(
+    /unregisterDynamicModule\(moduleId\)/.test(surfacesTs) &&
+      !/unregisterDynamicModules\(pluginId\)/.test(surfacesTs),
+    '次级界面模块逐个移除，而不是按插件清（按插件清会顺手清掉清单里的模块）'
+  );
+  check(
+    /^  clearSurfaceModules\(\);/m.test(pluginRuntimeTs),
+    '重载全部插件时清掉次级界面的记账（否则会去开一个目录里不存在的 id）'
+  );
+
+  // ---- 界面表从宿主读，不在前端再解析一遍清单 ----
+  check(
+    /pub async fn plugin_surfaces\(/.test(pluginCommandsRs),
+    'plugin_surfaces 命令存在（界面列表由宿主给出）'
+  );
+  check(
+    /invoke<DeclaredSurface\[\]>\('plugin_surfaces'/.test(surfacesTs),
+    '前端从宿主读界面表，而不是自己解析 contributes.surfaces'
+  );
+  // 判据要宽到能抓住**任何**形式的自己解析：`contributes.surfaces`、
+  // `contributes?.surfaces`、`(x.contributes as any).surfaces`。
+  // 只查前两种写法的话，第三种能过 —— 而它做的事完全一样。
+  check(
+    !/contributes[\s\S]{0,40}?\bsurfaces\b/.test(pluginRuntimeTs),
+    'pluginRuntime 不自己解析清单里的界面表（那份规则只有 Rust 一处）'
+  );
+  check(
+    buildRs.includes('"plugin_surfaces"') &&
+      read('../src-tauri/capabilities/app-commands.json').includes('"allow-plugin-surfaces"'),
+    'plugin_surfaces 进了应用级 ACL 清单并被授权（否则这条命令在运行期被拒）'
+  );
+
+  // ---- 停用/卸载插件：它开着的界面必须一起消失 ----
+  //
+  // 不关的话，那些 webview 会继续停在屏幕上，而它们属于一个"已经不存在的插件"：
+  // 下一次协议请求会被判成"当前不可用"，用户看到几块再也刷不出来的空白面板，
+  // 唯一的补救是重启应用。
+  for (const [command, body] of [
+    ['set_plugin_enabled', /pub async fn set_plugin_enabled\([\s\S]*?\n\}/.exec(pluginCommandsRs)?.[0] ?? ''],
+    ['uninstall_plugin', /pub async fn uninstall_plugin\([\s\S]*?\n\}/.exec(pluginCommandsRs)?.[0] ?? ''],
+  ] as Array<[string, string]>) {
+    check(
+      /close_all_surfaces\(&app, &id\)/.test(body),
+      `${command} 会关掉这个插件还开着的界面（否则留下再也刷不出来的空白面板）`
+    );
+  }
+
+  // ---- 清单里的模块可以指向某个界面 ----
+  check(
+    /surface: asOptionalString\(entry\.surface\)/.test(
+      contributionsTs
+    ),
+    'contributes.modules[].surface 被读出来（模块据此指向某个界面）'
+  );
+  check(
+    /surface: contribution\.surface/.test(pluginRuntimeTs),
+    '模块描述符带上界面名'
+  );
+  // 被 `contributes.modules` 声明过的界面**不再**造隐藏模块 ——
+  // 造了的话 `ui.openSurface` 会打开隐藏的那个，同一个界面于是有两个 webview，
+  // 而 webview 标签是唯一的（宿主会判成冲突，用户看到的是"点了没反应"）。
+  check(
+    /claimed/.test(surfacesTs) && /if \(claimed\.has\(surface\.id\)\) continue;/.test(surfacesTs),
+    '已经被模块声明过的界面不再造隐藏模块（否则同一个界面会有两块 webview）'
+  );
+
+  // 主界面不单独造隐藏模块：它已经由清单里的某一条模块代表了。
+  check(
+    /if \(surface\.primary\) continue;/.test(surfacesTs),
+    '主界面不登记隐藏模块（它由 contributes.modules 里的那一条代表）'
+  );
+
+  // ---- `types.rs` 不该被这次改动无谓地牵动 ----
+  //
+  // `contributes.surfaces` 刻意留在自由形状的 `contributes` 里，而不是变成
+  // `PluginManifest` 上的一个强类型字段：清单是外部输入，一个写错形状的 surfaces
+  // 不该让**整个插件**不合法（那会让它连装都装不上）。
+  check(
+    /pub contributes: Option<serde_json::Value>/.test(typesForSurfaces),
+    'contributes 仍然是自由形状（surfaces 的形状错误不该让整个插件不可用）'
+  );
 }
 
 

@@ -147,6 +147,7 @@
     "allow-sandbox-surface-hide",
     "allow-sandbox-surface-close",
     "allow-sandbox-surface-bounds",
-    "allow-sandbox-self-test"
+    "allow-sandbox-self-test",
+    "allow-plugin-surfaces"
   ]
 }

@@ -59,6 +59,25 @@ export interface ModuleDescriptor {
    * 而且旧式插件仍走 `component` 那条路，两者要能共存。
    */
   sandboxed?: boolean;
+  /**
+   * 这个沙箱模块对应插件清单里的**哪一个界面**（`contributes.surfaces[].id`）。
+   *
+   * 缺省是主界面。`SandboxSurface` 靠它决定要向宿主请求 `plugin-<id>#<界面>`
+   * 里的哪一个 —— 少了它，同一插件的两个界面会去抢同一条标签。
+   */
+  surface?: string;
+  /**
+   * **不进任何模块列表**，但可以被按 id 打开。
+   *
+   * 用途只有一个：插件用 `ctx.ui.openSurface('detail')` 打开的次级界面。
+   * 它们必须能开成标签（那正是"宿主决定位置"的实现），但**不该**出现在侧边栏、
+   * 仪表盘或命令面板里 —— 用户没有从那里打开它们的入口，而列出来会让人以为
+   * 那是一堆独立的模块。
+   *
+   * 与 `visible: false` 的区别是刻意的：`visible: false` 仍然收进「隐藏模块」
+   * 面板（用户能找到并固定出来），而 `hidden` 连那里都不进。
+   */
+  hidden?: boolean;
 }
 
 export interface ModuleTomlChild {

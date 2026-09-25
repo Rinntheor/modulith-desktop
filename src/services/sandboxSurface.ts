@@ -54,9 +54,17 @@ export interface SurfaceBounds {
  *
  * **已经开着时是"重新显示并摆放"，不是错误** —— 切换标签再切回来会走到这条路径。
  * 宿主那一侧按这个语义实现（见 `sandbox::open_surface_at` 与 `surface.rs`）。
+ *
+ * `surface` 省略时是**主界面**（`"main"`）。省略是有意义的：单界面插件（包括
+ * 全部已发布插件）的调用点因此一个字都不用改。多界面插件必须传具体的界面 id
+ * —— 不传的话两个界面会去抢同一条 `plugin-<id>` 标签，而那是宿主侧的一个显式冲突。
  */
-export function openSandboxSurface(pluginId: string, bounds: SurfaceBounds): Promise<void> {
-  return invoke('sandbox_surface_open', { pluginId, bounds });
+export function openSandboxSurface(
+  pluginId: string,
+  bounds: SurfaceBounds,
+  surface?: string
+): Promise<void> {
+  return invoke('sandbox_surface_open', { pluginId, surface: surface ?? null, bounds });
 }
 
 /**
@@ -65,16 +73,17 @@ export function openSandboxSurface(pluginId: string, bounds: SurfaceBounds): Pro
  * 这条是本轮新增的：在这之前，"不可见"只能靠 `close` 表达 —— 于是每切一次标签
  * 就销毁再重建一个 webview。
  */
-export function hideSandboxSurface(pluginId: string): Promise<void> {
-  return invoke('sandbox_surface_hide', { pluginId });
+export function hideSandboxSurface(pluginId: string, surface?: string): Promise<void> {
+  return invoke('sandbox_surface_hide', { pluginId, surface: surface ?? null });
 }
 
 /** 重新摆放。没打开时静默成功 —— 布局变化时会被无条件调用。 */
 export function setSandboxSurfaceBounds(
   pluginId: string,
-  bounds: SurfaceBounds
+  bounds: SurfaceBounds,
+  surface?: string
 ): Promise<void> {
-  return invoke('sandbox_surface_bounds', { pluginId, bounds });
+  return invoke('sandbox_surface_bounds', { pluginId, surface: surface ?? null, bounds });
 }
 
 /**
@@ -82,9 +91,13 @@ export function setSandboxSurfaceBounds(
  *
  * 这一条很重要：前端在卸载、隐藏、切换标签时都会调用它，把"本来就没开"当成错误
  * 会在日志里堆出一片没有信息量的噪声 —— 而噪声会让人连真的错误一起忽略。
+ *
+ * **不传 `surface` 时销毁这个插件的全部界面。** 那不是"顺手"，是唯一正确的语义：
+ * 插件被停用/卸载时调用方只知道插件 id，而那时它开着的每一个界面都必须消失 ——
+ * 只关掉主界面会让别的界面留在一个"插件已经不存在"的状态里，再也刷不出来。
  */
-export function closeSandboxSurface(pluginId: string): Promise<void> {
-  return invoke('sandbox_surface_close', { pluginId });
+export function closeSandboxSurface(pluginId: string, surface?: string): Promise<void> {
+  return invoke('sandbox_surface_close', { pluginId, surface: surface ?? null });
 }
 
 /**

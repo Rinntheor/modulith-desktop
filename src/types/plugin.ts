@@ -144,6 +144,17 @@ export interface ModuleContribution {
   category?: string;
   /** 侧边栏徽标文本 */
   badge?: string;
+  /**
+   * 这个模块打开的是插件的**哪一个界面**（`contributes.surfaces[].id`）。
+   *
+   * 只对 `runtime: "sandboxed"` 的插件有意义。缺省是主界面（`"main"`）——
+   * 单界面插件因此一个字都不用写。
+   *
+   * 一个插件可以有多个模块指向同一个界面（例如"笔记"与"最近笔记"两个侧边栏
+   * 入口打开同一块界面），那时它们共享同一个 webview —— 这正是想要的：
+   * 界面是重的那一半，入口是轻的。
+   */
+  surface?: string;
 }
 
 /**

@@ -51,10 +51,12 @@
   var PLUGIN_ID = '__PLUGIN_ID__';
   var PLUGIN_NAME = '__PLUGIN_NAME__';
   var PLUGIN_VERSION = '__PLUGIN_VERSION__';
+  var PLUGIN_SURFACE = '__PLUGIN_SURFACE__';
   var PLUGIN_RUNTIME = '__PLUGIN_RUNTIME__';
   var ACTIVATION_EVENT = '__PLUGIN_ACTIVATION__';
   var PERMISSIONS = __PLUGIN_PERMISSIONS__;
   var DATA_AVAILABLE = __PLUGIN_DATA_AVAILABLE__;
+  var SURFACES = __PLUGIN_SURFACES__;
 
   var RPC_ROOT = '/' + PLUGIN_ID + '/rpc/';
   var DATA_ROOT = '/' + PLUGIN_ID + '/data/';
@@ -652,6 +654,52 @@
         items: options0.items || [],
       });
     },
+
+    // ============================================================
+    // 多界面（api: 3）
+    // ============================================================
+    //
+    // 一个界面就是一个 webview。这三条是**请求**，不是直接的窗口操作：
+    //
+    //   openSurface  → 宿主广播 → 前端开一个标签 → 前端量矩形 → 建 webview
+    //
+    // 之所以绕这一圈：只有前端知道界面该放在哪（标签栏多高、侧边栏是否展开、
+    // 分屏开没开）。宿主在这一侧建就只能自己猜一个矩形，而猜出来的界面会漂在
+    // 某个不对的地方。**位置由宿主决定，插件只说要哪一个界面。**
+
+    /**
+     * 打开自己声明的某个界面。
+     *
+     * `id` 必须是清单里 `contributes.surfaces` 声明过的。返回时界面**还没有**
+     * 建好 —— 这是一次请求，不是一次等待。要确认它开着，用 `listSurfaces()`。
+     *
+     * `options.bounds` 目前只是**建议**，宿主以自己量出来的为准。
+     */
+    openSurface: function (id, options) {
+      return rpc('ui.openSurface', { id: String(id) });
+    },
+
+    /** 关闭自己开着的某个界面。没开着时静默成功。 */
+    closeSurface: function (id) {
+      return rpc('ui.closeSurface', { id: String(id) });
+    },
+
+    /**
+     * 自己声明的全部界面，以及**哪些开着**。
+     *
+     * 每一项：`{ id, name, primary, open, current }`。
+     *   · `open` —— 宿主那一侧确认已经建出来了；
+     *   · `current` —— 发起这次调用的就是它（后台插件拿到的全是 false，
+     *     因为它没有界面）。
+     *
+     * 值来自宿主而不是本页的猜测：本页只知道自己在哪一块 webview 里，
+     * 不知道别的界面开没开。
+     */
+    listSurfaces: function () {
+      return rpc('ui.listSurfaces', {}).then(function (value) {
+        return value || [];
+      });
+    },
   };
 
   // ============================================================
@@ -666,7 +714,22 @@
       version: PLUGIN_VERSION,
       runtime: PLUGIN_RUNTIME,
       permissions: PERMISSIONS.slice(),
+      /**
+       * 我现在在哪一个界面里。
+       *
+       * 主界面是 `"main"`。单界面插件看到的永远是它 —— 而多界面插件需要靠它
+       * 分辨"我这份代码是被当成列表加载的，还是被当成详情加载的"。
+       */
+      surface: PLUGIN_SURFACE,
     },
+
+    /**
+     * 我声明了哪些界面：`[{ id, name, primary }]`。
+     *
+     * 这是**清单的投影**（同步可读），不是运行期状态。想知道哪些开着，
+     * 用 `ui.listSurfaces()`。
+     */
+    surfaces: SURFACES,
 
     /** 本次由什么唤醒（沙箱界面总是 `open`：用户打开了它）。 */
     activationEvent: ACTIVATION_EVENT,

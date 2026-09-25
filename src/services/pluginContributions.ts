@@ -281,6 +281,10 @@ function normalizeModules(
       priority: asOptionalNumber(entry.priority),
       category: asOptionalString(entry.category),
       badge: asOptionalString(entry.badge),
+      // 界面名**不在这里校验**：合法形状由 Rust 侧的 `surfaces.rs` 定义
+      // （它还要挡"清单里根本没有这个界面"）。这里只把它原样带过去，
+      // 由宿主在真正建界面时判 —— 前端再实现一遍白名单只会多一套会漂的规则。
+      surface: asOptionalString(entry.surface),
     });
   });
 

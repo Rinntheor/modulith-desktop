@@ -209,6 +209,7 @@ pub fn run() -> Result<(), tauri::Error> {
         sandbox_surface_close,
         sandbox_surface_bounds,
         sandbox_self_test,
+        plugin_surfaces,
         set_plugin_theme,
         get_plugin_theme,
         set_plugin_shortcuts,

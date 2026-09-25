@@ -14,6 +14,7 @@ pub mod sandbox;
 pub mod signature;
 pub mod shortcuts;
 pub mod surface;
+pub mod surfaces;
 pub mod theme;
 pub mod types;
 pub mod validator;

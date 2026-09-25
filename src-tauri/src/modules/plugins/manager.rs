@@ -553,6 +553,10 @@ pub struct SandboxView {
     /// 资源根目录（开发链接优先，与其它读取路径一致）
     pub root: PathBuf,
     /// 入口脚本（相对 `root`）
+    ///
+    /// **这是主界面的入口。** 次级界面的入口在 `surfaces` 里按界面 id 取。
+    /// 保留这个字段是因为它被三处既有代码读着（自检、日志、断言），而这些地方
+    /// 说的都是"这个插件的主入口"。
     pub main: String,
     /// 样式（相对 `root`）
     pub style: Option<String>,
@@ -560,6 +564,18 @@ pub struct SandboxView {
     pub permissions: Vec<String>,
     /// 清单声明的运行位置
     pub runtime: PluginRuntime,
+    /// 这个插件声明的全部界面（至少一个，且一定含主界面）。
+    ///
+    /// 解析在**这里**做而不是让沙箱那边自己读清单：清单只有一个读者，
+    /// 而"这个插件有哪些界面"是清单的事实之一 —— 与根目录、权限同一个来源。
+    pub surfaces: super::surfaces::SurfaceSet,
+}
+
+impl SandboxView {
+    /// 取一个界面的声明。`None` = 清单里没有这个界面。
+    pub fn surface(&self, id: &str) -> Option<&super::surfaces::SurfaceDecl> {
+        self.surfaces.get(id)
+    }
 }
 
 impl PluginManager {
@@ -587,23 +603,39 @@ impl PluginManager {
         let root = self.asset_root(entry);
         let manifest = read_manifest(&root)?;
 
+        let display_name = if manifest.display_name.trim().is_empty() {
+            manifest.name.clone()
+        } else {
+            manifest.display_name.clone()
+        };
+
+        // 界面声明**解析失败就是不可用**，而不是退回隐式单界面。
+        //
+        // 退回会制造一个非常糟的状态：插件作者写了三个界面，其中一个 id 打错了，
+        // 于是那个界面静默消失 —— 而作者看到的是"点了没反应"。宁可整块界面
+        // 都建不出来，并把清单里的那一句话说清楚。
+        let surfaces = super::surfaces::SurfaceSet::parse(
+            manifest.contributes.as_ref(),
+            &manifest.main,
+            manifest.style.as_deref(),
+            &display_name,
+        )
+        .map_err(|message| PluginError::InvalidManifest(format!("{id}: {message}")))?;
+
         Ok(SandboxView {
             id: id.to_string(),
-            name: if manifest.display_name.trim().is_empty() {
-                manifest.name.clone()
-            } else {
-                manifest.display_name.clone()
-            },
+            name: display_name,
             version: manifest.version.clone(),
             root,
-            main: manifest.main.clone(),
-            style: manifest.style.clone(),
+            main: surfaces.primary().entry.clone(),
+            style: surfaces.primary().style.clone(),
             permissions: manifest
                 .permissions
                 .iter()
                 .map(|permission| permission.as_str().to_string())
                 .collect(),
             runtime: manifest.runtime,
+            surfaces,
         })
     }
 

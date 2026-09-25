@@ -32,21 +32,26 @@ fn to_msg<E: std::fmt::Display>(err: E) -> String {
 // 真正的隔离（见 docs/08-规划/插件沙箱与数据-v2.0范围.md §2.3）。
 // 代价是它盖在 DOM 之上，位置只能由宿主摆 —— 于是有了这三条命令。
 
-/// 显示一个沙箱插件的界面（不存在就建），并摆到给定矩形。
+/// 显示一个沙箱插件的一个界面（不存在就建），并摆到给定矩形。
 ///
-/// 只对清单里写了 `runtime: "sandboxed"` 的**已安装**插件有效；其余一律拒绝
-/// （理由见 `sandbox::open_surface_at`）。
+/// 只对清单里写了 `runtime: "sandboxed"` 的**已安装**插件、且清单里**声明过**的
+/// 界面 id 有效；其余一律拒绝（理由见 `sandbox::open_surface_at`）。
 ///
-/// **这三条命令必须是 `async`。** 同步命令的函数体在 IPC 线程（也就是主线程）
+/// `surface` 缺省是主界面（`"main"`）。缺省值的意义在于：单界面插件的调用方
+/// （包括已发布的那 9 个）**一个字都不用改** —— 它们的形态与多界面之前逐字节相同。
+///
+/// **这四条命令必须是 `async`。** 同步命令的函数体在 IPC 线程（也就是主线程）
 /// 上就地执行，而它们最终会创建 / 摆弄 / 销毁真实 webview —— 那正是不能在主线程
 /// 上做的事。把它写回同步的，就是那次整机假死。完整推导见 `surface.rs` 文件头。
 #[tauri::command]
 pub async fn sandbox_surface_open(
     app: AppHandle,
     plugin_id: String,
+    surface: Option<String>,
     bounds: super::surface::SurfaceBounds,
 ) -> Result<(), String> {
-    super::sandbox::open_surface_at(&app, &plugin_id, bounds).await
+    let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
+    super::sandbox::open_surface_at(&app, &plugin_id, &surface, bounds).await
 }
 
 /// 隐藏界面但**不销毁**。切标签、宿主浮层盖上来、窗口被收起时走它。
@@ -55,14 +60,30 @@ pub async fn sandbox_surface_open(
 /// 而重新创建要重走一遍 WebView2 控制器创建（几百毫秒），插件自己的界面状态
 /// 也会一起丢掉。
 #[tauri::command]
-pub async fn sandbox_surface_hide(app: AppHandle, plugin_id: String) -> Result<(), String> {
-    super::sandbox::hide_surface(&app, &plugin_id).await
+pub async fn sandbox_surface_hide(
+    app: AppHandle,
+    plugin_id: String,
+    surface: Option<String>,
+) -> Result<(), String> {
+    let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
+    super::sandbox::hide_surface(&app, &plugin_id, &surface).await
 }
 
 /// 关闭并销毁一个沙箱插件的界面。没开着时是**静默成功** ——
 /// 前端在卸载时无条件调用它，把"本来就没开"当成错误只会在日志里堆噪声。
+///
+/// 不传 `surface` 时关掉这个插件的**全部**界面。这不是顺手加的：插件被停用或
+/// 卸载时，它开着的每一个界面都必须消失 —— 而那时调用方（前端）只知道插件 id。
 #[tauri::command]
-pub async fn sandbox_surface_close(app: AppHandle, plugin_id: String) -> Result<(), String> {    super::sandbox::close_surface(&app, &plugin_id).await
+pub async fn sandbox_surface_close(
+    app: AppHandle,
+    plugin_id: String,
+    surface: Option<String>,
+) -> Result<(), String> {
+    match surface {
+        Some(surface) => super::sandbox::close_surface(&app, &plugin_id, &surface).await,
+        None => super::sandbox::close_all_surfaces(&app, &plugin_id).await,
+    }
 }
 
 /// 重新摆放一个沙箱插件的界面。
@@ -73,9 +94,11 @@ pub async fn sandbox_surface_close(app: AppHandle, plugin_id: String) -> Result<
 pub async fn sandbox_surface_bounds(
     app: AppHandle,
     plugin_id: String,
+    surface: Option<String>,
     bounds: super::surface::SurfaceBounds,
 ) -> Result<(), String> {
-    super::sandbox::set_surface_bounds(&app, &plugin_id, bounds).await
+    let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
+    super::sandbox::set_surface_bounds(&app, &plugin_id, &surface, bounds).await
 }
 
 /// 运行沙箱自检（诊断用）。**由人显式触发。**
@@ -90,6 +113,42 @@ pub async fn sandbox_surface_bounds(
 #[tauri::command]
 pub async fn sandbox_self_test(app: AppHandle) -> Result<(), String> {
     super::sandbox::open_selftest(&app).await
+}
+
+/// 一个插件声明了哪些界面（`contributes.surfaces`）。
+///
+/// ============================================================
+/// 为什么做成命令，而不是让前端自己解析清单
+/// ============================================================
+//
+// `contributes.surfaces` 的合法形状由 Rust 侧的 `surfaces::SurfaceSet::parse`
+// 定义：它要挡入口路径越界、缺主界面、id 冲突、数量超限。前端再实现一遍判断
+// 只会多出一套会漂的规则 —— 而漂开的方向是**"宿主认为有两个界面、前端只登记了
+// 一个"**，症状是某个界面点了没反应。这与 `plugin_background_contribution`
+// 是同一条分工。
+///
+/// 单界面插件（包括全部已发布插件）会拿到一个长度为 1、`primary: true` 的数组
+/// —— 这正是"隐式主界面"在界面这一侧的可见形式。
+#[tauri::command]
+pub async fn plugin_surfaces(
+    state: tauri::State<'_, super::PluginState>,
+    id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let manager = state.inner().0.read().await;
+    let view = manager.sandbox_view(&id).map_err(to_msg)?;
+
+    Ok(view
+        .surfaces
+        .all()
+        .iter()
+        .map(|surface| {
+            serde_json::json!({
+                "id": surface.id,
+                "name": surface.name,
+                "primary": surface.is_primary(),
+            })
+        })
+        .collect())
 }
 
 /// 把宿主的主题快照交给插件系统。由前端在主题变化时调用。
@@ -355,18 +414,49 @@ pub fn verify_plugin_index(
 
 #[tauri::command]
 pub async fn set_plugin_enabled(
+    app: AppHandle,
     state: State<'_, PluginState>,
     id: String,
     enabled: bool,
 ) -> Result<InstalledPlugin, String> {
-    let mut manager = state.inner().0.write().await;
-    manager.set_enabled(&id, enabled).map_err(to_msg)
+    let outcome = {
+        let mut manager = state.inner().0.write().await;
+        manager.set_enabled(&id, enabled).map_err(to_msg)?
+    };
+
+    // 停用一个插件时，它**已经开着的界面必须一起消失**。
+    //
+    // 不关的话，那些 webview 会继续活着并停在屏幕上 —— 它们属于一个"已经不存在
+    // 的插件"，下一次协议请求会被判成"这个插件当前不可用"，于是用户看到几块再也
+    // 刷不出来的空白面板，而唯一的补救方式是重启应用。
+    //
+    // 放在**命令这一层**而不是让前端记得调：停用插件有三条路径（界面上的开关、
+    // 卸载、将来的命令行），让每一条都记得做同一件事，迟早会漏掉一条 ——
+    // 而漏掉的表现是一个还需要重启才能恢复的状态。
+    if !enabled {
+        if let Err(error) = super::sandbox::close_all_surfaces(&app, &id).await {
+            log::warn!("停用 {id} 时关闭它的界面失败：{error}");
+        }
+    }
+
+    Ok(outcome)
 }
 
 #[tauri::command]
-pub async fn uninstall_plugin(state: State<'_, PluginState>, id: String) -> Result<(), String> {
-    let mut manager = state.inner().0.write().await;
-    manager.uninstall(&id).map_err(to_msg)
+pub async fn uninstall_plugin(app: AppHandle, state: State<'_, PluginState>, id: String) -> Result<(), String> {
+    {
+        let mut manager = state.inner().0.write().await;
+        manager.uninstall(&id).map_err(to_msg)?;
+    }
+
+    // 与停用同理：被卸载的插件不该留下任何界面。顺序是**先卸再关** ——
+    // 反过来的话，`close_all_surfaces` 之后到 `uninstall` 之间那段窗口里，
+    // 插件还能重新建出一个界面来。
+    if let Err(error) = super::sandbox::close_all_surfaces(&app, &id).await {
+        log::warn!("卸载 {id} 时关闭它的界面失败：{error}");
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

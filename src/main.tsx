@@ -12,6 +12,7 @@ import { subscribeBackendNotificationEvents } from './services/notifications';
 import { subscribePluginEvents } from './services/backgroundPlugins';
 import { installPluginThemeSync } from './services/pluginThemeSync';
 import { installPluginShortcutSync } from './services/pluginShortcutSync';
+import { installPluginSurfaceRequests } from './services/pluginSurfaces';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
@@ -104,6 +105,19 @@ installPluginThemeSync();
  * 没有反应，而在宿主里是好的。插件那一侧的桥接层接住并转发回来，这里负责执行。
  */
 installPluginShortcutSync();
+
+/*
+ * 接住插件请求打开 / 关闭**界面**的广播（`ctx.ui.openSurface` / `closeSurface`）。
+ *
+ * 方向是反的：这两条由插件发起、由前端执行。原因只有一个 —— **只有前端知道
+ * 界面该放在哪**（标签栏多高、侧边栏是否展开、分屏开没开）。宿主那一侧建 webview
+ * 就只能自己猜一个矩形，而猜出来的界面会漂在某个不对的地方。
+ *
+ * 因此插件调 `ui.openSurface('detail')` 之后发生的是：宿主广播 → 这里开一个标签
+ * → 标签里的占位量出矩形 → 宿主把 webview 摆过去。**位置由宿主决定，插件只说
+ * 要哪一个界面。** 见 `pluginSurfaces.ts` 的文件头。
+ */
+installPluginSurfaceRequests();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

@@ -29,6 +29,12 @@ import {
   getPluginModuleIds,
 } from './moduleCatalog';
 import type { ModuleDescriptor } from '../types/module';
+import {
+  clearSurfaceModules,
+  fetchDeclaredSurfaces,
+  registerSurfaceModules,
+  unregisterSurfaceModules,
+} from './pluginSurfaces';
 import type {
   ActivationEvent,
   CommandContribution,
@@ -507,6 +513,10 @@ function buildDeclaredModuleDescriptor(
     // 清单说它跑在自己的 webview 里。渲染端据此换成一块占位，
     // 由 `SandboxSurface` 把它量出来交给 Rust。
     sandboxed: plugin.manifest.runtime === 'sandboxed',
+    // 这个模块打开的是哪一个界面。缺省是主界面 —— 单界面插件因此不必写它，
+    // 而多界面插件写错一个名字时宿主会在 `open_surface_at` 里拒绝并说清
+    // "清单里没有这个界面"，而不是建出一块服务 404 的空面板。
+    surface: contribution.surface,
   };
 }
 
@@ -2185,6 +2195,10 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
   //     而「未激活时侧边栏也应该是完整的」正是这次改动要保住的东西。
   cleanupInjected(pluginId);
   cleanupPluginResources(pluginId);
+  // 次级界面模块**无论声明式与否都要清**：它们是沙箱插件的界面，而不是清单里
+  // 声明的模块 —— `contract.declarative` 说的是"这个插件的模块来自清单"，
+  // 与"它的界面模块要不要撤"是两件事。
+  unregisterSurfaceModules(pluginId);
   if (!contract?.declarative) {
     unregisterDynamicModules(pluginId);
   }
@@ -2283,6 +2297,7 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
     console.error(`[pluginRuntime] 插件 "${pluginId}" 加载失败:`, error);
     cleanupInjected(pluginId);
     cleanupPluginResources(pluginId);
+    unregisterSurfaceModules(pluginId);
     if (!contract?.declarative) {
       unregisterDynamicModules(pluginId);
     }
@@ -2303,6 +2318,7 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
 export function unloadPlugin(pluginId: string): void {
   cleanupInjected(pluginId);
   cleanupPluginResources(pluginId);
+  unregisterSurfaceModules(pluginId);
   unregisterDynamicModules(pluginId);
   loadStates.delete(pluginId);
 }
@@ -2340,6 +2356,9 @@ export async function reloadPluginRuntime(
 
   // 清空全部动态模块，避免残留已卸载插件注册的模块
   clearDynamicModules();
+  // 次级界面模块的记账要一起清：那张表决定"`ui.openSurface` 能不能开"，
+  // 留着重载前的条目会让插件去开一个目录里已经不存在的 id。
+  clearSurfaceModules();
 
   // 作废已缓存的模块组件。**必须在这里做，而不是让调用方各自记得**：
   // 下面每个插件的 registerModule() 都会为同一模块 ID 造一个全新的懒加载
@@ -2381,6 +2400,39 @@ export async function reloadPluginRuntime(
     registerDeclaredCommands(plugin.id, contract.contributions.commands);
     registerPluginSettings(plugin.id, contract.contributions.settings);
   }
+
+  // ---- 多界面：把次级界面登记成可按 id 打开的隐藏模块 ----
+  //
+  // **只对沙箱插件做。** in-process 插件的界面是宿主这个 realm 里的 React 组件，
+  // 它没有"界面表"那一说；而界面表本身只有 `sandbox_view` 给得出 ——
+  // 它只服务沙箱插件。
+  //
+  // 界面表**从宿主读**（`fetchDeclaredSurfaces`），这里不解析清单里的那一段：
+  // 合法形状由 Rust 的 `surfaces.rs` 定义（它还要挡路径越界、缺主界面、id 冲突），
+  // 前端再实现一遍只会多出一套会漂的规则。
+  //
+  // 放在这里而不是各插件加载完之后：这一段是**读清单**的路径，跑完之后侧边栏与
+  // 命令面板就已经完整了。次级界面没有可见入口，但它必须在那之前就登记好，
+  // 否则插件在 `onStartup` 里立刻调 `ui.openSurface` 时会撞上"模块不存在"。
+  await Promise.all(
+    enabledPlugins
+      .filter((plugin) => plugin.manifest.runtime === 'sandboxed')
+      .map(async (plugin) => {
+        const surfaces = await fetchDeclaredSurfaces(plugin.id);
+        if (surfaces.length <= 1) return;
+
+        // 已经被 `contributes.modules` 声明过的界面不再造隐藏模块 ——
+        // 造了的话 `ui.openSurface` 会打开隐藏的那个，于是同一个界面在两个标签里
+        // 各开一个 webview，而 webview 标签是唯一的（宿主会判成冲突）。
+        const claimed = new Set(
+          (contracts.get(plugin.id)?.contributions.modules ?? [])
+            .map((module) => module.surface)
+            .filter((surface): surface is string => typeof surface === 'string')
+        );
+
+        registerSurfaceModules(plugin.id, surfaces, claimed);
+      })
+  );
 
   // 设置值要读回来，插件的 `ctx.settings.get()` 才是同步可用的。
   // 与插件代码一样是异步的，但**必须先于激活完成** —— 因此它在这里 await，

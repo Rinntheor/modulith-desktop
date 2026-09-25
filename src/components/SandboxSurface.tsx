@@ -77,6 +77,14 @@ import {
 
 interface SandboxSurfaceProps {
   pluginId: string;
+  /**
+   * 要挂哪一块界面（清单里 `contributes.surfaces[].id`）。
+   *
+   * 缺省是主界面。**它必须一路传到 Rust**：`sandbox_surface_*` 四条命令都按
+   * `(插件 id, 界面 id)` 定位 webview。少了它，同一插件的两个界面会去抢同一条
+   * `plugin-<id>` 标签，而宿主侧会把它判成一次显式的标签冲突。
+   */
+  surface?: string;
 }
 
 /**
@@ -174,7 +182,7 @@ function warnOnce(message: string): void {
   console.warn(`[sandboxSurface] ${message}`);
 }
 
-const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId }) => {
+const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) => {
   const holder = useRef<HTMLDivElement>(null);
 
   // 「标签是否被选中」+「窗口是否可见」。插件界面必须据此出现或消失 ——
@@ -221,25 +229,25 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId }) => {
 
       // 失败只记一条日志：界面没建出来不该把整个模块渲染炸掉，
       // 那样用户看到的是一个空白页而不是一条能读的原因。
-      call(pluginId, bounds).catch((error) => {
+      call(pluginId, bounds, surface).catch((error) => {
         console.warn(
           `[sandboxSurface] ${pluginId} 的界面${mode === 'open' ? '打开' : '摆放'}失败`,
           error
         );
       });
     },
-    [pluginId]
+    [pluginId, surface]
   );
 
   // ---- 可见性：显示或隐藏（不销毁）----
   useEffect(() => {
     if (!visible) {
       // 不可见：收起来。留着它会让原生 webview 盖在别的标签或宿主浮层上。
-      void hideSandboxSurface(pluginId).catch(() => {});
+      void hideSandboxSurface(pluginId, surface).catch(() => {});
       return;
     }
     apply('open');
-  }, [visible, apply, pluginId]);
+  }, [visible, apply, pluginId, surface]);
 
   // ---- 几何：尺寸与位置变化，以及宿主滚动 ----
   useEffect(() => {
@@ -324,9 +332,9 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId }) => {
   // 不销毁的话，切过的每一个沙箱插件都会留下一个渲染进程。
   useEffect(() => {
     return () => {
-      void closeSandboxSurface(pluginId).catch(() => {});
+      void closeSandboxSurface(pluginId, surface).catch(() => {});
     };
-  }, [pluginId]);
+  }, [pluginId, surface]);
 
   return (
     <div

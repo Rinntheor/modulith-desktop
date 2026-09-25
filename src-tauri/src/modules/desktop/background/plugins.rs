@@ -536,7 +536,10 @@ async fn handle_inbound(
             .to_string();
 
         let args = request.params.unwrap_or(Value::Null);
-        let result = rpc::dispatch(&app, &plugin_id, &method, &args).await;
+        // 第三个参数是**界面身份**。后台插件没有界面 —— 因此是 `None`，
+        // 而不是一个空字符串。`ctx.ui.openSurface` 这类成员在它这里会以
+        // "你不在任何一个界面里" 失败，而那正是事实。
+        let result = rpc::dispatch(&app, &plugin_id, None, &method, &args).await;
 
         if let Err(message) = &result {
             log::debug!("后台插件 {plugin_id} 的 ctx.{method} 被拒绝：{message}");

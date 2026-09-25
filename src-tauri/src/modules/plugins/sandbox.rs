@@ -119,42 +119,89 @@ const BRIDGE_JS: &str = include_str!("../../../resources/sandbox-bridge.js");
 // 见 docs/06-项目/已知问题与技术债.md §7.40。
 //
 // 现在的事实只有一个来源：`PluginManager::sandbox_view`。本模块只保留
-// **标签 → 插件 id** 这一条映射，而它不可能与真源漂开 —— 因为每一次界面创建
-// 都必须先通过 `sandbox_view` 拿到那个插件，拿不到就建不出来。
+// **标签 → 界面身份**这一条映射，而它不可能与真源漂开 —— 因为每一次界面创建
+// 都必须先通过 `sandbox_view` 拿到那个插件与那个界面，拿不到就建不出来。
 //
-// 也就是说：**没安装的插件拿不到界面，这是构造上就成立的**，不是靠一道检查。
+// 也就是说：**没安装的插件、没声明的界面，都拿不到界面，这是构造上就成立的**，
+// 不是靠一道检查。
 
-/// Tauri 托管的沙箱界面表：`webview 标签 → 插件 id`。
+/// 一条界面的身份：**哪个插件的哪一个界面**。
+///
+/// 这是"标签不是身份，注册表才是"那句话里**注册表里存的东西**。标签是名字，
+/// 这个才是身份 —— 协议处理器拿到标签之后查出来的就是它。
+///
+/// 它同时是 `rpc::dispatch` 的第三个参数：同一个 `ctx` 有两个调用方（沙箱界面与
+/// Node 后台），而**只有界面有"我在哪个界面里"这一说**。后台插件传 `None`，
+/// 于是"这个调用从哪个界面发出来"在类型上就是可选的，而不是一个空字符串约定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceKey {
+    /// 插件 id（原始值，不是净化过的那个）
+    pub plugin_id: String,
+    /// 界面 id
+    pub surface: String,
+}
+
+impl SurfaceKey {
+    pub fn new(plugin_id: impl Into<String>, surface: impl Into<String>) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            surface: surface.into(),
+        }
+    }
+
+    /// 是不是主界面。与 `SurfaceDecl::is_primary` 同一条判据。
+    pub fn is_primary(&self) -> bool {
+        self.surface == super::surfaces::PRIMARY_SURFACE
+    }
+
+    /// webview 标签。**这是名字，不是身份** —— 身份是 `SurfaceKey` 自身。
+    pub fn label(&self) -> String {
+        label_for_surface(&self.plugin_id, &self.surface)
+    }
+}
+
+/// Tauri 托管的沙箱界面表：`webview 标签 → 界面身份`。
 ///
 /// 用 `std::sync::RwLock` 而不是 tokio 的：协议处理器要同步读它，而临界区里只做
 /// 一次哈希查找 —— 短到不会成为一个需要异步的理由。
+///
+/// **键是标签，值是 `SurfaceKey`。** 这里曾经只存插件 id（多界面之前），
+/// 而那时"一个插件一个 webview"是成立的；现在同一个插件可以有好几个界面，
+/// 只存插件 id 会让协议处理器无法分辨"这个请求来自主界面还是详情界面"——
+/// 于是两个界面会拿到同一份入口文档，而症状是"详情界面显示的是列表"。
 #[derive(Default)]
-pub struct SandboxSurfaces(RwLock<HashMap<String, String>>);
+pub struct SandboxSurfaces(RwLock<HashMap<String, SurfaceKey>>);
 
 impl SandboxSurfaces {
-    /// 记下"我给这个插件建了界面"，返回它的 webview 标签。
+    /// 记下"我给这个界面建了 webview"，返回它的标签。
     ///
-    /// 标签冲突**必须**是显式错误：两个插件抢同一个 webview 名字时，静默让后来者
-    /// 覆盖先来者会造成"其中一个插件的界面永远打不开"，而那看起来像插件本身坏了。
-    fn claim(&self, plugin_id: &str) -> Result<String, String> {
-        let label = label_for(plugin_id);
+    /// 标签冲突**必须**是显式错误：两个界面抢同一个 webview 名字时，静默让后来者
+    /// 覆盖先来者会造成"其中一个界面永远打不开"，而那看起来像插件本身坏了。
+    ///
+    /// 冲突有两个来源，都真实存在：
+    ///   * 两个插件的 id 净化后同名（`a.b` 与 `a-b`）；
+    ///   * 同一插件里两个界面 id 净化后同名 —— 这一条在 `surfaces.rs` 解析时
+    ///     就被拒了，这里再兜一次是因为 `claim` 也服务自检这类不走清单的调用方。
+    fn claim(&self, key: SurfaceKey) -> Result<String, String> {
+        let label = key.label();
         let mut map = self.0.write().unwrap_or_else(|e| e.into_inner());
 
         if let Some(existing) = map.get(&label) {
-            if existing != plugin_id {
+            if existing != &key {
                 return Err(format!(
-                    "webview 标签冲突：{label} 已经属于 {existing}，不能再给 {plugin_id}（两者的 id 净化后同名）"
+                    "webview 标签冲突：{label} 已经属于 {}#{}，不能再给 {}#{}",
+                    existing.plugin_id, existing.surface, key.plugin_id, key.surface
                 ));
             }
         }
 
-        map.insert(label.clone(), plugin_id.to_string());
+        map.insert(label.clone(), key);
         Ok(label)
     }
 
-    /// 这个标签是哪个插件的界面。没建过就返回 `None` —— 调用方必须把它当成
+    /// 这个标签是哪个插件的哪个界面。没建过就返回 `None` —— 调用方必须把它当成
     /// "这个请求不是来自插件 webview"，而不是"插件 id 是空串"。
-    fn plugin_of(&self, label: &str) -> Option<String> {
+    pub(super) fn key_of(&self, label: &str) -> Option<SurfaceKey> {
         self.0
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -176,30 +223,66 @@ impl SandboxSurfaces {
             .remove(label);
     }
 
-    /// 当前全部界面：`(标签, 插件 id)`。
+    /// 当前全部界面：`(标签, 身份)`。
     ///
-    /// 给**跨插件事件**用：一条事件要送到每一个还活着的界面，由各自的桥接层
-    /// 决定有没有人订阅它。
+    /// 给**跨插件事件**与**主题/快捷键推送**用：一条事件要送到每一个还活着的界面，
+    /// 由各自的桥接层决定有没有人订阅它。
     ///
     /// 为什么是"推给所有界面"而不是"宿主先问谁订阅了"：后者需要多一套
     /// 订阅登记的协议与状态（注册 / 注销 / 界面销毁时清理），而活着的界面
-    /// 受驻留上限约束（默认 3 个），推一圈的代价是有界的。**用一个有界的代价
-    /// 换掉一整套会漂的状态**，在这里是划算的。
-    pub(super) fn live(&self) -> Vec<(String, String)> {
+    /// 受驻留上限约束，推一圈的代价是有界的。**用一个有界的代价换掉一整套会漂
+    /// 的状态**，在这里是划算的。
+    pub(super) fn live(&self) -> Vec<(String, SurfaceKey)> {
         self.0
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(label, plugin)| (label.clone(), plugin.clone()))
+            .map(|(label, key)| (label.clone(), key.clone()))
             .collect()
+    }
+
+    /// 某个插件当前开着的界面 id 列表（去重、已排序）。
+    ///
+    /// 给 `ui.listSurfaces` 用。**从这张表读而不是问前端**：这张表就是"开没开"的
+    /// 真源，而前端那一侧还要经过标签状态、渲染时机、React 提交才能回答同一个
+    /// 问题 —— 两个来源一定会漂，而漂开的方向是"插件以为界面开着，其实早关了"。
+    pub(super) fn surfaces_of(&self, plugin_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|key| key.plugin_id == plugin_id)
+            .map(|key| key.surface.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 }
 
-/// 从插件 id 得到 webview 标签。
+/// 从插件 id 得到**主界面**的 webview 标签。
 ///
 /// **这不是身份**，只是名字（见文件头"标签不是身份"）。净化规则只保留字母数字与
 /// `-` `_`，其余一律换成 `-`。
 pub fn label_for(plugin_id: &str) -> String {
+    label_for_surface(plugin_id, super::surfaces::PRIMARY_SURFACE)
+}
+
+/// 从插件 id 与界面 id 得到 webview 标签。
+///
+/// 两条形态，与方案 §2 画的那张图逐字对应：
+///
+///   * 主界面 → `plugin-<净化后的 id>`（**不带** `#`）
+///   * 次级界面 → `plugin-<净化后的 id>#<界面 id>`
+///
+/// 主界面不带后缀是刻意的：已发布的单界面插件因此拿到与多界面之前**逐字节相同**
+/// 的标签，它们的日志、断言与"我建过哪些界面"都不会因为这一步而变化。
+///
+/// 界面 id **不再净化**，因为它进标签之前已经被 `surfaces::is_safe_surface_id`
+/// 白名单校验过。这里再净化一次反而有害：`a.b` 与 `a-b` 会变成同一条标签，
+/// 而那种冲突在解析期就该被拒。
+pub fn label_for_surface(plugin_id: &str, surface: &str) -> String {
     let sanitized: String = plugin_id
         .chars()
         .map(|c| {
@@ -210,7 +293,12 @@ pub fn label_for(plugin_id: &str) -> String {
             }
         })
         .collect();
-    format!("{LABEL_PREFIX}{sanitized}")
+
+    if surface == super::surfaces::PRIMARY_SURFACE {
+        format!("{LABEL_PREFIX}{sanitized}")
+    } else {
+        format!("{LABEL_PREFIX}{sanitized}#{surface}")
+    }
 }
 
 // ============================================================
@@ -258,26 +346,38 @@ async fn handle<R: Runtime>(
     };
 
     // 身份来自这张表，而表里的每一条都是**建界面时经 `PluginManager` 核实过**的。
-    // 也就是说：一个没安装的插件不可能出现在这里。
-    let Some(plugin_id) = surfaces.plugin_of(label) else {
+    // 也就是说：一个没安装的插件、或者一个没声明的界面，都不可能出现在这里。
+    let Some(key) = surfaces.key_of(label) else {
         log::warn!("[sandbox] 拒绝来自未建界面的 webview 的协议请求：{label}");
         return text(403, "这个来源不是插件界面");
     };
 
-    // 插件的事实（根目录、入口、样式、权限）从 `PluginManager` 读 —— 单一真源。
+    // 插件的事实（根目录、入口、样式、权限、界面表）从 `PluginManager` 读 —— 单一真源。
     // 锁在文件 IO 之前放掉（下面的入口文档与资源读取都要碰磁盘）。
     let view = {
         let Some(state) = app.try_state::<super::PluginState>() else {
             return text(503, "插件系统尚未就绪");
         };
         let manager = state.0.read().await;
-        match manager.sandbox_view(&plugin_id) {
+        match manager.sandbox_view(&key.plugin_id) {
             Ok(view) => view,
             Err(e) => {
-                log::warn!("[sandbox] 取不到 {plugin_id} 的沙箱视图：{e}");
+                log::warn!("[sandbox] 取不到 {} 的沙箱视图：{e}", key.plugin_id);
                 return text(404, "这个插件当前不可用");
             }
         }
+    };
+
+    // 界面必须在**当前**清单里仍然存在。开发链接（`devLink`）下清单是可变的，
+    // 因此"建界面时它存在"不等于"现在还存在" —— 一个被作者删掉的界面如果继续
+    // 服务旧文档，症状是"改了清单但界面还是旧的"。
+    let Some(surface) = view.surface(&key.surface) else {
+        log::warn!(
+            "[sandbox] {} 的清单里已经没有界面 {} 了（它可能刚被改掉）",
+            view.id,
+            key.surface
+        );
+        return text(404, "这个界面已经不存在了");
     };
 
     let path = request.uri().path().to_string();
@@ -296,14 +396,14 @@ async fn handle<R: Runtime>(
     match (method.as_str(), segments.get(1).copied()) {
         // 入口文档。**由宿主合成** —— 插件包因此不必自带 HTML。
         ("GET", None) | ("GET", Some("")) | ("GET", Some("index.html")) => {
-            entry_document(app, &view)
+            entry_document(app, &view, surface)
         }
 
         // 桥接层。它是宿主的一部分，不来自插件目录：插件拿不到它，也就改不了它。
         //
         // 每次响应都**按身份重新渲染一遍**（`bridge_script`），因此插件在顶层就能
-        // 同步读到自己的 id / 名称 / 权限，不必先 await 一次握手。
-        ("GET", Some("bridge.js")) => bridge_script(app, &view),
+        // 同步读到自己的 id / 名称 / 权限 / 界面名，不必先 await 一次握手。
+        ("GET", Some("bridge.js")) => bridge_script(app, &view, &key.surface),
 
         ("GET", Some("asset")) => {
             let rel = segments[2..].join("/");
@@ -332,7 +432,7 @@ async fn handle<R: Runtime>(
             let Some(method) = segments.get(2).copied() else {
                 return text(404, "缺少 RPC 方法");
             };
-            dispatch_rpc(app, &view, method, request.body()).await
+            dispatch_rpc(app, &key, method, request.body()).await
         }
 
         _ => text(404, "没有这条路径"),
@@ -367,7 +467,7 @@ async fn handle_selftest<R: Runtime>(
             if segments.get(2).copied() == Some("close") {
                 // 走所有者线程销毁，而不是就地从协议处理器里关 —— 这里正跑在
                 // 引擎的请求路径上（主线程）。理由见 surface.rs 的文件头。
-                if let Err(e) = close_surface(app, SELFTEST_ID).await {
+                if let Err(e) = close_surface(app, SELFTEST_ID, super::surfaces::PRIMARY_SURFACE).await {
                     log::warn!("[sandbox自检] 关闭界面失败：{e}");
                 }
                 return json(r#"{"ok":true}"#);
@@ -398,8 +498,9 @@ async fn handle_selftest<R: Runtime>(
 fn entry_document<R: Runtime>(
     app: &AppHandle<R>,
     plugin: &SandboxView,
+    surface: &super::surfaces::SurfaceDecl,
 ) -> http::Response<Cow<'static, [u8]>> {
-    let style = match &plugin.style {
+    let style = match &surface.style {
         Some(rel) => format!(
             r#"  <link rel="stylesheet" href="/{id}/asset/{rel}">"#,
             id = plugin.id,
@@ -463,10 +564,10 @@ fn entry_document<R: Runtime>(
   </body>
 </html>
 "#,
-        name = escape_html(&plugin.name),
+        name = escape_html(&surface.name),
         id = plugin.id,
         style = style,
-        main = escape_attr(&plugin.main),
+        main = escape_attr(&surface.entry),
         theme = theme,
     );
 
@@ -517,7 +618,11 @@ fn page(body: String, script_and_style: &str) -> http::Response<Cow<'static, [u8
 ///   * 插件在**顶层同步**就能读到自己的身份与权限，不必先 await 一次握手 ——
 ///     而"顶层同步可用"正是 v1.5 花一整轮保住的性质；
 ///   * 少一条往返。身份校验照旧在协议处理器里做，这条替换不是安全依据。
-fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
+fn bridge_script<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin: &SandboxView,
+    surface_id: &str,
+) -> http::Response<Cow<'static, [u8]>> {
     let permissions = serde_json::to_string(&plugin.permissions)
         .unwrap_or_else(|_| "[]".to_string());
 
@@ -533,13 +638,31 @@ fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::
         })
         .unwrap_or(false);
 
+    // 声明的界面表注入成字面量：插件在顶层就能写出 `if (Modulith.surfaces.length > 1)`
+    // 这样的特性探测，不必先 await 一次。它是**清单的投影**，不是运行期状态 ——
+    // "哪些界面开着"要去问 `ui.listSurfaces()`。
+    let declared: Vec<serde_json::Value> = plugin
+        .surfaces
+        .all()
+        .iter()
+        .map(|surface| {
+            serde_json::json!({
+                "id": surface.id,
+                "name": surface.name,
+                "primary": surface.is_primary(),
+            })
+        })
+        .collect();
+
     let source = BRIDGE_JS
         .replace("'__PLUGIN_ID__'", &js_string(&plugin.id))
         .replace("'__PLUGIN_NAME__'", &js_string(&plugin.name))
         .replace("'__PLUGIN_VERSION__'", &js_string(&plugin.version))
+        .replace("'__PLUGIN_SURFACE__'", &js_string(surface_id))
+        .replace("'__PLUGIN_RUNTIME__'", &js_string(runtime_wire(&plugin.runtime)))
         .replace("__PLUGIN_PERMISSIONS__", &permissions)
         .replace("__PLUGIN_DATA_AVAILABLE__", if data_available { "true" } else { "false" })
-        .replace("'__PLUGIN_RUNTIME__'", &js_string(runtime_wire(&plugin.runtime)))
+        .replace("__PLUGIN_SURFACES__", &serde_json::Value::from(declared).to_string())
         .replace("'__PLUGIN_ACTIVATION__'", &js_string("open"))
         // 主题快照注入成**字面量**而不是让桥接层先 RPC 一次：插件在顶层同步
         // 就能读到自己的令牌（与身份、权限同一个理由）。
@@ -568,8 +691,10 @@ fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::
         !source.contains("__PLUGIN_ID__")
             && !source.contains("__PLUGIN_NAME__")
             && !source.contains("__PLUGIN_VERSION__")
+            && !source.contains("__PLUGIN_SURFACE__")
             && !source.contains("__PLUGIN_PERMISSIONS__")
             && !source.contains("__PLUGIN_DATA_AVAILABLE__")
+            && !source.contains("__PLUGIN_SURFACES__")
             && !source.contains("__PLUGIN_RUNTIME__")
             && !source.contains("__PLUGIN_ACTIVATION__")
             && !source.contains("__PLUGIN_THEME__")
@@ -632,7 +757,7 @@ pub async fn apply_theme<R: Runtime>(app: &AppHandle<R>) {
         described = js_string(&described),
     );
 
-    for (label, _plugin_id) in surfaces.live() {
+    for (label, _key) in surfaces.live() {
         if let Err(error) = actor.eval(&label, script.clone()).await {
             // 一个界面推不到（多半是刚被销毁）不该影响其余界面。
             log::debug!("向沙箱界面 {label} 推送主题失败：{error}");
@@ -660,7 +785,7 @@ pub async fn apply_shortcuts<R: Runtime>(app: &AppHandle<R>) {
         js_string(&table.describe().to_string())
     );
 
-    for (label, _plugin_id) in surfaces.live() {
+    for (label, _key) in surfaces.live() {
         if let Err(error) = actor.eval(&label, script.clone()).await {
             log::debug!("向沙箱界面 {label} 推送快捷键表失败：{error}");
         }
@@ -851,7 +976,7 @@ fn plugin_manager<R: Runtime>(
 
 async fn dispatch_rpc<R: Runtime>(
     app: &AppHandle<R>,
-    plugin: &SandboxView,
+    key: &SurfaceKey,
     method: &str,
     body: &[u8],
 ) -> http::Response<Cow<'static, [u8]>> {
@@ -864,9 +989,12 @@ async fn dispatch_rpc<R: Runtime>(
         }
     };
 
-    // 语义在 \`super::rpc\` 里，这里只做**传输**上的翻译（HTTP ↔ Result）。
+    // 语义在 `super::rpc` 里，这里只做**传输**上的翻译（HTTP ↔ Result）。
     // 沙箱与 Node 后台两条路径共用同一份 ctx 实现 —— 见 rpc.rs 的文件头。
-    match super::rpc::dispatch(app, &plugin.id, method, &args).await {
+    //
+    // 界面身份**只在沙箱这条路径上存在**，因此它作为第三个参数传进去，
+    // 而 Node 那条路径传 `None`。理由见 `SurfaceKey`。
+    match super::rpc::dispatch(app, &key.plugin_id, Some(&key.surface), method, &args).await {
         Ok(value) => json_value(&serde_json::json!({ "ok": true, "value": value })),
         Err(message) => rpc_error(&message),
     }
@@ -1026,10 +1154,26 @@ pub async fn open_selftest<R: Runtime>(app: &AppHandle<R>) -> Result<(), String>
 
 /// 给一个**已安装**的插件显示沙箱界面。这是真插件唯一的入口。
 ///
-/// 三步的顺序是有意的，每一步都在为一个失效方式兜底：
+/// ============================================================
+/// 三个界面参数是怎么来的
+/// ============================================================
 ///
-///   1. 先经 `PluginManager` 核实它存在、已启用、且声明了 `runtime: sandboxed`
-///      —— 拿不到就**什么都不建**。没安装的插件因此构造上就不可能拿到界面；
+/// `surface` 是**要开哪一个界面**（清单里声明的 id）。它由调用方给出：
+///   * 前端打开一个标签时，取的是那个模块描述符上记的界面（见 `moduleCatalog`）；
+///   * 插件自己调 `ctx.ui.openSurface('detail')` 时，由宿主先把它变成一个标签，
+///     再回到这里 —— 也就是说**位置永远由宿主决定**，插件只说要哪一个界面。
+///
+/// 传一个清单里没有的界面 id 会在这里被拒（`view.surface()` 返回 `None`），
+/// 而不是建出一个服务 404 的空 webview。
+///
+/// ============================================================
+/// 三步的顺序
+/// ============================================================
+///
+/// 每一步都在为一个失效方式兜底：
+///
+///   1. 先经 `PluginManager` 核实它存在、已启用、声明了 `runtime: sandboxed`、
+///      且清单里有这个界面 —— 拿不到就**什么都不建**；
 ///   2. 再在界面表里占位。**先占位再建 webview**：反过来的话，webview 起来了而
 ///      协议请求先到，那一刻表里还没有这条记录，请求会被判成"不是插件界面"；
 ///   3. 最后交给所有者线程去建。建失败就撤销占位，免得留下一条指向不存在界面的记录。
@@ -1040,6 +1184,7 @@ pub async fn open_selftest<R: Runtime>(app: &AppHandle<R>) -> Result<(), String>
 pub async fn open_surface_at<R: Runtime>(
     app: &AppHandle<R>,
     plugin_id: &str,
+    surface: &str,
     bounds: SurfaceBounds,
 ) -> Result<(), String> {
     let view = {
@@ -1060,10 +1205,19 @@ pub async fn open_surface_at<R: Runtime>(
         ));
     }
 
+    if view.surface(surface).is_none() {
+        return Err(format!(
+            "{} 的清单里没有界面 {surface}（它声明的是：{}）",
+            view.id,
+            view.surfaces.ids().join("、")
+        ));
+    }
+
     let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
         return Err("沙箱界面表尚未就绪".to_string());
     };
-    let label = surfaces.claim(&view.id)?;
+    let key = SurfaceKey::new(view.id.clone(), surface);
+    let label = surfaces.claim(key)?;
 
     match actor(app)?.show(&label, &view.id, bounds).await {
         Ok(()) => Ok(()),
@@ -1076,22 +1230,32 @@ pub async fn open_surface_at<R: Runtime>(
     }
 }
 
-/// 隐藏一个插件的沙箱界面。**不销毁。**
+/// 隐藏一个插件的某个界面。**不销毁。**
 ///
 /// 切标签、宿主浮层盖上来、窗口被收起时走这条。留着 webview 是有意的：下一次
 /// 显示时不必再付一次控制器创建（那是几百毫秒），插件自己的界面状态也还在。
 /// 真正不再需要的界面由 `close_surface` 销毁。
-pub async fn hide_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
-    actor(app)?.set_visible(&label_for(plugin_id), false).await
+pub async fn hide_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: &str,
+) -> Result<(), String> {
+    actor(app)?
+        .set_visible(&label_for_surface(plugin_id, surface), false)
+        .await
 }
 
-/// 关掉一个插件的沙箱界面，并撤销它的占位。
+/// 关掉一个插件的某个界面，并撤销它的占位。
 ///
-/// 关掉之后同一个插件可以再建一次（用户切走标签再切回来）。因此这一步必须
+/// 关掉之后同一个界面可以再建一次（用户切走标签再切回来）。因此这一步必须
 /// **同时**清掉界面表里的那条记录 —— 只关 webview 而留着记录，下一次建的时候
 /// `claim` 会成功返回旧标签，而 webview 其实已经不在了。两处状态必须一起动。
-pub async fn close_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
-    let label = label_for(plugin_id);
+pub async fn close_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: &str,
+) -> Result<(), String> {
+    let label = label_for_surface(plugin_id, surface);
 
     if let Some(surfaces) = app.try_state::<SandboxSurfaces>() {
         surfaces.forget(&label);
@@ -1100,14 +1264,63 @@ pub async fn close_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> R
     actor(app)?.close(&label).await
 }
 
-/// 重新摆放一个插件的沙箱界面。界面不存在时**什么都不做**（返回 `Ok`）——
+/// 重新摆放一个插件的某个界面。界面不存在时**什么都不做**（返回 `Ok`）——
 /// 前端在布局变化时无条件调用它，把"还没打开"当成错误会让每次缩放都报一次。
 pub async fn set_surface_bounds<R: Runtime>(
     app: &AppHandle<R>,
     plugin_id: &str,
+    surface: &str,
     bounds: SurfaceBounds,
 ) -> Result<(), String> {
-    actor(app)?.place(&label_for(plugin_id), bounds).await
+    actor(app)?
+        .place(&label_for_surface(plugin_id, surface), bounds)
+        .await
+}
+
+/// 关掉一个插件的**全部**界面。
+///
+/// 插件被停用/卸载时走这条。少了它，一个被停用的插件留在屏幕上的那些界面会
+/// 继续活着 —— 而它们属于一个"已经不存在"的插件，下一次协议请求会被 404 拒掉，
+/// 用户看到的是一块再也刷不出来的空白。
+pub async fn close_all_surfaces<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+) -> Result<(), String> {
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        return Ok(());
+    };
+
+    // 先把标签收集出来：`live()` 拿的是快照，因此循环里 `forget` 不会与它打架。
+    let labels: Vec<String> = surfaces
+        .live()
+        .into_iter()
+        .filter(|(_, key)| key.plugin_id == plugin_id)
+        .map(|(label, _)| label)
+        .collect();
+
+    let mut first_error = None;
+    for label in labels {
+        surfaces.forget(&label);
+        if let Err(error) = actor(app)?.close(&label).await {
+            log::warn!("关闭 {plugin_id} 的界面 {label} 失败：{error}");
+            first_error.get_or_insert(error);
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// 某个插件当前开着的界面 id（去重排序）。
+///
+/// 给 `ctx.ui.listSurfaces()` 用。**这是"开着"的唯一真源** —— 见
+/// `SandboxSurfaces::surfaces_of`。
+pub fn live_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Vec<String> {
+    app.try_state::<SandboxSurfaces>()
+        .map(|surfaces| surfaces.surfaces_of(plugin_id))
+        .unwrap_or_default()
 }
 
 /// 取界面所有者线程的句柄。
@@ -1119,4 +1332,127 @@ pub(crate) fn actor<R: Runtime>(
 ) -> Result<tauri::State<'_, super::surface::SurfaceActor>, String> {
     app.try_state::<super::surface::SurfaceActor>()
         .ok_or_else(|| "沙箱界面线程尚未就绪".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::plugins::surfaces::PRIMARY_SURFACE;
+
+    /// 主界面的标签**不带** `#` 后缀。
+    ///
+    /// 这一条是整个多界面改动的兼容性保证：已发布的单界面插件因此拿到与之前
+    /// 逐字节相同的标签，它们的日志、断言与"我建过哪些界面"都不会变化。
+    #[test]
+    fn the_primary_surface_keeps_the_plain_label() {
+        assert_eq!(label_for("com.example.notes"), "plugin-com-example-notes");
+        assert_eq!(
+            label_for_surface("com.example.notes", PRIMARY_SURFACE),
+            "plugin-com-example-notes"
+        );
+        assert_eq!(label_for("com.example.notes"), label_for_surface("com.example.notes", PRIMARY_SURFACE));
+    }
+
+    /// 次级界面的标签带上界面名。
+    ///
+    /// 少了后缀的话，同一插件的两个界面会抢同一条标签，而 `claim` 会把第二个
+    /// 判成冲突 —— 症状是"详情界面永远打不开"，而那看起来像插件自己坏了。
+    #[test]
+    fn a_secondary_surface_carries_its_name_in_the_label() {
+        assert_eq!(
+            label_for_surface("com.example.notes", "detail"),
+            "plugin-com-example-notes#detail"
+        );
+        assert_ne!(
+            label_for_surface("com.example.notes", "detail"),
+            label_for_surface("com.example.notes", "main")
+        );
+    }
+
+    /// 插件 id 仍然要被净化，而界面名**已经**被 `surfaces.rs` 白名单挡过，
+    /// 因此不净化 —— 净化反而有害（`a.b` 与 `a-b` 会变成同一条标签）。
+    #[test]
+    fn the_plugin_id_is_sanitized_but_the_surface_name_is_not() {
+        assert_eq!(label_for("a.b"), "plugin-a-b");
+        // 两个不同的插件 id 净化后同名 → 后面那个会在 claim 时被判成冲突
+        assert_eq!(label_for("a.b"), label_for("a-b"));
+
+        // 界面名不被净化：一个带点的名字经 `label_for_surface` 出来仍然是带点的
+        // （它根本不该走到这里 —— `is_safe_surface_id` 会先拒掉它）。
+        assert!(label_for_surface("p", "a.b").ends_with("#a.b"));
+    }
+
+    /// `SurfaceKey` 的构造与判定。
+    #[test]
+    fn a_surface_key_knows_whether_it_is_the_primary_one() {
+        let primary = SurfaceKey::new("p", PRIMARY_SURFACE);
+        let detail = SurfaceKey::new("p", "detail");
+
+        assert!(primary.is_primary());
+        assert!(!detail.is_primary());
+        assert_eq!(primary.label(), "plugin-p");
+        assert_eq!(detail.label(), "plugin-p#detail");
+        assert_ne!(primary, detail);
+    }
+
+    /// 界面表：同一个插件的两个界面各自占一条，互不冲突；换个插件抢同一条标签
+    /// 才是冲突。
+    #[test]
+    fn the_surface_table_keeps_two_surfaces_of_one_plugin_apart() {
+        let table = SandboxSurfaces::default();
+
+        let main = table.claim(SurfaceKey::new("p", "main")).expect("主界面");
+        let detail = table.claim(SurfaceKey::new("p", "detail")).expect("详情界面");
+        assert_ne!(main, detail);
+
+        assert_eq!(table.key_of(&main).unwrap().surface, "main");
+        assert_eq!(table.key_of(&detail).unwrap().surface, "detail");
+
+        // 重复 claim 同一条是幂等的（前端会重复调用 open）
+        assert_eq!(table.claim(SurfaceKey::new("p", "main")).unwrap(), main);
+
+        // 同一个界面名给不同的插件：标签不同，因此不冲突
+        assert_ne!(table.claim(SurfaceKey::new("q", "main")).unwrap(), main);
+
+        // 插件 id 净化后同名（`p-x` 与 `p.x` 都变成 `p-x`）→ **必须**是一个
+        // 显式错误，而不是静默让后来者覆盖先来者。
+        table.claim(SurfaceKey::new("p-x", "main")).unwrap();
+        let clash = table.claim(SurfaceKey::new("p.x", "main"));
+        assert!(clash.is_err(), "净化后同名的两个插件必须被判成标签冲突");
+        assert!(clash.unwrap_err().contains("标签冲突"));
+    }
+
+    /// `forget` 之后同一条标签可以再次 claim —— 这正是"关掉再打开"的路径。
+    #[test]
+    fn forgetting_a_label_frees_it_for_the_next_open() {
+        let table = SandboxSurfaces::default();
+        let label = table.claim(SurfaceKey::new("p", "detail")).unwrap();
+
+        table.forget(&label);
+        assert!(table.key_of(&label).is_none());
+
+        assert_eq!(table.claim(SurfaceKey::new("p", "detail")).unwrap(), label);
+    }
+
+    /// `live()` 与 `surfaces_of()` 是"哪些界面开着"的真源。
+    #[test]
+    fn live_and_surfaces_of_agree_with_what_was_claimed() {
+        let table = SandboxSurfaces::default();
+        table.claim(SurfaceKey::new("p", "main")).unwrap();
+        table.claim(SurfaceKey::new("p", "detail")).unwrap();
+        table.claim(SurfaceKey::new("q", "main")).unwrap();
+
+        assert_eq!(table.live().len(), 3);
+        assert_eq!(table.surfaces_of("p"), vec!["detail".to_string(), "main".to_string()]);
+        assert_eq!(table.surfaces_of("q"), vec!["main".to_string()]);
+        assert!(table.surfaces_of("nope").is_empty());
+    }
+
+    /// `forget` 不存在的标签是静默的 —— 关一个没开着的界面是正常路径。
+    #[test]
+    fn forgetting_something_that_was_never_claimed_is_not_an_error() {
+        let table = SandboxSurfaces::default();
+        table.forget("plugin-nobody");
+        assert!(table.live().is_empty());
+    }
 }
