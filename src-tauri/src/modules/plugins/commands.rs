@@ -62,8 +62,7 @@ pub async fn sandbox_surface_hide(app: AppHandle, plugin_id: String) -> Result<(
 /// 关闭并销毁一个沙箱插件的界面。没开着时是**静默成功** ——
 /// 前端在卸载时无条件调用它，把"本来就没开"当成错误只会在日志里堆噪声。
 #[tauri::command]
-pub async fn sandbox_surface_close(app: AppHandle, plugin_id: String) -> Result<(), String> {
-    super::sandbox::close_surface(&app, &plugin_id).await
+pub async fn sandbox_surface_close(app: AppHandle, plugin_id: String) -> Result<(), String> {    super::sandbox::close_surface(&app, &plugin_id).await
 }
 
 /// 重新摆放一个沙箱插件的界面。
@@ -91,6 +90,48 @@ pub async fn sandbox_surface_bounds(
 #[tauri::command]
 pub async fn sandbox_self_test(app: AppHandle) -> Result<(), String> {
     super::sandbox::open_selftest(&app).await
+}
+
+/// 把宿主的主题快照交给插件系统。由前端在主题变化时调用。
+///
+/// ============================================================
+/// 为什么是"前端推上来"而不是宿主自己去读
+/// ============================================================
+///
+/// 主题的**真源在宿主文档里**（那一堆 CSS 自定义属性），而宿主文档跑在主窗口的
+/// webview 里。Rust 这一侧没有 `document` 可读，也不该去读一个它看不见的东西。
+///
+/// 因此前端是唯一知道"现在的令牌是什么"的一方，它把整份快照推上来，宿主只负责
+/// 把它注入插件文档并推给已经打开的界面。
+///
+/// **返回是否真的变了**：前端会因为它自己的理由重推同一份快照（窗口重新获得
+/// 焦点、设置页重渲染），而每一次"真的变了"都会触发一圈 `eval` ——
+/// 不判等会让那些无关的动作触发所有插件界面重绘。
+#[tauri::command]
+pub async fn set_plugin_theme(
+    app: AppHandle,
+    theme: super::theme::ThemeSnapshot,
+) -> Result<bool, String> {
+    let Some(state) = app.try_state::<super::theme::PluginTheme>() else {
+        return Err("主题尚未就绪".to_string());
+    };
+
+    if !state.set(theme) {
+        return Ok(false);
+    }
+
+    // 只推给**已经打开的**界面。没打开的会在它下一次加载时从入口文档里拿到
+    // 最新的那一份，不需要任何额外动作。
+    super::sandbox::apply_theme(&app).await;
+    Ok(true)
+}
+
+/// 当前的主题快照（诊断与自检用）。
+#[tauri::command]
+pub fn get_plugin_theme(app: AppHandle) -> serde_json::Value {
+    app.try_state::<super::theme::PluginTheme>()
+        .map(|state| state.describe())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 #[tauri::command]

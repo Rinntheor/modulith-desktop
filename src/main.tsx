@@ -10,6 +10,7 @@ import { installGlobalErrorHandlers } from './services/globalErrorHandlers';
 import { installMemoryLevelPolicy } from './services/memoryLevel';
 import { subscribeBackendNotificationEvents } from './services/notifications';
 import { subscribePluginEvents } from './services/backgroundPlugins';
+import { installPluginThemeSync } from './services/pluginThemeSync';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
@@ -82,6 +83,17 @@ void subscribeBackendNotificationEvents();
  * 见 `BootGate` 里对 `syncBackgroundPlugins` 的调用。
  */
 void subscribePluginEvents();
+
+/*
+ * 把宿主的主题推给插件系统，并在每次主题变化时再推一次。
+ *
+ * 装在最外层并且**立刻推一次**：插件可能在主题变化之前就被打开，而它的入口
+ * 文档依赖宿主已经收到过快照 —— 晚一步的表现在深色主题下是一次白闪。
+ *
+ * 主题的真源在宿主文档里（CSS 自定义属性），Rust 那一侧读不到，因此方向只能是
+ * 前端推上去。见 `pluginThemeSync` 的文件头。
+ */
+installPluginThemeSync();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

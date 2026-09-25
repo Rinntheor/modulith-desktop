@@ -296,7 +296,7 @@ async fn handle<R: Runtime>(
     match (method.as_str(), segments.get(1).copied()) {
         // 入口文档。**由宿主合成** —— 插件包因此不必自带 HTML。
         ("GET", None) | ("GET", Some("")) | ("GET", Some("index.html")) => {
-            entry_document(&view)
+            entry_document(app, &view)
         }
 
         // 桥接层。它是宿主的一部分，不来自插件目录：插件拿不到它，也就改不了它。
@@ -395,7 +395,10 @@ async fn handle_selftest<R: Runtime>(
 ///
 /// `script-src 'self'`（不是 `'unsafe-inline'`）：桥接与插件脚本都是同源外部文件，
 /// 插件因此不能靠内联脚本绕过 —— 它的入口只有一个。
-fn entry_document(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
+fn entry_document<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin: &SandboxView,
+) -> http::Response<Cow<'static, [u8]>> {
     let style = match &plugin.style {
         Some(rel) => format!(
             r#"  <link rel="stylesheet" href="/{id}/asset/{rel}">"#,
@@ -404,6 +407,15 @@ fn entry_document(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
         ),
         None => String::new(),
     };
+
+    // 主题在**入口文档里**就注入，而不是等桥接层起来之后再改。
+    //
+    // 顺序很重要：先注入后渲染，插件的第一帧就是对的。反过来（先渲染再改）
+    // 在深色主题下会白闪一帧，而那一下很显眼。理由详见 `theme.rs` 的文件头。
+    let theme = app
+        .try_state::<super::theme::PluginTheme>()
+        .map(|state| state.get().to_css())
+        .unwrap_or_default();
 
     let body = format!(
         r#"<!doctype html>
@@ -436,6 +448,12 @@ fn entry_document(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
       html, body {{ margin: 0; padding: 0; height: 100%; }}
       #modulith-root {{ min-height: 100%; }}
     </style>
+    <!--
+      宿主的主题令牌。**这一段由 `theme.rs` 生成**，插件的 CSS 可以直接用
+      与宿主同名的变量（`var(--accent-500)`），不需要任何前缀或改名。
+    -->
+    <style id="modulith-theme">
+{theme}    </style>
   </head>
   <body>
     <div id="modulith-root"></div>
@@ -449,6 +467,7 @@ fn entry_document(plugin: &SandboxView) -> http::Response<Cow<'static, [u8]>> {
         id = plugin.id,
         style = style,
         main = escape_attr(&plugin.main),
+        theme = theme,
     );
 
     page(body, "script-src 'self'; style-src 'self' 'unsafe-inline'")
@@ -521,7 +540,18 @@ fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::
         .replace("__PLUGIN_PERMISSIONS__", &permissions)
         .replace("__PLUGIN_DATA_AVAILABLE__", if data_available { "true" } else { "false" })
         .replace("'__PLUGIN_RUNTIME__'", &js_string(runtime_wire(&plugin.runtime)))
-        .replace("'__PLUGIN_ACTIVATION__'", &js_string("open"));
+        .replace("'__PLUGIN_ACTIVATION__'", &js_string("open"))
+        // 主题快照注入成**字面量**而不是让桥接层先 RPC 一次：插件在顶层同步
+        // 就能读到自己的令牌（与身份、权限同一个理由）。
+        //
+        // 用 `serde_json::to_string` 并**不**包引号：它是一个 JSON 对象字面量，
+        // 直接放进 JS 里就是对象字面量 —— 包成字符串再 parse 是多一次解析。
+        .replace(
+            "__PLUGIN_THEME__",
+            &app.try_state::<super::theme::PluginTheme>()
+                .map(|state| state.describe().to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        );
 
     // 占位符没被替换掉 = 桥接层与这里的约定漂了。那时交给插件的会是一段
     // 字面量 `'__PLUGIN_ID__'`，症状是"插件的 id 变成了这个怪字符串" ——
@@ -533,7 +563,8 @@ fn bridge_script<R: Runtime>(app: &AppHandle<R>, plugin: &SandboxView) -> http::
             && !source.contains("__PLUGIN_PERMISSIONS__")
             && !source.contains("__PLUGIN_DATA_AVAILABLE__")
             && !source.contains("__PLUGIN_RUNTIME__")
-            && !source.contains("__PLUGIN_ACTIVATION__"),
+            && !source.contains("__PLUGIN_ACTIVATION__")
+            && !source.contains("__PLUGIN_THEME__"),
         "桥接脚本里的占位符没有被全部替换 —— sandbox-bridge.js 与 bridge_script 的约定漂了"
     );
 
@@ -553,8 +584,54 @@ fn runtime_wire(runtime: &super::types::PluginRuntime) -> &'static str {
     }
 }
 
-/// 把一个字符串变成合法的 JS 字符串字面量。
+/// 把当前主题推给每一个还活着的沙箱界面。
 ///
+/// ============================================================
+/// 为什么是"换一段样式表"而不是"重新加载界面"
+/// ============================================================
+///
+/// 重新加载插件界面会**丢掉它全部运行期状态** —— 用户正在填的表单、滚动位置、
+/// 展开的树。用户只是切了一下浅色/深色，不该因此丢掉正在做的事。
+///
+/// 因此这里只替换 `<style id="modulith-theme">` 的**文本**。插件的 CSS 里
+/// 那些 `var(--accent-500)` 会自动重新求值，因为变量是在 `:root` 上重新声明的。
+///
+/// 顺带调一次 `__modulithThemeChanged`，让订阅了 `ctx.theme.onChange` 的插件
+/// 能在需要用 JS 拿颜色（canvas、SVG）时重新取一次。
+pub async fn apply_theme<R: Runtime>(app: &AppHandle<R>) {
+    let Some(theme) = app.try_state::<super::theme::PluginTheme>() else {
+        return;
+    };
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        return;
+    };
+    let Some(actor) = app.try_state::<super::surface::SurfaceActor>() else {
+        return;
+    };
+
+    let snapshot = theme.get();
+    let css = snapshot.to_css();
+    let described = theme.describe().to_string();
+
+    let script = format!(
+        "(function () {{\n\
+         \x20 var style = document.getElementById('modulith-theme');\n\
+         \x20 if (style) style.textContent = JSON.parse({css});\n\
+         \x20 if (window.__modulithThemeChanged) window.__modulithThemeChanged(JSON.parse({described}));\n\
+         }})();",
+        css = js_string(&css),
+        described = js_string(&described),
+    );
+
+    for (label, _plugin_id) in surfaces.live() {
+        if let Err(error) = actor.eval(&label, script.clone()).await {
+            // 一个界面推不到（多半是刚被销毁）不该影响其余界面。
+            log::debug!("向沙箱界面 {label} 推送主题失败：{error}");
+        }
+    }
+}
+
+/// 把一个字符串变成合法的 JS 字符串字面量。
 /// 用 `serde_json` 而不是手写转义：它已经处理了引号、反斜杠与控制字符，
 /// 而手写的那份总会在某个不常见字符上出错 —— 而出错的方向是"注入"。
 ///

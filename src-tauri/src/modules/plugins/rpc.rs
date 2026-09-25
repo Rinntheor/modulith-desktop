@@ -587,6 +587,21 @@ pub async fn dispatch<R: Runtime>(
             json_ok()
         }
 
+        // ---- 主题 ----------------------------------------------------------
+        //
+        // 主题令牌在**入口文档**里就已经注入了（见 `theme.rs`），因此插件在
+        // 样式表里直接 `var(--accent-500)` 就行，不必先取一次。
+        //
+        // 这一条是给"需要用 JS 拿颜色"的场景准备的：画到 canvas 上、算对比度、
+        // 生成 SVG。没有它的话那些插件只能去读 `getComputedStyle` ——
+        // 而读到之后还得自己订阅主题变化再读一次，也就是每个插件都要实现一遍。
+        "theme.tokens" => {
+            let Some(state) = app.try_state::<super::theme::PluginTheme>() else {
+                return rpc_error("主题尚未就绪");
+            };
+            json_value(state.describe())
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
     }
 }

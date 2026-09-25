@@ -109,6 +109,13 @@ pub fn run() -> Result<(), tauri::Error> {
         // 完整推导见 modules/plugins/surface.rs 的文件头。
         app.manage(modules::plugins::surface::SurfaceActor::spawn(handle.clone()));
 
+        // 插件主题快照。
+        //
+        // 主题的**真源在宿主文档里**（那一堆 CSS 自定义属性），而 Rust 这一侧
+        // 没有 document 可读。因此它由前端推上来（命令 set_plugin_theme），
+        // 宿主负责注入插件入口文档并推给已经打开的界面。见 modules/plugins/theme.rs。
+        app.manage(modules::plugins::theme::PluginTheme::new());
+
         // 沙箱自检**不在启动路径上**。
         //
         // 它曾经在这里起一个 4 秒后的异步任务，无条件弹出一块 560×420 的诊断面板。
@@ -192,6 +199,8 @@ pub fn run() -> Result<(), tauri::Error> {
         sandbox_surface_close,
         sandbox_surface_bounds,
         sandbox_self_test,
+        set_plugin_theme,
+        get_plugin_theme,
         list_plugins,
         get_plugin,
         list_plugin_permissions,

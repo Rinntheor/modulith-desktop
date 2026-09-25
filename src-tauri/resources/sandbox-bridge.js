@@ -400,6 +400,72 @@
   };
 
   // ============================================================
+  // 主题
+  // ============================================================
+  //
+  // 令牌已经在**入口文档**里注入了（宿主合成的那一段 style 元素），因此插件的
+  // CSS 直接 var(--accent-500) 就行 —— 与宿主同名、同值。
+  //
+  // 这里给的是**用 JS 拿颜色**的那条路：画到 canvas、算对比度、生成 SVG。
+  // 没有它的话那些插件只能自己读 getComputedStyle，还要自己订阅主题变化再读一次。
+
+  var themeState = __PLUGIN_THEME__;
+  var themeHandlers = [];
+
+  /** 宿主换主题时调用的入口（见 sandbox.rs 的 apply_theme）。 */
+  window.__modulithThemeChanged = function (next) {
+    themeState = next || themeState;
+
+    // 复制一份再遍历：处理器里取消订阅会让原数组在遍历中变短。
+    themeHandlers.slice().forEach(function (handler) {
+      try {
+        handler(themeState);
+      } catch (error) {
+        console.error('[Modulith] 主题变化处理器抛错:', error);
+      }
+    });
+  };
+
+  var theme = {
+    /** 当前主题：resolved / reduceMotion / glass / tokens */
+    current: function () {
+      return themeState;
+    },
+
+    /** 问宿主再取一次。正常情况下不必用 —— 变化会被主动推过来。 */
+    tokens: function () {
+      return rpc('theme.tokens', {}).then(function (value) {
+        themeState = value || themeState;
+        return themeState;
+      });
+    },
+
+    /**
+     * 主题变化时被调用。返回取消订阅的函数。
+     *
+     * 它**同步先调一次**：插件多半想先把当前的画一遍，而异步的首调会让第一帧
+     * 是空的（或者要插件自己写一段重复的初始化）。
+     */
+    onChange: function (handler) {
+      if (typeof handler !== 'function') {
+        throw new Error('ctx.theme.onChange 需要一个函数');
+      }
+      themeHandlers.push(handler);
+      try {
+        handler(themeState);
+      } catch (error) {
+        console.error('[Modulith] 主题变化处理器抛错:', error);
+      }
+
+      return function () {
+        themeHandlers = themeHandlers.filter(function (item) {
+          return item !== handler;
+        });
+      };
+    },
+  };
+
+  // ============================================================
   // 对外的那一个对象
   // ============================================================
 
@@ -575,6 +641,8 @@
     clipboard: clipboard,
 
     events: events,
+
+    theme: theme,
 
     disposables: {
       add: disposables.add,

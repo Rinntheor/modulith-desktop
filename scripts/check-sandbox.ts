@@ -70,7 +70,7 @@ section('桥接层的占位符');
     check(occurrences === 1, `${token} 恰好出现一次（带引号的形式）`);
   }
 
-  for (const token of ['__PLUGIN_PERMISSIONS__', '__PLUGIN_DATA_AVAILABLE__']) {
+  for (const token of ['__PLUGIN_PERMISSIONS__', '__PLUGIN_DATA_AVAILABLE__', '__PLUGIN_THEME__']) {
     const occurrences = bridgeJs.split(token).length - 1;
     check(occurrences === 1, `${token} 恰好出现一次`);
   }
@@ -83,7 +83,11 @@ section('桥接层的占位符');
     .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
     .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
     .replaceAll('__PLUGIN_PERMISSIONS__', '["storage"]')
-    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true');
+    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
+    .replaceAll(
+      '__PLUGIN_THEME__',
+      '{"resolved":"dark","reduceMotion":false,"glass":true,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
+    );
 
   const leftover = [
     '__PLUGIN_ID__',
@@ -93,6 +97,7 @@ section('桥接层的占位符');
     '__PLUGIN_ACTIVATION__',
     '__PLUGIN_PERMISSIONS__',
     '__PLUGIN_DATA_AVAILABLE__',
+    '__PLUGIN_THEME__',
   ].filter((token) => rendered.includes(token));
 
   check(
@@ -143,7 +148,7 @@ section('文档的 CSP');
   }
 
   // 调用点：入口文档必须走 `page(..., "script-src 'self' …")`。
-  const entryFn = /fn entry_document\([\s\S]*?\n}/.exec(sandboxRs);
+  const entryFn = /fn entry_document(?:<[^>]*>)?\([\s\S]*?\n}/.exec(sandboxRs);
   check(entryFn !== null, 'sandbox.rs 里能找到 entry_document()');
 
   // **只看 `script-src` 这一条指令的内容**，不是"整段里有没有出现过某个字符串"。
@@ -184,7 +189,7 @@ section('文档的 CSP');
 section('入口文档的脚本顺序');
 
 {
-  const entryFn = /fn entry_document\([\s\S]*?\n}/.exec(sandboxRs);
+  const entryFn = /fn entry_document(?:<[^>]*>)?\([\s\S]*?\n}/.exec(sandboxRs);
   if (entryFn) {
     const bridge = entryFn[0].indexOf('bridge.js');
     const main = entryFn[0].indexOf('asset/{main}');
@@ -779,14 +784,18 @@ section('前端界面协作');
 section('完整 API 表面');
 
 {
-  const rendered = bridgeJs
-    .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
-    .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
-    .replaceAll("'__PLUGIN_VERSION__'", '"1.2.3"')
-    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
-    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
-    .replaceAll('__PLUGIN_PERMISSIONS__', '["storage","plugin-data","clipboard"]')
-    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true');
+    const rendered = bridgeJs
+      .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
+      .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
+      .replaceAll("'__PLUGIN_VERSION__'", '"1.2.3"')
+      .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
+      .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
+      .replaceAll('__PLUGIN_PERMISSIONS__', '["storage","plugin-data","clipboard"]')
+      .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
+      .replaceAll(
+        '__PLUGIN_THEME__',
+        '{"resolved":"light","reduceMotion":true,"glass":false,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
+      );
 
   const fakeWindow: Record<string, unknown> = {
     // 桥接层在文档消失时要跑清理函数；这条检查里没有真实的页面生命周期。
@@ -872,6 +881,11 @@ section('完整 API 表面');
       // 3.6 系统与集成
       ['events.emit', isFunction],
       ['events.on', isFunction],
+
+      // 3.4 界面 · 主题
+      ['theme.current', isFunction],
+      ['theme.tokens', isFunction],
+      ['theme.onChange', isFunction],
       ['launcher.launch', isFunction],
       ['icons.extract', isFunction],
       ['shell.revealInFolder', isFunction],
@@ -1000,6 +1014,83 @@ section('完整 API 表面');
 
 function isFunction(value: unknown): boolean {
   return typeof value === 'function';
+}
+
+// ============================================================
+// 12. 主题：从宿主文档到插件文档的这条链必须完整
+// ============================================================
+//
+// 主题要跨过四个地方：宿主 CSS → 前端读出来 → 命令送上来 → 入口文档注入
+// 以及推给已打开的界面。**任何一环断掉都是静默的** —— 插件那边只是颜色不对，
+// 而四个地方各自的代码看起来都是对的。
+//
+// 逐环断言，因为断在哪一环给出的排查方向完全不同。
+
+section('主题链路');
+
+{
+  const commandsRs = read('../src-tauri/src/modules/plugins/commands.rs');
+  const themeRs = read('../src-tauri/src/modules/plugins/theme.rs');
+  const themeSyncTs = read('../src/services/pluginThemeSync.ts');
+  const mainTsx = read('../src/main.tsx');
+
+  // 环 1：宿主文档 → 前端。必须**遍历 computed style**，而不是维护一张令牌表。
+  //
+  // 维护令牌表意味着每加一个 CSS 变量都要记得补一条，而漏补不会报错 ——
+  // 插件那边只是少一个变量，表现为某一处颜色退回浏览器默认值。
+  check(
+    /getComputedStyle\(document\.documentElement\)/.test(themeSyncTs),
+    '前端从宿主文档的 computed style 里读令牌（而不是维护一张会漂的清单）'
+  );
+  check(
+    /startsWith\('--tw-'\)/.test(themeSyncTs),
+    'Tailwind 的内部变量（--tw-*）被排除（它们是构建产物，不是设计令牌）'
+  );
+
+  // 环 2：前端 → 后端。必须**装到启动路径上**，否则主题永远送不到。
+  check(
+    /installPluginThemeSync\(\)/.test(mainTsx) && /subscribeTheme\(/.test(themeSyncTs),
+    '主题同步装在启动路径上，且订阅了主题变化（否则只有首帧是对的）'
+  );
+
+  // 环 3：后端 → 入口文档。
+  check(
+    /try_state::<super::theme::PluginTheme>/.test(sandboxRs) &&
+      /modulith-theme/.test(sandboxRs),
+    '入口文档里注入了 theme.rs 生成的令牌块'
+  );
+
+  // 环 4：后端 → **已经打开的**界面。
+  //
+  // 少了这一环的表现很具体：用户切主题，已打开的插件界面**不动** ——
+  // 必须关掉再打开才对。而那看起来像"这个插件不支持主题"。
+  check(
+    /set_plugin_theme[\s\S]{0,1200}?apply_theme\(&app\)\.await/.test(commandsRs),
+    '主题变了会推给已经打开的插件界面（否则要关掉重开才生效）'
+  );
+  check(
+    /for \(label, _plugin_id\) in surfaces\.live\(\)/.test(sandboxRs),
+    '主题推送遍历全部活着的界面'
+  );
+
+  // 推送方式是**换样式表文本**，不是重新加载界面。
+  //
+  // 重新加载会丢掉插件全部运行期状态（正在填的表单、滚动位置、展开的树）——
+  // 用户只是切了一下明暗，不该因此丢掉正在做的事。
+  check(
+    /style\.textContent = JSON\.parse/.test(sandboxRs),
+    '推送主题是替换样式表文本，而不是重新加载界面'
+  );
+
+  // 注入防线：样式表是由字符串拼出来的，因此名字与值都必须过滤。
+  check(
+    /fn is_safe_custom_property/.test(themeRs) && /fn sanitize_value/.test(themeRs),
+    'token 名与值在拼进样式表之前都经过过滤（否则是 CSS 注入）'
+  );
+  check(
+    /color-scheme: \{\}/.test(themeRs),
+    '注入里带了 color-scheme（否则深色主题下插件的滚动条是白的）'
+  );
 }
 
 // ============================================================

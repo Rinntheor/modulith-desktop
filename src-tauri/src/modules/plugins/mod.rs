@@ -13,6 +13,7 @@ pub mod rpc;
 pub mod sandbox;
 pub mod signature;
 pub mod surface;
+pub mod theme;
 pub mod types;
 pub mod validator;
 

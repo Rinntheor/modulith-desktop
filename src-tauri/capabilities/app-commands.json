@@ -36,6 +36,8 @@
     "allow-background-plugin-start",
     "allow-background-plugin-stop",
     "allow-plugin-background-contribution",
+    "allow-set-plugin-theme",
+    "allow-get-plugin-theme",
     "allow-get-close-to-tray",
     "allow-set-close-to-tray",
     "allow-is-tray-available",
