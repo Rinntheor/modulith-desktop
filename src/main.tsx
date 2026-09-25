@@ -14,7 +14,7 @@ import { installPluginThemeSync } from './services/pluginThemeSync';
 import { installPluginShortcutSync } from './services/pluginShortcutSync';
 import { installPluginSurfaceRequests } from './services/pluginSurfaces';
 import { installPluginUiState } from './services/pluginUiState';
-import { installPluginCommandDispatch } from './services/pluginRuntime';
+import { installPluginCommandDispatch, installPluginDownloadProgress } from './services/pluginRuntime';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
 
@@ -143,6 +143,15 @@ installPluginUiState();
  * 沙箱插件不走这条路：它的命令由宿主直接推进它的界面（`sandbox::deliver_command`）。
  */
 installPluginCommandDispatch();
+
+/*
+ * 接住 in-process 插件的**下载进度**。
+ *
+ * 沙箱插件的进度由宿主直接推进它的界面（回调在另一个 realm 里）；in-process
+ * 插件的回调就在宿主这个 realm —— 而"这次下载是谁发起的"只有前端知道
+ * （`ctx.http.download` 是前端发起的）。因此那张表也由这里持有。
+ */
+installPluginDownloadProgress();
 
 const rootElement = document.getElementById("root") as HTMLElement;
 

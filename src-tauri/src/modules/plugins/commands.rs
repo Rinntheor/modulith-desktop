@@ -635,6 +635,30 @@ pub async fn plugin_db_exec(
         .await
 }
 
+/// `ctx.http.download`：把一个大文件直接下到插件数据目录。
+///
+/// 与 `plugin_db_*` 同一条理由：它只是把调用转给**沙箱协议那条路径用的同一个**
+/// 方法（`PluginManager::http_download`）。权限、出站策略、配额、三段式落盘全部
+/// 在那一侧，因此两条路径不可能漂开。
+///
+/// 进度不从这里回去（RPC 是"发出去、拿到结果"）—— 它走
+/// `rpc::DOWNLOAD_PROGRESS` 这条广播，由前端交给 in-process 插件的回调。
+#[tauri::command]
+pub async fn plugin_http_download(
+    state: tauri::State<'_, super::PluginState>,
+    id: String,
+    url: String,
+    rel: String,
+    headers: Option<std::collections::HashMap<String, String>>,
+) -> Result<super::types::DownloadOutcome, String> {
+    let manager = state.inner().0.clone();
+    let guard = manager.read().await;
+    guard
+        .http_download(&id, &url, &rel, headers, |_, _| {})
+        .await
+        .map_err(to_msg)
+}
+
 #[tauri::command]
 pub async fn plugin_db_transaction(
     app: AppHandle,

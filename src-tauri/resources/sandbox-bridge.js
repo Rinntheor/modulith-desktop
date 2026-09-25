@@ -813,6 +813,40 @@
   });
 
   // ============================================================
+  // 下载进度
+  // ============================================================
+  //
+  // 进度不可能走 RPC 的返回值（那是"发出去、拿到结果"），因此宿主把它推过来 ——
+  // 与主题、快捷键、命令同一条通道。
+  //
+  // 回调**按目标路径**存放：一个插件可以同时下好几个文件，而宿主的每一次推送都
+  // 带着 `rel`。
+  //
+  // **不在这里"下载结束后删掉"**：最后一次进度是宿主从另一个任务推过来的，它可能
+  // 比 RPC 的返回值晚到一点点 —— 那时删掉处理器就等于吞掉"100%"那一帧，而界面会
+  // 永远停在 96%。留着的代价是"每个下载过的路径一个闭包"，那是有界的；下一个下载
+  // 同一个路径时它会被覆盖。
+
+  var downloadHandlers = Object.create(null);
+
+  window.__modulithDownloadProgress = function (payload) {
+    if (!payload || typeof payload.rel !== 'string') return;
+
+    var handler = downloadHandlers[payload.rel];
+    if (typeof handler !== 'function') return;
+
+    try {
+      handler({
+        rel: payload.rel,
+        received: payload.received,
+        total: payload.total === undefined ? null : payload.total,
+      });
+    } catch (error) {
+      console.error('[Modulith] 下载进度回调抛错（' + payload.rel + '）:', error);
+    }
+  };
+
+  // ============================================================
   // 命令
   // ============================================================
   //
@@ -1152,6 +1186,56 @@
           method: options0.method === undefined ? 'GET' : options0.method,
           headers: options0.headers === undefined ? null : options0.headers,
           body: options0.body === undefined ? null : options0.body,
+        });
+      },
+
+      /**
+       * 把一个文件**直接下到数据目录**，不经过 JS 内存。
+       *
+       *   await Modulith.http.download(url, 'models/model.bin', function (p) {
+       *     // p: { rel, received, total }，total 可能为 null（分块传输）
+       *   });
+       *   // → { rel, bytes, contentType, status }
+       *
+       * ============================================================
+       * 为什么不能"先 fetch 再 dataDir.write"
+       * ============================================================
+       *
+       * `http.fetch` 的响应体是**一个字符串**：整段字节会在宿主的 Rust 里驻留一次、
+       * 编码成 JSON、过一遍 IPC、在你的 JS 堆里再驻留一次、再写回去。峰值内存是
+       * 文件大小的好几倍 —— 对一个 200 MB 的模型文件，那就是几个 GB。
+       *
+       * 这一条从网络流直接写进磁盘，全程只有一个固定大小的缓冲区。
+       *
+       * ============================================================
+       * 目标路径的上级目录必须**已经存在**
+       * ============================================================
+       *
+       * 与 `dataDir.write` 同一条规则：不自动建父目录。先 `dataDir.mkdir('models')`。
+       *
+       * ============================================================
+       * 落盘是"全有或全无"
+       * ============================================================
+       *
+       * 失败（网络断、超出配额、HTTP 非 2xx）时目标文件**不会出现**，也**不会**
+       * 留下一个被截断的版本 —— 而截断的版本看起来完全正常（图片能打开一半）。
+       */
+      download: function (url, rel, onProgress, options) {
+        var options0 = options || {};
+        var key = String(rel);
+
+        if (typeof onProgress === 'function') {
+          downloadHandlers[key] = onProgress;
+        } else {
+          // `download(url, rel, options)` 那种写法：第三个参数是选项
+          if (onProgress && typeof onProgress === 'object') options0 = onProgress;
+          delete downloadHandlers[key];
+        }
+
+        return rpc('http.download', {
+          url: url,
+          rel: key,
+          headers: options0.headers === undefined ? null : options0.headers,
         });
       },
     },

@@ -49,7 +49,13 @@ log = { version = "0.4", features = ["std"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 uuid = { version = "1.0", features = ["v4", "serde"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+# `stream` 是 ``ctx.http.download`` 的前提：它提供 `Response::bytes_stream`，
+# 也就是"边收边写"而不是"整份收完再写"。没有它的话，那个接口只能先 `bytes()`
+# 一次性拿到全部内容 —— 而那正是它要避免的事。
+reqwest = { version = "0.11", features = ["json", "rustls-tls", "stream"], default-features = false }
+# 只用到 `StreamExt::next`。它已经在依赖树里（reqwest 与 tokio 都间接依赖它），
+# 因此这里显式声明只是拿到它的名字。
+futures-util = "0.3"
 urlencoding = "2.1"
 zip = "0.6"
 tokio = { version = "1", features = ["full"] }

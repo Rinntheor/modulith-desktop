@@ -168,6 +168,7 @@ fn main() {
                 "sandbox_surface_bounds",
                 "sandbox_self_test",
                 "plugin_surfaces",
+                "plugin_http_download",
                 "plugin_db_query",
                 "plugin_db_exec",
                 "plugin_db_transaction",

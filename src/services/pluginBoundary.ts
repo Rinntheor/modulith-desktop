@@ -412,6 +412,15 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
     { name: 'post', io: 'host-object', migration: 'pass-data', note: '同上。data 会被 JSON.stringify，因此入参是值' },
     { name: 'put', io: 'host-object', migration: 'pass-data', note: '同上' },
     { name: 'delete', io: 'host-object', migration: 'pass-data', note: '同上' },
+    // 与上面四个**刻意不同**：它不返回 Response，也不带任何字节回来。
+    // 内容直接落进插件数据目录，返回值只有 `{ rel, bytes, contentType, status }`
+    // —— 全部是值。进度走回调，因此那一项是 `callable`。
+    {
+      name: 'download',
+      io: 'value',
+      migration: 'as-is',
+      note: '返回 { rel, bytes, contentType, status }；进度由宿主推过来（回调是 callable，不跨边界）',
+    },
   ],
   logger: [
     { name: 'debug', io: 'value', migration: 'as-is', note: '返回 void，参数是字符串与任意值' },

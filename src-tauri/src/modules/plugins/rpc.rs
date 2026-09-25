@@ -434,6 +434,89 @@ pub async fn dispatch<R: Runtime>(
             }
         }
 
+        // 把一个大文件**直接下到数据目录**，不经过 JS 内存。
+        //
+        // ============================================================
+        // 它为什么不是 `http.fetch` 的一个选项
+        // ============================================================
+        //
+        // `http.fetch` 的响应体是**一个字符串**。一个 200 MB 的文件走那条路意味着
+        // 整段字节在 Rust 里驻留一次、编码成 JSON、过一遍 IPC、在插件的 JS 堆里
+        // 再驻留一次、再 base64 一次写回去 —— 峰值内存是文件大小的好几倍，而换来
+        // 的只是"文件从网上下到了磁盘"。
+        //
+        // 这一条从网络流直接写进磁盘，全程只有一个固定大小的缓冲区。
+        //
+        // ============================================================
+        // 进度是怎么回去的
+        // ============================================================
+        //
+        // RPC 是"发出去、拿到结果"，因此进度不可能走返回值。它走的是宿主 →
+        // 插件的推送通道（`SurfaceActor::eval`），与主题、快捷键、命令同一条。
+        //
+        // 推给**发起调用的那块界面**：一次下载是它发起的，进度条也画在它那里。
+        "http.download" => {
+            let Some(url) = arg_str(args, "url") else {
+                return rpc_error("缺少 url");
+            };
+            let Some(rel) = arg_str(args, "rel") else {
+                return rpc_error("缺少 rel（下载目标，相对数据目录）");
+            };
+
+            let headers: Option<HashMap<String, String>> = match arg(args, "headers") {
+                None => None,
+                Some(value) => match serde_json::from_value(value.clone()) {
+                    Ok(headers) => Some(headers),
+                    Err(e) => return rpc_error(&format!("headers 必须是字符串到字符串的表：{e}")),
+                },
+            };
+
+            // 进度回调必须能跨 `await` 传到管理器里去，而它还要在每次回调时
+            // 推一条脚本给插件界面 —— 那是一件异步的事。因此这里把它做成
+            // "派生一个任务"，而不是阻塞流式循环等 eval 完成。
+            //
+            // 节流在管理器那一侧（见 `PROGRESS_STEP_BYTES`）：它决定**调不调**，
+            // 这里只负责把调到的那一次送出去。
+            let progress_app = app.clone();
+            let progress_plugin = plugin_id.to_string();
+            let progress_surface = surface.map(str::to_string);
+            let progress_rel = rel.to_string();
+
+            let manager = match plugin_manager(app) {
+                None => return rpc_error("插件系统尚未就绪"),
+                Some(handle) => handle,
+            };
+
+            // 锁**不能跨整个下载**：那会把整个插件系统的读路径一起按住 ——
+            // 包括别的插件的界面。先取一份管理器句柄的克隆，放掉读锁，
+            // 再用它跑下载。
+            let result = {
+                let guard = manager.read().await;
+                guard
+                    .http_download(plugin_id, url, rel, headers, move |received, total| {
+                        let app = progress_app.clone();
+                        let plugin = progress_plugin.clone();
+                        let surface = progress_surface.clone();
+                        let rel = progress_rel.clone();
+
+                        // 派生而不是等待：`eval` 要落到界面线程，而流式循环在
+                        // 一个阻塞线程上。等它会让"下载速度"跟着"界面响应速度"走。
+                        tauri::async_runtime::spawn(async move {
+                            super::sandbox::deliver_download_progress(
+                                &app, &plugin, &rel, received, total, surface.as_deref(),
+                            )
+                            .await;
+                        });
+                    })
+                    .await
+            };
+
+            match result {
+                Ok(outcome) => json_value(serde_json::json!(outcome)),
+                Err(e) => rpc_error(&e.to_string()),
+            }
+        }
+
         // ---- 系统能力 ------------------------------------------------------
 
         "system.launch" => {
@@ -1155,6 +1238,13 @@ pub const SHORTCUT_TRIGGERED: &str = "modulith://plugin-shortcut";
 
 /// 插件请求宿主更新它的状态指示（徽标 / 进度 / 启动占位）。
 pub const PLUGIN_UI: &str = "modulith://plugin-ui";
+
+/// 下载进度广播给**前端**时的事件名。
+///
+/// 沙箱插件那一条走"推脚本进它的 webview"（`sandbox::deliver_download_progress`），
+/// 因为它的回调在另一个 realm 里。in-process 插件的回调就在宿主这个 realm ——
+/// 前端接住这条事件，把它交给插件注册的处理函数。
+pub const DOWNLOAD_PROGRESS: &str = "modulith://plugin-download-progress";
 
 /// 徽标文本的长度上限。
 ///

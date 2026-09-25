@@ -273,6 +273,105 @@ pub fn mkdir(root: &Path, rel: &str) -> Result<(), String> {
     std::fs::create_dir_all(&path).map_err(|e| format!("创建目录失败：{e}"))
 }
 
+// ============================================================
+// 流式写入（`ctx.http.download`）
+// ============================================================
+//
+// ============================================================
+// 为什么它不是"先下一份字节再调 write"
+// ============================================================
+//
+// `write` 拿的是**一整块字节**。用它来接几百 MB 的下载等于要求调用方先把整份
+// 内容放进内存 —— 而那正是这个接口存在的理由。
+//
+// 因此这里给出的是**三段式**：`begin_stream` 拿一个目标与这次能写多少，
+// 调用方自己分块写进 `temp`，最后 `finish_stream` 改名。
+//
+// 路径校验与配额判定仍然只有这一处：`begin_stream` 内部走的还是 `resolve`，
+// 与 `read` / `write` / `remove` 完全同一条规则。
+
+/// 一次流式写入的目标。
+#[derive(Debug, Clone)]
+pub struct StreamTarget {
+    /// 最终路径。**只要全部字节都到齐了才会出现**。
+    pub path: PathBuf,
+    /// 临时路径。写的就是它。
+    pub temp: PathBuf,
+    /// 这次写入**最多**能占多少字节（配额里剩下的部分，且不超过单文件上限）。
+    pub headroom: u64,
+}
+
+/// 开始一次流式写入。
+///
+/// `used_bytes` 是数据目录**当前**的占用（`used_bytes(root)`）。覆盖已有文件时
+/// 会先把旧文件占的字节从占用里减掉 —— 与 `write` 同一条判据：不这么做的话，
+/// "把一个大文件换成一个小一点的"会被自己的旧体积挡住。
+pub fn begin_stream(root: &Path, rel: &str, used_bytes: u64) -> Result<StreamTarget, String> {
+    let path = resolve(root, rel)?;
+
+    if path == root {
+        return Err("目标不能是数据根目录自身".to_string());
+    }
+
+    // **不自动建父目录。** 与 `write` 同一条理由：写入路径里悄悄创建目录，会让
+    // 一个拼错的路径变成"它明明成功了、东西在别处"。
+    let Some(parent) = path.parent() else {
+        return Err("路径没有父目录".to_string());
+    };
+    if !parent.is_dir() {
+        return Err("上级目录不存在（先用 mkdir 建它）".to_string());
+    }
+
+    let existing = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let headroom = MAX_TOTAL_BYTES
+        .saturating_sub(used_bytes.saturating_sub(existing))
+        .min(MAX_FILE_BYTES);
+
+    // 临时文件的扩展名是追加的，因此它仍然在同一个目录里 —— 最后的 `rename`
+    // 因此是**同卷**改名，也就是原子操作。跨卷改名会退化成"复制一遍"，
+    // 那样就又不原子了。
+    let temp = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.part"),
+        None => "part".to_string(),
+    });
+
+    Ok(StreamTarget {
+        path,
+        temp,
+        headroom,
+    })
+}
+
+/// 收尾：把 `.part` 改名成目标。
+///
+/// 同卷改名是原子的，因此目标文件**要么不存在、要么是完整的** ——
+/// 而"写到一半被截断的文件"看起来完全正常（图片能打开一半），调用方分辨不了。
+pub fn finish_stream(target: &StreamTarget) -> Result<(), String> {
+    std::fs::rename(&target.temp, &target.path).map_err(|e| {
+        format!(
+            "把 {} 改名成 {} 失败：{e}",
+            target.temp.display(),
+            target.path.display()
+        )
+    })
+}
+
+/// 放弃一次流式写入：删掉那个 `.part`。
+///
+/// **调用方必须先关掉文件句柄**：Windows 上"还开着的文件"删不掉，于是失败的
+/// 下载会留下一个 `.part`，而它看起来像一份没写完但可能还有用的数据。
+/// 删不掉时也不报错 —— 一个残留的临时文件比一条让原始错误被覆盖的报错好。
+pub fn abort_stream(target: &StreamTarget) {
+    if let Err(error) = std::fs::remove_file(&target.temp) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            log::debug!(
+                "清掉未完成的下载文件 {} 失败：{error}",
+                target.temp.display()
+            );
+        }
+    }
+}
+
 /// 删除一个文件或一个目录（递归）。
 ///
 /// **递归删除是有意的**，也是这里最需要想清楚的一步：不递归的话，插件想清掉自己
@@ -565,5 +664,125 @@ mod tests {
         let root = temp_root("rmroot");
         assert!(remove(&root, "").is_err());
         assert!(root.is_dir(), "根目录必须还在");
+    }
+
+    // ============================================================
+    // 流式写入（ctx.http.download 的落盘那一半）
+    // ============================================================
+
+    /// 临时文件必须与目标**同一个目录**。
+    ///
+    /// 跨卷改名会退化成"复制一遍"，于是"要么不存在、要么完整"这条保证就没了 ——
+    /// 而它是整个三段式写入存在的理由。
+    #[test]
+    fn the_temp_file_lives_next_to_the_target() {
+        let root = temp_root("stream-temp");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+
+        let target = begin_stream(&root, "docs/a.bin", 0).expect("应当能开始");
+
+        assert_eq!(target.path, root.join("docs").join("a.bin"));
+        assert_eq!(target.path.parent(), target.temp.parent());
+        assert_eq!(
+            target.temp.file_name().and_then(|n| n.to_str()),
+            Some("a.bin.part"),
+            "临时文件是目标名加 .part，而不是一个随机名字"
+        );
+    }
+
+    /// 没有扩展名时临时名也要能建出来。
+    #[test]
+    fn a_target_without_an_extension_still_gets_a_temp_name() {
+        let root = temp_root("stream-noext");
+        let target = begin_stream(&root, "plain", 0).expect("应当能开始");
+        assert_eq!(
+            target.temp.file_name().and_then(|n| n.to_str()),
+            Some("plain.part")
+        );
+    }
+
+    /// 路径校验仍然只有 `resolve` 那一处。
+    ///
+    /// 流式写入不是"另一条写入路径"，它必须继承同一套边界 —— 否则下载就成了
+    /// 唯一一个能越界的写。
+    #[test]
+    fn streaming_inherits_the_same_path_rules() {
+        let root = temp_root("stream-paths");
+
+        for hostile in ["../escape.bin", "a/../../escape.bin", "C:/x.bin", "a:b.bin"] {
+            assert!(
+                begin_stream(&root, hostile, 0).is_err(),
+                "这个路径必须被拒绝：{hostile}"
+            );
+        }
+
+        // 数据根自身不是文件
+        assert!(begin_stream(&root, "", 0).is_err());
+        // 上级目录不存在时不自动创建（与 write 同一条规则）
+        assert!(begin_stream(&root, "nope/a.bin", 0).is_err());
+    }
+
+    /// 覆盖已有文件时，旧文件占的字节要**先减掉**。
+    ///
+    /// 不这么做的话，"把一个大文件换成一个小一点的"会被自己的旧体积挡住 ——
+    /// 与 `write` 里那条判据是同一条。
+    #[test]
+    fn the_headroom_accounts_for_replacing_an_existing_file() {
+        let root = temp_root("stream-headroom");
+
+        // 目录里已经占了 1 GiB 的账（用一个假的 used 值表达），而目标是 100 字节
+        let existing = 100u64;
+        std::fs::write(root.join("a.bin"), vec![0u8; existing as usize]).unwrap();
+
+        let target = begin_stream(&root, "a.bin", MAX_TOTAL_BYTES).expect("应当能开始");
+
+        // 余量 = 上限 - (已用 - 旧文件) —— 也就是"至少还能写回旧文件那么大"
+        assert!(
+            target.headroom >= existing,
+            "替换旧文件时至少要把旧文件那部分让出来：{}",
+            target.headroom
+        );
+    }
+
+    /// 余量永远不会超过单文件上限。
+    #[test]
+    fn the_headroom_never_exceeds_the_per_file_limit() {
+        let root = temp_root("stream-cap");
+        let target = begin_stream(&root, "a.bin", 0).expect("应当能开始");
+        assert_eq!(target.headroom, MAX_FILE_BYTES);
+    }
+
+    /// 收尾之后目标存在、临时文件不存在。
+    #[test]
+    fn finishing_moves_the_temp_onto_the_target() {
+        let root = temp_root("stream-finish");
+        let target = begin_stream(&root, "done.bin", 0).expect("应当能开始");
+
+        std::fs::write(&target.temp, b"hello").unwrap();
+        assert!(!target.path.exists(), "改名之前目标不该存在");
+
+        finish_stream(&target).expect("应当能改名");
+
+        assert_eq!(std::fs::read(&target.path).unwrap(), b"hello");
+        assert!(!target.temp.exists(), "临时文件应当已经不在");
+    }
+
+    /// 放弃之后**目标不出现**，临时文件被清掉。
+    ///
+    /// 这是"全有或全无"的另一半：失败时留下一个被截断的目标文件是最糟的结果 ——
+    /// 它看起来完全正常（图片能打开一半）。
+    #[test]
+    fn aborting_leaves_no_target_and_no_temp() {
+        let root = temp_root("stream-abort");
+        let target = begin_stream(&root, "partial.bin", 0).expect("应当能开始");
+
+        std::fs::write(&target.temp, b"half").unwrap();
+        abort_stream(&target);
+
+        assert!(!target.path.exists(), "目标不该出现");
+        assert!(!target.temp.exists(), "临时文件应当被清掉");
+
+        // 再放弃一次不是错误（失败路径可能被走两遍）
+        abort_stream(&target);
     }
 }

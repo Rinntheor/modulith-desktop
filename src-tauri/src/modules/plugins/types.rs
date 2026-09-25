@@ -700,6 +700,24 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// 一次流式下载的结果（`ctx.http.download`）。
+///
+/// **没有 body。** 字节已经落在磁盘上那个文件里了 —— 把它们的长度报出来是为了让
+/// 调用方能核对"下下来的和预期的一样大"，而不是提示它把内容读回内存。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadOutcome {
+    /// 落盘路径，相对插件数据根。**与调用方传进来的那个一致** ——
+    /// 回传它是为了让调用方不必自己记（下载可能是并发发起的）。
+    pub rel: String,
+    /// 实际写入了多少字节。它与 `Content-Length` 不一致时（分块传输、服务器撒谎）
+    /// 以这个为准。
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub status: u16,
+}
+
 // ============================================================
 // 错误
 // ============================================================

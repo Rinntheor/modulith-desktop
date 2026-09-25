@@ -16,6 +16,7 @@ use super::data_root;
 use super::icon;
 use super::quota;
 use super::types::{
+    DownloadOutcome,
     ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio, PluginError, PluginManifest,
     PluginPermission, PluginResult, PluginRuntime, PluginStatus, RegistryEntry, RegistryFile,
 };
@@ -66,6 +67,15 @@ const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_README_BYTES: u64 = 64 * 1024;
 /// HTTP 代理允许的最大响应体（2 MB）
 const MAX_HTTP_BODY_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 一次下载**推到界面的进度**之间至少差多少字节。
+///
+/// 一个 200 MB 的文件按块回调会有上万次。每次都推一次 IPC，等于把"下载一个文件"
+/// 变成一次针对宿主的 DDOS —— 而进度的用处只是让界面上的条动起来。
+///
+/// 256 KiB 在 1 MB/s 的链路上约等于每四分之一秒一次：够顺滑，也不会把消息通道
+/// 占满。
+const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 /// 从插件仓库拉取的单个文本文件允许的最大体积（1 MB）
 ///
 /// 索引正常只有几 KB，README 通常几十 KB。上限的意义是**不把一个来路不明的巨大响应
@@ -2150,15 +2160,21 @@ impl PluginManager {
 // ============================================================
 
 impl PluginManager {
-    /// 代插件发起 HTTP 请求（受权限约束）
-    pub async fn http_request(
+    /// 建一个**已经通过权限与策略前置检查**的请求。
+    ///
+    /// `http_request` 与 `http_download` 共用它。抽出来的理由与文件里其它几处
+    /// 完全一样：**两条路径各写一遍权限判定，一定会漂** —— 而漂开的方向是
+    /// "某一条忘了 `network-external` 检查"，那正好是唯一不能出错的那一类。
+    ///
+    /// 出站策略与流量日志**不在这里**：它们在 `NetClient::execute` 里（同一条出口，
+    /// 市场索引与诊断也走它）。这里只做"这个插件能不能发这个请求"。
+    fn plugin_request(
         &self,
         id: &str,
         method: &str,
         url: &str,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
-    ) -> PluginResult<HttpResponse> {
+    ) -> PluginResult<reqwest::RequestBuilder> {
         let method = method.trim().to_ascii_uppercase();
         if !matches!(
             method.as_str(),
@@ -2197,14 +2213,6 @@ impl PluginManager {
             )));
         }
 
-        // ---- 出站策略与流量日志 ----
-        //
-        // **不在这里判定，也不在这里记日志。** 两件事都在 `NetClient::execute` 里，
-        // 与市场索引、诊断走同一条出口。
-        //
-        // 上一版把这段逻辑手写在这里，结果是同一个文件里的 `fetch_once` 没写 ——
-        // 用户设了「禁止出站」后市场照样能加载。一个必须靠"记得写"才生效的纪律，
-        // 迟早会在某个新加的调用点上漏掉；收口到门面之后，漏掉是编译不过的。
         let mut request = self
             .net
             .request(
@@ -2225,6 +2233,34 @@ impl PluginManager {
             }
         }
 
+        Ok(request)
+    }
+
+    /// 把出站策略的拒绝翻成一句带插件名的说明
+    ///
+    /// 用户需要知道是**哪一支**插件在撞策略，而不是只看到"离线模式已开启"却不知道
+    /// 谁在试。两条路径共用它，理由与 `plugin_request` 一样。
+    fn map_net_error(id: &str, error: NetError) -> PluginError {
+        match error {
+            NetError::Denied(reason) => PluginError::PermissionDenied(format!(
+                "插件 {} 的请求被出站策略拒绝：{}",
+                id, reason
+            )),
+            other => PluginError::NetworkError(other.message()),
+        }
+    }
+
+    /// 代插件发起 HTTP 请求（受权限约束）
+    pub async fn http_request(
+        &self,
+        id: &str,
+        method: &str,
+        url: &str,
+        headers: Option<HashMap<String, String>>,
+        body: Option<String>,
+    ) -> PluginResult<HttpResponse> {
+        let mut request = self.plugin_request(id, method, url, headers)?;
+
         if let Some(body) = body {
             request = request.body(body);
         }
@@ -2233,15 +2269,7 @@ impl PluginManager {
             .net
             .execute(request, NetOrigin::plugin(id, "插件网络请求"))
             .await
-            .map_err(|error| match error {
-                // 被策略拒绝时给出带插件名的说明：用户需要知道是哪一支插件在撞策略，
-                // 而不是只看到"离线模式已开启"却不知道谁在试
-                NetError::Denied(reason) => PluginError::PermissionDenied(format!(
-                    "插件 {} 的请求被出站策略拒绝：{}",
-                    id, reason
-                )),
-                other => PluginError::NetworkError(other.message()),
-            })?;
+            .map_err(|error| Self::map_net_error(id, error))?;
         let status = response.status().as_u16();
 
         let mut response_headers: HashMap<String, String> = HashMap::new();
@@ -2279,6 +2307,188 @@ impl PluginManager {
             status,
             headers: response_headers,
             body,
+        })
+    }
+
+    /// 把一个大文件**直接下到插件数据目录**，不经过 JS 内存。
+    ///
+    /// ============================================================
+    /// 为什么不能"下载完再写"
+    /// ============================================================
+    ///
+    /// `ctx.http.fetch` 的响应体是**一个字符串**（见 `HttpResponse`）。一个 200 MB
+    /// 的模型文件走那条路意味着：整段字节在 Rust 里驻留一次、编码成 JSON 字符串
+    /// （+UTF-8 开销）、过一遍 IPC、在插件的 JS 堆里再驻留一次、再 base64 一次写回去。
+    /// 峰值内存是文件大小的好几倍，而它换来的只是"文件从网上下到了磁盘"。
+    ///
+    /// 这一条从网络流直接写进磁盘，全程只有一个固定大小的缓冲区。
+    ///
+    /// ============================================================
+    /// 三段式的写入：`.part` → 校验 → 改名
+    /// ============================================================
+    ///
+    /// 直接往目标文件写、中途断了，留下的是一个**被截断的文件** —— 而它看起来
+    /// 完全正常（图片能打开一半、JSON 是坏的）。调用方没有任何办法分辨"下载失败"
+    /// 与"下载到的东西本来就是坏的"。
+    ///
+    /// 因此先写 `<名字>.part`，只在**全部字节都到齐**之后改名过去。改名在同一卷上
+    /// 是原子的，于是目标文件要么不存在、要么是完整的。
+    ///
+    /// ============================================================
+    /// 配额在**写入过程中**判，不是写完再算
+    /// ============================================================
+    ///
+    /// 写完再统计意味着一个插件可以先占满磁盘再收到"你超了"。这里的做法是：
+    /// 先按当前占用算出**这次最多能写多少**，超出立刻中止并删掉 `.part`。
+    ///
+    /// `on_progress` 由调用方给，用来把进度推给插件。它被**节流**后调用
+    /// （见 `PROGRESS_STEP_BYTES`）—— 一个 200 MB 的文件会产生上万次块回调，
+    /// 每次都推一次 IPC 等于把下载变成一次 DDOS。
+    pub async fn http_download<F>(
+        &self,
+        id: &str,
+        url: &str,
+        rel: &str,
+        headers: Option<HashMap<String, String>>,
+        mut on_progress: F,
+    ) -> PluginResult<DownloadOutcome>
+    where
+        F: FnMut(u64, Option<u64>),
+    {
+        if rel.trim().is_empty() {
+            return Err(PluginError::DataDirViolation(
+                "下载需要一个目标路径".to_string(),
+            ));
+        }
+        // 数据库文件是引擎掌握的：往里写一段 HTTP 响应体会让整个库变成
+        // "file is not a database"，而插件自己一点数据都取不回来。
+        if super::db::is_reserved_data_path(rel) {
+            return Err(PluginError::DataDirViolation(format!(
+                "{} 是 ctx.db 的数据库文件，不能作为下载目标",
+                super::db::DB_FILE_NAME
+            )));
+        }
+
+        let request = self.plugin_request(id, "GET", url, headers)?;
+
+        let root = self.checked_data_dir(id)?;
+        // 目标与配额余量在**发请求之前**算好：一个明显写不下的目标不该先把
+        // 网络流量花掉再告诉你。
+        let target = data_dir::begin_stream(&root, rel, data_dir::used_bytes(&root))
+            .map_err(PluginError::DataDirViolation)?;
+
+        let response = self
+            .net
+            .execute(request, NetOrigin::plugin(id, "插件下载"))
+            .await
+            .map_err(|error| Self::map_net_error(id, error))?;
+
+        let status = response.status().as_u16();
+
+        // 非 2xx 一律**不落盘**，并把响应体的一小段带出来。
+        //
+        // 把它当文件写下去是错的：一个写着"404 Not Found"的 HTML 存成 `model.bin`
+        // 之后，问题会推迟到"读它的时候"才出现，而那时离原因已经很远。
+        if !(200..300).contains(&status) {
+            let snippet = response
+                .text()
+                .await
+                .map(|text| text.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            return Err(PluginError::NetworkError(format!(
+                "下载失败：HTTP {status}{}",
+                if snippet.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{snippet}）")
+                }
+            )));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        let total = response.content_length();
+
+        // Content-Length 已知且已经超过余量时**立刻拒绝**：这省下的不只是一次
+        // 白下的流量，还有"下到一半才发现写不下"的那个状态。
+        if let Some(total) = total {
+            if total > target.headroom {
+                data_dir::abort_stream(&target);
+                return Err(PluginError::QuotaExceeded(format!(
+                    "下载目标过大：服务器声明 {total} 字节，而这次最多还能写 {} 字节",
+                    target.headroom
+                )));
+            }
+        }
+
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mut file = tokio::fs::File::create(&target.temp)
+            .await
+            .map_err(|e| PluginError::DataDirViolation(format!("建不了临时文件：{e}")))?;
+
+        let mut stream = response.bytes_stream();
+        let mut written: u64 = 0;
+        let mut last_reported: u64 = 0;
+
+        let outcome = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    PluginError::NetworkError(format!("下载中断：{e}"))
+                })?;
+
+                written += chunk.len() as u64;
+
+                // 边写边判。`Content-Length` 可能缺失（分块传输），也可能撒谎 ——
+                // 后者是这个判断存在的真正理由。
+                if written > target.headroom {
+                    return Err(PluginError::QuotaExceeded(format!(
+                        "下载超出配额：已经写入 {written} 字节，而这次最多还能写 {} 字节",
+                        target.headroom
+                    )));
+                }
+
+                file.write_all(&chunk).await.map_err(|e| {
+                    PluginError::DataDirViolation(format!("写入失败：{e}"))
+                })?;
+
+                if written - last_reported >= PROGRESS_STEP_BYTES {
+                    last_reported = written;
+                    on_progress(written, total);
+                }
+            }
+
+            file.flush()
+                .await
+                .map_err(|e| PluginError::DataDirViolation(format!("写入失败：{e}")))?;
+            Ok(())
+        }
+        .await;
+
+        // 失败时显式关掉句柄再删：Windows 上"还开着的文件"删不掉，于是失败的
+        // 下载会留下一个 `.part`，而它看起来像一份没写完但可能还有用的数据。
+        drop(file);
+
+        if let Err(error) = outcome {
+            data_dir::abort_stream(&target);
+            return Err(error);
+        }
+
+        // 最后一次进度**无条件推**：不推的话界面会永远停在 96% 那一格。
+        on_progress(written, total);
+
+        data_dir::finish_stream(&target).map_err(PluginError::DataDirViolation)?;
+
+        Ok(DownloadOutcome {
+            rel: rel.to_string(),
+            bytes: written,
+            content_type,
+            status,
         })
     }
 }

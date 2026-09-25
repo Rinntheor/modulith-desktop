@@ -1324,6 +1324,79 @@ pub fn live_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Vec<Str
         .unwrap_or_default()
 }
 
+/// 把一条**下载进度**推给插件的界面。
+///
+/// 与 `deliver_command` 同一条通道（`SurfaceActor::eval`），但多一个 `rel`：
+/// 一个插件可以同时下好几个文件，而进度条要能分辨是哪一个。
+///
+/// `only` 给了一个界面名时只推那一块 —— 下载是**某一块界面**发起的，进度条也画在
+/// 它那里。别的界面没必要收到一条它没法处理的进度。
+///
+/// 回调由桥接层持有（`Modulith.http.download(url, rel, onProgress)` 里的那个
+/// 函数），宿主只负责把数字送到。
+pub async fn deliver_download_progress<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    rel: &str,
+    received: u64,
+    total: Option<u64>,
+    only: Option<&str>,
+) {
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        return;
+    };
+    let Some(actor) = app.try_state::<super::surface::SurfaceActor>() else {
+        return;
+    };
+
+    let payload = serde_json::json!({
+        "rel": rel,
+        "received": received,
+        "total": total,
+    })
+    .to_string();
+
+    let script = format!(
+        "window.__modulithDownloadProgress && window.__modulithDownloadProgress(JSON.parse({}));",
+        js_string(&payload)
+    );
+
+    for (label, key) in surfaces.live() {
+        if key.plugin_id != plugin_id {
+            continue;
+        }
+        if let Some(only) = only {
+            if key.surface != only {
+                continue;
+            }
+        }
+
+        if let Err(error) = actor.eval(&label, script.clone()).await {
+            log::debug!("向沙箱界面 {label} 推送下载进度失败：{error}");
+        }
+    }
+
+    // 界面这一侧推完，还要给**前端**留一条：in-process 插件的下载进度没有别的
+    // 办法回到它的回调里（它与宿主在同一个 realm，但那条通道是"宿主推脚本进
+    // 插件 webview"）。前端据此把数字交给它注册的处理函数。
+    //
+    // 两条都用，而不是二选一：一个插件可能同时被 in-process 与沙箱两种形态加载
+    // （取决于清单），而宿主在推的时候并不知道该走哪一条 —— 也不知道这次下载
+    // 是哪一个形态发起的。多推一条的代价是一条本地事件。
+    use tauri::Emitter;
+    if let Err(error) = app.emit(
+        super::rpc::DOWNLOAD_PROGRESS,
+        serde_json::json!({
+            "pluginId": plugin_id,
+            "rel": rel,
+            "received": received,
+            "total": total,
+        }),
+    ) {
+        log::debug!("广播下载进度失败：{error}");
+    }
+}
+
 /// 把一条**命令**送进插件的界面。
 ///
 /// ============================================================

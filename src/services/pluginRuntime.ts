@@ -975,6 +975,128 @@ function pluginHttp(pluginId: string) {
     put: (url: string, data?: unknown, init?: RequestInit) =>
       request('PUT', url, { ...normalize(init), body: data === undefined ? undefined : JSON.stringify(data) }),
     delete: (url: string, init?: RequestInit) => request('DELETE', url, normalize(init)),
+
+    /**
+     * 把一个文件**直接下到数据目录**，不经过 JS 内存。
+     *
+     * 与沙箱桥接层**同名同形**（这是"同一个插件能切换运行位置"的全部依据）。
+     * 与 `dataDir` 的分工：`dataDir.write` 拿的是**一整块字节**，用它接几百 MB 的
+     * 下载等于要求调用方先把整份内容放进内存 —— 而那正是这个接口存在的理由。
+     *
+     * 目标路径的上级目录必须已经存在（与 `dataDir.write` 同一条规则）。
+     * 失败时目标文件不会出现，也不会留下一个被截断的版本。
+     */
+    download: (
+      url: string,
+      rel: string,
+      onProgress?: (progress: DownloadProgress) => void,
+      options?: { headers?: Record<string, string> }
+    ) => pluginHttpDownload(pluginId, url, rel, onProgress, options),
+  };
+}
+
+// ============================================================
+// `ctx.http.download` 的进度通道
+// ============================================================
+//
+// 沙箱插件那一条走"宿主推一段脚本进它的 webview"（回调在另一个 realm 里）。
+// in-process 插件的回调就在**宿主这个 realm** —— 因此前端接住一条 Tauri 事件，
+// 按 `(插件, 相对路径)` 找到处理函数，直接调它。
+//
+// 宿主两条都推（它并不知道这次下载是哪个形态发起的），因此这里**找不到处理函数
+// 就什么都不做**：沙箱插件的进度已经在它自己的文档里处理过了。
+
+/** 一条下载进度 */
+export interface DownloadProgress {
+  rel: string;
+  received: number;
+  /** `null` = 服务器没给 `Content-Length`（分块传输） */
+  total: number | null;
+}
+
+/** 宿主广播下载进度时的事件名（与 `rpc.rs::DOWNLOAD_PROGRESS` 逐字一致） */
+export const DOWNLOAD_PROGRESS = 'modulith://plugin-download-progress';
+
+/** `插件 id + 相对路径` → 进度处理函数 */
+const downloadHandlers = new Map<string, (progress: DownloadProgress) => void>();
+
+function downloadKey(pluginId: string, rel: string): string {
+  // 用 NUL 分隔：插件 id 里不可能有它（清单规则限制在字母数字与 `._-`），
+  // 而拼接用的分隔符如果可能与 id 或路径撞上，就会出现"两个不同的下载共用
+  // 一个处理器"—— 而那是静默的。
+  return `${pluginId}\u0000${rel}`;
+}
+
+async function pluginHttpDownload(
+  pluginId: string,
+  url: string,
+  rel: string,
+  onProgress: ((progress: DownloadProgress) => void) | undefined,
+  options: { headers?: Record<string, string> } | undefined
+): Promise<{ rel: string; bytes: number; contentType?: string; status: number }> {
+  const key = downloadKey(pluginId, rel);
+  if (typeof onProgress === 'function') downloadHandlers.set(key, onProgress);
+  else downloadHandlers.delete(key);
+
+  try {
+    return await invoke('plugin_http_download', {
+      id: pluginId,
+      url,
+      rel,
+      headers: options?.headers ?? null,
+    });
+  } finally {
+    // in-process 这一侧可以安全地在这里摘掉：进度是从**同一个 realm** 的前端事件
+    // 派发的，而 `invoke` 的 Promise 一定晚于所有已派发的事件回调。
+    //
+    // （沙箱那一侧**不能**这么做 —— 它的进度由另一个任务推过去，可能比 RPC 的
+    // 返回值晚一点到，删早了会吞掉 100% 那一帧。）
+    downloadHandlers.delete(key);
+  }
+}
+
+/**
+ * 装上 in-process 插件的下载进度监听。返回退订函数。
+ *
+ * 失败只记一条警告：这条通道只影响进度回调，不该让启动路径抛异常。
+ */
+export function installPluginDownloadProgress(): () => void {
+  let disposed = false;
+  let stop: (() => void) | null = null;
+
+  void (async () => {
+    try {
+      const { listen } = await import('@tauri-apps/api/event');
+      const off = await listen<{ pluginId: string; rel: string } & DownloadProgress>(
+        DOWNLOAD_PROGRESS,
+        (event) => {
+          const payload = event.payload;
+          if (!payload?.pluginId || !payload.rel) return;
+
+          const handler = downloadHandlers.get(downloadKey(payload.pluginId, payload.rel));
+          if (!handler) return;
+
+          try {
+            handler({ rel: payload.rel, received: payload.received, total: payload.total ?? null });
+          } catch (error) {
+            console.error('[pluginRuntime] 下载进度回调抛错:', error);
+          }
+        }
+      );
+
+      if (disposed) {
+        off();
+        return;
+      }
+      stop = off;
+    } catch (error) {
+      console.warn('[pluginRuntime] 无法订阅下载进度（进度回调将不可用）:', error);
+    }
+  })();
+
+  return () => {
+    disposed = true;
+    stop?.();
   };
 }
 

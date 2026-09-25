@@ -149,6 +149,7 @@
     "allow-sandbox-surface-bounds",
     "allow-sandbox-self-test",
     "allow-plugin-surfaces",
+    "allow-plugin-http-download",
     "allow-plugin-db-query",
     "allow-plugin-db-exec",
     "allow-plugin-db-transaction"

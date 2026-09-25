@@ -975,6 +975,7 @@ section('完整 API 表面');
 
       // 3.3 网络
       ['http.fetch', isFunction],
+      ['http.download', isFunction],
 
       // 3.4 界面（沙箱里没有 registerModule —— 沙箱插件自己就是界面）
       ['notifications.notify', isFunction],
@@ -2196,6 +2197,209 @@ section('插件数据库（ctx.db）');
     );
   }
 }
+
+
+
+
+// ============================================================
+// 18. `ctx.http.download`：大文件直接落盘，不经过 JS 内存
+// ============================================================
+//
+// 这一节守的是那条接口**存在的理由本身**：如果它中间任何一环把整份字节拿进内存，
+// 它就退化成了 `http.fetch` + `dataDir.write`，而那两个已经存在了 ——
+// 一个不再省任何东西的同名接口比没有它更糟（作者会以为它省了）。
+//
+// 三件事因此必须逐条盯住：**流式写**、**三段式落盘**、**边写边判配额**。
+
+section('下载到数据目录（ctx.http.download）');
+
+{
+  const dbAndDownloadRs = read('../src-tauri/src/modules/plugins/manager.rs');
+  const dataDirRs = read('../src-tauri/src/modules/plugins/data_dir.rs');
+  const rpcForDownload = read('../src-tauri/src/modules/plugins/rpc.rs');
+  const commandsForDownload = read('../src-tauri/src/modules/plugins/commands.rs');
+  const runtimeForDownload = read('../src/services/pluginRuntime.ts');
+  const cargoForDownload = read('../src-tauri/Cargo.toml');
+
+  const downloadFn =
+    /pub async fn http_download<F>\([\s\S]*?\n    \}\n\}/.exec(dbAndDownloadRs)?.[0] ?? '';
+  check(downloadFn.length > 0, 'manager 里有 http_download，且能被定位到');
+
+  // ---- 流式：真正的 `bytes_stream`，而不是 `bytes()` ----
+  check(
+    /response\.bytes_stream\(\)/.test(downloadFn),
+    '响应体是**流式**读的（`bytes()` 会把整份拿进内存 —— 那正是这个接口要避免的）'
+  );
+  check(
+    !/response\.bytes\(\)/.test(downloadFn),
+    'http_download 里没有一次性拿全量字节'
+  );
+  check(
+    /file\.write_all\(&chunk\)/.test(downloadFn),
+    '每一块直接写进文件句柄'
+  );
+  check(
+    /content_type/.test(downloadFn) && !/String::from_utf8/.test(downloadFn),
+    '下载不解码文本（解码意味着整份内容变成字符串）'
+  );
+
+  // ---- 三段式：`.part` → 改名 ----
+  const beginFn = /pub fn begin_stream\([\s\S]*?\n\}/.exec(dataDirRs)?.[0] ?? '';
+  check(
+    /path\.with_extension\(/.test(beginFn) && /\.part/.test(beginFn),
+    '临时文件由目标名加后缀得到（同一个目录 —— 跨卷改名就不原子了）'
+  );
+  check(
+    /pub fn finish_stream\([\s\S]{0,600}?std::fs::rename/.test(dataDirRs),
+    '收尾是**同卷改名**（目标要么不存在、要么完整）'
+  );
+  check(
+    /pub fn abort_stream\([\s\S]{0,600}?std::fs::remove_file\(&target\.temp\)/.test(dataDirRs),
+    '放弃时删掉临时文件'
+  );
+  check(
+    /data_dir::finish_stream\(&target\)/.test(downloadFn),
+    'http_download 只在全部字节到齐后改名'
+  );
+  check(
+    /if let Err\(error\) = outcome \{[\s\S]{0,200}?data_dir::abort_stream\(&target\)/.test(downloadFn),
+    '中途失败时删掉临时文件（留一个被截断的目标是最糟的结果 —— 它看起来正常）'
+  );
+  // Windows 上"还开着的文件"删不掉，于是失败的下载会留下一个 `.part`
+  check(
+    /drop\(file\);[\s\S]{0,200}?data_dir::abort_stream/.test(downloadFn),
+    '失败时**先关句柄再删**（Windows 上开着就删不掉）'
+  );
+
+  // ---- 配额：边写边判 ----
+  check(
+    /if written > target\.headroom \{/.test(downloadFn),
+    '配额在写入过程中判（写完再算意味着插件可以先占满磁盘再收到"你超了"）'
+  );
+  check(
+    /if total > target\.headroom \{[\s\S]{0,200}?return Err\(PluginError::QuotaExceeded/.test(downloadFn),
+    'Content-Length 已知且已超余量时**发请求后立刻拒绝**（省掉一次白下的流量）'
+  );
+  check(
+    /PROGRESS_STEP_BYTES/.test(dbAndDownloadRs) && /const PROGRESS_STEP_BYTES: u64 = 256 \* 1024;/.test(dbAndDownloadRs),
+    '进度被节流（200 MB 会产生上万次块回调，每次都推 IPC 等于 DDOS 自己）'
+  );
+  check(
+    /on_progress\(written, total\);[\s\S]{0,200}?data_dir::finish_stream/.test(downloadFn),
+    '最后一次进度**无条件推**（否则界面永远停在 96% 那一格）'
+  );
+
+  // ---- 非 2xx 不落盘 ----
+  check(
+    /if !\(200\.\.300\)\.contains\(&status\) \{[\s\S]{0,400}?return Err\(PluginError::NetworkError/.test(
+      downloadFn
+    ),
+    '非 2xx 不落盘（把一段"404 Not Found"的 HTML 存成 model.bin 会把问题推迟到读它的时候）'
+  );
+
+  // ---- 权限与策略：与 http.fetch **共用**一份判定 ----
+  //
+  // 两条路径各写一遍权限判定一定会漂，而漂开的方向是"某一条忘了 network-external"。
+  check(
+    /fn plugin_request\(/.test(dbAndDownloadRs) && /fn map_net_error\(/.test(dbAndDownloadRs),
+    '权限判定与错误翻译各抽成一处'
+  );
+  check(
+    /self\.plugin_request\(id, "GET", url, headers\)\?/.test(downloadFn),
+    'http_download 走**同一个** plugin_request（不自己再判一遍权限）'
+  );
+  const requestFn = /pub async fn http_request\([\s\S]*?\n    \}/.exec(dbAndDownloadRs)?.[0] ?? '';
+  check(
+    /self\.plugin_request\(id, method, url, headers\)\?/.test(requestFn),
+    'http_request 也走那一个'
+  );
+  check(
+    !/is_loopback_host\(/.test(downloadFn) && !/network-external/.test(downloadFn),
+    'http_download 里没有第二份权限判定'
+  );
+
+  // ---- 依赖：流式的前提 ----
+  check(
+    /features = \["json", "rustls-tls", "stream"\]/.test(cargoForDownload),
+    'reqwest 打开了 `stream` 特性（`bytes_stream` 的前提）'
+  );
+
+  // ---- 两条调用路径都转给同一个实现 ----
+  check(
+    /"http\.download" => \{[\s\S]*?\.http_download\(/.test(rpcForDownload),
+    '沙箱协议那一条转给 PluginManager::http_download'
+  );
+  check(
+    /pub async fn plugin_http_download\(/.test(commandsForDownload) &&
+      /\.http_download\(&id, &url, &rel, headers/.test(commandsForDownload),
+    'in-process 那一条也转给同一个实现'
+  );
+  check(
+    !/data_dir::begin_stream/.test(rpcForDownload) && !/data_dir::begin_stream/.test(commandsForDownload),
+    '落盘的实现只有一处（两条路径都不自己写一遍）'
+  );
+
+  // ---- 进度：两条路都要到得了回调 ----
+  check(
+    /pub async fn deliver_download_progress<R: Runtime>/.test(sandboxRs) &&
+      /window\.__modulithDownloadProgress && window\.__modulithDownloadProgress\(JSON\.parse/.test(
+        sandboxRs
+      ),
+    '沙箱插件的进度推给它的界面'
+  );
+  check(
+    /pub const DOWNLOAD_PROGRESS: &str = "modulith:\/\/plugin-download-progress"/.test(rpcForDownload) &&
+      /app\.emit\(\s*super::rpc::DOWNLOAD_PROGRESS/.test(sandboxRs),
+    'in-process 插件的进度走一条广播（它的回调在宿主这个 realm 里）'
+  );
+  check(
+    /downloadHandlers\[key\] = onProgress/.test(bridgeJs) &&
+      /window\.__modulithDownloadProgress = function/.test(bridgeJs),
+    '桥接层持有沙箱侧的进度回调'
+  );
+  check(
+    /^installPluginDownloadProgress\(\);/m.test(read('../src/main.tsx')),
+    'in-process 那一条的监听真的装在启动路径上'
+  );
+  // 沙箱侧**不能**在 Promise 结束时删回调：最后一次进度可能晚于返回值。
+  check(
+    !/\.finally\(function \(\) \{[\s\S]{0,200}?delete downloadHandlers/.test(bridgeJs),
+    '桥接层不在下载结束时删回调（最后一次进度可能比返回值晚到，删早了会吞掉 100%）'
+  );
+
+  // ---- 与 ctx.dataDir 的关系：临时文件也在配额里 ----
+  check(
+    /pub headroom: u64/.test(dataDirRs) && /MAX_FILE_BYTES/.test(beginFn),
+    '余量既受总配额约束、也不超过单文件上限'
+  );
+  check(
+    /used_bytes\.saturating_sub\(existing\)/.test(beginFn),
+    '覆盖已有文件时先减掉旧体积（与 write 同一条判据）'
+  );
+  // 流式写入**不是另一条写入路径**：它必须继承同一套边界，
+  // 否则下载就成了唯一一个能越界的写。
+  check(
+    /pub fn begin_stream\(root: &Path, rel: &str, used_bytes: u64\) -> Result<StreamTarget, String> \{\s*\n\s*let path = resolve\(root, rel\)\?;/.test(
+      dataDirRs
+    ),
+    '流式写入走**同一个** resolve（自己拼路径就等于绕过整个 chroot 语义）'
+  );
+  check(
+    !/root\.join\(rel\)/.test(beginFn),
+    'begin_stream 里没有自己拼路径'
+  );
+  // 三段式的行为由 `data_dir.rs` 自己的单元测试覆盖。
+  for (const test of [
+    'the_temp_file_lives_next_to_the_target',
+    'streaming_inherits_the_same_path_rules',
+    'the_headroom_accounts_for_replacing_an_existing_file',
+    'finishing_moves_the_temp_onto_the_target',
+    'aborting_leaves_no_target_and_no_temp',
+  ]) {
+    check(dataDirRs.includes(`fn ${test}(`), `数据目录里有流式写入的测试 ${test}`);
+  }
+}
+
 
 
 

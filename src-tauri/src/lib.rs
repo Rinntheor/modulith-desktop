@@ -238,6 +238,7 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_storage_keys,
         plugin_db_query,
         plugin_db_exec,
+        plugin_http_download,
         plugin_db_transaction,
         plugin_data_clear,
         plugin_data_usage,
