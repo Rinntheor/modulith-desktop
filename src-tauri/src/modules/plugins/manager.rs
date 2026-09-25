@@ -31,6 +31,17 @@ pub struct StorageUsage {
     pub key_count: usize,
 }
 
+/// 一个**已卸载插件**留下的数据目录。
+///
+/// 卸载保留数据（见 `PluginManager::uninstall`）之后，磁盘上会出现这种目录。
+/// 它们必须能被用户看见并清掉 —— 否则"数据不会丢"的另一面就是"空间没人知道"。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanData {
+    pub id: String,
+    pub bytes: u64,
+}
+
 /// 一页存储键。
 ///
 /// `nextCursor` 为空表示**已经到底**。给一个"下一页是空的"游标会让调用方
@@ -1083,7 +1094,31 @@ impl PluginManager {
         self.to_installed(&entry)
     }
 
-    /// 卸载插件：删除插件目录、插件数据目录与注册表条目
+    /// 卸载插件：删除插件目录与注册表条目。**数据目录保留。**
+    ///
+    /// ============================================================
+    /// 为什么不再顺手删数据
+    /// ============================================================
+    //
+    // 这里原来是 `remove_dir_all(&plugin_dir)` 紧接着
+    // `remove_dir_all(&plugin_data_dir)` —— **而且"卸载前二次确认"这个设置关掉时
+    // 整条路径连一个对话框都没有**（见前端 `requestUninstall`）。也就是说：
+    // 用户点一下卸载，插件攒了几个月的数据就没了，没有提示、不进回收站。
+    //
+    // 那是这个插件系统里唯一一处**静默且不可逆地销毁用户数据**的地方。它之所以
+    // 一直没被当成缺陷，是因为在"每个插件只有几 KB 配置"的时代，损失小到没人注意。
+    // 一旦插件开始存文档、图片、数据库，同一个行为就从"无所谓"变成"灾难"。
+    //
+    // 现在语义反过来了：**卸载只删代码，数据默认留下。** 理由是三条：
+    //
+    //   1. 卸载的意图是"我不要这个插件了"，不是"我要销毁它存的东西"。
+    //      这是两件事，不该由一次点击一起完成。
+    //   2. 重装同一个插件能拿回数据 —— 这是最常见的"我先卸了试试"的用法。
+    //   3. 真要删，有一个**独立的、要确认的**入口（`clear_data`）。
+    //
+    // 代价必须说清楚：**卸载之后会留下磁盘占用。** 因此残留必须可见、可清 ——
+    // 否则这就只是把一个静默的数据丢失换成了一个静默的空间泄漏。
+    // 见 `orphan_data()`。
     pub fn uninstall(&mut self, id: &str) -> PluginResult<()> {
         validate_plugin_id(id, "插件 ID")?;
 
@@ -1101,15 +1136,22 @@ impl PluginManager {
             std::fs::remove_dir_all(&plugin_dir)?;
         }
 
-        let data_dir = self.plugin_data_dir(id)?;
-        if data_dir.exists() {
-            std::fs::remove_dir_all(&data_dir)?;
-        }
-
         self.registry.remove(id);
         self.save_registry()?;
 
-        log::info!("插件 {} 已卸载", id);
+        // 把"数据还在、在哪"写进日志。删除动作不该静默，**保留动作同样不该静默** ——
+        // 用户过一阵发现磁盘少了几百 MB 时，这条是唯一能解释它的东西。
+        let kept = self.plugin_data_dir(id)?;
+        if kept.is_dir() {
+            log::info!(
+                "插件 {} 已卸载；数据保留在 {}（{} 字节）。要一并删除，用「插件数据」里的残留清理。",
+                id,
+                kept.display(),
+                dir_size(&kept)
+            );
+        } else {
+            log::info!("插件 {} 已卸载", id);
+        }
         Ok(())
     }
 }
@@ -1500,19 +1542,45 @@ impl PluginManager {
         })
     }
 
-    /// 清空插件数据目录。
+    /// 清空插件数据目录。**需要插件仍然安装且声明了 `storage`。**
     ///
     /// **这里曾经完全缺少 ID 守卫**（`data_dir.join(id)` 直接用未校验的 `id`），
     /// `id = ".."` 会让目标解析为应用数据目录本身而被整个删除 —— 连
     /// settings.json / auth.json / notifications.json 一起消失。现在 ID 校验
     /// 收在 `plugin_data_dir` 里，本方法只需保证「只删该插件自己的数据目录」。
+    ///
+    /// 与 `clear_data` 的分工：这一条是**插件自己在运行期**能触发的清空
+    /// （它必须仍然装、仍然有权限）；`clear_data` 是**宿主替用户**执行的删除，
+    /// 卸载之后也要能用。
     pub fn storage_clear(&self, id: &str) -> PluginResult<()> {
         let dir = self.checked_storage_dir(id)?;
+        self.remove_data_dir(&dir, id)
+    }
+
+    /// 删除一个插件的数据目录。**不要求插件仍然安装。**
+    ///
+    /// 为什么必须有这一条：卸载改成"保留数据"之后，`storage_clear` 就够不着那些
+    /// 数据了 —— 它经过 `checked_storage_dir` → `require_permission` → 读清单，
+    /// 而未安装的插件读不到清单。**于是"保留数据"会变成一个再也删不掉的目录**，
+    /// 那只是把静默的数据丢失换成了静默的空间泄漏。
+    ///
+    /// 它是宿主侧的动作（由用户从界面上触发），因此**不做权限判定** ——
+    /// 权限是"插件能不能动自己的数据"，而这里是"用户能不能删自己机器上的东西"。
+    /// 保留的仍然只有 ID 守卫与越界检查。
+    pub fn clear_data(&self, id: &str) -> PluginResult<()> {
+        let dir = self.plugin_data_dir(id)?;
+        self.remove_data_dir(&dir, id)
+    }
+
+    /// 删除数据目录的公共部分：越界检查 + 递归删除。
+    ///
+    /// 两条守卫对所有调用方都成立，因此收在一处 —— 散落的话，漏掉任意一处就等于没有防护。
+    fn remove_data_dir(&self, dir: &Path, id: &str) -> PluginResult<()> {
         if !dir.is_dir() {
             return Ok(());
         }
         // 不变量：目标必须是 data_dir 之下的一个条目，且不能是 data_dir 本身
-        if !validator::is_within(&self.data_dir, &dir) {
+        if !validator::is_within(&self.data_dir, dir) {
             return Err(PluginError::SandboxViolation(format!(
                 "拒绝清空越界目录: {}",
                 id
@@ -1521,6 +1589,73 @@ impl PluginManager {
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+
+    /// 一个插件数据目录的占用字节数。
+    ///
+    /// **不要求插件仍然安装，也不要求它声明 `storage`。** 与 `storage_usage` 的分工：
+    /// 那一个回答"插件的键值存储用了多少配额"，要过权限；这一个只回答"这个目录占了
+    /// 多少磁盘"，是给人看的数字 —— 卸载确认框与残留清理都要它。
+    ///
+    /// 递归统计是这个功能里唯一会慢的一步，因此**只在用户真的要看的时候调它**
+    /// （打开卸载确认框、或列出残留），不要在插件列表里对每个插件都算一遍。
+    pub fn data_usage(&self, id: &str) -> PluginResult<u64> {
+        let dir = self.plugin_data_dir(id)?;
+        Ok(if dir.is_dir() { dir_size(&dir) } else { 0 })
+    }
+
+    /// 列出**已卸载插件的残留数据**。
+    ///
+    /// 卸载保留数据之后，磁盘上会出现一批"没有对应插件"的目录。它们必须能被用户
+    /// 看见 —— 否则"数据不会丢"这句话的另一面就是"占用的空间没人知道"。
+    ///
+    /// 只认**合法插件 id 形状**的目录名：数据目录下不该有别的名字，出现了也不该
+    /// 由这里去动它。目录名非法的一律跳过，也就不可能被这个功能删掉。
+    pub fn orphan_data(&self) -> Vec<OrphanData> {
+        let mut orphans: Vec<OrphanData> =
+            scan_orphan_dirs(&self.data_dir, |id| self.registry.contains_key(id))
+                .into_iter()
+                .map(|(id, path)| OrphanData {
+                    id,
+                    bytes: dir_size(&path),
+                })
+                .collect();
+
+        // 按占用从大到小：这个列表的用途是"我该清理哪个"，不是"有哪些"。
+        orphans.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
+        orphans
+    }
+}
+
+/// 找出数据目录里"没有对应插件"的子目录。**纯函数，因此可以被单测。**
+///
+/// 为什么把它摘出来：这个判定决定**哪些目录会被列给用户、进而可能被删掉**，
+/// 因此它比周围那些 IO 更需要能被单独构造用例覆盖。收在 `PluginManager` 里的话，
+/// 就只能靠"装一个插件再卸掉"来间接验证它，而那种测试很难覆盖"目录名不合法"
+/// 这一类边界。
+///
+/// 只认**合法插件 id 形状**的目录名：数据目录下本不该有别的名字，出现了也不该由
+/// 这里去描述它，更不该被这条路径删掉 —— 一个不认识的东西，正确的处理是不碰它。
+fn scan_orphan_dirs(
+    data_dir: &Path,
+    is_installed: impl Fn(&str) -> bool,
+) -> Vec<(String, PathBuf)> {
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_installed(&name) {
+                return None;
+            }
+            validate_plugin_id(&name, "插件 ID").ok()?;
+            Some((name, entry.path()))
+        })
+        .collect()
 }
 
 // ============================================================
@@ -2792,6 +2927,84 @@ mod tests {
             perms
         ))
         .expect("最小清单应当能解析")
+    }
+
+    // ============================================================
+    // 残留数据：哪些目录算"已卸载插件的残留"
+    // ============================================================
+    //
+    // 这个判定决定**哪些目录会被列给用户、进而可能被删掉**，因此它比周围那些 IO
+    // 更需要直接的用例。它是纯函数（`scan_orphan_dirs`），所以能这样测。
+
+    /// 还装着的插件不是残留 —— 否则用户会看到自己正在用的插件出现在"清理"列表里。
+    #[test]
+    fn orphan_scan_skips_installed_plugins() {
+        let root = temp_dir("orphan-installed");
+        std::fs::create_dir_all(root.join("com.test.alive")).unwrap();
+        std::fs::create_dir_all(root.join("com.test.gone")).unwrap();
+
+        let found = scan_orphan_dirs(&root, |id| id == "com.test.alive");
+
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["com.test.gone"], "已安装的插件不该被算成残留");
+    }
+
+    /// **名字不合法的目录一律不碰。**
+    ///
+    /// 数据目录下本不该有这些东西，但"出现了怎么办"必须是有意的：不认识的东西，
+    /// 正确的处理是不去描述它、更不去删它。
+    ///
+    /// 这条测试的第一版写砸了，值得记下来：它造了几个"非法名"目录（`trailing.`、
+    /// `a\b`），然后断言结果里只剩合法的那个 —— 结果失败了，因为**文件系统把它们
+    /// 规范化掉了**：`trailing.` 在 Windows 上建出来叫 `trailing`，`a\b` 建出来是
+    /// 目录 `a`，两个都是**合法**的插件 id 形状。也就是说那条测试的"非法名"前提
+    /// 根本不成立。
+    ///
+    /// 现在它断言的是**真正的不变量**（返回的每一个 id 都合法），并且**先自检前提**
+    /// （确实造出了至少一个非法名）—— 否则一条什么都没造出来的测试会安静地通过。
+    #[test]
+    fn orphan_scan_only_ever_returns_valid_plugin_ids() {
+        let root = temp_dir("orphan-badnames");
+
+        let candidates = ["with space", "semi;colon", "at@sign", "star*", "pipe|"];
+        let mut created: Vec<&str> = Vec::new();
+        for name in candidates {
+            if std::fs::create_dir_all(root.join(name)).is_ok() {
+                created.push(name);
+            }
+        }
+        std::fs::create_dir_all(root.join("com.test.ok")).unwrap();
+        // 一个**文件**也不该被算成残留目录。
+        std::fs::write(root.join("not-a-dir.txt"), b"x").unwrap();
+
+        let found = scan_orphan_dirs(&root, |_| false);
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+
+        assert!(ids.contains(&"com.test.ok"), "合法的数据目录应被列出");
+        for id in &ids {
+            assert!(
+                validate_plugin_id(id, "插件 ID").is_ok(),
+                "扫出了一个不合法的 id：{id}"
+            );
+        }
+
+        // 前提自检：没有造出任何非法名字的话，上面那个循环等于没测。
+        assert!(
+            created
+                .iter()
+                .any(|name| validate_plugin_id(name, "插件 ID").is_err()),
+            "一个非法目录名都没造出来，这条测试是空的：{created:?}"
+        );
+    }
+
+    /// 数据目录不存在时返回空表，而不是报错。
+    ///
+    /// 这条路径在真实使用里会出现：用户从没让任何插件写过数据，
+    /// 而"插件"页每次打开都会问一次残留。
+    #[test]
+    fn orphan_scan_tolerates_a_missing_data_dir() {
+        let root = temp_dir("orphan-missing").join("nope");
+        assert!(scan_orphan_dirs(&root, |_| false).is_empty());
     }
 
     /// 未声明 `storage` 时必须拒绝。

@@ -2494,10 +2494,50 @@ export async function setPluginEnabled(pluginId: string, enabled: boolean): Prom
   await reloadPluginRuntime();
 }
 
+/**
+ * 卸载插件。**数据会保留。**
+ *
+ * 卸载的意图是"我不要这个插件了"，不是"我要销毁它存的东西"——这是两件事，
+ * 不该由一次点击一起完成。重装同一个插件会拿回数据，这是"先卸了试试"的常见用法。
+ *
+ * 要连数据一起删，卸载之后再调 `clearPluginData`（它是单独一步、要确认）。
+ * 之前这里是静默一起删的，见 `PluginManager::uninstall` 上的说明。
+ */
 export async function uninstallPlugin(pluginId: string): Promise<void> {
   unloadPlugin(pluginId);
   await invoke('uninstall_plugin', { id: pluginId });
   await reloadPluginRuntime();
+}
+
+/**
+ * 删除一个插件的数据目录。**不可撤销，调用方必须先确认。**
+ *
+ * 与 `clearPluginStorage` 的分工：那一条要求插件仍然安装且声明了 `storage`
+ * （插件清自己的数据）；这一条卸载之后也能用，因为它是用户删自己机器上的东西。
+ */
+export async function clearPluginData(pluginId: string): Promise<void> {
+  await invoke('plugin_data_clear', { id: pluginId });
+}
+
+/** 一个插件数据目录占用的字节数（**不要求它仍然安装**）。 */
+export async function getPluginDataUsage(pluginId: string): Promise<number> {
+  return invoke<number>('plugin_data_usage', { id: pluginId });
+}
+
+/** 一个已卸载插件留下的数据目录 */
+export interface OrphanPluginData {
+  id: string;
+  bytes: number;
+}
+
+/**
+ * 列出已卸载插件的残留数据（按占用从大到小）。
+ *
+ * 卸载保留数据必须在界面上有对应的出口：否则"数据不会丢"的另一面就是
+ * "占用的空间没人知道"。
+ */
+export async function listOrphanPluginData(): Promise<OrphanPluginData[]> {
+  return invoke<OrphanPluginData[]>('plugin_data_orphans');
 }
 
 export async function installPluginFromPackage(path: string): Promise<InstalledPlugin> {

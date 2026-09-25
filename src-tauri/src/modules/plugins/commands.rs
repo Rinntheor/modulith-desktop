@@ -390,6 +390,41 @@ pub async fn plugin_storage_keys(
     manager.storage_keys(&id).map_err(to_msg)
 }
 
+/// 删除一个插件的数据目录（**不要求它仍然安装**）。不可撤销。
+///
+/// 与 `plugin_storage_clear` 的分工：那一条要求插件仍然安装且声明了 `storage`
+/// 权限（它是"插件清自己的数据"）；这一条是**用户删自己机器上的东西**，
+/// 因此卸载之后也要能用 —— 否则"卸载保留数据"会把残留变成删不掉的目录。
+///
+/// 前端必须**先确认**再调它。它不是"顺手清一下"的接口。
+#[tauri::command]
+pub async fn plugin_data_clear(state: State<'_, PluginState>, id: String) -> Result<(), String> {
+    let manager = state.inner().0.read().await;
+    manager.clear_data(&id).map_err(to_msg)
+}
+
+/// 一个插件数据目录的占用字节数（**不要求它仍然安装**）。
+///
+/// 与 `plugin_storage_usage` 的分工：那一个报的是键值存储的配额用量、要过权限；
+/// 这一个只是"这个目录占了多少磁盘"—— 卸载确认框要拿它把选择说清楚。
+#[tauri::command]
+pub async fn plugin_data_usage(state: State<'_, PluginState>, id: String) -> Result<u64, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_usage(&id).map_err(to_msg)
+}
+
+/// 列出已卸载插件的残留数据（id 与占用字节数，按占用从大到小）。
+///
+/// 卸载保留数据之后必须有这一条：没有它，那些目录既占着空间、又没有任何界面
+/// 能描述它们。
+#[tauri::command]
+pub async fn plugin_data_orphans(
+    state: State<'_, PluginState>,
+) -> Result<Vec<super::manager::OrphanData>, String> {
+    let manager = state.inner().0.read().await;
+    Ok(manager.orphan_data())
+}
+
 /// 分页列出该插件的存储键（设置 → 插件 与插件自己的列表都走它）
 ///
 /// 与 `plugin_storage_keys` 的区别是**规模**：那一条一次返回全部键，而插件存储

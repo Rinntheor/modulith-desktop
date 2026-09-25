@@ -41,8 +41,12 @@ import {
   installPluginFromUrl,
   setPluginEnabled,
   uninstallPlugin,
+  clearPluginData,
+  getPluginDataUsage,
+  listOrphanPluginData,
   subscribePlugins,
   type InstalledPlugin,
+  type OrphanPluginData,
   type PluginLoadState,
 } from '../../services/pluginRuntime';
 import {
@@ -59,6 +63,7 @@ import IconPlate from '../../components/icons/IconPlate';
 import { subscribeFileDrop, isFileDropAvailable } from '../../services/fileDrop';
 import { useModuleActive } from '../../hooks/useModuleActive';
 import { runSandboxSelfTest } from '../../services/sandboxSurface';
+import { formatBytes } from '../../utils/format';
 
 type FilterTab = 'all' | 'enabled' | 'disabled' | 'error';
 type SortMode = 'name' | 'version' | 'installed' | 'status';
@@ -176,9 +181,17 @@ const ConfirmDialog: React.FC<{
   message: React.ReactNode;
   confirmLabel: string;
   busy: boolean;
+  /**
+   * 消息与按钮之间的附加内容（复选框之类）。
+   *
+   * 加这个插槽是为了"卸载时要不要连数据一起删"：那是一个**必须由用户在当场做出**的
+   * 选择，而不是一个可以被默认掉的开关。放在对话框里，用户看到的是"这条数据现在
+   * 会怎样"；放进设置里，他下次点卸载时已经忘了自己开过什么。
+   */
+  extra?: React.ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
-}> = ({ open, title, message, confirmLabel, busy, onConfirm, onCancel }) => (
+}> = ({ open, title, message, confirmLabel, busy, extra, onConfirm, onCancel }) => (
   <AnimatePresence>
     {open && (
       <>
@@ -204,6 +217,8 @@ const ConfirmDialog: React.FC<{
               <div className="text-sm text-gray-600 mt-1.5 leading-relaxed">{message}</div>
             </div>
           </div>
+
+          {extra}
 
           <div className="flex justify-end gap-2 mt-5">
             <button
@@ -364,6 +379,19 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const [dropActive, setDropActive] = useState(false);
   /** 沙箱自检面板正在打开（防连点） */
   const [selfTestBusy, setSelfTestBusy] = useState(false);
+  /**
+   * 卸载确认框里的"连数据一起删"。
+   *
+   * **每次打开都重置为假。** 它是一个不可撤销的选择，默认必须是"不删"；
+   * 记住上一次的勾选等于让用户在不知情的情况下销毁数据。
+   */
+  const [deleteDataOnUninstall, setDeleteDataOnUninstall] = useState(false);
+  /** 被点卸载那个插件的数据占用。打开确认框时现取 —— 见 `getPluginDataUsage`。 */
+  const [pendingUninstallBytes, setPendingUninstallBytes] = useState<number | null>(null);
+  /** 已卸载插件留下的数据目录。 */
+  const [orphans, setOrphans] = useState<OrphanPluginData[]>([]);
+  const [orphanCleanupOpen, setOrphanCleanupOpen] = useState(false);
+  const [orphanCleanupBusy, setOrphanCleanupBusy] = useState(false);
 
   const flash = useCallback((kind: Feedback['kind'], message: string, ms = 5000) => {
     setFeedback({ kind, message });
@@ -610,15 +638,35 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     [afterMutation, flash]
   );
 
+  /**
+   * 卸载。
+   *
+   * `alsoDeleteData` **默认为假**，而且这个默认是有意的：仅卸载插件本身是"我不要它了"，
+   * 删数据是"我要销毁它存的东西"——后者必须有一个人当场做出的选择。
+   *
+   * 注意 `confirmBeforeUninstall` 关掉时走的是同一条函数、同样保留数据。
+   * 以前那条路径连对话框都没有，却会把数据一起删掉：那是这个系统里唯一一处
+   * **静默且不可逆地销毁用户数据**的地方。
+   */
   const handleUninstall = useCallback(
-    async (target: InstalledPlugin) => {
+    async (target: InstalledPlugin, alsoDeleteData = false) => {
+      const name = target.manifest.displayName || target.id;
       setBusyId(target.id);
       try {
         await uninstallPlugin(target.id);
+        if (alsoDeleteData) {
+          // 删除走**另一条**命令：它不要求插件仍然安装，因此卸载之后才调得动。
+          await clearPluginData(target.id);
+        }
         setPendingUninstall(null);
         setDetail(null);
         afterMutation();
-        flash('success', `已卸载插件「${target.manifest.displayName || target.id}」`);
+        flash(
+          'success',
+          alsoDeleteData
+            ? `已卸载插件「${name}」，它的数据也已删除。`
+            : `已卸载插件「${name}」。它的数据已保留 —— 重装同一个插件就能拿回来。`
+        );
       } catch (err) {
         flash('error', `卸载失败：${err instanceof Error ? err.message : String(err)}`);
       } finally {
@@ -632,13 +680,62 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const requestUninstall = useCallback(
     (plugin: InstalledPlugin) => {
       if (getCachedSettings().confirmBeforeUninstall) {
+        setDeleteDataOnUninstall(false);
+        setPendingUninstallBytes(null);
         setPendingUninstall(plugin);
+        // 现取占用：递归统计有点慢，不值得让插件列表每次都为它付钱。
+        // 取不到就当"没说"—— 一个拿不到的数字不该挡住卸载。
+        void getPluginDataUsage(plugin.id)
+          .then((bytes) => setPendingUninstallBytes(bytes))
+          .catch(() => setPendingUninstallBytes(null));
       } else {
+        // 这条路径**同样保留数据**（`alsoDeleteData` 默认为假）。
+        // 以前它连对话框都没有，却会把数据一起删掉。
         void handleUninstall(plugin);
       }
     },
     [handleUninstall]
   );
+
+  /** 重新读一遍残留数据目录。安装/卸载之后都要刷。 */
+  const refreshOrphans = useCallback(() => {
+    void listOrphanPluginData()
+      .then(setOrphans)
+      .catch(() => setOrphans([]));
+  }, []);
+
+  useEffect(() => {
+    refreshOrphans();
+  }, [refreshOrphans, plugins]);
+
+  /**
+   * 清理全部残留数据。
+   *
+   * **逐条调用同一个 `plugin_data_clear`**，而不是加一条"全清"命令：后者会是一个
+   * 一次调用删掉多个目录的接口，而它的 ID 守卫就只剩下"这是 data_dir 的子目录"
+   * 这一条 —— 一条命令能删多少东西，应当与它做过的校验成正比。
+   *
+   * 逐条失败不中断：能清多少清多少，剩下的下一次还能清。把失败原样报出来。
+   */
+  const handleOrphanCleanup = useCallback(async () => {
+    setOrphanCleanupBusy(true);
+    const failures: string[] = [];
+    for (const orphan of orphans) {
+      try {
+        await clearPluginData(orphan.id);
+      } catch (error) {
+        failures.push(orphan.id);
+      }
+    }
+    setOrphanCleanupBusy(false);
+    setOrphanCleanupOpen(false);
+    refreshOrphans();
+    if (failures.length === 0) {
+      flash('success', `已清理 ${orphans.length} 个插件的残留数据。`);
+    } else {
+      flash('error', `这些插件的残留数据没能清理：${failures.join('、')}`);
+    }
+  }, [orphans, refreshOrphans, flash]);
 
   const handleExport = useCallback(
     async (plugin: InstalledPlugin) => {
@@ -853,6 +950,34 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/*
+        已卸载插件的残留数据。
+
+        卸载**保留数据**之后必须有这一块：否则"数据不会丢"的另一面就是
+        "占用的空间没人知道、也没人删得掉"。它只在真的有残留时出现。
+      */}
+      {orphans.length > 0 && (
+        <div className="mb-5 p-3.5 rounded-xl flex items-start gap-3 border border-amber-200 bg-amber-50">
+          <AlertTriangle className="w-4 h-4 text-amber-500 mt-0.5 shrink-0" />
+          <div className="flex-1 min-w-0 text-sm text-amber-800">
+            <p>
+              有 <strong>{orphans.length}</strong> 个已卸载插件留下了数据，共{' '}
+              <strong>{formatBytes(orphans.reduce((sum, o) => sum + o.bytes, 0))}</strong>。
+              卸载不会删数据（重装同一个插件就能拿回来），所以它们会留在这里。
+            </p>
+            <p className="mt-1 text-xs text-amber-700 break-all">
+              {orphans.map((o) => `${o.id}（${formatBytes(o.bytes)}）`).join('、')}
+            </p>
+          </div>
+          <button
+            onClick={() => setOrphanCleanupOpen(true)}
+            className="shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white border border-amber-300 text-amber-800 hover:bg-amber-100 transition-colors"
+          >
+            清理
+          </button>
+        </div>
+      )}
 
       {/* 统计 */}
       <div className="grid grid-cols-2 @3xl:grid-cols-4 gap-3 mb-6">
@@ -1149,16 +1274,67 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
             <>
               确定要卸载「
               <strong>{pendingUninstall.manifest.displayName || pendingUninstall.id}</strong>
-              」吗？插件的文件与存储数据都会被删除，此操作不可撤销。
+              」吗？插件的文件会被删除。
+              <br />
+              <span className="text-emerald-700">
+                它的数据会<strong>保留</strong>
+                —— 重装同一个插件就能拿回来。
+              </span>
             </>
+          )
+        }
+        extra={
+          pendingUninstall && (
+            <label className="flex items-start gap-2.5 mt-4 p-3 rounded-lg border border-red-200 bg-red-50 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={deleteDataOnUninstall}
+                onChange={(event) => setDeleteDataOnUninstall(event.target.checked)}
+                className="mt-0.5 accent-red-600"
+              />
+              <span className="text-xs text-red-800 leading-relaxed">
+                连同它的数据一起删除
+                {pendingUninstallBytes !== null && pendingUninstallBytes > 0 && (
+                  <> （{formatBytes(pendingUninstallBytes)}）</>
+                )}
+                。
+                <strong>此操作不可撤销，也不会进回收站。</strong>
+              </span>
+            </label>
           )
         }
         confirmLabel="卸载"
         busy={pendingUninstall ? busyId === pendingUninstall.id : false}
         onConfirm={() => {
-          if (pendingUninstall) void handleUninstall(pendingUninstall);
+          if (pendingUninstall) void handleUninstall(pendingUninstall, deleteDataOnUninstall);
         }}
-        onCancel={() => setPendingUninstall(null)}
+        onCancel={() => {
+          setPendingUninstall(null);
+          setDeleteDataOnUninstall(false);
+          setPendingUninstallBytes(null);
+        }}
+      />
+
+      {/* 残留数据清理确认 */}
+      <ConfirmDialog
+        open={orphanCleanupOpen}
+        title="清理残留数据"
+        message={
+          <>
+            将删除这 <strong>{orphans.length}</strong> 个已卸载插件留下的全部数据，共{' '}
+            <strong>{formatBytes(orphans.reduce((sum, o) => sum + o.bytes, 0))}</strong>。
+            这些插件当前没有安装，因此这些数据
+            <strong>不会再有任何界面用到它们</strong>。
+            <br />
+            <span className="text-red-700">
+              <strong>此操作不可撤销，也不会进回收站。</strong>
+            </span>
+          </>
+        }
+        confirmLabel="删除"
+        busy={orphanCleanupBusy}
+        onConfirm={() => void handleOrphanCleanup()}
+        onCancel={() => setOrphanCleanupOpen(false)}
       />
 
       {/* URL 安装 */}
