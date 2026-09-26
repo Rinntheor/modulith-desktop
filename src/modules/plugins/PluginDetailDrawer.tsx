@@ -30,6 +30,12 @@ import { DRAWER_ENTER, DRAWER_EXIT } from '../../utils/motionCurves';
 import Markdown from '../../components/Markdown';
 import type { InstalledPlugin, PluginLoadState } from '../../services/pluginRuntime';
 import { readPluginReadme } from '../../services/pluginRuntime';
+import {
+  backgroundPluginStatus,
+  pluginBackgroundContribution,
+  type BackgroundContribution,
+  type BackgroundPluginStatus,
+} from '../../services/backgroundPlugins';
 
 interface PluginDetailDrawerProps {
   plugin: InstalledPlugin | null;
@@ -78,6 +84,70 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
      * 视觉结果，也就不会闪一个空标题出来。
      */
     const [readme, setReadme] = useState<string | null | undefined>(undefined);
+
+    /**
+     * 后台（无界面）插件在不在跑、以及它跑在哪一层边界里。
+     *
+     * ============================================================
+     * 为什么这件事必须显示出来
+     * ============================================================
+     *
+     * `isolated` 与 `netRestricted` 是**两件不同的事**，而它们很容易被读成一件：
+     *
+     *   * `isolated` —— Node 的 `--permission` 那一层在不在；
+     *   * `netRestricted` —— 那一层**管不管得住网络**。宿主从不传 `--allow-net`，
+     *     但"不授予"只有在那个 scope 存在时才等于拒绝，而它是**版本相关的**
+     *     （实测 Node 24.15.0 就没有，网络完全不受管）。
+     *
+     * 合成一个绿色"已隔离"的结果是：用户以为插件连不上网，而它可以直接
+     * `fetch` 出去。**让用户以为某项受管控、实际不受管控，比不告诉他更危险** ——
+     * 他会基于一个错误的前提做决定。
+     *
+     * 取后台声明走**宿主**（`plugin_background_contribution`）而不是在前端读
+     * `manifest.contributes`：入口路径的合法性由 Rust 判定（它是放行目录的依据），
+     * 前端再判一遍就是第二份会漂的规则。没有声明就不取状态，因此这条调用
+     * 不会出现在绝大多数插件上。
+     */
+    const [backend, setBackend] = useState<{
+      contribution: BackgroundContribution;
+      status: BackgroundPluginStatus | null;
+    } | null>(null);
+
+    useEffect(() => {
+      if (!plugin) {
+        setBackend(null);
+        return;
+      }
+
+      let alive = true;
+      setBackend(null);
+
+      void (async () => {
+        try {
+          const contribution = await pluginBackgroundContribution(plugin.id);
+          if (!alive || !contribution) return;
+
+          const items = await backgroundPluginStatus();
+          if (!alive) return;
+
+          // 只认 id 完全相等的那个：这一层不做任何规范化，否则"界面显示了谁"
+          // 与"实际跑的是谁"就有了两个答案。
+          setBackend({
+            contribution,
+            status: items.find((item) => item.id === plugin.id) ?? null,
+          });
+        } catch {
+          // 取不到不该让整份详情页报错：它是补充信息。
+          if (alive) setBackend(null);
+        }
+      })();
+
+      return () => {
+        alive = false;
+      };
+      // `plugin` 是对象且每次列表刷新都会换引用，这里按 id 依赖。
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [plugin?.id]);
 
     useEffect(() => {
       if (!plugin) return;
@@ -291,8 +361,9 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                     <div className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2">
                       <p className="text-[11px] text-emerald-800 leading-relaxed">
                         <span className="font-medium">已隔离。</span>
-                        这个插件跑在它自己的 webview 里，而那个 webview
-                        <span className="font-medium">不匹配任何宿主授权</span>
+                        这个插件跑在一个与宿主<span className="font-medium">不同来源</span>的文档里
+                        （跨源 iframe），而那一边
+                        <span className="font-medium">拿不到任何宿主 IPC</span>
                         —— 因此下面这份列表是<b>有执行者的</b>：越出列表的调用会在
                         宿主那一层被拒绝。
                       </p>
@@ -305,6 +376,43 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                         <span className="font-medium">是它的声明，不是对它的约束</span>
                         —— 它实际能触达宿主的一切能力，而宿主无法核实它是否如实申报。
                       </p>
+                    </div>
+                  )}
+
+                  {/*
+                    后台（无界面）插件：把"跑在哪一层边界里"与"网络管不管得住"
+                    **分开说**。合成一句会影响用户的判断，而那是安全信息。
+                  */}
+                  {backend && (
+                    <div className="mb-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                      <p className="text-[11px] text-gray-700 leading-relaxed">
+                        <span className="font-medium">它还有一份后台代码。</span>
+                        那部分跑在一个<span className="font-medium">独立的 Node 进程</span>里
+                        （不是 webview，也不占渲染进程）：文件读只放开它自己的目录、
+                        <code className="px-0.5">process.env</code> 已清空。
+                      </p>
+                      {backend.status?.running ? (
+                        <p className="mt-1.5 text-[11px] leading-relaxed">
+                          {backend.status.netRestricted ? (
+                            <span className="text-emerald-800">
+                              当前正在运行，且网络也被引擎拦住了。
+                            </span>
+                          ) : (
+                            <span className="text-amber-800">
+                              当前正在运行。
+                              <b>但它的网络不受管</b>：这台机器上的 Node 版本没有"网络"那一项
+                              权限（<code className="px-0.5">--allow-net</code>），因此"不授予"
+                              等于什么也没做。它的 <code className="px-0.5">ctx.http</code> 仍然
+                              每次都判 <code className="px-0.5">network</code> 权限，但它可以直接
+                              <code className="px-0.5">fetch</code> 外连 —— 别按权限列表去理解它。
+                            </span>
+                          )}
+                        </p>
+                      ) : (
+                        <p className="mt-1.5 text-[11px] text-gray-500 leading-relaxed">
+                          当前没有在运行{backend.status?.reason ? `：${backend.status.reason}` : ''}。
+                        </p>
+                      )}
                     </div>
                   )}
 

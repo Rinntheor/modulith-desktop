@@ -630,6 +630,20 @@ async function startBackgroundPlugins(): Promise<void> {
           degraded.map((item) => item.id).join('、')
       );
     }
+
+    // **网络那一项要单独说。** `isolated: true` 只说明权限模型开着，而它管不管
+    // 得住网络取决于那个 Node 有没有 `--allow-net` 这个 scope —— 那是版本相关的，
+    // 本机 Node 24 就没有，实测网络完全不受管。
+    //
+    // 合成一句"已隔离"会让用户以为插件连不上网。这两件事分开说。
+    const netOpen = started.filter((item) => item.running && !item.netRestricted);
+    if (netOpen.length > 0) {
+      console.warn(
+        `[boot] 这些后台插件的**网络不受管**（当前 Node 的权限模型没有网络那一项）：` +
+          `${netOpen.map((item) => item.id).join('、')}。` +
+          '它们的 ctx.http 仍然每次判权限，但可以直接 fetch / net.connect 外连。'
+      );
+    }
   } catch (error) {
     console.warn(
       '[boot] 后台插件未能启动（多半是没有可用的 Node 运行时）：',

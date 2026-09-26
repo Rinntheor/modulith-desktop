@@ -76,6 +76,16 @@ use crate::modules::plugins::{rpc, PluginState};
 /// 特定小版本上生效的开关不值得写进这里 —— 版本不够就如实降级并报出来。
 const PERMISSION_MODEL_MIN_MAJOR: u64 = 23;
 
+/// 网络那一项在 Node 权限模型里的旗标名。
+///
+/// 宿主**从不**传它 —— 传了就等于把外连权限授予插件。这个常量只用于
+/// **探测**：`<node> --help` 里有没有它，决定了"不授予"到底等不等于"拒绝"。
+///
+/// 它是一个常量而不是散在代码里的字面量，因为它的用途只有一个、而且写错的方向
+/// 很坏：拼错成 `--allow-nets` 会让探测永远返回 `false`，于是界面会一直说
+/// "网络没被管住" —— 一个**听起来更安全**的假警报，没人会去查它。
+const NET_SCOPE_FLAG: &str = "--allow-net";
+
 /// 一个正在跑的后台插件。
 struct Running {
     host: Arc<BackgroundHost>,
@@ -103,6 +113,25 @@ pub struct BackgroundPluginStatus {
     pub pid: Option<u32>,
     /// 是否跑在引擎级权限之下。`false` 且 `running` = 降级运行。
     pub isolated: bool,
+    /// 这一层权限是否**真的管住了网络**。
+    ///
+    /// ============================================================
+    /// 为什么它必须与 `isolated` 分开
+    /// ============================================================
+    ///
+    /// 宿主启动插件子进程时只传 `--permission --allow-fs-read=<插件目录>`，
+    /// **从不传 `--allow-net`** —— 意图是"网络一律不给"。而"不授予"只有在
+    /// 那个 scope **存在**时才等于拒绝：`--permission` 默认拒绝一切可用权限，
+    /// 但网络这一项**是版本相关的**。
+    ///
+    /// 实测（本机 Node 24.15.0）：`--help` 里的权限能力没有 `--allow-net`，
+    /// 而在 `--permission --allow-fs-read=<dir>` 之下 `dns.lookup('example.com')`
+    /// **成功**、`net.connect` / `fetch` 得到的都是网络层错误而不是
+    /// `ERR_ACCESS_DENIED`。也就是那台机器上"权限模型一项网络操作都没拦"。
+    ///
+    /// 因此 `isolated === true` **不等于**网络被管住。界面必须分别说这两件事，
+    /// 否则用户会读到一个绿色的"已隔离"，并据此认为插件连不上网。
+    pub net_restricted: bool,
     pub uptime_ms: u64,
     /// 最近一次失败的原因
     pub reason: Option<String>,
@@ -118,6 +147,8 @@ pub struct BackgroundPlugins {
     running: Mutex<HashMap<String, Running>>,
     /// Node 是否支持权限模型。缓存 —— 它是"启动一次子进程问版本"，不该每次拉起都问。
     permission_model: Mutex<Option<bool>>,
+    /// Node 的权限模型**有没有网络那一项**（`--allow-net`）。同样缓存。
+    net_scope: Mutex<Option<bool>>,
 }
 
 impl BackgroundPlugins {
@@ -160,6 +191,26 @@ impl BackgroundPlugins {
         };
 
         let isolated = self.permission_model_supported(&node).await;
+
+        // 顺便把"网络那一项存不存在"问出来并缓存（`status()` 是同步的，只能读缓存）。
+        //
+        // 放在这里，而不是某个专门的状态查询里：这是**唯一**一个已经在启动子进程的
+        // 位置，多问一次 `--help` 的开销可以忽略；而"没拉起过任何后台插件"时
+        // 根本不需要这个答案。
+        let net_scope = self.net_scope_supported(&node).await;
+
+        if isolated && !net_scope {
+            // 这条警告是本模块最该留下的一条日志：它说明"已隔离"这四个字在
+            // **网络**这件事上是空的。插件仍可直接 `fetch` 出去，而宿主那一侧
+            // 除了 `ctx.http` 之外没有任何强制点。
+            log::warn!(
+                "Node {} 的权限模型没有网络那一项（缺 {NET_SCOPE_FLAG}），因此后台插件 \
+                 {} 的网络**不受管**：它的 ctx.http 仍然每次判权限，但它可以直接 \
+                 fetch / net.connect 外连",
+                node.display(),
+                launch.id
+            );
+        }
 
         // ============================================================
         // 子进程的权限：只放开**这个插件自己的代码目录**
@@ -393,8 +444,14 @@ impl BackgroundPlugins {
     }
 
     /// 当前状态。**不启动任何东西。**
+    ///
+    /// ⚠️ `net_restricted` 需要问一次 Node 的能力（`--help`），而这是一个 `sync`
+    /// 函数。因此它**只读缓存**：缓存里没有就报 `false`（"没被管住"）。
+    /// 这个方向是刻意的 —— 在拿到证据之前，界面不该宣称网络已被限制。
+    /// 缓存由 `start`（真正要拉起子进程时）填上。
     pub fn status(&self, _app: &AppHandle) -> Vec<BackgroundPluginStatus> {
         let running = self.running.lock().unwrap();
+        let net_scope = *self.net_scope.lock().unwrap();
 
         let mut items: Vec<BackgroundPluginStatus> = running
             .iter()
@@ -405,6 +462,10 @@ impl BackgroundPlugins {
                     running: status.running,
                     pid: status.pid,
                     isolated: entry.isolated,
+                    // 网络被管住 = 权限模型开着 **且** 那个 scope 真的存在。
+                    // 前半句单独成立时（本机 Node 24 就是这种）网络完全不受管 ——
+                    // 那正是这一位存在的理由。
+                    net_restricted: entry.isolated && net_scope.unwrap_or(false),
                     uptime_ms: entry.started_at.elapsed().as_millis() as u64,
                     reason: status.reason,
                 }
@@ -488,6 +549,51 @@ impl BackgroundPlugins {
         };
 
         *self.permission_model.lock().unwrap() = Some(supported);
+        supported
+    }
+
+    /// 这个 Node 的权限模型**有没有网络那一项**。
+    ///
+    /// ============================================================
+    /// 判据为什么是 `--help`，不是 `process.permission.has('net')`
+    /// ============================================================
+    ///
+    /// 直觉上应当去问运行时"你能管网络吗"。实测那条路**走不通**：在
+    /// `--permission` 之下，`process.permission.has('net')` 返回 `false`，
+    /// 而 `process.permission.has('definitely-not-a-scope')` **也返回 `false`**
+    /// （连 `has('fs.read')` 都是 `false`，哪怕入口文件本来就允许读）。
+    /// 它回答的是"整个 scope 被授予了吗"，不是"这个 scope 存在吗" ——
+    /// 两者在结果上不可区分，因此**不能用它做诚实的探测**。
+    ///
+    /// 可靠且**无副作用**的判据是运行时自己列出的能力：`<node> --help` 的输出里
+    /// 有没有 `--allow-net`。它不联网、不建进程池、毫秒级，而且与版本号无关 ——
+    /// 猜一个版本阈值会在 Node 改动时静默失效。
+    ///
+    /// 缓存：一次运行里 Node 不会换版本（换了路径会清 `permission_model` 缓存，
+    /// 见 `set_configured_node`；这里跟着一起失效）。
+    async fn net_scope_supported(&self, node: &Path) -> bool {
+        if let Some(cached) = *self.net_scope.lock().unwrap() {
+            return cached;
+        }
+
+        let supported = match tokio::process::Command::new(node)
+            .arg("--help")
+            .output()
+            .await
+        {
+            Ok(output) => {
+                // help 有的写 stdout、有的写 stderr，两边都看。
+                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                text.contains(NET_SCOPE_FLAG)
+            }
+            Err(error) => {
+                log::warn!("无法读取 Node 的权限能力（{}）：{error}", node.display());
+                false
+            }
+        };
+
+        *self.net_scope.lock().unwrap() = Some(supported);
         supported
     }
 }

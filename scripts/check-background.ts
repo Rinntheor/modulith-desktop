@@ -48,6 +48,18 @@ function read(relative: string): string {
   return readFileSync(join(PROJECT_ROOT, relative), 'utf-8');
 }
 
+/**
+ * 剥掉行注释与块注释。
+ *
+ * **反面判据（"不许出现某个词"）必须对着剥干净的代码做。** 这一条在本仓库里
+ * 反复踩到：被禁用的写法（`--allow-net`、`process.permission.has`、`add_child`）
+ * 恰好都是被**长篇解释过为什么不能用**的词，于是注释里写着它、断言就红了 ——
+ * 而修它的唯一办法是删掉注释，也就是最该留下的那份知识第一个消失。
+ */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+}
+
 const libRs = read('src-tauri/src/lib.rs');
 const protocolRs = read('src-tauri/src/modules/desktop/background/protocol.rs');
 const desktopModRs = read('src-tauri/src/modules/desktop/mod.rs');
@@ -55,6 +67,10 @@ const serviceTs = read('src/services/backgroundHost.ts');
 const tauriConf = read('src-tauri/tauri.conf.json');
 const backgroundModRs = read('src-tauri/src/modules/desktop/background/mod.rs');
 const desktopCommandsRs = read('src-tauri/src/modules/desktop/commands.rs');
+const backgroundPluginsRs = read('src-tauri/src/modules/desktop/background/plugins.rs');
+const backgroundPluginsTs = read('src/services/backgroundPlugins.ts');
+const bootTs = read('src/services/boot.ts');
+const pluginDrawerTsx = read('src/modules/plugins/PluginDetailDrawer.tsx');
 
 const SCRIPT_PATH = 'src-tauri/resources/background-host.mjs';
 const script = read(SCRIPT_PATH);
@@ -419,11 +435,93 @@ console.log('\n后台插件的 ctx 表面：');
     /--allow-fs-read=/.test(pluginHostRs) && !/--allow-fs-write=/.test(pluginHostRs),
     '子进程只被放开读权限，且没有任何写权限'
   );
+
+  // **判据必须落在"构造 node_args 那一段"上，不能是"整个文件里没有这个词"。**
+  //
+  // 这一条原本写的是 `!/--allow-net/.test(plugins.rs)` —— 它守的是"宿主不传
+  // `--allow-net`"，而实现成"这个词不许出现在文件里"。后来加了网络能力探测
+  // （`NET_SCOPE_FLAG`，它**必须**写出这个词才能去 `--help` 里找），那条断言
+  // 就红了。被拦下的不是缺陷，是这条断言自己太钝。
+  //
+  // 现在的判据是：只放开读、且**额外**放开的旗标一个都没有（白名单之外全禁）。
+  const extraGrants = pluginHostRs
+    .split('\n')
+    .filter((line) => line.trimStart().startsWith('node_args.push('))
+    .join('\n');
   check(
-    !/--allow-child-process|--allow-worker|--allow-addons|--allow-net/.test(pluginHostRs),
-    '子进程没有额外放开子进程 / worker / addon / 网络'
+    extraGrants.length > 0 && !/--allow-(child-process|worker|addons|net|wasi|inspector)/.test(extraGrants),
+    'node_args 里除了 --permission / --allow-fs-read 之外没有放开任何一项'
+  );
+
+  // ============================================================
+  // 网络那一项：宿主不放开它，而"不放开"到底等不等于"拒绝"是**版本相关的**
+  // ============================================================
+  //
+  // 这一节存在的理由是一次实测（`staging/probe-node-net.cjs`）：在
+  // `--permission --allow-fs-read=<dir>` 之下，Node 24.15.0 的
+  // `dns.lookup('example.com')` **成功**、`net.connect` / `fetch` 得到的都不是
+  // `ERR_ACCESS_DENIED` —— 也就是说那台机器上"权限模型一项网络操作都没拦"。
+  // 因此 `isolated: true` **不等于**网络被管住，界面必须分开说。
+  check(
+    /NET_SCOPE_FLAG: &str = "--allow-net"/.test(pluginHostRs),
+    '网络那一项的旗标名是一个常量（拼错方向很坏：会给出一个"更安全"的假警报）'
+  );
+
+  // 判据必须是 `--help`，**不能**是 `process.permission.has('net')`。
+  //
+  // 后者实测对不存在的 scope 同样返回 `false`（连 `'fs.read'` 都返回 `false`），
+  // 分不出"拒绝了"与"这个 scope 不存在" —— 用它做探测会得到一个永远为假的答案，
+  // 而那个答案看起来是"安全"。
+  check(
+    /async fn net_scope_supported\(&self, node: &Path\) -> bool/.test(pluginHostRs) &&
+      /\.arg\("--help"\)/.test(pluginHostRs),
+    '网络能力靠 <node> --help 探测（不是 process.permission.has，那个分不出"不存在"）'
+  );
+  // 反面判据对着**剥掉注释**的代码做：上面那段 doc 注释里就写着
+  // `process.permission.has('net')`（为了说明为什么不能用它），
+  // 不剥注释的话这条断言会被自己的解释文字打红。
+  const pluginHostCode = stripComments(pluginHostRs);
+  check(
+    !/process\.permission\.has/.test(pluginHostCode),
+    '没有用 process.permission.has 判网络（它对不存在的 scope 也返回 false）'
+  );
+  check(
+    /net_restricted:\s*entry\.isolated\s*&&\s*net_scope\.unwrap_or\(false\)/.test(pluginHostRs),
+    'net_restricted = 权限模型开着 **且** 那个 scope 真的存在（两者缺一，网络就不受管）'
+  );
+  // 缓存没填上时报 `false`（"没被管住"）：在拿到证据之前不该宣称网络已被限制。
+  check(
+    /net_scope\.unwrap_or\(false\)/.test(pluginHostRs),
+    '没探测到就按"没被管住"报（在拿到证据之前不宣称安全）'
+  );
+  // 拉起子进程时顺便探测，因为 `status()` 是同步的、只能读缓存。
+  check(
+    /let net_scope = self\.net_scope_supported\(&node\)\.await;/.test(pluginHostRs),
+    '启动子进程时顺手填上缓存（status() 是同步的，只能读缓存）'
+  );
+  check(
+    /if isolated && !net_scope \{[\s\S]{0,700}?log::warn!/.test(pluginHostRs),
+    '权限模型开着但管不住网络时留下一条警告日志'
+  );
+
+  // 前端两侧都要接上：类型字段 + 界面说出来。少了任何一半，用户都读不到这件事。
+  check(
+    /netRestricted: boolean;/.test(backgroundPluginsTs),
+    '前端类型里有 netRestricted（它必须与 isolated 分开）'
+  );
+  check(
+    /const netOpen = started\.filter\(\(item\) => item\.running && !item\.netRestricted\);/.test(
+      bootTs
+    ),
+    '启动时把"网络不受管"单独报出来（合成一句"已隔离"会让用户以为插件连不上网）'
+  );
+  check(
+    /backend\.status\.netRestricted/.test(pluginDrawerTsx) &&
+      /但它的网络不受管/.test(pluginDrawerTsx),
+    '插件详情里分别说隔离与网络两件事'
   );
 }
+
 
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
