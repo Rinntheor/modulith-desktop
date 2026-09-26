@@ -1591,6 +1591,61 @@ section('主题链路');
     'Tailwind 的内部变量（--tw-*）被排除（它们是构建产物，不是设计令牌）'
   );
 
+  // ---- 令牌的**来源**：不能只靠枚举 --------------------------------------
+  //
+  // ============================================================
+  // 这是一次真实故障，而且它活了很久
+  // ============================================================
+  //
+  // 旧写法只做一件事：遍历 `getComputedStyle(documentElement)` 的索引，假设
+  // "CSSStyleDeclaration 会把自定义属性也枚举出来"。**那个假设是错的**，
+  // 而它被写成了注释里的事实，因此没有任何东西去验证它。
+  //
+  // 表现：插件的主色**永远是靛蓝**，切主题也不变 —— 因为插件 CSS 写的是
+  // `var(--accent-600, #4f46e5)`（带兜底值），而 `--accent-*` 一个都没送过去，
+  // 于是兜底值生效。**而且没有任何报错**：注入进插件文档的样式块照常存在，
+  // 只是里面一条令牌都没有。
+  //
+  // 为什么它没被别的东西抓住：明暗（深/浅）走的是**类名**，类名由同一份快照的
+  // `resolved` 算出来，**不看 `tokens`**。所以"深色能跟着变"全绿，令牌那半空着。
+  // 下面这一组判据**必须对着剥掉注释的代码做**：这段修复的说明里反复提到
+  // `document.styleSheets`、`buildAccentVariables`、枚举——那些词在注释里出现是
+  // 应该的，而不剥注释的话，把整段代码删掉仍能让断言通过（变异测试打回过）。
+  const themeSyncCode = stripComments(themeSyncTs);
+
+  check(
+    /buildAccentVariables\(getAccentId\(\)\)/.test(themeSyncCode),
+    '★ 令牌来源之一是**生产者的名单**（buildAccentVariables）—— 不依赖枚举行为，因此不会漂'
+  );
+  check(
+    /document\.styleSheets/.test(themeSyncCode) && /sheet\.cssRules/.test(themeSyncCode),
+    '★ 令牌来源之二是样式表里声明过的自定义属性（宿主设计令牌都在那里）'
+  );
+  check(
+    // 枚举保留为第三个来源，但**不能是唯一来源**。
+    /for \(let index = 0; index < computed\.length; index \+= 1\)/.test(themeSyncCode) &&
+      /take\(computed\[index\]\)/.test(themeSyncCode),
+    '枚举作为第三个来源保留（在会枚举的引擎上是补充，不是唯一）'
+  );
+  check(
+    // 取得到才算数：三个来源给的都是**候选名单**，值仍然从计算样式里读。
+    /getPropertyValue\(name\)\.trim\(\)/.test(themeSyncCode),
+    '候选名字的值仍然从计算样式里取（取不到就不收）'
+  );
+  check(
+    // 空令牌表必须说出来 —— 这是那个故障静默了这么久的原因。
+    /Object\.keys\(theme\.tokens\)\.length === 0/.test(themeSyncCode) &&
+      /console\.warn/.test(themeSyncCode),
+    '★ 读到 0 个令牌时主动告警（否则这个故障在界面上毫无痕迹）'
+  );
+
+  // 跨源样式表读 cssRules 会抛，因此那一段必须在 try 里 ——
+  // 它抛出去会让整个 readHostTheme 失败，而那会把"少几个令牌"变成"一个都没有"。
+  check(
+    /try \{\s*rules = sheet\.cssRules;\s*\} catch \{\s*continue;\s*\}/.test(themeSyncCode),
+    '读跨源样式表时局部 catch 后跳过（否则一个跨源表会让整次读取失败）'
+  );
+
   // 环 2：前端 → 后端。必须**装到启动路径上**，否则主题永远送不到。
   check(
     /installPluginThemeSync\(\)/.test(mainTsx) && /subscribeTheme\(/.test(themeSyncTs),

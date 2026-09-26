@@ -34,6 +34,7 @@ import {
   getResolvedTheme,
   subscribeTheme,
 } from './theme';
+import { buildAccentVariables, getAccentId } from './accent';
 
 /** 与 Rust 侧 `theme::ThemeSnapshot` 一一对应 */
 export interface PluginThemeSnapshot {
@@ -47,6 +48,34 @@ export interface PluginThemeSnapshot {
  * 读出宿主文档当前的真实主题。
  *
  * 导出是为了让它可被单独测试 —— 它是这个文件里唯一有判断的部分。
+ *
+ * ============================================================
+ * 这个函数曾经只做一件事：遍历 `getComputedStyle(documentElement)`
+ * ============================================================
+ *
+ * 旧写法假设"`CSSStyleDeclaration` 会把自定义属性也枚举出来，因此遍历一次就能拿到
+ * 全部令牌"。**那个假设是错的**，而它被写成了注释里的事实 —— 于是没有任何东西
+ * 去验证它。
+ *
+ * 用户实测的表现：插件里的主色**永远是靛蓝**，切主题也不变。原因是插件 CSS 写的
+ * 是 `var(--accent-600, #4f46e5)`（带兜底值），而 `--accent-*` **根本没有被送过去** ——
+ * 兜底值生效了。真正的令牌表始终是空的。
+ *
+ * 而"深色/浅色能跟着变"这件事当时是好的，它掩盖了这个缺陷：明暗走的是**类名**，
+ * 类名由同一份快照的 `resolved` 算出来，**不看 `tokens`**。所以只测类名的那几条
+ * 断言全绿，而令牌那半一直是空的。
+ *
+ * 现在的判据是**三个来源取并集**，任何一个能工作就够：
+ *
+ *   1. **生产者的名单**：`buildAccentVariables(getAccentId())` 给出的键就是主色那
+ *      一套（`--accent-50` … `--accent-900`）。这不是"又维护了一份清单"——它问的
+ *      是**同一个函数**它刚产出了什么，因此不可能漂。
+ *   2. **样式表里声明过的**：遍历 `document.styleSheets` 收集 `:root` 规则里出现的
+ *      自定义属性名。宿主的设计令牌（`--surface-*`、`--text-*` 等）都声明在那里。
+ *   3. **枚举**：保留原来的遍历。在会枚举的引擎上它是上面两条之外的补充。
+ *
+ * 最后每一个候选名字都从 `documentElement` 上取**计算值**（`getPropertyValue`），
+ * 空的一律丢掉 —— 取得到才算数，这条没有变。
  */
 export function readHostTheme(): PluginThemeSnapshot {
   const tokens: Record<string, string> = {};
@@ -54,19 +83,54 @@ export function readHostTheme(): PluginThemeSnapshot {
   if (typeof document !== 'undefined') {
     const computed = getComputedStyle(document.documentElement);
 
-    for (let index = 0; index < computed.length; index += 1) {
-      const name = computed[index];
-
-      // 只收自定义属性。标准属性有几百条，而且它们描述的是宿主自己的布局 ——
-      // 与插件无关，只会把快照撑成几十 KB。
-      if (!name.startsWith('--')) continue;
+    const take = (name: string | undefined): void => {
+      if (!name || !name.startsWith('--')) return;
 
       // Tailwind 的内部变量（`--tw-*`）是**构建产物**，不是设计令牌。
       // 传过去只会让快照里多出几十条插件永远不该引用的东西。
-      if (name.startsWith('--tw-')) continue;
+      if (name.startsWith('--tw-')) return;
+
+      if (tokens[name] !== undefined) return;
 
       const value = computed.getPropertyValue(name).trim();
       if (value) tokens[name] = value;
+    };
+
+    // 来源 1：主色那一套。**这一条是修好那个故障的关键** ——
+    // 它不依赖任何枚举行为。
+    for (const name of Object.keys(buildAccentVariables(getAccentId()))) {
+      take(name);
+    }
+
+    // 来源 2：样式表里声明过的自定义属性。
+    //
+    // 跨源样式表读 `cssRules` 会抛（CORS），因此整段包在 try 里 ——
+    // 读不到不代表出错，来源 1 与 3 仍然在。
+    try {
+      for (const sheet of Array.from(document.styleSheets)) {
+        let rules: CSSRuleList | null = null;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue;
+        }
+        if (!rules) continue;
+
+        for (const rule of Array.from(rules)) {
+          const style = (rule as CSSStyleRule).style;
+          if (!style) continue;
+          for (let index = 0; index < style.length; index += 1) {
+            take(style[index]);
+          }
+        }
+      }
+    } catch {
+      // 样式表不可读（跨源、或引擎不给）时静默跳过：另外两个来源还在。
+    }
+
+    // 来源 3：枚举（原来的写法）。
+    for (let index = 0; index < computed.length; index += 1) {
+      take(computed[index]);
     }
   }
 
@@ -86,7 +150,22 @@ export function readHostTheme(): PluginThemeSnapshot {
  * 一圈 `eval` 推给所有已打开的插件界面。
  */
 export function syncPluginTheme(): Promise<boolean> {
-  return invoke<boolean>('set_plugin_theme', { theme: readHostTheme() });
+  const theme = readHostTheme();
+
+  // 令牌表为空时**必须说出来**。
+  //
+  // 这是那次故障之所以活了这么久的原因：注入进插件文档的样式块**照常存在**，
+  // 只是里面一条令牌都没有。于是插件的 `var(--accent-600, #4f46e5)` 全部落到
+  // 兜底值上 —— 表现是"插件永远是主题的默认配色"，而**没有任何一处报错**。
+  // 一句话留在这里，DevTools 里就能看见，而不是要靠"盯着插件的颜色猜"。
+  if (Object.keys(theme.tokens).length === 0) {
+    console.warn(
+      '[pluginThemeSync] 这次读到 0 个设计令牌 —— 插件会全部落到自己 CSS 里的兜底值上' +
+        '（表现为"主题配色不跟着变"）。请检查 readHostTheme 的三个来源。'
+    );
+  }
+
+  return invoke<boolean>('set_plugin_theme', { theme });
 }
 
 /** 当前的主题快照（诊断与自检用）。 */
