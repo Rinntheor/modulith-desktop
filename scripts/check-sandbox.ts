@@ -1210,13 +1210,42 @@ section('前端界面协作');
     sandboxTokens.includes('allow-scripts') && sandboxTokens.includes('allow-same-origin'),
     `iframe 的 sandbox 带着 allow-scripts 与 allow-same-origin（实际：${sandboxAttr || '（没有 sandbox 属性 = 全部放开）'}）`
   );
+
+  // ★ `allow-forms`：少了它，`<form>` 的 `submit` 事件**根本不派发** ——
+  // React 的 `onSubmit` 一次都不会跑，点按钮毫无反应，而控制台里连一条错误都没有。
+  //
+  // 实测（`staging/form-sandbox-probe.html`，headless Chrome，同一份文档三组对照）：
+  //   无 allow-forms → submit 处理器触发 **0 次**；有 → 1 次；不带 sandbox → 1 次。
+  //
+  // 真实插件受影响：`kanban` 6 处 `onSubmit`/`<form>`（"添加卡片"/"添加列表"
+  // 就是表单提交）、`quick-launch` 2 处。
+  check(
+    sandboxTokens.includes('allow-forms'),
+    'iframe 放开了 allow-forms（否则插件里的 <form onSubmit> 静默不触发，"按钮点了没反应"）'
+  );
+
+  // ★ 而 `allow-forms` **必须**与 CSP 的 `form-action 'none'` 配对。
+  //
+  // 单独放开表单会开两条坏路，两条都实测到了（`staging/form-action-probe.html`）：
+  //   · 一个忘了 `preventDefault` 的插件会把**自己的 iframe 导航走** —— 界面消失；
+  //   · POST 到外部变成一条不经过 `fetch` 的出站通路。
+  // 加上 `form-action 'none'` 之后，上面两件事都被挡住，而 `submit` 事件照常派发
+  // （实测：两种写法都仍然触发 1 次、iframe 都没被导航走）。
+  //
+  // 两条断言必须**成对**存在：只钉 `allow-forms` 会放过"CSP 少了配对"，
+  // 只钉 CSP 会放过"iframe 没放开 therefore 插件全坏"。
+  check(
+    /form-action 'none'/.test(stripComments(sandboxRs)),
+    '★ 插件文档的 CSP 带着 form-action \'none\'（它是 allow-forms 的配对，两条缺一不可）'
+  );
+
   check(
     !sandboxTokens.some((token) =>
-      ['allow-top-navigation', 'allow-top-navigation-by-user-activation', 'allow-popups', 'allow-forms', 'allow-downloads', 'allow-pointer-lock'].includes(
+      ['allow-top-navigation', 'allow-top-navigation-by-user-activation', 'allow-popups', 'allow-downloads', 'allow-pointer-lock'].includes(
         token
       )
     ),
-    `iframe 没有放开顶层跳转 / 弹窗 / 表单提交 / 下载 / 指针锁定（实际：${sandboxAttr}）`
+    `iframe 没有放开顶层跳转 / 弹窗 / 下载 / 指针锁定（实际：${sandboxAttr}）`
   );
 
   // ★ `allow-modals`：少了它，`alert` / `confirm` / `prompt` 会被**静默**挡掉 ——
@@ -1636,42 +1665,41 @@ section('主题链路');
   //
   // 为什么它没被别的东西抓住：明暗（深/浅）走的是**类名**，类名由同一份快照的
   // `resolved` 算出来，**不看 `tokens`**。所以"深色能跟着变"全绿，令牌那半空着。
-  // 下面这一组判据**必须对着剥掉注释的代码做**：这段修复的说明里反复提到
-  // `document.styleSheets`、`buildAccentVariables`、枚举——那些词在注释里出现是
-  // 应该的，而不剥注释的话，把整段代码删掉仍能让断言通过（变异测试打回过）。
+  // 下面这一组判据**必须对着剥掉注释的代码做**：修复说明里会提到各种标识符，
+  // 不剥注释的话，把整段代码删掉仍能让断言通过（变异测试打回过）。
   const themeSyncCode = stripComments(themeSyncTs);
 
+  // 空令牌表必须说出来 —— 那个故障在界面上毫无痕迹，日志里至少要有一条。
   check(
-    /buildAccentVariables\(getAccentId\(\)\)/.test(themeSyncCode),
-    '★ 令牌来源之一是**生产者的名单**（buildAccentVariables）—— 不依赖枚举行为，因此不会漂'
-  );
-  check(
-    /document\.styleSheets/.test(themeSyncCode) && /sheet\.cssRules/.test(themeSyncCode),
-    '★ 令牌来源之二是样式表里声明过的自定义属性（宿主设计令牌都在那里）'
-  );
-  check(
-    // 枚举保留为第三个来源，但**不能是唯一来源**。
-    /for \(let index = 0; index < computed\.length; index \+= 1\)/.test(themeSyncCode) &&
-      /take\(computed\[index\]\)/.test(themeSyncCode),
-    '枚举作为第三个来源保留（在会枚举的引擎上是补充，不是唯一）'
-  );
-  check(
-    // 取得到才算数：三个来源给的都是**候选名单**，值仍然从计算样式里读。
-    /getPropertyValue\(name\)\.trim\(\)/.test(themeSyncCode),
-    '候选名字的值仍然从计算样式里取（取不到就不收）'
-  );
-  check(
-    // 空令牌表必须说出来 —— 这是那个故障静默了这么久的原因。
     /Object\.keys\(theme\.tokens\)\.length === 0/.test(themeSyncCode) &&
       /console\.warn/.test(themeSyncCode),
-    '★ 读到 0 个令牌时主动告警（否则这个故障在界面上毫无痕迹）'
+    '读到 0 个令牌时主动告警（否则这类故障在界面上毫无痕迹）'
   );
 
-  // 跨源样式表读 cssRules 会抛，因此那一段必须在 try 里 ——
-  // 它抛出去会让整个 readHostTheme 失败，而那会把"少几个令牌"变成"一个都没有"。
+  // ★★ 必须**同时**订阅主题与配色 —— 这是"插件主色永远是默认色"的根因。
+  //
+  // 宿主里有两套互不相干的通知：`theme.ts` 的 `subscribeTheme`（深浅/动效/毛玻璃）
+  // 与 `accent.ts` 的 `subscribeAccent`（**主色**，它有自己的 listeners 与
+  // 自己的 notify）。这里从前只订阅了前者，于是 `setAccentId(用户选的色)` 之后
+  // 没有任何东西把新快照推给插件 —— 插件永远停在外壳启动那一刻那一份上。
+  //
+  // 而 `subscribeAccent` 在此之前**全仓库零个订阅者**：一个导出了却没人用的
+  // 订阅接口，正是"某个事件源没人听"这类缺陷最容易长出来的地方。
   check(
-    /try \{\s*rules = sheet\.cssRules;\s*\} catch \{\s*continue;\s*\}/.test(themeSyncCode),
-    '读跨源样式表时局部 catch 后跳过（否则一个跨源表会让整次读取失败）'
+    /subscribeTheme\(push\)/.test(themeSyncCode),
+    '主题同步订阅了主题变化（深/浅、动效、毛玻璃）'
+  );
+  check(
+    /subscribeAccent\(push\)/.test(themeSyncCode),
+    '★ 主题同步**也**订阅了配色变化（主色有自己的一套通知，主题那一路收不到它）'
+  );
+
+  // 反面：`subscribeAccent` 不能是一个没人用的导出。它被定义出来就是为了让
+  // "改主色"这件事有接收方；零个订阅者时那个接口是死的。
+  check(
+    (read('../src/services/pluginThemeSync.ts').match(/subscribeAccent\(/g) ?? []).length >= 1 &&
+      /export function subscribeAccent/.test(read('../src/services/accent.ts')),
+    'subscribeAccent 有真实订阅者（不是一个导出了却没人听的接口）'
   );
 
   // 环 2：前端 → 后端。必须**装到启动路径上**，否则主题永远送不到。

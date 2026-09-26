@@ -415,7 +415,47 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
           // "allow-scripts + allow-same-origin" 那条经典警告在这里**不适用**：
           // 它说的是"被嵌的文档与父文档同源"，而插件来源与宿主**不同源**，
           // 因此插件够不到 `parent`，也就删不掉这个属性。
-          sandbox="allow-scripts allow-same-origin allow-modals"
+          sandbox="allow-scripts allow-same-origin allow-modals allow-forms"
+          /*
+           * ============================================================
+           * `allow-forms` —— 少了它，React 的 `onSubmit` **一次都不会触发**
+           * ============================================================
+           *
+           * 这是换 iframe 之后第四个"宿主少给了东西"的例子，也是最隐蔽的一个：
+           * 没有 `allow-forms` 时，`<form>` 的提交被 sandbox 直接掐掉 —— 而
+           * **`submit` 事件根本不派发**。于是 `onSubmit={...}` 里的处理器永远
+           * 不跑，点击按钮**毫无反应**，控制台里连一条错误都没有。
+           *
+           * 实测（`staging/form-sandbox-probe.html`，headless Chrome，同一份文档
+           * 跑三组对照）：
+           *
+           *   无 allow-forms  →  submit 处理器触发 **0 次**
+           *   有 allow-forms  →  触发 1 次
+           *   不带 sandbox    →  触发 1 次
+           *
+           * 受影响的是真实插件：`kanban` 用了 6 处 `onSubmit`/`<form>`
+           * （"添加卡片"/"添加列表"就是表单提交），`quick-launch` 用了 2 处。
+           * 用户报的"点那个按钮毫无反应"就是这一条。
+           *
+           * ============================================================
+           * 为什么会放它进来：它与 CSP 里的 `form-action 'none'` 是**配对**的
+           * ============================================================
+           *
+           * 单独放开 `allow-forms` 会让表单成为一条出站通路（POST 到外部）——
+           * 而且一个忘了 `preventDefault` 的插件会把**自己的 iframe 导航走**，
+           * 界面整个消失。这两件事都实测到了
+           * （`staging/form-action-probe.html`）：
+           *
+           *   allow-forms + form-action 'none'，插件 preventDefault  → 正常
+           *   allow-forms + form-action 'none'，插件**没** preventDefault → 正常
+           *      （导航被 CSP 挡住，界面还在 —— 这一条是配对里承重的那一半）
+           *   allow-forms、**没有** form-action                          → iframe 被导航走
+           *
+           * 插件的 CSP 早就有 `form-action 'none'`（`sandbox.rs` 的
+           * `page_with_frame`），因此这里放开是**安全的那一半**。
+           * 门禁同时钉住这两件事：`allow-forms` 必须在，`form-action 'none'` 也必须在 ——
+           * 只钉其中一条都会让另一个方向的错误溜过去。
+           */
           /*
            * ============================================================
            * 剪贴板必须由**父文档显式委派**，否则插件那一侧根本拿不到它
