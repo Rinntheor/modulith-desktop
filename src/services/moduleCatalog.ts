@@ -243,13 +243,33 @@ export function getNotificationSourcesFor(moduleId: string): string[] {
 /**
  * 把通知的 `source` 解析为「点击这条通知应该打开哪个模块」。
  *
- * 三种情况：
+ * 四种情况：
  *   * source 本身就是一个模块 ID（宿主与内建模块）→ 直接用它；
+ *   * source 是 `plugin:<插件 ID>`（**插件推来的通知用的是这个形式**）→
+ *     剥掉前缀，再按下面的插件 ID 处理；
  *   * source 是插件 ID → 取该插件注册的**第一个**模块（插件可能注册多个，
  *     通知本身不携带「属于哪个模块」的信息，取第一个是当前能做到的最合理猜测）；
  *   * 两者都不是（插件已卸载、模块已隐藏）→ 返回 null，界面据此不显示跳转入口。
  *
  * 返回 null 时**不要**退回图标或 id 当作目标：那会打开一个不存在的标签。
+ *
+ * ============================================================
+ * `plugin:` 前缀这一条是补上的，它是一次真实的故障
+ * ============================================================
+ *
+ * 宿主侧（`rpc.rs` 的 `notify`）把插件通知的 source 写成 `plugin:<插件 ID>`，
+ * 为的是让通知中心把它**归到那个插件名下**、而不是笼统的 `host`。
+ *
+ * 但模块 ID 的形态是 `plugin:<插件 ID>#<界面>`（见 `pluginSurfaces.ts`）——
+ * 于是 `plugin:com.x.kanban` 既不是一个模块 ID（少了 `#界面`），也不是一个插件
+ * ID（多了前缀），两条路都落空，解析结果是 null。
+ *
+ * 用户侧的表现就是：通知里那一栏显示 `plugin:com.rinntheor.modulith.kanban`
+ * （一个原始 ID），点它跳不过去。
+ *
+ * 前缀与模块 ID 的前缀是**同一个字符串**，因此顺序很重要：先按完整模块 ID 比
+ * （上面那一条），再剥前缀 —— 反过来的话，一个真正的模块 ID 会被剥成一个不存在
+ * 的插件 ID。
  */
 export function resolveNotificationTarget(source: string): string | null {
   if (!source) return null;
@@ -257,7 +277,15 @@ export function resolveNotificationTarget(source: string): string | null {
   const flat = getCatalogFlatMap();
   if (flat.has(source)) return source;
 
-  const owned = getPluginModuleIds(source).filter((id) => flat.has(id));
+  // 插件推来的通知：`plugin:<插件 ID>`。剥掉前缀，下面按插件 ID 找它注册的模块。
+  //
+  // 只剥**没有** `#` 的那种：带 `#` 的是完整模块 ID，已经在上面那一条里处理过
+  // （能走到这里说明它不在目录里，剥了也没用，反而可能撞上一个同名的插件 ID）。
+  const pluginId = source.startsWith('plugin:') && !source.includes('#')
+    ? source.slice('plugin:'.length)
+    : source;
+
+  const owned = getPluginModuleIds(pluginId).filter((id) => flat.has(id));
   if (owned.length > 0) {
     // 按 priority 取最靠前的那个，与侧边栏顺序一致
     owned.sort((a, b) => (flat.get(a)?.priority ?? 0) - (flat.get(b)?.priority ?? 0));

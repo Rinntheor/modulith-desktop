@@ -293,7 +293,10 @@ const NotificationCenter: React.FC<NotificationCenterProps> = ({
               ) : (
                 notifications.map((notification) => {
                   // 跳转目标可能是模块本身（宿主与内建模块），也可能是该插件
-                  // 注册的某个模块（插件的 source 是插件 ID）——由解析器统一处理
+                  // 注册的某个模块 —— 插件推来的通知 source 是 `plugin:<插件 ID>`
+                  // （宿主侧写成这样是为了把通知归到那个插件名下），由解析器
+                  // 统一剥前缀并挑出该插件优先级最高的模块。见
+                  // `resolveNotificationTarget` 上的说明。
                   const target = resolveNotificationTarget(notification.source);
                   const descriptor = target ? catalog.get(target) : undefined;
                   const sourceLabel =

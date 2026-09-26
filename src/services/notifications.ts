@@ -149,10 +149,47 @@ export function isNotificationsLoaded(): boolean {
 
 /** 从后端读取通知列表 */
 export async function loadNotifications(): Promise<AppNotification[]> {
+  // 变化之前就已经在列表里的 id。用它把"这次新出现的"挑出来 —— 后端只发一条
+  // "列表变了"的事件，不带负载，因此**新在哪几条**只能这样算出来。
+  const knownIds = new Set(notifications.map((item) => item.id));
+  const hadLoadedOnce = loaded;
+
   try {
     const list = await invoke<AppNotification[]>('list_notifications');
     loaded = true;
     setList(list);
+
+    // ============================================================
+    // 后端产生的通知也要**弹浮层 + 响提示音**
+    // ============================================================
+    //
+    // 从前这里只有 `setList`，于是任何**不是由前端发起**的通知都是静默的：
+    // 它进了通知中心、未读数也变了，但用户当时什么都感觉不到 —— 直到自己
+    // 碰巧去打开通知列表。用户实测报的就是这一条（"通知信息是发在通知里面了，
+    // 但是我们发现没有提醒，没有铃声提醒，也没有弹窗提醒"）。
+    //
+    // 判据是"**新出现的**且未读"：
+    //   · 按 id 比对，而不是看 `count` —— 后端合并同键通知时 id 不变，
+    //     于是"重试循环里反复产生的同一条"不会每次都响（那会从提醒变成骚扰）；
+    //   · 首次加载时 `hadLoadedOnce` 为假，**不弹**：否则启动那一刻会把
+    //     历史上所有未读通知一起弹一遍。
+    if (hadLoadedOnce) {
+      for (const item of list) {
+        if (knownIds.has(item.id) || item.read) continue;
+
+        presentNotification(
+          {
+            title: item.title,
+            body: item.body,
+            level: item.level as ToastLevel,
+            variant: toastVariantFor(item.category),
+            source: item.source,
+          },
+          item.id
+        );
+      }
+    }
+
     return list;
   } catch (error) {
     // 后端不可用（纯前端预览）不该让界面报错，按「没有通知」处理
@@ -192,16 +229,52 @@ export function getNotificationSummary(): NotificationSummary {
  * 共享同一组例外。其中「合并键命中不响」尤其重要 —— 模块在重试循环里反复产生
  * 同一条通知时，每次都响一声会从提醒变成骚扰。
  */
-function presentNotification(input: {
-  title: string;
-  body?: string;
-  level: ToastLevel;
-  variant: ToastVariant;
-  source: string;
-}): void {
+function presentNotification(
+  input: {
+    title: string;
+    body?: string;
+    level: ToastLevel;
+    variant: ToastVariant;
+    source: string;
+  },
+  /**
+   * 这条通知的 id（知道就给）。给出来就能保证**一条通知只弹一次**。
+   *
+   * ============================================================
+   * 为什么需要它
+   * ============================================================
+   *
+   * 现在有**两条**路会把一条通知呈现在用户面前：
+   *
+   *   1. 前端自己调的 `pushNotification`（宿主模块产生的通知走这条）；
+   *   2. **后端**产生的通知 —— 插件通过 `ctx.notifications.show(...)`、后台插件
+   *      的定时提醒都属于这一类。它们落盘之后只发一条"列表变了"的事件，前端
+   *      以前**只刷新列表、不弹浮层也不响**。
+   *
+   * 第 2 条是用户实测报上来的：通知进了通知中心，但没有提醒、没有声音、也没有
+   * 弹窗。而第 1 条本来就会弹 —— 因此修好第 2 条之后，同一条通知可能被两条路
+   * 各弹一次（两声、两个浮层）。按 id 去重是唯一可靠的办法：两条路看到的是
+   * **同一个** id，而"是不是同一条通知"正是它定义的东西。
+   */
+  id?: string
+): void {
+  if (id !== undefined) {
+    if (presentedIds.has(id)) return;
+    presentedIds.add(id);
+  }
+
   showToast(input);
   playNotificationSound();
 }
+
+/**
+ * 已经呈现过的通知 id。
+ *
+ * 只增不减：一份通知 id 在这条进程的生命周期里唯一，而"释放"它的唯一时机是
+ * 通知被删掉 —— 那时它也不会再被呈现一次。做成有界缓存只会多出一处"什么时候
+ * 该淘汰"的判断，而这个集合的大小上界就是本次运行收到的通知条数。
+ */
+const presentedIds = new Set<string>();
 
 /**
  * 推送一条通知。
@@ -249,15 +322,27 @@ export async function pushNotification(input: PushNotificationInput): Promise<vo
 
   setList(list);
 
+  // 记下这一次推送落成了哪一条。**必须在呈现之前算出来**：`loadNotifications`
+  // 那条路（后端变化事件）会按 id 判断"是不是新的"，而它和这一条说的是同一条
+  // 通知 —— 不告诉它的话，同一条会被弹两次、响两声。
+  //
+  // 有合并键时认键，否则认最新的一条（列表是最新在前）。
+  const justPushed = input.dedupeKey
+    ? list.find((item) => item.dedupeKey === input.dedupeKey)
+    : list[0];
+
   if (input.silent || willMerge) return;
 
-  presentNotification({
-    title: input.title,
-    body: input.body,
-    level: level as ToastLevel,
-    variant: toastVariantFor(category),
-    source: input.source ?? HOST_SOURCE,
-  });
+  presentNotification(
+    {
+      title: input.title,
+      body: input.body,
+      level: level as ToastLevel,
+      variant: toastVariantFor(category),
+      source: input.source ?? HOST_SOURCE,
+    },
+    justPushed?.id
+  );
 }
 
 /**

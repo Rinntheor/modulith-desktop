@@ -266,6 +266,74 @@ check(
   '订阅是异步的，因此不 await（失败只记警告，不该挡住启动）'
 );
 
+// ============================================================
+// 后端产生的通知也必须**弹浮层 + 响提示音**
+// ============================================================
+//
+// 这是一次用户实测报上来的故障：插件通过 `ctx.notifications.show(...)` 推的通知
+// 进了通知中心、未读数也变了，但**没有提醒、没有铃声、没有弹窗**。
+//
+// 根因：`push()`（Rust）只落盘 + 广播一条"列表变了"的事件，而前端那条路上从前
+// 只有 `setList` —— 也就是说"弹浮层与响提示音"只挂在**前端自己发起**的
+// `pushNotification` 上。任何不是由界面发起的通知因此都是静默的。
+//
+// 这几条断言守的是两件事：新通知要弹，且**只弹一次**。
+check(
+  /if \(hadLoadedOnce\) \{/.test(notificationsTs),
+  '只在**已经加载过一次**之后才弹：否则启动那一刻会把历史未读一起弹一遍'
+);
+check(
+  /const knownIds = new Set\(notifications\.map\(\(item\) => item\.id\)\);/.test(notificationsTs),
+  '按 **id** 比对挑出"这次新出现的"（后端合并同键通知时 id 不变，于是重试循环不会每次都响）'
+);
+check(
+  /knownIds\.has\(item\.id\) \|\| item\.read/.test(notificationsTs),
+  '只对"新出现的**且未读**"弹（已读的不该再打扰）'
+);
+check(
+  // 通知的浮层与提示音必须在 `loadNotifications` 里真的被调到。
+  /presentNotification\(\s*\{[\s\S]{0,400}?item\.id\s*\)/.test(notificationsTs),
+  'loadNotifications 里真的调了 presentNotification（浮层 + 提示音是同一处）'
+);
+
+// 去重：两条路（前端主动推送、后端变化事件）看的是**同一个** id。
+check(
+  /const presentedIds = new Set<string>\(\)/.test(notificationsTs) &&
+    /if \(presentedIds\.has\(id\)\) return;/.test(notificationsTs),
+  '按 id 去重，保证一条通知只弹一次（否则两条路各弹一次 —— 两声、两个浮层）'
+);
+check(
+  /presentNotification\(\s*\{[\s\S]{0,400}?\},\s*justPushed\?\.id\s*\)/.test(notificationsTs),
+  '前端主动推送那条路把 id 交给去重（不交的话上面的去重形同虚设）'
+);
+
+// ============================================================
+// 通知的跳转：`plugin:<插件 ID>` 必须能被解析成模块
+// ============================================================
+//
+// 宿主把插件通知的 source 写成 `plugin:<插件 ID>`（为了归到插件名下），而模块 ID
+// 的形态是 `plugin:<插件 ID>#<界面>`。于是那个字符串**两条路都落空**：不是一个
+// 模块 ID（少了 `#界面`），也不是一个插件 ID（多了前缀）。
+//
+// 用户看到的就是通知里那一栏显示 `plugin:com.rinntheor.modulith.kanban`、
+// 点了跳不过去。
+const moduleCatalogTs = read('src/services/moduleCatalog.ts');
+check(
+  /source\.startsWith\('plugin:'\) && !source\.includes\('#/.test(moduleCatalogTs),
+  '解析通知来源时剥掉 `plugin:` 前缀（且只剥不带 `#` 的那种 —— 带 `#` 的是完整模块 ID）'
+);
+check(
+  /source\.slice\('plugin:'\.length\)/.test(moduleCatalogTs),
+  '剥前缀用的是同一个字面量（写死长度会在前缀变化时静默错位）'
+);
+check(
+  // 顺序：先按完整模块 ID 比，再剥前缀。反过来的话一个真正的模块 ID 会被剥成
+  // 一个不存在的插件 ID。
+  moduleCatalogTs.indexOf('if (flat.has(source)) return source;') <
+    moduleCatalogTs.indexOf("source.startsWith('plugin:')"),
+  '先按完整模块 ID 比、再剥前缀（顺序反了会把真模块 ID 剥坏）'
+);
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

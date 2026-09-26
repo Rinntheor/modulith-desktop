@@ -416,6 +416,33 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
           // 它说的是"被嵌的文档与父文档同源"，而插件来源与宿主**不同源**，
           // 因此插件够不到 `parent`，也就删不掉这个属性。
           sandbox="allow-scripts allow-same-origin"
+          /*
+           * ============================================================
+           * 剪贴板必须由**父文档显式委派**，否则插件那一侧根本拿不到它
+           * ============================================================
+           *
+           * 这是一次真实的故障：`encode-lab` 的"复制结果"点了没反应，它自己报
+           * "复制没有成功，可以手动选中内容复制"。原因是它调
+           * `navigator.clipboard.writeText`（桥接层的 `ctx.clipboard` 也是同一
+           * 个东西），而**跨源 iframe 里 `navigator.clipboard` 是 undefined** ——
+           * Permissions Policy 的 `clipboard-write` 默认白名单是 `self`，跨源
+           * 子框架必须由父文档用 `allow=` 显式放开。
+           *
+           * 也就是说：这不是插件写错了，是**换成 iframe 之后宿主少给了一样东西**。
+           * 子 WebView 时代每个插件有自己的文档，那一层天然可用，所以以前没暴露。
+           *
+           * `clipboard-read` 一并放开：`ctx.clipboard.readText()` 是文档里写明的
+           * 能力，只放开写会让"读"变成一条永远失败的接口。读那一侧浏览器自己还会
+           * 再要一次用户手势与授权，不是这里放开就等于能随便读。
+           *
+           * ⚠️ 代价要说清：放开之后，插件**绕过** `ctx.clipboard` 直接调
+           * `navigator.clipboard` 也能写剪贴板，因此 `clipboard` 权限在沙箱里
+           * 仍然只是 `ctx.clipboard` 那道门（与 `permissions.rs` 里把它标成
+           * "前端强制"是一致的，那里已经写明"页面脚本本来就能直接调它"）。
+           * 反过来（不放开）的代价是：所有复制功能**全都不能用**，而那不是更安全，
+           * 那是坏掉。
+           */
+          allow="clipboard-read; clipboard-write"
         />
       )}
 

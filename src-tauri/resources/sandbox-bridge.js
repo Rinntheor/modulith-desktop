@@ -541,6 +541,35 @@
       return false;
     }
 
+    /**
+     * 这个文档里**到底有没有**剪贴板接口。
+     *
+     * 与 `allowed` 是两件不同的事：`allowed` 是"插件声明了权限没有"，而这一条是
+     * "环境给不给"。跨源 iframe 里 `navigator.clipboard` 默认是 **undefined** ——
+     * 要由宿主的父文档用 `allow="clipboard-read; clipboard-write"` 显式委派
+     * （见 `SandboxSurface.tsx`）。
+     *
+     * 分开的理由：少了这一条，插件拿到的是
+     * `Cannot read properties of undefined (reading 'writeText')` —— 那句话指向
+     * 插件自己的代码，而真正的原因在宿主。这个文件里的形状分歧已经让插件白屏过
+     * 两次了，报错指向错的地方是同一类代价。
+     */
+    function environmentReady() {
+      return (
+        typeof navigator !== 'undefined' &&
+        !!navigator.clipboard &&
+        typeof navigator.clipboard.writeText === 'function'
+      );
+    }
+
+    function unavailable() {
+      return Promise.reject(
+        new Error(
+          '这个文档里没有剪贴板接口（跨源 iframe 需要父文档显式放开 clipboard 权限）'
+        )
+      );
+    }
+
     return {
       /** 权限是否已声明（插件据此自行降级，而不必看控制台）。 */
       isAvailable: function () {
@@ -555,11 +584,15 @@
        */
       readText: function () {
         if (!guard()) return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
+        if (!environmentReady() || typeof navigator.clipboard.readText !== 'function') {
+          return unavailable();
+        }
         return navigator.clipboard.readText();
       },
 
       writeText: function (text) {
         if (!guard()) return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
+        if (!environmentReady()) return unavailable();
         return navigator.clipboard.writeText(String(text));
       },
     };
