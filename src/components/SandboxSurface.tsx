@@ -1,83 +1,48 @@
 // src/components/SandboxSurface.tsx
 //
-// 沙箱插件界面的**占位与定位**。
+// 沙箱插件界面：一块**跨源 iframe**，加上它上面那层宿主的启动占位。
 //
 // ============================================================
-// 它在做一件不太常见的事
+// 它曾经做的是完全不同的另一件事
 // ============================================================
 //
-// 插件界面不是这个 DOM 树里的一部分 —— 它是宿主在**这个窗口里另开的一个 webview**，
-// 浮在所有 DOM 之上。这个组件因此只做三件事：
+// v1.6.0 之前插件界面是宿主窗口里另开的一个 webview：引擎把它合成在父窗口客户区
+// **之上**，CSS 碰不到它。于是这个组件当时的主要工作是三件很别扭的事 ——
 //
-//   1. 占住内容区（一块位置正确的空地）；
-//   2. 把这个空地的矩形量出来交给 Rust；
-//   3. **在它不该被看见时让它消失** —— 原生 webview 不看 CSS，宿主的
-//      `display: none` / `visibility: hidden` 对它一点作用都没有。
+//   1. 占一块位置正确的空地，把矩形量出来交给 Rust 去摆那个原生控件；
+//   2. 每 150ms 做一次命中测试，判断"有没有宿主浮层盖在它上面"，盖住了就把它
+//      收起来（原生层不看 z-index，不收起来它就会盖住宿主自己的对话框）；
+//   3. 组件被卸载时显式销毁那个 webview。
 //
-// 第 3 条是最容易漏的一条：标签切走只是让 React 不再渲染这一块，而那块 webview
-// 仍然悬在界面上。所以"可见性"必须被显式处理。
+// 三件都不再需要：iframe 就在这个文档里，**层级由 CSS 决定**，位置由布局决定，
+// 卸载由 React 决定。这一层因此只剩下两件事：向宿主换一个令牌，以及把宿主推来的
+// 消息转成 `postMessage` 送进去。
 //
-// ============================================================
-// 什么时候该消失：三种，而且是三个不同的信号
-// ============================================================
-//
-//   * **标签切走 / 窗口收起** —— `useModuleActive()`。
-//     它已经把"窗口最小化或隐藏到托盘"算进去了（`document.visibilityState`）。
-//   * **宿主自己的浮层盖上来** —— 设置面板、通知、右键菜单落在内容区之上时，
-//     原生 webview 会**盖住它们**（它是绘制在 DOM 之上的）。这时必须让位。
-//   * **模块被卸载** —— 那时不再隐藏，而是销毁。隐藏留着是有上限的，
-//     否则切过的每个插件都会留下一个渲染进程。
-//
-// 前两种走"隐藏"，最后一种走"销毁"。区别是刻意的：隐藏几乎瞬时，而重新创建
-// 要重走一遍 WebView2 控制器创建（几百毫秒），插件自己的界面状态也会丢掉。
+// 这也是用户报的两个缺陷的根因所在：标题栏的搜索框展开时压不住插件界面、
+// 侧边栏边缘的模糊被它盖住 —— 那不是"判据不够准"，是原生层本来就不参与 CSS 层叠。
 //
 // ============================================================
-// 第二类信号为什么用几何判断，而不是去订阅每个浮层
+// 唯一的布局契约
 // ============================================================
 //
-// 宿主的浮层分散在很多地方（设置面板、通知、各模块自己的对话框、将来的命令面板），
-// 而且以后还会有新的。逐个接线意味着**每加一个浮层都要记得回来改这里一次**，
-// 而漏掉的那一次不会有任何报错 —— 只是插件界面盖在那个浮层上面，看起来像"浮层
-// 坏了"。这种"要求未来的人记得做一件看不出后果的事"的设计，早晚会失效。
+// 这块 iframe 必须填满**内容视口**（`.lc-tab-panel`），而不是填满它的父元素。
 //
-// 所以这里反过来问一个几何问题：**这个占位块的中心点，现在最上面是谁？**
+// 父元素是 `<div class="p-8">`，高度由内容决定 —— 而这里渲染的内容是绝对定位的，
+// 于是父元素的高度是 **0**。实测撞到过一次：`h-full` 解析成 0，建出来的界面是
+// 2240×1。`absolute inset-0` 量的是最近的那个**定位**祖先，而 `.lc-tab-panel`
+// 正是 `absolute inset-y-0`，因此它给出的是内容视口本身 —— 也正是这里想要的。
 //
-//   * 返回占位块自己 → 没人盖着它 → 可以让插件界面露出来；
-//   * 返回别的东西 → 有东西盖在它上面 → 收起来。
-//
-// 它对"将来新增的浮层"自动生效，不需要任何人记得回来改。代价写在下面的
-// "已知的限制"里。
-//
-// ============================================================
-// 已知的限制（不要在文档里把这几条说成已解决）
-// ============================================================
-//
-//   * **需要"盖得住三分之一"才让位。** 采样是一个 5×5 网格加上一个覆盖率阈值
-//     （见 `COVERAGE_THRESHOLD`）。一个只压住一小条、或者形状零碎的浮层仍可能
-//     被放过去 —— 那是刻意的：判据一旦收紧到"任意一点被盖住就让位"，
-//     内容区里一条普通的浮动提示就会让插件界面闪掉，而那个代价比"偶尔被盖一角"大。
-//     这条限制曾经更严重（只看中心点），标题栏搜索展开与侧边栏边缘都因此被盖住，
-//     是用户报上来的两个缺陷。
-//   * **`pointer-events: none` 的浮层看不见。** 几何判断用的是命中测试，
-//     而命中测试看不见不接收指针的元素。这类浮层很罕见，且加一个
-//     `pointer-events: auto` 的包裹层即可被发现。
-//   * **它不随内容滚动，而是钉在内容视口上。** 它占的是标签面板的**可见区域**，
-//     不是可滚动内容的高度 —— 宿主内容往下滚，它不动。写长页面的插件应当把
-//     滚动放在自己的 WebView 里（它有自己的滚动条）。
-//     这是刻意的，不是没做完：一个跟着内容滚的原生层会与 DOM 的合成时机打架，
-//     而"视口内一块固定区域"是一个能被准确表达、也能被准确测出来的东西。
-//   * **它看不见原生层。** 命中测试问的是 DOM，而插件界面自己就是一个原生
-//     webview —— 因此"两个插件界面互相重叠"这类问题不在它的判据里。
+// 同一个选择器在 `AllModulesPanel` 里已经用过一次，因此它是一条既有的契约。
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 import { useModuleActive } from '../hooks/useModuleActive';
 import {
   closeSandboxSurface,
-  hideSandboxSurface,
   openSandboxSurface,
-  setSandboxSurfaceBounds,
-  type SurfaceBounds,
+  postToSurface,
+  subscribeSandboxPush,
+  type SandboxSurfaceHandle,
 } from '../services/sandboxSurface';
 import {
   beginHostSplash,
@@ -90,156 +55,30 @@ interface SandboxSurfaceProps {
   /**
    * 要挂哪一块界面（清单里 `contributes.surfaces[].id`）。
    *
-   * 缺省是主界面。**它必须一路传到 Rust**：`sandbox_surface_*` 四条命令都按
-   * `(插件 id, 界面 id)` 定位 webview。少了它，同一插件的两个界面会去抢同一条
-   * `plugin-<id>` 标签，而宿主侧会把它判成一次显式的标签冲突。
+   * 缺省是主界面。**它必须一路传到宿主**：`sandbox_surface_open` 按
+   * `(插件 id, 界面 id)` 签发令牌，少了它，同一插件的两个界面会去要同一个
+   * 主界面 —— 于是"详情"页显示的是列表。
    */
   surface?: string;
 }
 
-/**
- * 内容视口的选择器。**这是与宿主布局的契约。**
- *
- * 走 `closest` 而不是量自己的矩形，理由是一次实测：
- *
- *   `Home` 里的结构是
- *     `<section class="lc-tab-panel absolute inset-y-0 overflow-y-auto">`
- *       `<div class="p-8">`                      ← 高度由内容决定
- *         模块
- *
- *   `p-8` 的高度是 `auto`，而沙箱界面在这里渲染的是一个**空** div ——
- *   于是 `h-full`（父元素高度的 100%）解析成 `auto`，高度是 **0**。
- *   实测那次建出来的 webview 是 `2240×1`：宽度对，高度 1 像素。
- *
- * 换成量 `.lc-tab-panel` 就对了：它是 `absolute inset-y-0`，高度确定，
- * 而且它正是"内容视口" —— 也正是这个文件一开始就想量的那个东西。
- *
- * 同一个选择器在 `AllModulesPanel` 里已经用过一次（`closest('.lc-tab-panel')`），
- * 因此它是一条既有的契约，不是这里新发明的。`check:sandbox` 有一条断言盯着
- * 它与 `Home.tsx` 里的类名一致。
- */
+/** 内容视口的选择器。见文件头"唯一的布局契约"。 */
 const PANEL_SELECTOR = '.lc-tab-panel';
 
 /**
- * 算出插件界面该占的矩形：**内容视口的整块**。
+ * 等多久还算"正在加载"。
  *
- * **不内缩。** 这里原来会减掉父级 `p-8` 的 2rem 内边距，为的是"与同屏的其它模块
- * 看起来一致"。那个意图是错的：其它模块是一张卡片，四周留白是设计；而插件界面是
- * **一个应用**，它该占满自己那一块，留白由插件自己决定。
- *
- * 实测正是如此：用户报的"存在留白、未全屏"里，40px 来自两个地方 ——
- * 这里的 2rem，加上宿主合成文档里 `<body>` 的默认 8px（那一处已修）。
- *
- * 量不到视口时返回 `null`：**宁可什么都不建，也不要建一个尺寸错误的界面。**
+ * 判据不是 `onload` —— 一个**加载失败**的文档照样会触发它，只是里面是引擎画的
+ * 错误页。真正的就绪信号是桥接层挂好之后主动发回来的那条 `ready`（见
+ * `resources/sandbox-bridge.js`）。这条超时只是"连那条信号都没等到"时的兜底。
  */
-function measureSurface(element: HTMLElement): SurfaceBounds | null {
-  const panel = element.closest(PANEL_SELECTOR) as HTMLElement | null;
-  if (!panel) return null;
-
-  const rect = panel.getBoundingClientRect();
-  if (rect.width < 1 || rect.height < 1) return null;
-
-  return {
-    x: rect.left,
-    y: rect.top,
-    width: rect.width,
-    height: rect.height,
-  };
-}
-
-/**
- * 插件界面该占的那块矩形，现在被盖住了多少。
- *
- * ============================================================
- * 为什么不是"只看中心点"
- * ============================================================
- *
- * 这里原来是**一个**命中测试：量矩形中心，看最上面那个元素是不是还在内容视口里。
- * 那条判据有一个写下来的已知限制 ——"浮层只盖住一角时不会被发现"——
- * 而它已经变成了两个用户实际报出来的缺陷：
- *
- *   * 标题栏的搜索框展开时，那个下拉从**上方**盖进内容区。它压住的是矩形顶部，
- *     而矩形的中心点在下拉之下**几十甚至上百像素**，命中测试落在内容里、
- *     判定为"没被盖住"。于是插件的原生 webview 就盖在那个下拉上面。
- *   * 侧边栏那一侧的模糊边缘同理：它压在矩形的**一侧**，不在中心。
- *
- * 中心点之所以被选中，是为了"宁可晚一点让位，也不要因为一个边角上的提示条
- * 把整个插件界面闪掉"。那个取舍仍然成立 —— 因此改法不是"任意一点被盖住就让位"，
- * 而是**按比例**：在一小块网格上采样，被盖住的点占到一定比例才算数。
- * 一条角落里的提示条只会命中少数几个点，而一个横跨内容区的下拉会命中一整排。
- *
- * 返回 `true` 表示"该让位了"。
- */
-function isCovered(element: HTMLElement, bounds: SurfaceBounds): boolean {
-  const panel = element.closest(PANEL_SELECTOR) as HTMLElement | null;
-  if (!panel) return false;
-
-  // 采样点内缩：矩形边缘正好落在面板边框上，量到边缘会把"面板自己的边框"
-  // 也算成一次命中，结果随亚像素抖动而变。内缩 1px 让采样落在真正的内容上。
-  const inset = 1;
-  const left = bounds.x + inset;
-  const top = bounds.y + inset;
-  const width = bounds.width - inset * 2;
-  const height = bounds.height - inset * 2;
-  if (width <= 0 || height <= 0) return false;
-
-  // 5×5 网格。取 5 而不是 3：3×3 只在中线附近采样，一个高度较小的下拉
-  // （标题栏那种一行高的展开）可能整条落在采样线之间。
-  const STEPS = 5;
-  let covered = 0;
-  let sampled = 0;
-
-  for (let row = 0; row < STEPS; row += 1) {
-    for (let column = 0; column < STEPS; column += 1) {
-      const x = left + (width * column) / (STEPS - 1);
-      const y = top + (height * row) / (STEPS - 1);
-
-      // 视口之外的点命中不到任何元素，`elementFromPoint` 返回 null。
-      // 那不是"被盖住"，因此跳过而不是算进分母 —— 界面滚动到视口外时
-      // 否则会被判成整块被盖。
-      const hit = document.elementFromPoint(x, y);
-      if (!hit) continue;
-
-      sampled += 1;
-      if (!panel.contains(hit)) covered += 1;
-    }
-  }
-
-  // 一个点都采不到时**不判定**被盖住：那说明布局处在某种我们量不准的状态，
-  // 而把插件界面藏起来是代价最大的一种反应。
-  if (sampled === 0) return false;
-
-  return covered / sampled >= COVERAGE_THRESHOLD;
-}
-
-/**
- * 判定为"被盖住"所需要的覆盖率。
- *
- * 0.3 是在两种误判之间取的：太小的话，内容区里一条普通的浮动提示就会让插件
- * 界面闪掉；太大的话，一个只盖住上方三分之一的下拉（正是标题栏搜索那种）
- * 会被放过去。三分之一恰好是"一条横跨内容区的下拉"与"一个角落提示"
- * 在 5×5 网格上的分界。
- */
-const COVERAGE_THRESHOLD = 0.3;
-
-
-/**
- * 两次确认才改判。
- *
- * 一次命中测试可能因为过渡动画中的中间帧而偶然落在别处。改判的代价不是一次
- * 样式变化，而是**隐藏再显示一个原生 webview**，那是一次肉眼可见的闪烁。
- */
-const CONFIRMATIONS = 2;
-
-/** 轮询间隔。150ms 是"浮层出现后察觉不到延迟"与"每秒 6 次命中测试"之间的取舍。 */
-const POLL_MS = 150;
+const READY_TIMEOUT_MS = 10_000;
 
 /**
  * 启动占位的语气 → 文字颜色。
  *
- * 只改文字颜色，不改底色：占位那块底色必须与内容区一致（`bg-white`，深色模式下
- * 由 `dark-theme.css` 覆盖）—— 换一个底色会让它看起来像一块**弹窗**，
- * 而它其实只是"这块位置还没准备好"。
+ * 只改文字颜色，不改底色：占位那块底色必须与内容区一致 —— 换一个底色会让它
+ * 看起来像一块**弹窗**，而它其实只是"这块位置还没准备好"。
  */
 const SPLASH_TONES: Record<string, string> = {
   info: 'text-gray-400',
@@ -250,8 +89,8 @@ const SPLASH_TONES: Record<string, string> = {
 /**
  * 同一条警告只说一次。
  *
- * 遮挡轮询每 150ms 跑一次，量不到视口时若每次都写一行，日志会被同一句话淹掉 ——
- * 而这一条恰恰是**最需要被看见**的那类信号（它意味着宿主布局变了）。
+ * 这块布局契约一旦断了，症状是"插件界面盖住整个窗口" —— 而它每渲染一次就会
+ * 说一遍同样的话，把日志淹掉。这一条恰恰是最需要被看见的那类信号。
  */
 const warned = new Set<string>();
 function warnOnce(message: string): void {
@@ -262,249 +101,242 @@ function warnOnce(message: string): void {
 
 const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) => {
   const holder = useRef<HTMLDivElement>(null);
+  const frame = useRef<HTMLIFrameElement>(null);
 
-  // 「标签是否被选中」+「窗口是否可见」。插件界面必须据此出现或消失 ——
-  // 原生 webview 不看 CSS，只认我们显式发的指令。
+  /**
+   * 这一块界面的桥接层有没有报过到。
+   *
+   * 它是 `useRef` 而不是 state：它只影响"超时该不该判失败"，不影响渲染结果 ——
+   * 放进 state 会让那个每秒都在跑的判断把组件重渲染一遍。
+   */
+  const readyRef = useRef(false);
+
+  // 「标签是否被选中」+「窗口是否可见」。
+  //
+  // 它**不再用来显示/隐藏任何原生东西** —— 非激活的标签面板由 CSS 的
+  // `visibility: hidden` 藏起来（见 styles/global/index.css），而 iframe 是普通
+  // DOM，跟着一起藏。它现在只决定一件事：**要不要现在就去换令牌**。
+  // 后台标签页里的插件界面不该占着一份文档。
   const active = useModuleActive();
 
-  // 「宿主浮层是否盖在它上面」。判据见 isCovered。
-  const [covered, setCovered] = useState(false);
-
   // 界面 id 的缺省值。**只有这一处**允许把缺省写出来。
-  //
-  // `SandboxSurface` 是被 `ModuleRenderer` 按描述符渲染的，而描述符来自插件清单 ——
-  // 单界面插件根本不写 `surface`。缺省在**四条命令**里也各有一份（Rust 侧），
-  // 而这里这一份决定了组件"认为自己在哪一块界面"，两边不一致的话
-  // `hide` 会作用在另一块上。
+  // 宿主那一侧也有一份（两条命令里），两边不一致的话，"详情"界面会去要主界面。
   const surfaceId = surface ?? 'main';
 
-  // 「这块界面是不是还在启动」。为真时宿主自己画一块占位，并把插件的 webview
-  // 先收起来（原生 webview 盖在 DOM 之上，不让开的话占位根本看不见）。
+  // 宿主签发的凭据。`null` 表示还没换到（或换失败了）—— 那时不渲染 iframe。
+  const [handle, setHandle] = useState<SandboxSurfaceHandle | null>(null);
+  const handleRef = useRef<SandboxSurfaceHandle | null>(null);
+
+  // 加载失败的原因。为 `null` 表示没有已知的失败。
+  const [failure, setFailure] = useState<string | null>(null);
+
+  // 布局契约是否成立。`null` 表示还没量过（首帧）。
+  const [panelOk, setPanelOk] = useState<boolean | null>(null);
+
+  // 换令牌的重试计数。宿主撤销一块界面（插件被停用/卸载，或自检窗口关掉）时会
+  // 推一条 `close` —— 那时必须**重新**走一遍换令牌，而不是停在没有 iframe 的状态。
+  const [generation, setGeneration] = useState(0);
+
+  // 「这块界面是不是还在启动」。为真时宿主自己在它上面画一块占位。
   const [splash, setSplash] = useState(() => getPluginSplash(pluginId, surfaceId));
   useEffect(() => subscribePluginUi(() => setSplash(getPluginSplash(pluginId, surfaceId))), [
     pluginId,
     surfaceId,
   ]);
 
-  const visible = active && !covered;
-
-  /**
-   * 这块界面**曾经被建出来过**吗。
-   *
-   * 只用来决定"切标签回来时要不要再立一次启动占位" —— webview 还活着的时候
-   * 再闪一次"正在启动"是错的：插件自己的界面状态都还在，它并没有在启动。
-   */
-  const everOpened = useRef(false);
-
-  /**
-   * 把矩形交给宿主。
-   *
-   * `open` 与 `bounds` 分开：`open` 会走一遍 `PluginManager` 核实插件（读清单），
-   * 而 `bounds` 只是摆一下位置。窗口缩放与滚动会高频触发后者，不该每次都去读盘。
-   *
-   * **这里刻意不做遮挡判断。** 曾经加过一次"被盖住就不打开"，为的是省掉
-   * "先闪出来再收回去"的那一帧。那个取舍是错的：遮挡判断是一个**启发式**
-   * （只看中心点的命中测试，见 `isCovered`），它一旦误判，代价是
-   * **插件界面永远出不来** —— 而省下的只是一帧。
-   *
-   * 所以这一层永远往"能用"那一侧倒：先打开；如果确实被盖着，轮询会在两次确认
-   * 之后（约 300ms）把它收起来。宁可闪一下，不可打不开。
-   *
-   * `withSplash` 是**启动占位**那条路径：webview 照样要建出来（它的文档要开始
-   * 加载，加载完才会把占位撤掉），但先不显示 —— 那块位置这一帧属于宿主画的占位。
-   */
-  const apply = useCallback(
-    (mode: 'open' | 'bounds', withSplash = false) => {
-      const element = holder.current;
-      if (!element) return;
-
-      const bounds = measureSurface(element);
-      if (!bounds) {
-        // 量不出来就**什么都不做**。曾经让 0 高度一路走到 `sanitized()`
-        // 被夹成 1，结果是建出一个 2240×1 的面板，而症状看起来像"插件坏了"。
-        // 一句能指路的警告，比一个尺寸错误的界面有用得多。
-        warnOnce(
-          `${pluginId}:量不到内容视口（${PANEL_SELECTOR}），先不建界面。` +
-            '如果一直这样，说明宿主的内容区布局变了 —— 见 SandboxSurface 的 measureSurface。'
-        );
-        return;
-      }
-
-      const call = mode === 'open' ? openSandboxSurface : setSandboxSurfaceBounds;
-
-      // 失败只记一条日志：界面没建出来不该把整个模块渲染炸掉，
-      // 那样用户看到的是一个空白页而不是一条能读的原因。
-      call(pluginId, bounds, surfaceId, withSplash ? false : undefined).catch((error) => {
-        console.warn(
-          `[sandboxSurface] ${pluginId} 的界面${mode === 'open' ? '打开' : '摆放'}失败`,
-          error
-        );
-      });
-    },
-    [pluginId, surfaceId]
-  );
-
-  // ---- 可见性：显示或隐藏（不销毁），以及启动占位 ----
-  //
-  // ============================================================
-  // 一条规则，两个状态
-  // ============================================================
-  //
-  //   * 有占位 → webview **收起来**（那块位置这一帧属于宿主画的占位；
-  //     原生 webview 盖在 DOM 之上，不让开的话占位根本看不见）；
-  //   * 没占位 → webview **显示出来**并摆正。
-  //
-  // 只有一条规则是有意的。曾经想过"占位只在第一次打开时出现"，然后给"插件后来
-  // 自己立了一块占位"单开一条分支 —— 那条分支的后果是：插件说"我在忙"，而屏幕上
-  // 什么都没有（它的占位被自己的 webview 盖住了）。一条规则让那种状态不可能出现。
-  //
-  // ============================================================
-  // `everOpened` 解决的是什么
-  // ============================================================
-  //
-  // 切标签回来**不该再闪一次"正在启动"**：webview 还活着，插件自己的界面状态
-  // 也还在。因此宿主占位只在**这块界面从来没被建过**时才立。
-  //
-  // 它是 `useRef` 而不是 state：它不影响渲染结果，只影响"下一次该不该立占位"，
-  // 而放进 state 会让这个 effect 因为自己写的东西而再跑一遍。
+  // ---- 布局契约的检查 ----
   useEffect(() => {
-    if (!visible) {
-      // 不可见：收起来。留着它会让原生 webview 盖在别的标签或宿主浮层上。
-      void hideSandboxSurface(pluginId, surfaceId).catch(() => {});
-      return;
-    }
-
-    if (!everOpened.current) {
-      everOpened.current = true;
-      // 先立占位，再建 webview —— 而且建出来就**不显示**。
-      //
-      // 反过来（先建再收）会有一帧 webview 已经显示出来的闪烁，而这一条路径
-      // 每次打开插件都会走到。`beginHostSplash` 是幂等的：布局变化重复调用
-      // 不会把超时重置掉（否则一个真的卡住的插件永远等不到兜底）。
-      beginHostSplash(pluginId, surfaceId);
-      apply('open', true);
-      return;
-    }
-
-    apply('open', splash !== null);
-  }, [visible, splash, apply, pluginId, surfaceId]);
-
-  // ---- 几何：尺寸与位置变化，以及宿主滚动 ----
-  useEffect(() => {
-    if (!visible) return;
-
     const element = holder.current;
-    if (!element) return;
+    const ok = element !== null && element.closest(PANEL_SELECTOR) !== null;
+    setPanelOk(ok);
 
-    // 用 rAF 合并同一帧内的多次回调 —— ResizeObserver 在一次拖动里会触发很多次，
-    // 滚动同理，每次都发一条 IPC 是没必要的。
-    let frame = 0;
-    const schedule = () => {
-      if (frame) return;
-      frame = window.requestAnimationFrame(() => {
-        frame = 0;
-        apply('bounds');
+    if (!ok) {
+      const detail =
+        `这块界面不在 ${PANEL_SELECTOR} 里，因此没有地方放它。` +
+        '如果一直这样，说明宿主的内容区布局变了 —— 见 SandboxSurface 的文件头。';
+      warnOnce(`${pluginId}:${detail}`);
+      // **不能只写日志。** 日志在用户那里看不到，而他面对的是一个空白面板 ——
+      // 那与"插件坏了"长得一模一样。把原因画出来。
+      setFailure(detail);
+    }
+  }, [pluginId]);
+
+  // ---- 打开：只换令牌，不碰任何窗口系统 ----
+  //
+  // 三个条件缺一不可：
+  //   * 这块标签**正被选中** —— 后台标签页不该占一份文档；
+  //   * 布局契约成立 —— 否则 iframe 会铺满整个窗口；
+  //   * 还没有凭据 —— 宿主那一侧是幂等的，但每一轮都是一条 IPC。
+  //
+  // **拿到令牌不等于界面能跑。** 令牌只是"这个来源被允许读这个插件的数据"，
+  // 文档能不能加载出来由 `ready` 那条消息回答（见下面的就绪检查）。
+  useEffect(() => {
+    if (!active || panelOk !== true) return;
+    if (handleRef.current !== null) return;
+
+    // 先立占位，再取令牌。占位是幂等的：布局变化重复调用不会把超时重置掉
+    // （否则一个真的卡住的插件永远等不到兜底）。
+    beginHostSplash(pluginId, surfaceId);
+
+    let cancelled = false;
+
+    void openSandboxSurface(pluginId, surfaceId)
+      .then((next) => {
+        if (cancelled) {
+          // 这一次请求已经作废（组件卸载或参数变了），把刚换到的凭据还回去。
+          // 不还的话，宿主那一侧会留下一条指向**不存在 iframe** 的记录，而它仍然
+          // 读得到这个插件的数据。
+          void closeSandboxSurface(next.token).catch(() => {});
+          return;
+        }
+        // 换到新凭据 = 换了一块文档，上一块的"我起来了"不再作数。
+        readyRef.current = false;
+        handleRef.current = next;
+        setHandle(next);
+        setFailure(null);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setFailure(`插件界面打不开：${String(error)}`);
       });
-    };
-
-    const observer = new ResizeObserver(schedule);
-    // 观察**内容视口**而不是占位块：占位块现在是零尺寸的锚点（矩形由
-    // `measureSurface` 从视口算出来），观察它等于什么都没观察。
-    // 侧边栏折叠、分屏拖动、窗口缩放改变的都是视口的尺寸。
-    const panel = (element.closest(PANEL_SELECTOR) as HTMLElement | null) ?? element;
-    observer.observe(panel);
-    window.addEventListener('resize', schedule);
-
-    // 捕获阶段监听滚动。滚动事件**不冒泡**，而滚动发生在某个祖先容器上而不是
-    // window 上 —— 只在 window 上监听冒泡阶段什么也收不到。
-    //
-    // 界面本身钉在内容视口上，因此滚动**不该**让它移动（这正是"内容视口"的
-    // 含义）。留着这个监听是为了另一件事：滚动会改变宿主内容的位置，而
-    // 遮挡判断依赖的就是位置 —— 浮层多半是随内容一起滚的。
-    document.addEventListener('scroll', schedule, true);
 
     return () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      observer.disconnect();
-      window.removeEventListener('resize', schedule);
-      document.removeEventListener('scroll', schedule, true);
+      cancelled = true;
     };
-  }, [visible, apply]);
+  }, [active, panelOk, pluginId, surfaceId, generation]);
 
-  // ---- 遮挡：宿主浮层出现时让位 ----
+  // ---- 收回令牌 ----
+  //
+  // 组件卸载、或者 `pluginId` / `surface` 变了时走这条。**认令牌而不是认名字**：
+  // 一个界面在"关掉又打开"之间会拿到不同的令牌，按名字关会让一次迟到的卸载把
+  // 新开的那一块关掉。理由见 `services/sandboxSurface.ts`。
   useEffect(() => {
-    if (!active) {
-      // 不在前台就不必轮询，也不该留着一个"被盖住"的旧判断。
-      setCovered(false);
-      return;
-    }
+    return () => {
+      const current = handleRef.current;
+      handleRef.current = null;
+      if (current) void closeSandboxSurface(current.token).catch(() => {});
+    };
+  }, [pluginId, surfaceId]);
 
-    let candidate = false;
-    let agreed = 0;
+  // ---- 宿主推来的消息 → postMessage ----
+  //
+  // Rust 那一边够不到这个 iframe 的文档（跨源），它只能发一条 Tauri 事件。
+  // 持有 iframe 的是**这个文档**，因此转发只能在这里做。
+  useEffect(() => {
+    return subscribeSandboxPush((push) => {
+      const current = handleRef.current;
+      if (!current || push.token !== current.token) return;
 
-    const interval = window.setInterval(() => {
-      const element = holder.current;
-      if (!element) return;
-
-      const bounds = measureSurface(element);
-      if (!bounds) return;
-
-      const now = isCovered(element, bounds);
-      if (now === candidate) {
-        agreed = 0;
+      if (push.channel === 'close') {
+        // 宿主撤销了这块界面（插件被停用/卸载）。**它没法替我们拆 DOM** ——
+        // 这条消息存在的意义就是"请你把它卸掉"。清掉凭据会让 iframe 从渲染树上
+        // 消失，而 `generation` 让打开那条 effect 再跑一遍（插件还在的话会拿到
+        // 一个新令牌；不在的话会显示原因）。
+        handleRef.current = null;
+        setHandle(null);
+        setGeneration((value) => value + 1);
         return;
       }
 
-      agreed += 1;
-      if (agreed < CONFIRMATIONS) return;
+      postToSurface(frame.current, current.url, push);
+    });
+  }, []);
 
-      candidate = now;
-      agreed = 0;
-      setCovered(now);
-    }, POLL_MS);
-
-    return () => window.clearInterval(interval);
-  }, [active]);
-
-  // ---- 卸载：销毁 ----
+  // ---- 就绪检查 ----
   //
-  // 与"隐藏"分开：切标签只是看不见，而卸载意味着这块内容不会再回来了。
-  // 不销毁的话，切过的每一个沙箱插件都会留下一个渲染进程。
+  // ============================================================
+  // 为什么判据是桥接层发回来的 `ready`，而不是 iframe 的 `load`
+  // ============================================================
+  //
+  // `load` 在一个**加载失败**的文档上照样会触发 —— 引擎会拿它自己画的一张错误页
+  // 来触发它。那意味着"用 load 判断成功"会把最需要被发现的那种失败（协议没接上、
+  // 令牌被拒、CSP 拦了自己）判成成功，而症状是一块永远白着的面板。
+  //
+  // 桥接层是那份文档里**我们自己的**代码，它跑到发 `ready` 就说明：文档加载了、
+  // 脚本加载了、协议通了。那是唯一一个不容易骗过自己的信号。
+  //
+  // ============================================================
+  // 监听器为什么与"等超时"分成两个 effect
+  // ============================================================
+  //
+  // 监听器挂在**组件装载时**，而不是拿到凭据之后：iframe 一开始加载，那份文档就
+  // 可能已经跑完桥接层并把 `ready` 发出来了 —— 而 React 的 effect 在提交之后才跑。
+  // 把监听器和 `handle` 绑在一起，会让"恰好在这一瞬之间到达的 `ready`"丢掉，
+  // 于是界面明明好着，十秒后却跳出一句"没有就绪"。
+  //
+  // `readyRef` 与它配套：拿到**新**凭据时先清掉（见下面的打开那一条 effect），
+  // 超时那一边才不会被上一块界面留下的旧结论救活。
+
   useEffect(() => {
-    return () => {
-      void closeSandboxSurface(pluginId, surfaceId).catch(() => {});
+    const onMessage = (event: MessageEvent) => {
+      // **身份判据是 `event.source`，不是 `event.origin`。** 来源字符串是发送方
+      // 自己声明的（一个 `data:` 文档的来源就是字符串 `"null"`），而窗口引用不能
+      // 伪造 —— 只有那块 iframe 的 `contentWindow` 能等于它。
+      if (event.source !== frame.current?.contentWindow) return;
+
+      const data = event.data as { __modulith?: unknown; channel?: unknown } | null;
+      if (!data || data.__modulith !== true || data.channel !== 'ready') return;
+
+      readyRef.current = true;
+      setFailure(null);
     };
-  }, [pluginId, surface]);
+
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+
+  useEffect(() => {
+    if (!handle) return;
+
+    const timer = window.setTimeout(() => {
+      if (readyRef.current) return;
+      setFailure(
+        `插件界面在 ${READY_TIMEOUT_MS / 1000} 秒内没有就绪。` +
+          '这通常意味着那份文档没有被加载 —— 见应用日志里的 [sandbox] 记录。'
+      );
+    }, READY_TIMEOUT_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [handle]);
 
   return (
-    <>
-      <div
-        ref={holder}
-        // **零尺寸的锚点，刻意不是"占满父容器"。**
-        //
-        // 这里曾经写的是 `h-full w-full`，本意是"占住内容区"。但 `h-full` 是
-        // 父元素高度的 100%，而父级 `div.p-8` 的高度由内容决定 —— 内容是空的，
-        // 于是高度是 0。矩形现在由 `measureSurface` 从内容视口算出来，这个 div
-        // 只负责两件事：把插件界面挂进正确的标签面板（`closest`），
-        // 以及让读屏软件知道这里没有内容。
-        //
-        // **它必须保持"不定位于"（不带 `relative`）**：下面那块占位用的是
-        // `absolute inset-0`，它要相对 `.lc-tab-panel` 铺满 —— 而那正是
-        // `measureSurface` 量出来的同一块矩形。给锚点加上 `relative` 会让占位
-        // 缩成一个 0×0 的点，症状是"点了插件之后什么都没有"。
-        className="h-0 w-0"
-        aria-hidden="true"
-      />
+    <div ref={holder} className="absolute inset-0">
+      {panelOk === true && handle && (
+        <iframe
+          ref={frame}
+          src={handle.url}
+          // 读屏软件与调试都要能认出这是哪一块界面。
+          title={`插件界面：${pluginId}${surfaceId === 'main' ? '' : `（${surfaceId}）`}`}
+          className="h-full w-full border-0 bg-white"
+          // ============================================================
+          // `sandbox` 属性：默认拒绝，逐条放开
+          // ============================================================
+          //
+          // 没写出来的那些**默认全部拒绝**：表单提交、弹窗、模态框（alert /
+          // confirm）、顶层跳转、下载、指针锁定、自动播放。每少放开一条，就少一条
+          // 插件能绕开宿主的出站路径 —— 而这些能力对插件界面没有一条是必需的。
+          //
+          // 两条必须放开：
+          //   * `allow-scripts` —— 那就是插件代码本身；
+          //   * `allow-same-origin` —— 不放开的话文档会退化成一个**不透明来源**，
+          //     于是它连自己那份 `fetch`（到 `modulith-plugin.localhost`）都算跨源，
+          //     而宿主没有为它准备 CORS 头。
+          //
+          // "allow-scripts + allow-same-origin" 那条经典警告在这里**不适用**：
+          // 它说的是"被嵌的文档与父文档同源"，而插件来源与宿主**不同源**，
+          // 因此插件够不到 `parent`，也就删不掉这个属性。
+          sandbox="allow-scripts allow-same-origin"
+        />
+      )}
 
       {/*
-        启动占位。**由宿主渲染** —— 理由与浮层那三样一样，而且这里还多一条硬的：
-        插件的 webview 已经建出来了（它的文档要开始加载），宿主想在那块位置上画
-        任何东西，就必须先把 webview 收起来。收起来这件事由上面的 effect 做。
+        启动占位。**由宿主渲染**，而且它现在真的在 iframe 上面 —— 两者都是普通
+        DOM，`z-10` 就够了。曾经为了让它可见，必须先把原生 webview 显式收起来。
 
         内容刻意极简：一句话 +（有进度时）一条细线。它是**等待**，不是界面 ——
         长得越像界面，用户越会去点它。
       */}
-      {visible && splash && (
+      {splash && (
         <div
           className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white"
           role="status"
@@ -533,7 +365,18 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
           )}
         </div>
       )}
-    </>
+
+      {/*
+        失败。**必须说出来** —— iframe 模型的失效方式是一块白面板，而白面板不
+        告诉任何人它为什么白：协议没接上、令牌被拒、CSP 拦了自己，三者在这里
+        长得一模一样。这句话把用户从"插件是不是坏了"引到日志里的那一条。
+      */}
+      {failure && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-white p-6">
+          <p className="max-w-md text-center text-xs leading-relaxed text-rose-600">{failure}</p>
+        </div>
+      )}
+    </div>
   );
 };
 

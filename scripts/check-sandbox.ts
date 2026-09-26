@@ -8,9 +8,9 @@
 // 它守的是什么
 // ============================================================
 //
-// 沙箱的安全性质由 `check:acl` 断言（没有任何 capability 把插件 webview 纳入作用域、
-// build.rs 必须有应用级 ACL 清单）。这个脚本守的是**另一类**会静默失效的东西：
-// 那条通道本身。
+// 沙箱的安全性质由 `check:acl` 断言（没有任何 capability 把插件侧的窗口
+// —— 现在只剩自检窗口那一个 `plugin-*` 标签 —— 纳入作用域、build.rs 必须有
+// 应用级 ACL 清单）。这个脚本守的是**另一类**会静默失效的东西：那条通道本身。
 //
 // 这几处的共同点是"改错了不会有任何症状，直到有人在真实运行里撞上"：
 //
@@ -46,6 +46,21 @@ function section(title: string): void {
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (relative: string): string => readFileSync(resolve(here, relative), 'utf8');
 const exists = (relative: string): boolean => existsSync(resolve(here, relative));
+
+/**
+ * 剥掉行注释与块注释。
+ *
+ * **这一步不是可选的。** 门禁要找的每个词（`get_webview_window`、`add_child`、
+ * `webview_label`、`SurfaceActor`）都恰好是本仓库里被**长篇解释过为什么不能用**的
+ * 词。不剥注释的话，一份说明"不许这么写"的注释会把门禁判成违规，而修它的唯一
+ * 办法是删掉注释 —— 于是最该留下的那份知识第一个消失。
+ *
+ * 定义放在最前面：从第 6 节起就要用它，而 `const` 有暂时性死区。
+ */
+const stripComments = (source: string): string =>
+  source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+const strip = stripComments;
 
 const sandboxRs = read('../src-tauri/src/modules/plugins/sandbox.rs');
 const bridgeJs = read('../src-tauri/resources/sandbox-bridge.js');
@@ -174,23 +189,79 @@ section('桥接层的占位符');
 section('文档的 CSP');
 
 {
-  // `page` 是共用的 CSP 外壳，`script_and_style` 由调用方给。
-  const pageFn = /fn page\([\s\S]*?\n}/.exec(sandboxRs);
-  check(pageFn !== null, 'sandbox.rs 里能找到 page()');
+  // `page` 现在只是共用外壳的一个薄入口：真正的指令在 `page_with_frame` 里。
+  //
+  // 判据**必须锚在 `page_with_frame` 的函数体上**。从前它锚在 `page` 上，而
+  // iframe 模型把 `page` 变成了两行转发 —— 于是整节 CSP 断言一起变绿（它们查的
+  // 字符串一个字都不在 `page` 里了）。那正是"门禁静默变弱"的形状。
+  const pageFn = /fn page_with_frame\([\s\S]*?\n}/.exec(sandboxRs);
+  check(pageFn !== null, 'sandbox.rs 里能找到 page_with_frame()');
 
   if (pageFn) {
     const body = pageFn[0];
     for (const directive of [
       "default-src 'none'",
       'connect-src',
-      "frame-src 'none'",
       "object-src 'none'",
       "base-uri 'none'",
       "form-action 'none'",
     ]) {
       check(body.includes(directive), `CSP 里有 ${directive}`);
     }
+    // `frame-src` 的值**必须来自参数**，不能写死。
+    //
+    // 两张文档要给出不同的值：插件文档是 `'none'`，自检页是 `ORIGIN`（它要把探针
+    // 嵌进一个同源 iframe）。把 `page_with_frame` 里的参数写成字面量 `'none'`
+    // 会让自检页的探针 iframe 加载不出来 —— 而症状是自检**永远报"探针没有回话"**，
+    // 看起来像协议坏了。反过来写死成 `ORIGIN` 则会让插件文档也能嵌别的文档。
+    check(
+      /frame-src \{frame_src\}/.test(body),
+      'frame-src 的值来自参数（两张文档的差别只有这一处实现）'
+    );
   }
+
+  // 插件文档**必须**是 `frame-src 'none'`：`page()` 把 `'none'` 写死传下去，
+  // 插件因此不能嵌别的文档借它的来源发请求。
+  const pageEntryFn = /fn page\(body: String[\s\S]*?\n}/.exec(sandboxRs)?.[0] ?? '';
+  check(
+    /page_with_frame\(body, script_and_style, "'none'"\)/.test(pageEntryFn),
+    "插件文档经 page() 把 frame-src 定成 'none'（插件不能借别人的来源发请求）"
+  );
+
+  // 自检页是唯一的例外：它传 `ORIGIN`，因为探针必须是一个**同源 iframe**
+  // 才能回答"真插件界面那个模型里到底有没有宿主 IPC"。
+  const selftestFrame = /fn selftest_html\([\s\S]*?\n}/.exec(sandboxRs)?.[0] ?? '';
+  check(
+    /page_with_frame\(/.test(selftestFrame) && /\bORIGIN\b/.test(selftestFrame),
+    '自检页把 frame-src 放开到 ORIGIN（它要嵌探针 iframe 才能回答"有没有宿主 IPC"）'
+  );
+
+  // `/<token>/probe` 必须真的有一条路由，否则自检页那个 iframe 只会拿到 404 ——
+  // 而"探针没有回话"与"探针说没有 IPC"在自检结果里长得几乎一样。
+  check(
+    /\(\"GET\", Some\(\"probe\"\)\)\s*=>\s*selftest_html\(SELFTEST_PROBE_HTML\)/.test(sandboxRs),
+    '自检页的探针有自己的一条路由（GET /<token>/probe）'
+  );
+  check(
+    /const SELFTEST_PROBE_HTML: &str = include_str!\([\s\S]{0,80}?sandbox-selftest-probe\.html\"\)/.test(
+      sandboxRs
+    ) && exists('../src-tauri/resources/sandbox-selftest-probe.html'),
+    '探针文档被编进二进制，且文件真的在仓库里'
+  );
+
+  // 宿主文档自己的 CSP 也必须允许这个来源。
+  //
+  // 漏掉这一条的表现是**全部插件界面一起空白**：插件 iframe 被**宿主**那份 CSP
+  // 拦下，于是连文档都到不了协议处理器 —— 而协议那一侧的日志一条都不会有。
+  // 这是"改一个地方、坏在另一个文件"的典型，因此单独钉一条。
+  const tauriConf = JSON.parse(read('../src-tauri/tauri.conf.json')) as {
+    app?: { security?: { csp?: { 'frame-src'?: string } } };
+  };
+  const hostFrameSrc = tauriConf.app?.security?.csp?.['frame-src'] ?? '';
+  check(
+    hostFrameSrc.includes('http://modulith-plugin.localhost'),
+    `宿主 CSP 的 frame-src 允许插件来源（实际是 ${JSON.stringify(hostFrameSrc)}）—— 少了它每个插件界面都会被宿主自己的 CSP 拦成空白`
+  );
 
   // 调用点：入口文档必须走 `page(..., "script-src 'self' …")`。
   const entryFn = /fn entry_document(?:<[^>]*>)?\([\s\S]*?\n}/.exec(sandboxRs);
@@ -236,13 +307,37 @@ section('入口文档的脚本顺序');
 {
   const entryFn = /fn entry_document(?:<[^>]*>)?\([\s\S]*?\n}/.exec(sandboxRs);
   if (entryFn) {
-    const bridge = entryFn[0].indexOf('bridge.js');
-    const main = entryFn[0].indexOf('asset/{main}');
+    const body = entryFn[0];
+    const bridge = body.indexOf('bridge.js');
+    const main = body.indexOf('asset/{main}');
     check(bridge !== -1, '入口文档里加载了 bridge.js');
     check(main !== -1, '入口文档里加载了插件入口脚本');
     check(
       bridge !== -1 && main !== -1 && bridge < main,
       'bridge.js 排在插件入口脚本之前'
+    );
+
+    // 三个子资源（react.js / bridge.js / 插件入口）与样式表的地址里都必须带
+    // **本界面的令牌**。地址是协议处理器唯一的身份来源：把令牌从地址里去掉，
+    // 这三个子资源一个都加载不到，而症状是白面板 + 三条 403。
+    const tokenUrls = [
+      ...body.matchAll(/<script src="\/\{token\}\/(react\.js|bridge\.js|asset\/\{main\})">/g),
+    ].map((match) => match[1]);
+    check(
+      tokenUrls.length === 3,
+      tokenUrls.length === 3
+        ? '三个脚本标签的地址第一段都是令牌'
+        : `入口文档里带令牌的脚本标签只有 ${tokenUrls.length} 个（应当 3 个）—— 少了令牌的子资源会被协议处理器 403`
+    );
+    check(
+      /<link rel="stylesheet" href="\/\{token\}\/asset\/\{rel\}">/.test(body),
+      '样式表的地址同样带令牌（它是同一个协议处理器上的请求）'
+    );
+    // 反面：**不许**再按插件 id 拼地址。协议处理器只认令牌，按 id 拼出来的地址
+    // 会被它拒掉，而资源与 RPC 会**一起**404。
+    check(
+      !/\/\{id\}\//.test(body),
+      '入口文档不再按插件 id 拼地址（协议只认令牌，按 id 拼会全部 403）'
     );
   }
 }
@@ -288,8 +383,8 @@ section('资源路径的越界判断');
 // **"沙箱以为这个插件存在、存储那边不认"**。实测撞到过一次（§7.40）。
 //
 // 现在的事实只有一个来源：`PluginManager::sandbox_view`。本模块只保留
-// **标签 → 插件 id** 一条映射，而它不可能与真源漂开：每次建界面都必须先通过
-// `sandbox_view`，拿不到就建不出来 —— **没安装的插件构造上就拿不到界面**。
+// **令牌 → 界面身份**一条映射，而它不可能与真源漂开：每次签发令牌都必须先通过
+// `sandbox_view`，拿不到就签不出来 —— **没安装的插件构造上就拿不到界面**。
 
 section('单一真源');
 
@@ -306,13 +401,22 @@ section('单一真源');
 
   // 界面表只记身份，不记事实。
   //
-  // **值从"插件 id"变成了 `SurfaceKey`（插件 + 界面）**，这是多界面那一步带来的：
-  // 同一个插件现在可以有好几个 webview，只记插件 id 会让协议处理器分辨不出
-  // "这个请求来自主界面还是详情界面"，而症状是"详情界面显示的是列表"。
+  // **键从"webview 标签"变成了"令牌"，值仍然是 `SurfaceKey`（插件 + 界面）。**
+  // 这是 iframe 模型带来的：iframe 没有自己的 webview 标签（`ctx.webview_label()`
+  // 对全部插件界面都返回 `main`），继续拿标签当键会让全部插件塌成同一个身份。
   // 判据仍然只针对**形状**：它必须是一张字符串到身份的映射，不能长出字段来。
   check(
-    /pub struct SandboxSurfaces\(RwLock<HashMap<String, SurfaceKey>>\)/.test(sandboxRs),
-    'SandboxSurfaces 只映射「标签 → 界面身份」，不存放插件的事实'
+    /pub struct SandboxSurfaces\(RwLock<Registry>\)/.test(sandboxRs),
+    'SandboxSurfaces 只映射「令牌 → 界面身份」，不存放插件的事实'
+  );
+  // 两张表必须关在**同一把锁**里。分开锁会出现"正向表说这个令牌属于 A、反向表说
+  // A 的令牌是另一个"的瞬间 —— 而那个瞬间的表现是同一个界面被签发两个令牌，
+  // 多出来的那个永远不会被回收，也就永远有效。
+  const registryStruct = /struct Registry \{[\s\S]*?\n}/.exec(sandboxRs)?.[0] ?? '';
+  check(
+    /by_token: HashMap<String, SurfaceKey>/.test(registryStruct) &&
+      /by_key: HashMap<SurfaceKey, String>/.test(registryStruct),
+    '注册表同时有「令牌 → 身份」与「身份 → 令牌」两张表（后者是幂等的依据）'
   );
   // 反向：它不许长出任何"插件的事实"字段。这两条一起才排得掉"把整份清单塞进去"。
   const surfacesStruct = /pub struct SandboxSurfaces[\s\S]*?\n}/.exec(sandboxRs);
@@ -329,55 +433,66 @@ section('单一真源');
 
   // 建界面的第一步必须是核实插件存在。
   //
-  // `async` 是**承重的**，不是风格：同步函数的函数体在 IPC 线程（主线程）上就地
-  // 执行，而这条函数最终要创建 webview —— 那是主线程不能做的事。见第 9 节。
-  const openFn = /pub async fn open_surface_at[\s\S]*?\n}/.exec(sandboxRs);
-  check(openFn !== null, 'sandbox.rs 里有 open_surface_at()，且是 async');
+  // 它**只签发一个令牌，不碰窗口系统**：从前的版本要创建一个子 webview，因此必须
+  // 绕开主线程（那是一次整机假死）。现在这条路径上只有两次纯内存操作，而
+  // "不能再创建 webview"这一条仍然要钉住 —— 把窗口创建加回来会让假死重新出现，
+  // 而它的症状是"点开一个插件，整个应用不响应且一条错误都不报"。
+  const openFn = /pub async fn open_surface<[\s\S]*?\n}/.exec(sandboxRs);
+  check(openFn !== null, 'sandbox.rs 里有 open_surface()，且是 async');
 
   if (openFn) {
     const body = openFn[0];
     check(
       /sandbox_view\(/.test(body),
-      'open_surface_at 先经 PluginManager 核实插件（这一步拿不到就什么都不建）'
+      'open_surface 先经 PluginManager 核实插件（这一步拿不到就什么都不建）'
     );
     check(
-      body.indexOf('sandbox_view(') < body.indexOf('claim('),
-      '核实排在占位之前 —— 反过来的话，未安装的插件也能先占住标签'
-    );
-    check(
-      body.indexOf('claim(') < body.indexOf('.show('),
-      '占位排在建 webview 之前 —— 反过来的话，首条协议请求会先到而表里还没有记录'
+      body.indexOf('sandbox_view(') < body.indexOf('issue('),
+      '核实排在签发令牌之前 —— 反过来的话，未安装的插件也能先拿到一块界面的凭据'
     );
     check(
       /needs_own_webview\(\)/.test(body),
-      'open_surface_at 检查清单声明的是 sandboxed（否则 in-process 插件也能拿到界面）'
+      'open_surface 检查清单声明的是 sandboxed（否则 in-process 插件也能拿到界面）'
     );
+    // 清单里没有的界面 id 必须在这里被拒，而不是签出一个服务 404 的令牌 ——
+    // 后者在前端看起来是"插件界面一直白着"。
     check(
-      /forget\(/.test(body),
-      '建 webview 失败时撤销占位 —— 留一条指向不存在界面的记录会让这个插件**永远建不出来**'
+      /if view\.surface\(surface\)\.is_none\(\) \{[\s\S]{0,240}?return Err\(/.test(body),
+      'open_surface 只签发清单里声明过的界面，否则直接报错'
     );
-    // 读锁必须在把活交给界面线程之前放掉：接口本身是 `let view = { ... };`
-    // 这个块，而判据是"从取锁到 .show( 之间确实出现了块的收尾 `};`"。
-    // 若有人把 `.show()` 挪进那个块里，读锁就会跨过 await —— 于是"等待这把锁的
-    // 写操作"与"界面线程创建 webview"会互等。
-    const between = body.slice(body.indexOf('read().await'), body.indexOf('.show('));
+    // **这条是新的边界**：签发令牌这条路径上不许再出现窗口创建。
     check(
-      between.includes('};'),
-      'open_surface_at 在把活交给界面线程之前已经放掉了注册表的读锁'
+      !/WebviewWindowBuilder|add_child|\.show\(/.test(body),
+      'open_surface 不创建任何窗口/webview（只签发令牌）—— 把它加回来就是那条整机假死的路'
     );
   }
 
-  // 关界面时**必须**同时撤销占位。只关 webview 而留着记录，下一次建界面会以为
-  // "已经建过了"，而 webview 其实已经不在了。
-  const closeFn = /pub async fn close_surface[\s\S]*?\n}/.exec(sandboxRs);
-  check(closeFn !== null, 'sandbox.rs 里有 close_surface()，且是 async');
+  // 关界面时**必须**同时撤销两张表。只关文档而留着记录，下一次建界面会以为
+  // "已经签过了"，于是一个已经不存在的 iframe 持有的令牌继续有效 ——
+  // 那条令牌还读得到这个插件的数据。
+  const closeFn = /pub fn close_surface<[\s\S]*?\n}/.exec(sandboxRs);
+  check(closeFn !== null, 'sandbox.rs 里有 close_surface()');
   check(
     closeFn !== null && /forget\(/.test(closeFn[0]),
-    'close_surface 同时撤销占位（两处状态必须一起动）'
+    'close_surface 撤销令牌（两处状态必须一起动）'
   );
   check(
-    closeFn !== null && closeFn[0].indexOf('forget(') < closeFn[0].indexOf('.close('),
-    'close_surface 先撤销占位再关 webview —— 顺序反了的话，协议处理器会在窗口已经消失之后还能查到一条记录'
+    closeFn !== null && !/\.close\(/.test(closeFn[0]),
+    'close_surface 不自己关窗口（iframe 的销毁是前端的事，宿主这一侧没有 DOM 可拆）'
+  );
+  // `forget` 本身必须**两张表一起删**：只删正向表的话，反向表里会留下一条
+  // "这个身份已经有令牌"的记录 —— 下一次 `issue` 会把那个已经失效的令牌原样
+  // 还回去，而它读不到任何东西（界面从此永远打不开）。
+  const forgetFn = /pub\(super\) fn forget\([\s\S]*?\n    \}/.exec(sandboxRs)?.[0] ?? '';
+  check(
+    /by_token\.remove\(token\)/.test(forgetFn) && /by_key\.remove\(&key\)/.test(forgetFn),
+    'forget 同时删掉两张表（只删一张会让失效的令牌被原样还回去）'
+  );
+  // 停用/卸载一个插件时，它的**全部**令牌都要收回，并且要拿到那些令牌去通知前端
+  // 卸掉 iframe —— 所以返回的是令牌列表，不是一个计数。
+  check(
+    /pub\(super\) fn forget_plugin\(&self, plugin_id: &str\) -> Vec<String>/.test(sandboxRs),
+    'forget_plugin 返回被撤销的令牌列表（调用方要靠它们让前端卸掉 iframe）'
   );
 
   // ============================================================
@@ -396,11 +511,30 @@ section('单一真源');
   // 诊断工具要由人叫才动。现在它由「插件」页上的按钮触发（`sandbox_self_test`）。
   //
   // 而能力本身要留着：它验的是边界本身，自检页是仓库里唯一会去故意违规的地方。
-  const openSelftestFn = /pub async fn open_selftest[\s\S]*?\n}\n/.exec(sandboxRs);
-  check(openSelftestFn !== null, 'sandbox.rs 里有 open_selftest()，且是 async');
+  //
+  // 它仍然是一个**真窗口**（`WebviewWindowBuilder`）："这个文档里有没有
+  // `__TAURI_INTERNALS__`"只有在真 webview 里才问得出来 —— iframe 里那两个全局
+  // 本来就按设计不存在，在那里问等于自问自答。
+  const openSelftestFn = /pub fn open_selftest<[\s\S]*?\n}\n/.exec(sandboxRs);
+  check(openSelftestFn !== null, 'sandbox.rs 里有 open_selftest()');
   check(
-    openSelftestFn !== null && !/open_surface_at/.test(openSelftestFn[0]),
+    openSelftestFn !== null && !/open_surface\(/.test(openSelftestFn[0]),
     '自检不给插件建界面（它只建自检页）'
+  );
+  // 自检窗口的令牌必须跟着窗口一起消失，而且**两条关闭路径都要挂**：
+  // 页面里那个"关闭"按钮走 `request_selftest_close`，窗口右上角的 X 走窗口事件。
+  // 只挂一条的话，另一条会留下一个仍然有效的令牌。
+  check(
+    /pub fn forget_selftest<[\s\S]*?forget_plugin\(SELFTEST_ID\)/.test(sandboxRs),
+    'forget_selftest 收回自检令牌（按 SELFTEST_ID 收，不误伤真插件）'
+  );
+  check(
+    /WindowEvent::Destroyed[\s\S]{0,200}?forget_selftest\(&handle\)/.test(sandboxRs),
+    '自检窗口被 X 关掉时令牌也跟着收回（只挂页面里那个按钮的话，X 会留下一条仍有效的令牌）'
+  );
+  check(
+    /surfaces\.issue\(key\)/.test(sandboxRs) && /SurfaceKey::new\(SELFTEST_ID/.test(sandboxRs),
+    '自检页与真插件界面走**同一套**身份机制（不给它开小门）'
   );
 
   // 启动路径（生成模板）里不许出现自检调用。这条盯的是"别再把它加回去"。
@@ -444,51 +578,116 @@ section('单一真源');
 // 插件 id 允许含 `.` `_` `-`，而标签的字符集更窄 —— 把 id 直接拼进标签会在
 // `a.b` 与 `a-b` 之间产生歧义。
 
+// ============================================================
+// 6. 身份是**令牌**，不是标签，也不是路径里声称的插件 id
+// ============================================================
+//
+// iframe 模型把身份的来源整个换掉了，这一节因此是全新的：
+//
+//   * iframe 没有自己的 webview 标签 —— `ctx.webview_label()` 对**全部**插件界面
+//     都返回 `main`。拿它当身份会让所有插件塌成同一个插件，症状是"装上第二个
+//     插件之后，它读到了第一个插件的数据"；
+//   * URL 里也没有插件 id 可以撒谎（地址是 `/<令牌>/…`）。因此从前那条
+//     "路径第一段必须与插件 id 相符"不再需要 —— 而且**不该**回来：它检查的是
+//     一个攻击者本来就能写对的东西；
+//   * 令牌是 `uuid` v4 的简单形式（32 个十六进制字符、122 位随机），**不能**由
+//     插件 id 派生。派生出来的令牌是可猜的，而猜中一个就等于拿到了那个插件的
+//     全部数据面（`data` 通道能读写的每一个字节）。
+
 section('身份来源');
 
 {
+  // 令牌的形状：32 个十六进制字符。这条形状校验是**第一道闸门**（路径第一段完全
+  // 来自外部），也是 `handle` 能安全地拿它去哈希之前唯一的代价。
   check(
-    /surfaces\.key_of\(label\)/.test(sandboxRs),
-    'handle() 从界面表取界面身份（而不是解析标签前缀）'
+    /pub\(super\) fn is_token\(token: &str\) -> bool \{\s*\n\s*token\.len\(\) == 32 && token\.bytes\(\)\.all\(\|b\| b\.is_ascii_hexdigit\(\)\)/.test(
+      sandboxRs
+    ),
+    'is_token 先按形状挡一道（长度 32 + 全是十六进制字符）'
+  );
+  // 令牌必须来自密码学随机源，而不是由插件 id 拼出来。
+  check(
+    /uuid::Uuid::new_v4\(\)\.simple\(\)\.to_string\(\)/.test(sandboxRs),
+    '令牌用 uuid v4 生成（122 位随机；由插件 id 派生的令牌是可猜的）'
+  );
+  const issueFn = /pub\(super\) fn issue\(&self, key: SurfaceKey\) -> String \{[\s\S]*?\n    \}/.exec(
+    sandboxRs
+  )?.[0] ?? '';
+  check(
+    /fn new_token\(\)/.test(sandboxRs) && /new_token\(\)/.test(issueFn),
+    'issue 经 new_token() 生成（令牌的产生只有一处实现）'
+  );
+  // 幂等：同一个界面永远只拿到一个令牌。少了它，React 的重复渲染与 StrictMode
+  // 的双调用会每次签发一个新令牌 —— 旧的那些永远不会被回收，也就永远有效，
+  // 而它们对应的 iframe 早已不存在。
+  check(
+    /registry\.by_key\.get\(&key\)[\s\S]{0,120}?return token\.clone\(\)/.test(issueFn),
+    'issue 是幂等的（同一界面复用同一个令牌，否则会攒下一堆没人看得见却仍然有效的凭据）'
+  );
+  // 碰撞检查：32 个十六进制字符的空间大到不会碰撞，但"不会"不是"不必检查"。
+  check(
+    /while registry\.by_token\.contains_key\(&token\)/.test(issueFn),
+    'issue 对令牌碰撞做检查（一次碰撞的后果是两个插件共享一份数据）'
+  );
+
+  // `handle()`：令牌取自**路径第一段**，身份取自界面表。
+  const handleFn = /async fn handle<R: Runtime>\([\s\S]*?\n}\n/.exec(sandboxRs)?.[0] ?? '';
+  check(handleFn.length > 0, '能定位到 handle() 的函数体');
+  check(
+    /let token = segments\.first\(\)\.copied\(\)\.unwrap_or\(""\)/.test(handleFn),
+    'handle() 从请求路径的第一段取令牌'
   );
   check(
-    /claimed != view\.id/.test(sandboxRs),
-    '路径第一段必须与插件 id 相符'
+    /if !is_token\(token\)/.test(handleFn) && /surfaces\.key_of\(token\)/.test(handleFn),
+    'handle() 先判令牌形状，再用界面表把令牌换成身份（表里没有就是"不是插件界面"）'
   );
-  // 界面名同样要经清单核实，而不是从标签里直接切出来用。
-  // 直接切会把"清单里已经删掉的界面"继续服务起来 —— 症状是"改了清单但界面还是旧的"。
-  // 这条同样要锚在控制流上：`.or(Some(prim ary))` 那种"总能拿到一个界面"的
-  // 兜底写法会保留 `view.surface(&key.surface)` 这句文本，却把校验绕过去了。
+  // **identity 绝不来自 webview 标签。** 这一条是本文件里最值得单钉的一条：
+  // iframe 模型下 `webview_label()` 恒为 `main`，用它当身份等于把所有插件
+  // 合成一个。注释里提到它是允许的（那是说明为什么不能用），判据因此先剥注释。
   check(
-    /let Some\(surface\) = view\.surface\(&key\.surface\) else \{[\s\S]{0,240}?return text\(404/.test(
+    !/webview_label/.test(strip(handleFn)),
+    'handle() 不看 webview_label（iframe 模型下它对全部插件界面都返回 main）'
+  );
+  // 旧设计那条"路径第一段必须等于插件 id"的检查**不许回来**：URL 里已经没有
+  // 插件 id 可撒谎，而重新引入它只会给出一条"看起来在防护"的假判断。
+  check(
+    !/claimed != view\.id/.test(sandboxRs),
+    '不再检查"路径第一段与插件 id 相符"（URL 里没有 id 可撒谎，那条检查是假的）'
+  );
+  // 界面名仍然要经清单核实，而不是从令牌那一侧信一个值过来。
+  // 直接信会把"清单里已经删掉的界面"继续服务起来 —— 症状是"改了清单但界面还是旧的"。
+  check(
+    /let Some\(surface\) = view\.surface\(&key\.surface\) else \{[\s\S]{0,300}?return text\(404/.test(
       sandboxRs
     ),
     'handle() 用清单核实界面名，找不到就 404'
   );
+  // 自检页那一条**也必须排在令牌校验之后**：它是宿主内置的，但把它公开给任何
+  // 请求都读得到的地址没有好处。
   check(
-    /fn label_for/.test(sandboxRs) && /LABEL_PREFIX/.test(sandboxRs),
-    '标签由 label_for 统一产出'
+    handleFn.indexOf('key_of(token)') < handleFn.indexOf('SELFTEST_ID'),
+    '自检分支排在令牌校验之后（内置文档也不该有一条谁都能读到的地址）'
+  );
+
+  // ---- 标签一整套东西应当**消失** ----
+  //
+  // 从前标签是身份（`label_for` 产出、`claim` 检测冲突）。iframe 没有标签，
+  // 于是那套机制整体删掉了。判据是它们**不在了** —— 留下来会让人以为身份
+  // 还有一条按标签的路径，而下一个人照着它写就会重新踩那个"全部塌成一个"的坑。
+  check(
+    !/fn label_for\b/.test(sandboxRs) && !/fn label_for_surface/.test(sandboxRs),
+    'label_for / label_for_surface 已删除（iframe 没有标签，身份不再从标签来）'
   );
   check(
-    /fn label_for_surface/.test(sandboxRs),
-    '次级界面的标签由 label_for_surface 统一产出（界面名带 # 后缀）'
+    !/fn claim\b/.test(sandboxRs) && !/标签冲突/.test(sandboxRs),
+    '标签冲突检测已删除（它检查的是一套不再存在的机制）'
   );
-  // 主界面不带后缀 —— 这一条是"已发布单界面插件逐字节不变"的那个保证。
+  // 真插件界面不再有窗口标签 —— 唯一还带 `plugin-` 前缀的标签是自检窗口，
+  // 而它必须带着那个前缀：`capabilities/` 靠它把这类窗口排除在全部 IPC 之外。
   check(
-    /if surface == super::surfaces::PRIMARY_SURFACE \{[\s\S]{0,80}format!\("\{LABEL_PREFIX\}\{sanitized\}"\)/.test(
-      sandboxRs
-    ),
-    '主界面的标签仍然是不带 # 的那一条（已发布的单界面插件因此一字不改）'
-  );
-  // 反过来：次级界面**必须**带上界面名。少了它，同一插件的两个界面会抢同一条
-  // 标签，而 `claim` 会把第二个判成冲突 —— 症状是"详情界面永远打不开"。
-  check(
-    /format!\("\{LABEL_PREFIX\}\{sanitized\}#\{surface\}"\)/.test(sandboxRs),
-    '次级界面的标签带上界面名（否则同一插件的两个界面互相冲突）'
-  );
-  check(
-    /标签冲突/.test(sandboxRs),
-    '标签冲突被显式检测（否则两个插件里有一个会静默失效）'
+    /pub const SELFTEST_LABEL: &str = "plugin-selftest";/.test(sandboxRs) &&
+      !/format!\("\{LABEL_PREFIX\}/.test(sandboxRs),
+    'SELFTEST_LABEL 是唯一还在拼出来的 plugin-* 窗口标签（真插件界面是 iframe，没有标签）'
   );
 }
 
@@ -564,24 +763,15 @@ const shortPath = (file: string): string =>
   file.replace(resolve(here, '../src-tauri/src'), 'src').replace(/\\/g, '/');
 
 /**
- * 剥掉行注释与块注释。
+ * 在一个文件里，剥掉注释之后含某个词的所有文件。
  *
- * **这一步不是可选的。** 这一节要找的每个词（`get_webview_window`、`add_child`、
- * `block_on`）都恰好是本仓库里被**长篇解释过为什么不能用**的词。不剥注释的话，
- * 一份说明"不许这么写"的注释会把门禁判成违规，而修它的唯一办法是删掉注释 ——
- * 于是最该留下的那份知识第一个消失。
+ * `stripComments` / `strip` 定义在文件开头（第 6 节起就要用）。
  */
-const stripComments = (source: string): string =>
-  source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-
-/** 在一个文件里，剥掉注释之后含某个词的所有文件。 */
 function filesContaining(needle: string, files: string[]): string[] {
   return files
     .filter((file) => stripComments(readFileSync(file, 'utf8')).includes(needle))
     .map(shortPath);
 }
-
-const strip = stripComments;
 
 // ============================================================
 // 8. 窗口查找不许走 `get_webview_window`
@@ -621,67 +811,92 @@ section('窗口查找');
 }
 
 // ============================================================
-// 9. 创建 webview 只能是所有者线程的事
+// 9. 现在只剩一个地方会创建窗口，而且只为自检窗口
 // ============================================================
 //
-// 这一节守的是本仓库发生过的**最严重**的一次缺陷：整机假死。
+// 这一节从前守的是本仓库发生过的**最严重**的一次缺陷：整机假死。
 //
 // 现象：点开一个沙箱插件之后，其余插件全部失效，主窗口的关闭/最大化/最小化全部
 // 没反应，托盘菜单同样没反应，而进程还活着、日志**戛然而止**、一条 ERROR 都没有。
 //
-// 真因是三条事实叠在一起（推导见 plugins/surface.rs 的文件头）：
-//
-//   1. `Window::add_child` = `run_on_main_thread(闭包)` + `rx.recv()` ——
-//      它**阻塞调用它的线程**；
-//   2. `run_on_main_thread` 在已经身处主线程时短路成**直接调用**；
-//   3. `#[tauri::command]` 默认是 `ExecutionContext::Blocking`，函数体就地执行，
-//      而 IPC 回调跑在主线程上。
-//
+// 真因是三条事实叠在一起：`Window::add_child` = `run_on_main_thread(闭包)` +
+// `rx.recv()`（它**阻塞调用它的线程**）；`run_on_main_thread` 在已经身处主线程时
+// 短路成**直接调用**；而 `#[tauri::command]` 的函数体在主线程上就地执行。
 // 于是"同步命令里建 webview" = 在 WebView2 自己的事件回调里同步创建另一个
-// WebView2 控制器，主线程从此不再回到事件循环。
+// WebView2 控制器，主线程从此不再回到事件循环。完整推导留在 git 历史里
+// `surface.rs` 的文件头（那个文件已经删掉）。
 //
-// 日志里其实已经跑过一次对照实验：自检界面由**另一个线程**创建，连续三个会话都
-// 成功；插件界面由前端命令创建，直接断在那里。唯一变量就是调用线程。
+// iframe 模型把整条路径拿掉了：插件界面是一块由 React 渲染的 `<iframe>`，
+// **没有任何 Rust 代码去创建它**。于是"所有者线程"这套机制整体成为历史。
 //
-// 下面每一条都指向同一句话：**动窗口的代码只允许在 surface.rs 的所有者线程上。**
+// 但"创建窗口"这件事没有消失，它剩下一处：**自检窗口**。这一节因此改成守那个
+// 残留 —— 全仓只有 `sandbox.rs` 会建窗口，而且只为 `SELFTEST_LABEL` 建。
+// 判据是"数出来只有一个"：这条边界失效的方向正是"下一个人顺手在别处又建了一个
+// 窗口"，而它的代价仍然是主线程阻塞。
 
-section('界面线程');
+section('创建窗口的位置');
 
 {
-  const surfaceFile = '../src-tauri/src/modules/plugins/surface.rs';
-  const surfaceRs = read(surfaceFile);
   const commandsRs = read('../src-tauri/src/modules/plugins/commands.rs');
 
-  // ① `add_child` 全仓只能出现在 surface.rs。
-  //    它出现在别处 = 有人在某个没被约束的线程上建 webview。
+  // ① `surface.rs` 已经删除。它存不存在是这一整节的前提：留着它，下一个人就会
+  //    照着它的所有者线程模型继续写。
+  check(
+    !exists('../src-tauri/src/modules/plugins/surface.rs'),
+    'plugins/surface.rs 已删除（插件界面不再由 Rust 创建）'
+  );
+
+  // ② `add_child` 全仓一处都不许有。它是那条整机假死路径的入口。
   const addChild = filesContaining('add_child', rustSources());
   check(
-    addChild.length === 1 && addChild[0].endsWith('plugins/surface.rs'),
-    addChild.length === 1 && addChild[0].endsWith('plugins/surface.rs')
-      ? 'add_child 只出现在 plugins/surface.rs（所有者线程）'
-      : `add_child 出现在这些文件里 —— 它们不在被约束的线程上：${addChild.join('、') || '（一处都没有，那也不对）'}`
+    addChild.length === 0,
+    addChild.length === 0
+      ? '全仓没有 add_child（插件界面是 iframe，不由 Rust 创建）'
+      : `这些文件仍在用 add_child —— 它会阻塞调用它的线程：${addChild.join('、')}`
   );
 
-  // ② 在 surface.rs 自身也只能有一处调用点。
-  //    多出来的那一份几乎一定是被复制到了 create() 之外的地方，而那里可能正跑在
-  //    主线程上 —— 这正是假死的形状。
-  const addChildCalls = (strip(surfaceRs).match(/\.add_child\s*\(/g) ?? []).length;
+  // ③ 所有者线程这套机制整体消失。判据落在源码（剥注释）上：留着它的名字会让人
+  //    以为还有一条"只能在某个线程上做"的约束，而照着写就会重新踩回假死。
   check(
-    addChildCalls === 1,
-    addChildCalls === 1
-      ? 'surface.rs 里 add_child 只有一个调用点'
-      : `surface.rs 里有 ${addChildCalls} 个 add_child 调用点，应当只有 1 个`
+    !/SurfaceActor/.test(strip(sandboxRs)),
+    'sandbox.rs 里没有 SurfaceActor（所有者线程这套机制整体消失）'
   );
-
-  // ③ 所有者线程真的存在。字符串里找不到就说明有人把线程换成了"就地执行"。
   check(
-    /mpsc::channel::<Job>\(\)/.test(surfaceRs) &&
-      /\.spawn\(move \|\| run\(app, rx\)\)/.test(surfaceRs),
-    'surface.rs 起了一条专属线程来执行界面操作'
+    !/std::thread::spawn/.test(strip(sandboxRs)),
+    'sandbox.rs 不起任何线程（签发令牌与建自检窗口都不需要）'
+  );
+  check(
+    !/mpsc::channel::<Job>\(\)/.test(sandboxRs) && !/\bJob\b/.test(strip(sandboxRs)),
+    'sandbox.rs 里没有作业队列（Job 是所有者线程的配套，一起删掉了）'
   );
 
-  // ④ 宿主侧不许把线程钉住。`block_on` 会把调用它的线程钉在那里，
-  //    而那个线程可能是主线程 —— 上一次就是它（在 open_surface_at 里读注册表）。
+  // ④ **全仓唯一创建窗口的地方**是 sandbox.rs 里的自检窗口。
+  //
+  //    这条是这一节的核：多一处就说明有人在别的地方建窗口，而那条路径可能正跑在
+  //    主线程上 —— 那正是假死的形状。
+  const windowBuilders = filesContaining('WebviewWindowBuilder', rustSources());
+  check(
+    windowBuilders.length === 1 && windowBuilders[0].endsWith('plugins/sandbox.rs'),
+    windowBuilders.length === 1 && windowBuilders[0].endsWith('plugins/sandbox.rs')
+      ? '全仓只有 plugins/sandbox.rs 会创建窗口'
+      : `这些文件在创建窗口：${windowBuilders.join('、') || '（一处都没有，那也不对）'} —— 多出来的那处可能正跑在主线程上`
+  );
+  const builderCalls = (strip(sandboxRs).match(/WebviewWindowBuilder::new\s*\(/g) ?? []).length;
+  check(
+    builderCalls === 1,
+    builderCalls === 1
+      ? 'sandbox.rs 里只有一个窗口创建点'
+      : `sandbox.rs 里有 ${builderCalls} 个窗口创建点，应当只有 1 个`
+  );
+  //    而那个创建点**必须**用 SELFTEST_LABEL：真插件界面是 iframe，没有任何一个
+  //    属于它们的窗口标签。用别的标签建出来就是一个"没有 capability 归属"的窗口。
+  check(
+    /WebviewWindowBuilder::new\(app, SELFTEST_LABEL,/.test(sandboxRs),
+    '那个窗口创建点用的是 SELFTEST_LABEL（真插件界面没有窗口，不该有别的标签）'
+  );
+
+  // ⑤ 宿主侧不许把线程钉住。`block_on` 会把调用它的线程钉在那里，而那个线程
+  //    可能是主线程 —— 上一次就是它（在 open_surface_at 里读注册表）。
   const blockOn = filesContaining('block_on', rustSources().filter((f) => shortPath(f).includes('/plugins/')));
   check(
     blockOn.length === 0,
@@ -690,7 +905,7 @@ section('界面线程');
       : `这些插件文件仍在 block_on —— 它会把调用线程钉住：${blockOn.join('、')}`
   );
 
-  // ⑤ 也不许自己去投主线程消息。这条与 block_on 是同一类错误的两张面孔。
+  // ⑥ 也不许自己去投主线程消息。这条与 block_on 是同一类错误的两张面孔。
   const mainThread = filesContaining('run_on_main_thread', rustSources().filter((f) => shortPath(f).includes('/plugins/')));
   check(
     mainThread.length === 0,
@@ -699,57 +914,64 @@ section('界面线程');
       : `这些插件文件在直接投主线程消息：${mainThread.join('、')}`
   );
 
-  // ⑥ 四条界面命令必须是 async。
-  //    同步命令的函数体在主线程上就地执行 —— 这不是风格问题，是假死的成因。
-  for (const name of [
-    'sandbox_surface_open',
-    'sandbox_surface_hide',
-    'sandbox_surface_close',
-    'sandbox_surface_bounds',
-  ]) {
+  // ⑦ 界面命令表：`open` 与 `close` 两条，都必须是 async。
+  //
+  //    同步命令的函数体在主线程上就地执行 —— 这不是风格问题，是当年那条假死的
+  //    成因。`open` 现在只签发令牌、`close` 只撤销令牌，两条都不碰窗口系统，但
+  //    "不许退回同步"这条约定没有理由松动：它们仍然读 `PluginManager`（一把
+  //    tokio 锁），而同步地去等一把异步锁会把主线程钉住。
+  //
+  //    `hide` / `bounds` 已经删除：原生 webview 需要显隐与摆放，iframe 由 CSS
+  //    决定这两件事。它们**不许回来** —— 命令还存在就说明有人以为界面还是原生层。
+  for (const name of ['sandbox_surface_open', 'sandbox_surface_close', 'sandbox_self_test']) {
     check(
       new RegExp(`pub async fn ${name}\\b`).test(commandsRs),
-      `${name} 是 async（写成同步就会在主线程上创建 webview）`
+      `${name} 是 async（同步命令的函数体在主线程上就地执行）`
+    );
+  }
+  for (const name of ['sandbox_surface_hide', 'sandbox_surface_bounds']) {
+    check(
+      !new RegExp(`pub async fn ${name}\\b`).test(commandsRs),
+      `${name} 已删除（iframe 的显隐与摆放由 CSS 决定，没有可隐藏/摆放的原生层）`
+    );
+  }
+  // 命令定义删了、`generate_handler!` 里却还留着，是一个**只在运行期**才现形的
+  // 缺陷：宿主会尝试注册一个不存在的命令名，而症状是"调用了不存在的命令" ——
+  // 而那句话看起来像前端写错了命令名。因此登记表也要一起断言。
+  const handlerList =
+    /tauri::generate_handler!\[[\s\S]*?\n    \]/.exec(read('../src-tauri/src/lib.rs'))?.[0] ?? '';
+  check(handlerList.length > 0, '能从 lib.rs 里定位到 generate_handler! 的命令登记表');
+  for (const name of ['sandbox_surface_open', 'sandbox_surface_close', 'sandbox_self_test']) {
+    check(
+      new RegExp(`\\b${name},`).test(handlerList),
+      `${name} 登记进了 generate_handler!（命令定义在那里，登记表也得有）`
+    );
+  }
+  for (const name of ['sandbox_surface_hide', 'sandbox_surface_bounds']) {
+    check(
+      !new RegExp(`\\b${name},`).test(handlerList),
+      `${name} 从 generate_handler! 里移除了（留着就是"调用了不存在的命令"）`
     );
   }
 
-  // ⑦ 所有者线程必须真的被托管。忘了 manage 的话，每条命令都会回
-  //    "界面线程尚未就绪" —— 一个看起来像初始化顺序问题的错误。
+  // ⑧ `SandboxSurfaces` 必须真的被托管，协议必须真的被注册。忘了 manage 的话，
+  //    每条命令都会回"沙箱界面表尚未就绪" —— 一个看起来像初始化顺序问题的错误。
   const generatorTs = read('../scripts/generate-backend-module.ts');
   check(
-    /SurfaceActor::spawn\(handle\.clone\(\)\)/.test(generatorTs) &&
-      /SurfaceActor::spawn\(handle\.clone\(\)\)/.test(read('../src-tauri/src/lib.rs')),
-    'lib.rs（及其模板）托管了 SurfaceActor'
-  );
-
-  // ⑧ 自检界面也必须走所有者线程。它曾经自己 spawn 一条线程 —— 那条路径能工作，
-  //    但它是"绕过约束"的先例：下一个人照着它写就会在别处照抄出一个主线程调用。
-  check(
-    !/std::thread::spawn/.test(strip(sandboxRs)),
-    'sandbox.rs 不再自己起线程（自检也走所有者线程）'
-  );
-
-  // ⑨ 驻留上限。`hide` 而不 `close` 是有代价的：切过的每个沙箱插件都会留下一个
-  //    渲染进程。没有上限，那是**设计出来的内存泄漏**。
-  const code = strip(surfaceRs);
-  check(
-    /const MAX_RESIDENT: usize = \d+/.test(code),
-    'surface.rs 有驻留上限常量'
+    /modules::plugins::sandbox::SandboxSurfaces::default\(\)/.test(generatorTs) &&
+      /modules::plugins::sandbox::SandboxSurfaces::default\(\)/.test(read('../src-tauri/src/lib.rs')),
+    'lib.rs（及其模板）托管了 SandboxSurfaces'
   );
   check(
-    /fn enforce_cap\(/.test(code) && /MAX_RESIDENT/.test(code),
-    '超过上限时真的会执行淘汰'
+    /modules::plugins::sandbox::register\(builder\)/.test(generatorTs) &&
+      /modules::plugins::sandbox::register\(builder\)/.test(read('../src-tauri/src/lib.rs')),
+    'lib.rs（及其模板）注册了沙箱协议（少了它每一条插件请求都到不了）'
   );
-  // ⑩ 淘汰必须**只**看隐藏的那些。少了这个过滤，用户正在看的界面会被别处打开的
-  //    插件销毁掉 —— 一个"我点了一下别的插件，眼前这个就白了"的故障。
+  //    而生成模板里不许再有所有者线程的托管：模板是"新模块生成出来长什么样"的
+  //    依据，留着旧的那一行会让下一个人把它当成仍然需要的初始化。
   check(
-    /filter\(\|\(_, resident\)\| !resident\.visible\)/.test(code),
-    '淘汰只挑隐藏的界面（正在被看着的永远不动）'
-  );
-  // ⑪ 回收与关闭都必须撤掉界面表里的占位。留着的话，那个插件**再也打不开**。
-  check(
-    /fn forget_claim</.test(code) && /forget_claim\(app, &label\)/.test(code),
-    '淘汰与关闭都撤销界面表里的占位（否则那个插件再也打不开）'
+    !/SurfaceActor::spawn/.test(strip(generatorTs)),
+    '生成模板里不再托管 SurfaceActor'
   );
 }
 
@@ -757,12 +979,17 @@ section('界面线程');
 // 10. 前端这一侧：隐藏与跟随
 // ============================================================
 //
-// 这两条守的是"界面看起来对不对"，而它们失效时同样不会有任何报错：
+// 这一节守的是前端与宿主之间那条**唯一的**协作契约：换一个令牌、把宿主推来的
+// 消息转成 `postMessage`。它失效时不会有任何报错：
 //
-//   * 少掉 `hide` → 切走标签之后插件界面**仍然浮在别的标签上面**；
-//   * 少掉滚动监听 → 宿主内容一滚，插件界面就停在原地，看起来像错位。
+//   * 少了令牌转发 → 插件永远收不到主题/命令/事件，表现是"改了主题它不动"；
+//   * `postMessage` 用了 `'*'` → 任何被嵌进来的文档在换过来源之后还收得到这条
+//     消息，而那正是 `postMessage` 最常见的一类事故；
+//   * iframe 少了 `sandbox` 属性 → 插件拿回弹窗、表单提交、顶层跳转这些出站路径。
 //
-// 两者的共同点是"只有肉眼能发现"，而那正是门禁该管的东西。
+// 而**从前那一整套几何逻辑整个消失了**：量矩形、跟随滚动、命中最上层元素。
+// 那是原生 webview 时代的产物（它盖在 DOM 之上、不随 CSS 走）。iframe 就在这个
+// 文档里，层级与位置由 CSS 决定。因此这一节也从"守几何"变成"守转发与边界"。
 
 section('前端界面协作');
 
@@ -770,72 +997,107 @@ section('前端界面协作');
   const serviceTs = read('../src/services/sandboxSurface.ts');
   const componentTsx = read('../src/components/SandboxSurface.tsx');
 
-  check(
-    /invoke\('sandbox_surface_hide'/.test(serviceTs),
-    '前端门面暴露了 hide（隐藏而不销毁）'
-  );
-  // 界面名走的是组件里的局部变量 `surfaceId`（它把缺省的 `main` 收在一处）。
-  // 断言因此盯的是"那个变量被传下去了"，而不是某个具体的变量名。
-  check(
-    /hideSandboxSurface\(pluginId, surfaceId\)/.test(componentTsx),
-    '不可见时调用 hide，而不是 close'
-  );
-  check(
-    /closeSandboxSurface\(pluginId, surfaceId\)/.test(componentTsx),
-    '卸载时才调用 close'
-  );
-  // 卸载时**只关自己这一块界面**，不是整个插件。
-  //
-  // 关掉整个插件在单界面时代是对的，多界面之后会变成一个很糟的 bug：主界面
-  // 的标签被切走时，插件的详情界面被一起销毁 —— 而用户完全不知道它为什么没了。
-  // 真正该"关掉全部"的是插件被停用/卸载那条路径，那时调用方只传插件 id。
-  check(
-    !/closeSandboxSurface\(pluginId\)\.catch/.test(componentTsx),
-    'SandboxSurface 卸载时不关掉整个插件的界面（那会顺手销毁兄弟界面）'
-  );
-  // 四条命令**都必须把界面名传下去**。漏一个的表现是那个操作作用在主界面上，
-  // 而用户动的是详情界面 —— 例如"关掉详情"结果关掉了主列表。
-  //
-  // `open` 与 `bounds` 走的是同一个变量 `call`（它们只差一个 IPC 名字），
-  // 因此这里分两步：先断言那个变量确实指向这两个函数，再断言调用点带着界面名。
-  check(
-    /const call = mode === 'open' \? openSandboxSurface : setSandboxSurfaceBounds;/.test(
-      componentTsx
-    ),
-    '打开与摆放走同一条调用路径（只差一个 IPC 名字）'
-  );
-  check(
-    /call\(pluginId, bounds, surfaceId, /.test(componentTsx),
-    '打开/摆放把界面名传给宿主（少了它每个界面都会退化成主界面）'
-  );
-  for (const fn of ['hideSandboxSurface', 'closeSandboxSurface']) {
+  // ---- 门面：只剩这几件事 ----
+  for (const fn of [
+    'openSandboxSurface',
+    'closeSandboxSurface',
+    'runSandboxSelfTest',
+    'subscribeSandboxPush',
+    'postToSurface',
+  ]) {
     check(
-      new RegExp(`${fn}\\(pluginId, surfaceId\\)`).test(componentTsx),
-      `${fn} 把界面名传给宿主（少了它每个界面都会退化成主界面）`
+      new RegExp(`export function ${fn}\\b`).test(serviceTs),
+      `门面暴露了 ${fn}`
+    );
+  }
+  // 而几何那一整套**不许回来**。命令已经删掉，前端留着对应函数会让下一个人
+  // 以为界面还是原生层，照着它写就会去要一个不存在的 IPC。
+  for (const ghost of [
+    'sandbox_surface_hide',
+    'sandbox_surface_bounds',
+    'hideSandboxSurface',
+    'setSandboxSurfaceBounds',
+    'measureSurface',
+  ]) {
+    check(
+      !new RegExp(ghost).test(strip(serviceTs)) && !new RegExp(ghost).test(strip(componentTsx)),
+      `${ghost} 已删除（iframe 的显隐与摆放由 CSS 决定，没有可隐藏/摆放的原生层）`
     );
   }
 
-  // 滚动事件**不冒泡**，且滚动发生在祖先容器而不是 window 上。
-  // 只在 window 上监听冒泡阶段等于什么都没听 —— 这条断言盯的就是那个写法。
+  // ---- 打开：必须把**界面名**传下去 ----
+  //
+  // 界面名走的是组件里的局部变量 `surfaceId`（它把缺省的 `main` 收在一处）。
+  // 断言因此盯的是"那个变量被传下去了"，而不是某个具体的变量名。少了它，
+  // 同一插件的两个界面会去要同一个主界面 —— 症状是"详情页显示的是列表"。
   check(
-    /addEventListener\('scroll',\s*schedule,\s*true\)/.test(componentTsx),
-    "滚动监听带捕获标志（滚动不冒泡，冒泡阶段收不到）"
+    /openSandboxSurface\(pluginId, surfaceId\)/.test(componentTsx),
+    '打开时把界面名传给宿主（少了它每个界面都会退化成主界面）'
   );
 
-  // 宿主浮层盖上来时必须让位。判据是命中最上面的元素是不是占位块自己。
+  // ---- 关闭：认**令牌**，不认名字 ----
+  //
+  // 一个界面在"关掉又打开"之间会拿到不同的令牌。按名字关会让一次迟到的卸载
+  // （StrictMode 的双调用、快速切标签）把**新开的那一块**关掉 —— 表现是
+  // "界面开着却什么都读不到"。
   check(
-    /elementFromPoint/.test(componentTsx),
-    '宿主浮层遮挡时会让位（而不是盖在浮层上面）'
+    /closeSandboxSurface\(current\.token\)|closeSandboxSurface\(next\.token\)/.test(componentTsx),
+    '关闭认令牌（认名字会让一次迟到的卸载关掉新开的那一块）'
+  );
+  check(
+    !/closeSandboxSurface\(pluginId/.test(componentTsx),
+    'SandboxSurface 不按插件 id 关（那会顺手销毁这个插件的兄弟界面）'
+  );
+  // 请求作废（组件卸载或参数变了）时，刚换到的凭据必须**还回去**。不还的话，
+  // 宿主那一侧会留下一条指向不存在 iframe 的记录，而它仍然读得到这个插件的数据。
+  check(
+    /if \(cancelled\) \{[\s\S]{0,400}?closeSandboxSurface\(next\.token\)/.test(componentTsx),
+    '请求作废时把刚拿到的令牌还回去（否则会留下一条仍然有效的凭据）'
   );
 
-  // ---- 矩形从哪里来 ----
+  // ---- 转发：按令牌挑订阅者，再 postMessage ----
+  check(
+    /subscribeSandboxPush\(/.test(componentTsx) && /push\.token !== current\.token/.test(componentTsx),
+    '推送按令牌分发给对应的那一块界面（不分发的话主题会推给别的插件）'
+  );
+  check(
+    /postToSurface\(frame\.current, current\.url, push\)/.test(componentTsx),
+    '推送最终交给 postToSurface（Rust 够不到 iframe 的文档，只有这个文档能转发）'
+  );
+  // `close` 是一条**宿主撤销界面**的推送：前端必须把凭据清掉（iframe 随之从渲染树
+  // 上消失），而不是把它当成一条普通消息转进文档。
+  check(
+    /if \(push\.channel === 'close'\)/.test(componentTsx) &&
+      !/postToSurface[\s\S]{0,80}?'close'/.test(componentTsx),
+    '`close` 由前端自己处理（清凭据、卸 iframe），不转进文档'
+  );
+
+  // ---- postToSurface 的 targetOrigin 必须是**算出来的** ----
   //
-  // 这里曾经量的是"占位块自己的矩形"，而占位块是 `h-full w-full` ——
-  // `h-full` 是父元素高度的 100%，父级 `div.p-8` 的高度由内容决定，内容为空，
-  // 于是高度是 **0**。实测那次建出来的 webview 是 `2240×1`：宽度对，高 1 像素。
-  // 症状看起来像"插件坏了"，根因是量错了东西。
-  //
-  // 现在量的是内容视口（`.lc-tab-panel`，`absolute inset-y-0`，高度确定）。
+  // `'*'` 意味着"任何来源都收得到这条消息"。虽然这条消息本来就是发给那个 iframe 的，
+  // 但 `'*'` 让任何被嵌进来的文档在换过来源之后还能收到它。
+  check(
+    /new URL\(url\)\.origin/.test(serviceTs),
+    'postToSurface 从宿主给的地址里取出来源（指哪打哪）'
+  );
+  const postFn = /export function postToSurface\([\s\S]*?\n\}/.exec(serviceTs)?.[0] ?? '';
+  check(
+    /target\.postMessage\(\{ __modulith: true, channel: push\.channel, payload: push\.payload \}, origin\)/.test(
+      postFn
+    ),
+    'postMessage 的 targetOrigin 是算出来的 origin，不是 \'*\''
+  );
+  check(
+    !/postMessage\([^)]*,\s*'\*'\)/.test(postFn),
+    "postToSurface **不**传 '*'（那会让换过来源的文档也收到这条消息）"
+  );
+  // 地址解析失败时必须**不发**：对着一个解析不出来的地址猜一个来源，比什么都不做更糟。
+  check(
+    /catch \{[\s\S]{0,240}?return;/.test(postFn),
+    '地址解析不出来时直接放弃这条推送（猜一个来源比什么都不做更糟）'
+  );
+
+  // ---- 布局契约与 iframe 边界 ----
   const homeTsx = read('../src/pages/Home.tsx');
 
   const selector = /const PANEL_SELECTOR = '([^']+)'/.exec(componentTsx);
@@ -844,40 +1106,42 @@ section('前端界面协作');
     selector !== null && homeTsx.includes(selector[1]),
     selector !== null && homeTsx.includes(selector[1])
       ? `内容视口选择器 ${selector?.[1]} 在 Home.tsx 里真的存在（跨文件契约没漂）`
-      : `SandboxSurface 量的是 ${selector?.[1]}，而 Home.tsx 里已经没有这个类名了 —— 矩形会量成 0`
+      : `SandboxSurface 依赖 ${selector?.[1]}，而 Home.tsx 里已经没有这个类名了 —— iframe 会铺满整个窗口`
   );
-
-  // 那个具体的错误写法不许回来。
+  // 容器必须 `absolute inset-0`：它相对的是最近的那个**定位**祖先，而
+  // `.lc-tab-panel` 正是 `absolute inset-y-0` —— 因此它给出的是内容视口本身。
+  // 换成 `h-full` 的话，父级 `div.p-8` 的高度由内容决定（内容为空 → 0），
+  // 于是 iframe 塌成 0 高。实测撞到过：界面是 2240×1。
   check(
-    !/className="h-full w-full"/.test(componentTsx),
-    '占位块不再是 h-full（父级高度由内容决定时它会塌成 0）'
+    /<div ref=\{holder\} className="absolute inset-0">/.test(componentTsx),
+    '容器是 absolute inset-0（`h-full` 会因父级高度为 0 而塌掉）'
   );
-
-  // 判据必须**具体到那几行**。第一版写的是 `/return null;/`，而文件里还有别的
-  // `return null;` —— 把守卫删掉它照样通过。用"删掉守卫"验证时它没有变红，
-  // 也就等于什么都没守。下面两条是照着实际那两行写的。
+  // **iframe 的 `sandbox` 属性是这一层的安全边界。** 没写出来的那些默认全部拒绝：
+  // 表单提交、弹窗、模态框、顶层跳转、下载、指针锁定、自动播放。两条必须放开：
+  // `allow-scripts`（插件代码本身）与 `allow-same-origin`（否则文档退化成不透明
+  // 来源，连它自己那份 fetch 都算跨源）。少了 `sandbox` 属性 = 全部放开。
   check(
-    /if \(rect\.width < 1 \|\| rect\.height < 1\) return null;/.test(componentTsx),
-    '视口本身是退化尺寸（宽或高为 0）时返回 null'
+    /sandbox="allow-scripts allow-same-origin"/.test(componentTsx),
+    'iframe 带着 sandbox="allow-scripts allow-same-origin"（少了它插件拿回弹窗/表单/顶层跳转）'
   );
-  // 插件界面**不该内缩**。这里原来会减掉父级 2rem 内边距，为的是"与其它模块
-  // 看起来一致" —— 那个意图是错的：其它模块是一张卡片，留白是设计；插件界面是
-  // 一个应用，它该占满自己那一块。实测这就是用户报的"留白、未全屏"的一半来源。
+  // 就绪信号必须是桥接层发回来的 `ready`，不是 iframe 的 `load`。
+  // `load` 在一个**加载失败**的文档上照样会触发（引擎拿自己画的错误页触发它），
+  // 用它判断成功会把"协议没接上 / 令牌被拒 / CSP 拦了自己"判成成功 ——
+  // 而症状是一块永远白着的面板。
   check(
-    !/getComputedStyle/.test(componentTsx),
-    '插件界面不按父级内边距内缩（它是应用，不是卡片）'
+    /event\.source !== frame\.current\?\.contentWindow/.test(componentTsx) &&
+      /data\.channel !== 'ready'/.test(componentTsx),
+    '就绪判据是那块 iframe 发回来的 ready（`load` 在加载失败的文档上也会触发）'
+  );
+  // 两层覆盖：启动占位在下、失败说明在上，都是普通 DOM —— `z-10` / `z-20` 就够了。
+  // 从前的原生 webview 盖在 DOM 之上，为了让它可见必须先把它显式收起来。
+  check(
+    /absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/.test(componentTsx),
+    '启动占位用 z-10 盖在 iframe 上（两者都是普通 DOM，层级由 CSS 决定）'
   );
   check(
-    /x: rect\.left,\s*\n\s*y: rect\.top,/.test(componentTsx),
-    '矩形直接就是内容视口本身'
-  );
-
-  // 而调用方必须真的**因此返回**。只让 measureSurface 返回 null、调用方继续往下走，
-  // 退化尺寸还是会到达宿主 —— 那正是 2240×1 那次的形状。
-  const applyBody = /const apply = useCallback\([\s\S]*?\n  \);/.exec(componentTsx);
-  check(
-    applyBody !== null && /if \(!bounds\) \{[\s\S]*?return;/.test(applyBody[0]),
-    '量不到视口时直接返回，不让退化尺寸走到宿主那边去'
+    /absolute inset-0 z-20 flex items-center justify-center bg-white p-6/.test(componentTsx),
+    '失败说明用 z-20 盖在占位与 iframe 之上（白面板必须说出它为什么白）'
   );
 }
 
@@ -931,6 +1195,10 @@ section('完整 API 表面');
   const fakeWindow: Record<string, unknown> = {
     // 桥接层在文档消失时要跑清理函数；这条检查里没有真实的页面生命周期。
     addEventListener: () => {},
+    // **令牌来自地址**：桥接层从 `location.pathname` 的第一段读出自己的令牌，
+    // 再据此拼 RPC 与数据的地址。这个假窗口因此必须给一个地址 —— 少了它，
+    // 整段脚本会在顶层抛一个 TypeError，而这一节会报成"桥接脚本执行失败"。
+    location: { pathname: '/0123456789abcdef0123456789abcdef/' },
   };
 
   let api: Record<string, any> | null = null;
@@ -1242,21 +1510,32 @@ section('主题链路');
   //
   // 少了这一环的表现很具体：用户切主题，已打开的插件界面**不动** ——
   // 必须关掉再打开才对。而那看起来像"这个插件不支持主题"。
+  //
+  // 中间那一跳是 iframe 模型**独有**的：Rust 拿不到那个文档（跨源），因此它只
+  // 发一条 Tauri 事件到主窗口，由前端按令牌找到 iframe 再 `postMessage` 进去。
+  // 判据因此必须覆盖**两段**：宿主推了（`push_to` 带 `"theme"` 通道），
+  // 以及它是由主题变化触发的。
   check(
-    /set_plugin_theme[\s\S]{0,1200}?apply_theme\(&app\)\.await/.test(commandsRs),
+    /set_plugin_theme[\s\S]{0,1600}?super::sandbox::apply_theme\(&app\)/.test(commandsRs),
     '主题变了会推给已经打开的插件界面（否则要关掉重开才生效）'
   );
   check(
-    /for \(label, _key\) in surfaces\.live\(\)/.test(sandboxRs),
-    '主题推送遍历全部活着的界面'
+    /for \(token, _key\) in surfaces\.live\(\)/.test(sandboxRs) &&
+      /push_to\(app, &token, "theme", payload\.clone\(\)\)/.test(sandboxRs),
+    '主题推送遍历全部活着的界面，逐条走 push_to 的 theme 通道'
   );
 
   // 推送方式是**换样式表文本**，不是重新加载界面。
   //
   // 重新加载会丢掉插件全部运行期状态（正在填的表单、滚动位置、展开的树）——
   // 用户只是切了一下明暗，不该因此丢掉正在做的事。
+  //
+  // 这一段现在在**桥接层**里（`PUSH_HANDLERS.theme`）：宿主推的是 `{css}`，
+  // 桥接层把它写进 `<style id="modulith-theme">` 的文本。判据因此落在桥接层
+  // 的 `textContent = payload.css` 上 —— 写成 `document.write` 或 `location.reload`
+  // 是同一条"重新加载"的退化，而它不会有任何报错。
   check(
-    /style\.textContent = JSON\.parse/.test(sandboxRs),
+    /style\.textContent = payload\.css/.test(bridgeJs),
     '推送主题是替换样式表文本，而不是重新加载界面'
   );
 
@@ -1275,9 +1554,10 @@ section('主题链路');
 // 13. 快捷键：焦点在插件里时宿主按键仍然要生效
 // ============================================================
 //
-// 焦点落进插件的 webview 之后，keydown 只在**插件自己的文档**里派发 ——
-// 宿主窗口上的监听器收不到。因此这一整条链路必须是通的，否则用户在插件里按
-// Ctrl+K / Ctrl+W / Ctrl+Tab 全都**一点反应都没有**，而在宿主里是好的。
+// 焦点落进插件那块 iframe 之后，keydown 只在**插件自己的文档**里派发 ——
+// 宿主文档上的监听器收不到（事件不跨文档边界）。因此这一整条链路必须是通的，
+// 否则用户在插件里按 Ctrl+K / Ctrl+W / Ctrl+Tab 全都**一点反应都没有**，
+// 而在宿主里是好的。
 
 section('快捷键链路');
 
@@ -1308,8 +1588,15 @@ section('快捷键链路');
     '入口文档里注入了快捷键表'
   );
   check(
-    /set_plugin_shortcuts[\s\S]{0,1400}?apply_shortcuts\(&app\)\.await/.test(commandsRs),
+    /set_plugin_shortcuts[\s\S]{0,1600}?super::sandbox::apply_shortcuts\(&app\)/.test(commandsRs),
     '快捷键表变了会推给已经打开的插件界面'
+  );
+  // 与主题同一条两跳通道（宿主 → 前端 → iframe），通道名是 `shortcuts`。
+  // 少了这一条，插件贡献的快捷键在**别的**插件界面里不会生效 —— 而两边都不会报错。
+  check(
+    /push_to\(app, &token, "shortcuts", payload\.clone\(\)\)/.test(sandboxRs) &&
+      /window\.__modulithShortcutsChanged/.test(bridgeJs),
+    '快捷键推送走 push_to 的 shortcuts 通道，并由桥接层交给插件'
   );
 
   // 环 3：桥接层的优先级 —— **插件自己的处理器先跑**。
@@ -1362,12 +1649,23 @@ section('快捷键链路');
 }
 
 // ============================================================
-// 14. 宿主浮层：对话框与菜单必须由**窗口**渲染
+// 14. 宿主浮层：对话框与菜单由**独立的窗口**渲染
 // ============================================================
 //
-// 沙箱插件的界面是一个原生子 webview，层级高于宿主文档的任何元素。宿主页面
-// 里画出来的浮层会被它整个盖住 —— z-index 写多大都没用，那是两套渲染层的
-// 顺序问题。因此浮层必须是一个独立的窗口。
+// **这一节的前提在 iframe 模型里变了，但结论没变。**
+//
+// 从前浮层必须是独立窗口，是因为沙箱界面是一个原生子 webview、层级高于宿主文档
+// 的任何元素 —— 宿主页面里画出来的浮层会被它整个盖住，z-index 写多大都没用。
+// 那个理由现在不成立了：插件界面是一块同文档的 iframe。
+//
+// 窗口仍然保留，因为另外两条理由与渲染层无关：
+//
+//   * 浮层要能被摆在**主窗口之外**（`tray_menu::position_for` 那份纯函数定位逻辑
+//     就是为它复用的），一个 DOM 组件做不到；
+//   * 插件画不出宿主的对话框 —— 让它自己画等于让它**冒充宿主界面**。
+//
+// 因此下面每一条断言照旧成立：它守的是"配对、超时、尺寸、失焦"这四件只有
+// 独立窗口才有的麻烦事，而它们与渲染层是哪一种无关。
 
 section('宿主浮层');
 
@@ -1384,6 +1682,18 @@ section('宿主浮层');
   // 漏登记时**开发模式一切正常**（Vite 按 URL 提供任意 HTML），而发布版里
   // 这个窗口是空白的 —— 那正是托盘菜单曾经踩过的坑，注释里写着。
   check(overlayHtmlExists, 'overlay.html 存在（浮层是独立入口）');
+  // 那个窗口必须**置顶**。主窗口里现在住着插件 iframe，而浮层要盖在它上面：
+  // 少了 `alwaysOnTop`，浮层会跑到主窗口后面，用户看到的是"点了菜单什么都没出现"。
+  {
+    const conf = JSON.parse(read('../src-tauri/tauri.conf.json')) as {
+      app?: { windows?: Array<{ label?: string; alwaysOnTop?: boolean; focus?: boolean }> };
+    };
+    const overlayWindow = (conf.app?.windows ?? []).find((w) => w.label === 'overlay');
+    check(
+      overlayWindow?.alwaysOnTop === true,
+      '浮层窗口在 tauri.conf.json 里是 alwaysOnTop（否则它会跑到主窗口后面）'
+    );
+  }
   check(
     /overlay: path\.resolve\(__dirname, 'overlay\.html'\)/.test(viteConf),
     'overlay.html 登记进了 vite 的多入口（漏了的话发布版里这个窗口是空白的）'
@@ -1471,14 +1781,17 @@ section('宿主浮层');
 // 15. 多界面（`api: 3`）
 // ============================================================
 //
-// 一个插件可以声明多个界面，每个界面一块自己的 webview。这一节守的是那件事
-// 里**最容易悄悄退化**的几处：
+// 一个插件可以声明多个界面，每个界面一块自己的 iframe（各自一份令牌）。这一节
+// 守的是那件事里**最容易悄悄退化**的几处：
 //
-//   * 主界面的标签**不带** `#` 后缀 —— 那是"已发布单界面插件一字不改"的全部依据；
-//   * 次级界面的标签**必须**带界面名 —— 少了它两个界面会抢同一条标签；
-//   * 打开界面**不由宿主建 webview**，而是广播给前端（只有前端知道摆在哪）；
+//   * 打开界面**不由宿主建任何东西**，而是广播给前端（只有前端知道把它挂在哪）；
 //   * 界面表的键是 `SurfaceKey`（插件 + 界面），不是插件 id；
-//   * 次级界面登记成 `hidden` 模块，且**不**出现在任何列表里。
+//   * 次级界面登记成 `hidden` 模块，且**不**出现在任何列表里；
+//   * 停用/卸载一个插件时，它开着的全部界面要一起消失。
+//
+// 从前这里还有两条关于**窗口标签**的（主界面标签不带 `#`、次级界面必须带界面名）。
+// iframe 没有标签：那个 `#` 后缀现在只活在**模块 id** 里（`plugin:<插件>#<界面>`），
+// 判据因此移到了下面那一条形状断言上。
 
 section('多界面（api: 3）');
 
@@ -1497,8 +1810,9 @@ section('多界面（api: 3）');
 
   // ---- 清单侧：主界面是必需的，而不是"第一个就是主界面" ----
   //
-  // 顺序定义主界面的话，调整清单顺序就会改变 webview 标签 —— 而所有关于标签的
-  // 推理（日志、断言、驻留表）都建立在"名字是稳定的"之上。
+  // 顺序定义主界面的话，调整清单顺序就会改变那个 id —— 而"单界面插件的调用方
+  // 一个字都不用改"这条保证、`Modulith.plugin.surface` 的取值、以及令牌注册表
+  // 里那一份 `(插件, 界面)` 身份，全都建立在"主界面这个名字是稳定的"之上。
   check(
     /pub const PRIMARY_SURFACE: &str = "main"/.test(surfacesRs),
     '主界面 id 是一个具名常量，而不是散在代码里的字面量'
@@ -1568,10 +1882,10 @@ section('多界面（api: 3）');
     '插件顶层就能读到 plugin.surface 与 surfaces（不必先 await）'
   );
 
-  // ---- 打开界面：**不由宿主建 webview** ----
+  // ---- 打开界面：**不由宿主建任何东西** ----
   //
-  // 只有前端知道界面该摆在哪（标签栏多高、侧边栏是否展开、分屏开没开）。
-  // 宿主在这一侧建就只能自己猜一个矩形，而猜出来的界面会漂在不对的地方。
+  // 只有前端知道界面该挂在哪（标签栏多高、侧边栏是否展开、分屏开没开），
+  // 而那件事现在是 CSS 布局：宿主在这一侧建就只能自己猜一个矩形。
   const openBranch = /"ui\.openSurface" => \{[\s\S]*?\n        \}/.exec(rpcForSurfaces);
   check(openBranch !== null, 'rpc.rs 里有 ui.openSurface 的分支');
   if (openBranch) {
@@ -1581,7 +1895,7 @@ section('多界面（api: 3）');
     );
     check(
       !/open_surface_at/.test(openBranch[0]),
-      'ui.openSurface **不自己建 webview**（那样摆出来的位置是猜的）'
+      'ui.openSurface **不自己建界面**（那样摆出来的位置是猜的）'
     );
     // 界面必须先在**当前**清单里，否则插件能要求打开一个不存在的界面，
     // 而宿主编出来的会是一块服务 404 的空面板。
@@ -1687,8 +2001,8 @@ section('多界面（api: 3）');
 
   // ---- 停用/卸载插件：它开着的界面必须一起消失 ----
   //
-  // 不关的话，那些 webview 会继续停在屏幕上，而它们属于一个"已经不存在的插件"：
-  // 下一次协议请求会被判成"当前不可用"，用户看到几块再也刷不出来的空白面板，
+  // 不关的话，那块 iframe 会继续留在屏幕上，而它属于一个"已经不存在的插件"：
+  // 令牌被收回之后它的每一条请求都 403，用户看到几块再也刷不出来的空白面板，
   // 唯一的补救是重启应用。
   for (const [command, body] of [
     ['set_plugin_enabled', /pub async fn set_plugin_enabled\([\s\S]*?\n\}/.exec(pluginCommandsRs)?.[0] ?? ''],
@@ -1712,11 +2026,11 @@ section('多界面（api: 3）');
     '模块描述符带上界面名'
   );
   // 被 `contributes.modules` 声明过的界面**不再**造隐藏模块 ——
-  // 造了的话 `ui.openSurface` 会打开隐藏的那个，同一个界面于是有两个 webview，
-  // 而 webview 标签是唯一的（宿主会判成冲突，用户看到的是"点了没反应"）。
+  // 造了的话 `ui.openSurface` 会打开隐藏的那个，同一个界面于是有两块 iframe
+  // （两份令牌、两份文档）。前端看到的是"点了没反应"，因为目标标签已经开着。
   check(
     /claimed/.test(surfacesTs) && /if \(claimed\.has\(surface\.id\)\) continue;/.test(surfacesTs),
-    '已经被模块声明过的界面不再造隐藏模块（否则同一个界面会有两块 webview）'
+    '已经被模块声明过的界面不再造隐藏模块（否则同一个界面会有两块 iframe）'
   );
 
   // 主界面不单独造隐藏模块：它已经由清单里的某一条模块代表了。
@@ -1748,8 +2062,8 @@ section('多界面（api: 3）');
 //
 //   * 徽标 / 进度画在宿主的侧边栏与标签栏上，插件文档碰不到它们 ——
 //     少接一环的表现是插件以为设了、用户什么都没看见；
-//   * 启动占位要覆盖插件那一块**位置**，而原生 webview 盖在 DOM 之上 ——
-//     少一步"把 webview 收起来"，占位就被自己盖住了，症状是"点了插件一片空白"；
+//   * 启动占位是一层**普通 DOM**（`z-10`）盖在 iframe 上 —— 少一层的话，
+//     症状是"点了插件，先看见一块空白，然后什么都没发生"；
 //   * 清单声明的右键菜单项要经由**命令机制**执行，而沙箱里没有"交出函数"
 //     这回事 —— 少一环的表现是"菜单里看得到、点了没反应"。
 
@@ -1757,10 +2071,8 @@ section('宿主渲染的状态指示与命令');
 
 {
   const rpcUiRs = read('../src-tauri/src/modules/plugins/rpc.rs');
-  const surfaceRsForUi = read('../src-tauri/src/modules/plugins/surface.rs');
   const pluginCommandsForUi = read('../src-tauri/src/modules/plugins/commands.rs');
   const managerForUi = read('../src-tauri/src/modules/plugins/manager.rs');
-  const surfaceServiceTs = read('../src/services/sandboxSurface.ts');
   const surfaceTsx = read('../src/components/SandboxSurface.tsx');
   const uiStateTs = read('../src/services/pluginUiState.ts');
   const catalogForUi = read('../src/services/moduleCatalog.ts');
@@ -1828,59 +2140,47 @@ section('宿主渲染的状态指示与命令');
     '没有界面上下文时（后台插件）三条都报错说清原因'
   );
 
-  // ---- 启动占位：webview 必须先收起来 ----
+  // ---- 命令把界面名一路传到签发那一步 ----
   //
-  // 原生 webview 盖在 DOM 之上。宿主想在那块位置上画占位，就必须先把它收起来 ——
-  // 而"先 show 再 hide"会有一帧肉眼可见的闪烁，且每次打开插件都会走到。
-  // 这两条**必须锚在 `Job::Show` 与 `fn show` 里**，不能全文件找。
-  //
-  // 试过一版全文件找的写法：`Job::Visible` 里也有 `visible: bool,`，
-  // `set_visible` 里也有 `if visible { show() } else { hide() }` ——
-  // 于是把 `Job::Show` 的那一项和 `fn show` 里那段整个删掉之后，门禁照样绿。
-  const showJob = /Show \{[\s\S]*?\n    \},/.exec(surfaceRsForUi)?.[0] ?? '';
+  // 缺省值（主界面）只在 `commands.rs` 里写出来一次。两处不一致的表现是
+  // "详情界面去要了主界面" —— 而两边的代码看起来都是对的。
   check(
-    /visible: bool,/.test(showJob),
-    '界面作业带着"显示还是隐藏"这一项'
-  );
-  const showFn = /fn show<R: Runtime>\([\s\S]*?\n\}/.exec(surfaceRsForUi)?.[0] ?? '';
-  check(
-    /if visible \{[\s\S]{0,200}?\.show\(\)[\s\S]{0,200}?\} else \{[\s\S]{0,200}?\.hide\(\)/.test(showFn),
-    '建界面时按 visible 决定显示还是隐藏（而不是先显示再收起）'
-  );
-  check(
-    /visible\.unwrap_or\(true\)/.test(pluginCommandsForUi) &&
-      /open_surface_at\(&app, &plugin_id, &surface, bounds, visible/.test(pluginCommandsForUi),
-    '命令把 visible 一路传到界面线程（缺省是显示）'
-  );
-  check(
-    /visible\?: boolean/.test(surfaceServiceTs) &&
-      /visible: visible/.test(surfaceServiceTs) &&
-      // `undefined` 不能被折成 `false`：那会让每一次正常打开都建出一块看不见的界面。
-      !/visible: visible \?\? false/.test(surfaceServiceTs),
-    '前端门面把 visible 原样传下去（不折成 false）'
+    /surface\.unwrap_or_else\(super::surfaces::primary_surface\)/.test(pluginCommandsForUi) &&
+      /super::sandbox::open_surface\(&app, &plugin_id, &surface\)/.test(pluginCommandsForUi),
+    'sandbox_surface_open 把界面名传给 open_surface，缺省取主界面（缺省值只有一处实现）'
   );
 
-  // ---- 启动占位：前端那一条链 ----
+  // ---- 启动占位：一层普通 DOM，不再是"先收起原生层" ----
+  // 从前这里守的是"建 webview 时必须先把它收起来，否则占位被自己盖住"。iframe
+  // 模型把那个机制整个拿掉了：占位与 iframe 都是普通 DOM，`z-10` 就够了。
+  //
+  // 但那条**顺序**仍然有意义，只是换了个理由：占位必须在换令牌**之前**立起来。
+  // 反过来的话，从"命令回到前端"到"iframe 第一帧"之间会有一小段两者都没有的
+  // 空窗 —— 那一次闪烁在慢机器上每次打开都能看见。
   check(
-    /beginHostSplash\(pluginId, surfaceId\);[\s\S]{0,200}?apply\('open', true\)/.test(surfaceTsx),
-    '先立占位、再带着"不显示"去建 webview（顺序反了会闪一帧）'
+    /beginHostSplash\(pluginId, surfaceId\);[\s\S]{0,400}?openSandboxSurface\(pluginId, surfaceId\)/.test(
+      surfaceTsx
+    ),
+    '先立占位、再去换令牌（顺序反了会闪一小段空白）'
   );
+  // 占位的**唯一**判据是"宿主这一侧有一条属于它的记录"，没有第二个分支去
+  // 决定 iframe 的可见性 —— iframe 的显隐归 CSS 管。
   check(
-    /apply\('open', splash !== null\)/.test(surfaceTsx),
-    '占位与否是**唯一**决定 webview 可见性的东西（一条规则，不留第二分支）'
-  );
-  check(
-    /const everOpened = useRef\(false\)/.test(surfaceTsx) &&
-      /if \(!everOpened\.current\)/.test(surfaceTsx),
-    '只有第一次打开才立占位（切标签回来不该再闪一次"正在启动"）'
+    /const \[splash, setSplash\] = useState\(\(\) => getPluginSplash\(pluginId, surfaceId\)\)/.test(
+      surfaceTsx
+    ),
+    '占位由宿主状态（pluginUiState）驱动，不由 iframe 的 load 事件驱动'
   );
   check(
     /absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/.test(surfaceTsx),
     '占位铺满内容视口（`absolute inset-0` 相对的是 `.lc-tab-panel`）'
   );
+  // 占位里那三条分支：定量进度、不定量进度、以及"插件自己接管过"的那一条。
+  // 少一条的表现分别是"永远停在 0%"和"明明在动却显示成卡住"。
   check(
-    /className="h-0 w-0"/.test(surfaceTsx) && !/className="relative h-0 w-0"/.test(surfaceTsx),
-    '锚点保持"不定位于"（加了 relative 会让占位缩成 0×0）'
+    /splash\.progress !== null && \(/.test(surfaceTsx) &&
+      /splash\.progress === null && splash\.auto === false && \(/.test(surfaceTsx),
+    '占位区分定量与不定量进度（画一条永远停在 0% 的定量条会让人以为卡住了）'
   );
 
   // ---- 自动清除与超时兜底 ----
@@ -1973,10 +2273,31 @@ section('宿主渲染的状态指示与命令');
     'includeDeclared 缺省是 **true** —— 否则清单里那一块永远用不上'
   );
   // 沙箱插件的命令跨不了 realm，只能推给它的界面。
+  //
+  // 从前这条推送是 `eval` 一段 `window.__modulithCommand(JSON.parse(…))` 进插件
+  // webview。跨源 iframe 没有那条路 —— 现在它走 `push_to` 的 `command` 通道，
+  // 由前端转成 `postMessage`，桥接层再交给 `__modulithCommand`。
+  // 判据因此必须覆盖**两端**：宿主推的是哪条通道，以及桥接层接的是哪个函数。
+  const deliverCommandFn =
+    /pub async fn deliver_command<R: Runtime>\([\s\S]*?\n}\n/.exec(sandboxRs)?.[0] ?? '';
+  check(deliverCommandFn.length > 0, '能定位到 deliver_command 的函数体');
   check(
-    /pub async fn deliver_command<R: Runtime>/.test(sandboxRs) &&
-      /window\.__modulithCommand && window\.__modulithCommand\(JSON\.parse/.test(sandboxRs),
-    '沙箱插件的命令推给它的界面（函数引用过不了 realm 边界）'
+    /push_to\(app, &token, "command", payload\.clone\(\)\)/.test(deliverCommandFn),
+    '沙箱插件的命令经 push_to 的 command 通道推给它的界面'
+  );
+  // 命令名来自清单（外部输入），因此必须**包成 JSON** 而不是拼进源码。
+  // `eval` 时代这条是注入防线；现在没有"拼"这一步，但"数据不经字符串拼接"
+  // 这条约定仍然值得钉住 —— 它决定了将来加一条推送时不必再考虑转义。
+  check(
+    /serde_json::json!\(\{ "command": command \}\)/.test(deliverCommandFn),
+    '命令名包成 JSON，不拼进源码（拼源码那条路在 eval 时代才需要转义）'
+  );
+  // 只推给**这个插件**的界面；给了 `only` 时再收窄到那一块。
+  // 少了插件的过滤，一条命令会送进每一个打开着的插件 —— 那是一个跨插件的越权。
+  check(
+    /if key\.plugin_id != plugin_id \{[\s\S]{0,80}?continue;/.test(deliverCommandFn) &&
+      /if key\.surface != only \{[\s\S]{0,80}?continue;/.test(deliverCommandFn),
+    '命令只推给这个插件的界面（给了 only 时再收窄到那一块）'
   );
   check(
     /super::sandbox::deliver_command\(app, plugin_id, &command, surface\)/.test(rpcUiRs),
@@ -1991,6 +2312,12 @@ section('宿主渲染的状态指示与命令');
     /commands\.on: function|on: function \(id, handler\)/.test(bridgeJs) &&
       /window\.__modulithCommand = function/.test(bridgeJs),
     '桥接层给出命令的注册入口'
+  );
+  // 桥接层的 `command` 推送处理器必须真的把它交给那个注册入口 —— 少了这一句，
+  // 推送到了但谁也不处理，症状与"宿主根本没推"完全一样。
+  check(
+    /command: function \(payload\) \{[\s\S]{0,200}?window\.__modulithCommand\(payload\)/.test(bridgeJs),
+    '桥接层的 command 推送处理器把负载交给注册入口'
   );
   check(
     /commands: commands,/.test(bridgeJs),
@@ -2381,12 +2708,22 @@ section('下载到数据目录（ctx.http.download）');
   );
 
   // ---- 进度：两条路都要到得了回调 ----
+  //
+  // 沙箱这一侧也是两跳（宿主 → 前端 → iframe）：从前它 `eval` 一段脚本进插件
+  // webview，现在走 `push_to` 的 `download-progress` 通道。`rel` 必须在负载里
+  // ——一个插件可以同时下好几个文件，进度条要能分辨是哪一个。
+  const deliverProgressFn =
+    /pub async fn deliver_download_progress<R: Runtime>\([\s\S]*?\n}\n/.exec(sandboxRs)?.[0] ?? '';
+  check(deliverProgressFn.length > 0, '能定位到 deliver_download_progress 的函数体');
   check(
-    /pub async fn deliver_download_progress<R: Runtime>/.test(sandboxRs) &&
-      /window\.__modulithDownloadProgress && window\.__modulithDownloadProgress\(JSON\.parse/.test(
-        sandboxRs
-      ),
-    '沙箱插件的进度推给它的界面'
+    /push_to\(app, &token, "download-progress", payload\.clone\(\)\)/.test(deliverProgressFn) &&
+      /"rel": rel,/.test(deliverProgressFn),
+    '沙箱插件的进度经 push_to 的 download-progress 通道推给它的界面，且带 rel'
+  );
+  // 进度只推给**发起它的那块界面**（给了 `only` 时）—— 别的界面收到也没法处理。
+  check(
+    /if key\.surface != only \{[\s\S]{0,80}?continue;/.test(deliverProgressFn),
+    '进度可以只推给发起它的那一块界面（别的界面收到也没法处理）'
   );
   check(
     /pub const DOWNLOAD_PROGRESS: &str = "modulith:\/\/plugin-download-progress"/.test(rpcForDownload) &&
@@ -2479,7 +2816,7 @@ section('宿主把自己的 React 送给沙箱插件');
   );
   check(
     /\(\"GET\", Some\(\"react\.js\"\)\) => script\(PLUGIN_REACT_JS\)/.test(sandboxRsForReact),
-    '插件协议上有一条 GET /<id>/react.js'
+    '插件协议上有一条 GET /<token>/react.js'
   );
 
   // ---- 2. 加载顺序：React → 桥接层 → 插件 ----
@@ -2487,14 +2824,17 @@ section('宿主把自己的 React 送给沙箱插件');
   // 三者都是入口文档里的 `<script src>`，因此按**出现位置**比大小就够了。
   // 这一条不能只查"三个标签都在" —— 顺序反了标签也都在，而结果是
   // `Modulith.React` 为 undefined。
+  //
+  // 地址的第一段是**令牌**（不再是插件 id）：协议处理器只认令牌，因此这里的
+  // 判据也必须按令牌的形式写 —— 否则"地址被换回 id 拼"这件事不会有任何东西发现。
   const entryDoc = /fn entry_document<R: Runtime>\([\s\S]*?\n\}/.exec(sandboxRsForReact)?.[0] ?? '';
   check(entryDoc.length > 0, '能定位到 entry_document 的函数体');
-  const reactAt = entryDoc.indexOf('<script src="/{id}/react.js">');
-  const bridgeAt = entryDoc.indexOf('<script src="/{id}/bridge.js">');
+  const reactAt = entryDoc.indexOf('<script src="/{token}/react.js">');
+  const bridgeAt = entryDoc.indexOf('<script src="/{token}/bridge.js">');
   // 锚在**脚本标签**上，不是裸的 `/asset/`：同一个函数体里还有一行
-  // `<link rel="stylesheet" href="/{id}/asset/{rel}">`（样式表），它在 `<head>` 里、
+  // `<link rel="stylesheet" href="/{token}/asset/{rel}">`（样式表），它在 `<head>` 里、
   // 排在所有脚本之前。用裸 `/asset/` 会命中那一行，于是这条断言恒为"顺序错了"。
-  const mainAt = entryDoc.indexOf('<script src="/{id}/asset/');
+  const mainAt = entryDoc.indexOf('<script src="/{token}/asset/');
   check(
     reactAt >= 0 && bridgeAt >= 0 && mainAt >= 0 && reactAt < bridgeAt && bridgeAt < mainAt,
     reactAt >= 0 && bridgeAt >= 0 && mainAt >= 0 && reactAt < bridgeAt && bridgeAt < mainAt
@@ -2640,7 +2980,11 @@ section('两侧的成员表');
       `${renderedForParity}\nreturn window.Modulith;`
     );
     parityApi = factory(
-      { addEventListener: () => {} },
+      {
+        addEventListener: () => {},
+        // 同 §11：令牌从地址里读，没有地址就整段脚本在顶层抛。
+        location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+      },
       () => Promise.reject(new Error('不发网络')),
       { clipboard: { readText: async () => '', writeText: async () => {} } }
     );
@@ -2693,7 +3037,9 @@ section('两侧的成员表');
 
   // **这几条是真实的缺口**，不是设计选择：
   //   * `manifest` —— 宿主没有把整份清单送进沙箱（只送了 id/name/version/permissions）；
-  //   * `fileDrop` —— 拖放是窗口级事件，子 webview 收不到，**补不了**。
+  //   * `fileDrop` —— 拖放是**窗口级**事件，而插件界面是一块 iframe：落到它上面的
+  //     拖放不会冒泡到宿主文档，宿主窗口收到的那一次也不带"指针落在哪一块界面上"
+  //     的信息，**补不了**。
   // 两条都写进插件开发文档，因此这里把它们钉成"已知且被承认"的清单：
   // 将来谁不小心弄丢了一个成员，差异清单会变长，这条就红了。
   const EXPECTED_IN_PROCESS_ONLY = ['fileDrop', 'manifest'].sort();
@@ -2737,64 +3083,224 @@ section('两侧的成员表');
 }
 
 // ============================================================
-// 21. 遮挡判断是"按比例采样"，不是"只看中心点"
+// 21. 桥接层的运行时守卫与推送通道
 // ============================================================
 //
-// 这一节守的是一次**由用户报出来的**缺陷。沙箱界面是原生层，它会盖住宿主 DOM；
-// 因此宿主必须判断"我现在是不是被别的东西盖住了"，被盖住就让位。
+// 这一节从前守的是**遮挡判断的采样**（5×5 网格 + 覆盖率阈值）。
 //
-// 原来的判据只量**矩形中心**一个点，而它有一个写下来的已知限制：
-// "浮层只盖住一角时不会被发现"。那条限制变成了两个可见的缺陷 ——
-// 标题栏的搜索下拉从上方盖进来、侧边栏那一侧的边缘压在矩形一侧，
-// 两者都**不在中心**，于是插件界面照样盖在上面。
+// 那一整套东西连同它要解决的问题一起消失了：原生 webview 盖在宿主 DOM 之上、
+// 不看 z-index，因此宿主必须自己判断"我是不是被别处的浮层盖住了"，而被盖住时
+// 唯一的反应是把它收起来 —— 收早收晚都会闪。iframe 就在这个文档里，**层叠由
+// CSS 决定**，标题栏的下拉与侧边栏的边缘天然压在它上面。
 //
-// 改法是按比例：5×5 网格采样 + 覆盖率阈值。这一节把那个形状钉住，
-// 因为退化成"一个点"在代码上只是少几行，而症状只在特定浮层出现时才看得见。
+// 判据是它**不许回来**：`isCovered` / `COVERAGE_THRESHOLD` / `elementFromPoint`
+// 这些名字一旦重新出现，就说明有人以为界面还是原生层，而在 iframe 上做那件事
+// 只会得到"插件界面莫名其妙自己藏起来"。§10 已经断言了其中一部分，这里补上
+// 采样特有的那几个常数。
+//
+// 省下来的位置放到这一节真正该守的东西上：iframe 模型下**新的**边界。
+// 前一份守卫（ACL 把 `plugin-*` 排除、协议处理器验令牌）是宿主的；这一节守的是
+// 插件文档**自己**那一侧 —— 而那三条的性质都是"坏掉时不会有任何症状"：
+//
+//   * 文档里出现宿主 IPC → 插件忽然能 `invoke` 全部应用命令；
+//   * 同源共享存储没封 → 插件 A 写的东西插件 B 读得到；
+//   * 推送入口不验发送方 → 任何能往这个窗口发消息的人都能冒充宿主。
 
-section('遮挡判断的采样');
+section('桥接层的运行时守卫');
 
 {
+  // 那条采样逻辑**不许回来**。判据是几个具名的常数与函数。
+  //
+  // 剥注释：这一节的引言正是在解释那一套东西**为什么**被删掉，不剥的话，
+  // 一份说明"这里不再做遮挡判断"的注释会把门禁判成违规。
   const surfaceTsx = read('../src/components/SandboxSurface.tsx');
-  const coveredFn = /function isCovered\([\s\S]*?\n\}/.exec(surfaceTsx)?.[0] ?? '';
+  const surfaceCode = strip(surfaceTsx);
+  for (const ghost of [
+    'isCovered',
+    'COVERAGE_THRESHOLD',
+    'CONFIRMATIONS',
+    'POLL_MS',
+    'elementFromPoint',
+  ]) {
+    check(
+      !new RegExp(`\\b${ghost}\\b`).test(surfaceCode),
+      `${ghost} 已删除（iframe 的层叠由 CSS 决定，不需要命中测试让位）`
+    );
+  }
 
-  check(coveredFn.length > 0, '能定位到 isCovered 的函数体');
+  // ---- 1. 这个文档里不该有宿主 IPC ----
+  //
+  // 沙箱依赖 Tauri 一侧的两件事：它不给子框架注入 IPC 初始化脚本，且 IPC 处理器
+  // 要求一个只注入主框架的随机键。**两件事都会静默失效** —— 哪一天不成立了，
+  // 这里不会报错、不会变慢、没有任何症状，只是插件忽然能 invoke 全部应用命令。
+  const assertFn = /function assertNoHostIpc\(\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? '';
+  check(assertFn.length > 0, '桥接层里有 assertNoHostIpc()');
+  // 四个名字一个都不能少：前两个是 Tauri 的注入面，`isTauri` 是它的探测标志，
+  // 而 `window.ipc` 是 Windows 上那条**不受 CSP 管辖**的原生桥 ——
+  // 少查最后那一个，正是"fetch 那条被 connect-src 挡住了，却还有一条路"的形状。
+  //
+  // 判据锚在**剥掉注释之后**的正文上：这个函数正是在注释里解释"为什么还要查
+  // `window.ipc`"，不剥的话，把那一行检查删掉它照样绿。
+  const assertCode = strip(assertFn);
+  for (const name of ['__TAURI_INTERNALS__', '__TAURI__', 'isTauri', 'ipc']) {
+    check(
+      new RegExp(`window\\.${name.replace(/\$/g, '\\$')}\\b`).test(assertCode),
+      `assertNoHostIpc 检查 ${name}（四个名字缺一，边界塌了就不会被发现）`
+    );
+  }
+  // 查到就**大声说出来**，而且不能只说给控制台听：release 版里没有控制台，
+  // 而这一条恰恰是最不该只留在控制台里的。
   check(
-    /for \(let row = 0; row < STEPS; row \+= 1\)/.test(coveredFn) &&
-      /for \(let column = 0; column < STEPS; column \+= 1\)/.test(coveredFn),
-    '采样是**网格**而不是单个点（单点无法发现"只盖住一角"的浮层）'
+    /found\.push\(/.test(assertCode) && /rpc\('log', \{ level: 'error'/.test(assertCode),
+    '查到宿主 IPC 时既进控制台也写进宿主日志（release 版看不到控制台）'
   );
+  // 而它必须**真的跑一次**：定义一个检查器却从不调用，等于什么都没查。
   check(
-    /const STEPS = (\d+);/.test(coveredFn) && Number(/const STEPS = (\d+);/.exec(coveredFn)?.[1]) >= 3,
-    `网格步长至少 3（实际 ${/const STEPS = (\d+);/.exec(coveredFn)?.[1] ?? '读不到'}）`
-  );
-  check(
-    /covered \/ sampled >= COVERAGE_THRESHOLD/.test(coveredFn),
-    '判据是**覆盖率**与阈值比较，而不是"任意一点被盖住就让位"'
-  );
-  check(
-    /if \(!hit\) continue;/.test(coveredFn),
-    '视口之外的点跳过而不是算进分母（否则界面滚出视口会被判成整块被盖）'
-  );
-  check(
-    /if \(sampled === 0\) return false;/.test(coveredFn),
-    '一个点都采不到时不判定被盖住（把界面藏起来是代价最大的反应）'
+    /var HOST_IPC_ABSENT = assertNoHostIpc\(\)/.test(bridgeJs),
+    'assertNoHostIpc 在文档加载时真的跑了一次（定义了却不调用等于没查）'
   );
 
-  const threshold = /const COVERAGE_THRESHOLD = ([0-9.]+);/.exec(surfaceTsx)?.[1];
+  // ---- 2. 同一个来源带来的共享存储必须封掉 ----
+  //
+  // 全部插件界面共享 `http://modulith-plugin.localhost` 这一个来源，因此
+  // `localStorage` / `sessionStorage` / `indexedDB` / `caches` 是**公用**的。
+  const freezeFn = /function freezeOriginStorage\(\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? '';
+  check(freezeFn.length > 0, '桥接层里有 freezeOriginStorage()');
+  // 同样剥注释：这一段的一开头就在注释里列了那四个名字，不剥的话把数组删空
+  // 这条断言照样绿。
+  const freezeCode = strip(freezeFn);
+  for (const name of ['localStorage', 'sessionStorage', 'indexedDB', 'caches']) {
+    check(
+      freezeCode.includes(`'${name}'`),
+      `freezeOriginStorage 封掉 ${name}（它与其它插件共享同一个来源）`
+    );
+  }
+  // **必须不可重定义。** 插件跑在同一个 realm 里：`configurable: true` 的覆盖
+  // 它自己 `delete` 一下就没了，那样封了等于没封。
+  //
+  // 两处 `defineProperty`（四个存储全局走一个 `forEach`，cookie 单独一处），
+  // 因此只数到 2 —— 关键是**两处都不能是 `configurable: true`**。
+  const configurableCount = (freezeCode.match(/configurable: false/g) ?? []).length;
+  const defineCount = (freezeCode.match(/Object\.defineProperty\(/g) ?? []).length;
   check(
-    threshold !== undefined && Number(threshold) > 0 && Number(threshold) < 1,
-    `阈值是 (0,1) 之间的比例（实际 ${threshold ?? '读不到'}）—— 取 0 或 1 都会让判据退化`
+    defineCount === 2 && configurableCount === defineCount,
+    `每一处覆盖都用 configurable: false（${configurableCount}/${defineCount} 处）—— 可重定义的封禁 delete 一下就没了`
+  );
+  // `document.cookie` 单独处理：**读**返回空串而不是抛（读的人多半是某个捆绑进来
+  // 的库在做特性探测，让它抛会把一个无关的插件直接打挂），**写**必须失败。
+  check(
+    /Object\.defineProperty\(document, 'cookie'/.test(freezeCode) &&
+      /return '';/.test(freezeCode) &&
+      /set: function \(\) \{[\s\S]{0,200}?throw new Error/.test(freezeCode),
+    'document.cookie 读返回空串、写抛错（写才是"把数据留给下一个插件"的那条路）'
+  );
+  check(
+    /freezeOriginStorage\(\);/.test(bridgeJs),
+    'freezeOriginStorage 在文档加载时真的被调用（定义了却不调用等于没封）'
   );
 
-  const pollFn =
-    /const interval = window\.setInterval\(\(\) => \{[\s\S]*?\}, POLL_MS\);/.exec(surfaceTsx)?.[0] ?? '';
+  // ---- 3. 推送入口必须同时验发送方与标记 ----
+  //
+  // 身份判据是 `event.source`，不是 `event.origin`：来源字符串是发送方自己声明的
+  // （一个 `data:` 文档的来源就是字符串 `"null"`），而窗口引用不能伪造 ——
+  // 只有宿主那个窗口能等于 `window.parent`。
+  const listenerFn =
+    /window\.addEventListener\(\s*'message',[\s\S]*?\n    false\s*\n  \);/.exec(bridgeJs)?.[0] ?? '';
+  check(listenerFn.length > 0, '能定位到 message 监听器');
   check(
-    /const now = isCovered\(element, bounds\);/.test(pollFn),
-    '轮询里调用的就是那个按比例的判据（而不是又写了一份单点判断）'
+    /if \(event\.source !== window\.parent\) return;/.test(listenerFn),
+    '推送入口验 event.source === window.parent（origin 是发送方自己声明的，不能当身份）'
   );
   check(
-    /CONFIRMATIONS/.test(pollFn) && /agreed < CONFIRMATIONS/.test(pollFn),
-    '改判要两次确认（一次命中测试可能落在过渡动画的中间帧上）'
+    /if \(!data \|\| data\.__modulith !== true\) return;/.test(listenerFn),
+    '推送入口验 data.__modulith === true（少了它，任何能往这个窗口发消息的人都能冒充宿主）'
+  );
+  // 所有推送处理器必须**经由那张表**分派：写在监听器外面的 `window.onmessage`
+  // 会绕开上面两条校验。
+  check(
+    /var PUSH_HANDLERS = \{/.test(bridgeJs) &&
+      /var handler = PUSH_HANDLERS\[data\.channel\]/.test(listenerFn),
+    '推送按一张处理器表分派（另写一条 onmessage 会绕开上面两条校验）'
+  );
+  check(
+    /if \(!handler\) return;/.test(listenerFn),
+    '认不出的 channel 一律忽略（宿主加一条新推送时，旧插件不该因此报错）'
+  );
+  // 宿主推的那五条通道，桥接层每一条都要有处理器。少一条的表现是那一类推送
+  // **静默丢失**（主题不动、命令没反应、跨插件事件收不到）。
+  for (const channel of ['theme', 'shortcuts', 'command', 'download-progress', 'event']) {
+    check(
+      new RegExp(`(?:^|\\s)'?${channel.replace('-', '\\-')}'?: function \\(`).test(bridgeJs),
+      `桥接层有 ${channel} 通道的处理器`
+    );
+  }
+
+  // ---- 4. 就绪信号 ----
+  //
+  // **这是唯一的就绪信号。** iframe 的 `load` 事件在一个加载失败的文档上照样会
+  // 触发（引擎拿它自己画的那张错误页触发它），因此宿主那边不能用它判断成功。
+  check(
+    /window\.parent\.postMessage\(\{ __modulith: true, channel: 'ready' \}, '\*'\)/.test(bridgeJs),
+    "桥接层就绪后向 window.parent 发一条 ready（它是宿主唯一骗不过自己的信号）"
+  );
+  // 这里的 `'*'` 是**必需**的：那个文档读不到宿主自己的来源。它不构成泄露 ——
+  // `postMessage` 只投递给 `window.parent` 一个窗口，而那条消息里只有这两个字段。
+  // 真正不许可的是**转发宿主推送**时用 `'*'`（那时来源是已知的，见 §10）。
+  check(
+    !/postToSurface[\s\S]{0,200}'ready'/.test(bridgeJs),
+    'ready 只有桥接层自己发（宿主不该再去转一条来源不明的 ready）'
+  );
+
+  // ---- 5. 令牌也是桥接层地址的来源 ----
+  //
+  // 桥接层**从地址读令牌**，不再由宿主送一个 `__PLUGIN_ID__` 给它拼 URL。
+  // 少了这一段，`RPC_ROOT` 会是 `//rpc/` —— 而症状是所有 RPC 一起 404。
+  check(
+    /var path = String\(window\.location\.pathname \|\| ''\)/.test(bridgeJs) &&
+      /split\('\/'\)\[0\]/.test(bridgeJs),
+    '桥接层从 location.pathname 的第一段读令牌（不再按插件 id 拼地址）'
+  );
+  check(
+    /var RPC_ROOT = '\/' \+ TOKEN \+ '\/rpc\/'/.test(bridgeJs) &&
+      /var DATA_ROOT = '\/' \+ TOKEN \+ '\/data\/'/.test(bridgeJs),
+    'RPC 与数据的地址都由令牌拼出来'
+  );
+
+  // ---- 6. 宿主侧确实把推送发到**主窗口** ----
+  //
+  // 令牌与 iframe 的绑定在前端那一个文档里，别的窗口（托盘菜单、自检窗口）
+  // 收到也做不了任何事。少了 `emit_to` 而用 `emit`，每条推送都会多绕一圈。
+  const pushFn = /pub\(super\) fn push_to<R: Runtime>\([\s\S]*?\n\}/.exec(sandboxRs)?.[0] ?? '';
+  check(pushFn.length > 0, '能定位到 push_to 的函数体');
+  check(
+    /app\.emit_to\(\s*crate::core::window::MAIN_WINDOW,\s*PUSH_EVENT,/.test(pushFn),
+    'push_to 只推给主窗口（令牌与 iframe 的绑定在那一个文档里）'
+  );
+  check(
+    /"token": token, "channel": channel, "payload": payload/.test(pushFn),
+    '推送负载带令牌、通道、负载三件（少了令牌前端分不清该转给哪一块界面）'
+  );
+  check(
+    /pub const PUSH_EVENT: &str = "modulith:\/\/sandbox-push"/.test(sandboxRs) &&
+      /const PUSH_EVENT = 'modulith:\/\/sandbox-push'/.test(
+        read('../src/services/sandboxSurface.ts')
+      ),
+    '宿主与前端用的推送事件名逐字相同（两边的字符串约定）'
+  );
+  // 宿主侧的通道名必须与桥接层那张处理器表对得上。少一条的表现是那一类推送
+  // 到了前端却没人处理 —— 与"宿主根本没推"完全一样。
+  for (const channel of ['"theme"', '"shortcuts"', '"command"', '"download-progress"', '"close"']) {
+    check(
+      sandboxRs.includes(`push_to(app, &token, ${channel},`) ||
+        new RegExp(`push_to\\(app, &token, ${channel.replace(/"/g, '"')}`).test(sandboxRs),
+      `宿主侧真的有 ${channel} 通道的推送`
+    );
+  }
+  check(
+    /super::sandbox::push_to\(app, &token, "event", envelope\.clone\(\)\)/.test(
+      read('../src-tauri/src/modules/plugins/rpc.rs')
+    ),
+    '跨插件事件也走 push_to 的 event 通道（它是同步的，不再拼脚本）'
   );
 }
 

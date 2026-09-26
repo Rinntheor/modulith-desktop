@@ -101,13 +101,20 @@ pub fn run() -> Result<(), tauri::Error> {
 
         app.manage(registry);
 
-        // 沙箱界面的**所有者线程**。
+        // 沙箱界面**不再有所有者线程**。
         //
-        // 全宿主只有它能创建 / 摆放 / 显示 / 销毁沙箱 webview；命令那边只投作业、
-        // 等回话。这不是"顺手优化"：从 IPC 线程（主线程）创建 webview 会让整个
-        // 应用假死 —— 窗口按钮、托盘、其余插件一起失去响应，而且**一处错误都不报**。
-        // 完整推导见 modules/plugins/surface.rs 的文件头。
-        app.manage(modules::plugins::surface::SurfaceActor::spawn(handle.clone()));
+        // v1.6.0 之前这里 manage 了一个 SurfaceActor：全宿主只有它能在主线程之外
+        // 创建 / 摆放 / 显示 / 销毁插件子 webview，因为从 IPC 线程（主线程）创建
+        // webview 会让整个应用假死 —— 窗口按钮、托盘、其余插件一起失去响应，
+        // 而且**一处错误都不报**。
+        //
+        // 插件界面改成跨源 iframe 之后，宿主这一侧不再碰窗口系统：它只签发一个
+        // 令牌（一次内存写入），窗口与几何全部交给浏览器的 DOM。那条线程连同它
+        // 服务的 surface.rs 一起删掉了。
+        //
+        // ⚠️ 那条约束本身**没有消失**：它适用于任何"从命令里创建 webview"的地方。
+        // 仓库里现在只剩沙箱自检会建窗口，因此 sandbox_self_test 必须保持
+        // async。完整推导留在 git 历史里 surface.rs 的文件头。
 
         // 插件主题快照。
         //
@@ -205,9 +212,7 @@ pub fn run() -> Result<(), tauri::Error> {
         clear_notifications,
         get_notification_summary,
         sandbox_surface_open,
-        sandbox_surface_hide,
         sandbox_surface_close,
-        sandbox_surface_bounds,
         sandbox_self_test,
         plugin_surfaces,
         set_plugin_theme,

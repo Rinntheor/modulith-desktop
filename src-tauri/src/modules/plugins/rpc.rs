@@ -452,7 +452,8 @@ pub async fn dispatch<R: Runtime>(
         // ============================================================
         //
         // RPC 是"发出去、拿到结果"，因此进度不可能走返回值。它走的是宿主 →
-        // 插件的推送通道（`SurfaceActor::eval`），与主题、快捷键、命令同一条。
+        // 插件的推送通道（`sandbox::push_to`，经前端转成一条 `postMessage`），
+        // 与主题、快捷键、命令同一条。
         //
         // 推给**发起调用的那块界面**：一次下载是它发起的，进度条也画在它那里。
         "http.download" => {
@@ -679,7 +680,7 @@ pub async fn dispatch<R: Runtime>(
                     .await;
             }
 
-            deliver_to_surfaces(app, plugin_id, name, &payload).await;
+            deliver_to_surfaces(app, plugin_id, name, &payload);
 
             json_ok()
         }
@@ -1173,10 +1174,10 @@ const DECLARED_PREFIX: &str = "declared:";
 /// 两条路径，因为插件有两种运行位置
 /// ============================================================
 ///
-/// * **sandboxed** —— 插件的代码在自己的 webview 里，宿主**不能**直接调它的
-///   函数。因此只能把"有人点了这条命令"送进它的界面（走 `SurfaceActor` 的 eval
-///   通道，也就是宿主 → 插件的唯一推送通道），由桥接层交给
-///   `Modulith.commands.on(id, handler)` 注册的处理器。
+/// * **sandboxed** —— 插件的代码在自己的文档里，宿主**不能**直接调它的函数。
+///   因此只能把"有人点了这条命令"送进它的界面（走 `sandbox::deliver_command`
+///   那条推送通道 —— 宿主 → 前端 → iframe，也是宿主 → 插件的唯一推送通道），
+///   由桥接层交给 `Modulith.commands.on(id, handler)` 注册的处理器。
 ///
 ///   顺带解决了一件事：沙箱桥接层**没有** `registerCommand` 那种"交出函数"
 ///   的接口 —— 它是跨 realm 的，函数交不过去。命令在沙箱里因此必然是
@@ -1354,7 +1355,7 @@ pub const CLOSE_SURFACE: &str = "modulith://close-surface";
 ///
 /// 排除的粒度是**插件**而不是界面：一个插件开了主列表与详情两块界面，它们属于
 /// 同一次对话，互相收到自己刚发出去的事件同样会递归。
-async fn deliver_to_surfaces<R: Runtime>(
+fn deliver_to_surfaces<R: Runtime>(
     app: &AppHandle<R>,
     source: &str,
     name: &str,
@@ -1364,27 +1365,16 @@ async fn deliver_to_surfaces<R: Runtime>(
         return;
     };
 
-    // 投递脚本用 `JSON.parse` 包一层而不是直接把 JSON 插进源码：
-    // 一个含 `</script>` 或某些 Unicode 的负载直接拼进去会破坏这段脚本，
-    // 而那种失败发生在插件界面的解析器里，看起来像"宿主推了一段坏脚本"。
-    let envelope = serde_json::json!({ "source": source, "name": name, "payload": payload }).to_string();
-    let script = format!(
-        "window.__modulithDeliver && window.__modulithDeliver(JSON.parse({}));",
-        super::sandbox::js_string(&envelope)
-    );
+    // 直接把结构化数据交出去。从前这里要拼一段 `window.__modulithDeliver(JSON.parse(…))`
+    // 的脚本，因而必须考虑"负载里含 `</script>` 或某些 Unicode 会不会拼坏源码"。
+    // 走 `postMessage` 之后没有"拼"这一步 —— 传的是对象，不是代码。
+    let envelope = serde_json::json!({ "source": source, "name": name, "payload": payload });
 
-    let Some(actor) = app.try_state::<super::surface::SurfaceActor>() else {
-        return;
-    };
-
-    for (label, key) in surfaces.live() {
+    for (token, key) in surfaces.live() {
         if key.plugin_id == source {
             continue;
         }
-        if let Err(error) = actor.eval(&label, script.clone()).await {
-            // 一个界面推不到（多半是刚被销毁）不该影响其余界面。
-            log::debug!("向沙箱界面 {label} 推送事件失败：{error}");
-        }
+        super::sandbox::push_to(app, &token, "event", envelope.clone());
     }
 }
 

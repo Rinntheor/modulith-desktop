@@ -50,10 +50,10 @@ export interface ModuleDescriptor {
    */
   iconSvg?: string;
   /**
-   * 这个模块的界面跑在一个**独立 webview** 里（插件清单写了 `runtime: "sandboxed"`）。
+   * 这个模块的界面跑在一个**跨源 iframe** 里（插件清单写了 `runtime: "sandboxed"`）。
    *
-   * 有它时 `component` 不再被渲染 —— `ModuleRenderer` 改为渲染一块占位，
-   * 由 `SandboxSurface` 把它量出来交给 Rust，让宿主把 webview 摆在那个位置。
+   * 有它时 `component` 不再被渲染 —— `ModuleRenderer` 改为渲染 `SandboxSurface`，
+   * 由它向宿主换一个令牌，再把 `<iframe>` 挂出来。
    *
    * 为什么不干脆不给 `component`：描述符的形状保持统一，调用方少一堆分支；
    * 而且旧式插件仍走 `component` 那条路，两者要能共存。
@@ -62,8 +62,8 @@ export interface ModuleDescriptor {
   /**
    * 这个沙箱模块对应插件清单里的**哪一个界面**（`contributes.surfaces[].id`）。
    *
-   * 缺省是主界面。`SandboxSurface` 靠它决定要向宿主请求 `plugin-<id>#<界面>`
-   * 里的哪一个 —— 少了它，同一插件的两个界面会去抢同一条标签。
+   * 缺省是主界面。`SandboxSurface` 靠它决定向宿主开口要**哪一块界面**的令牌 ——
+   * 少了它，同一插件的两个界面会去要同一个主界面，于是"详情"页显示的是列表。
    */
   surface?: string;
   /**

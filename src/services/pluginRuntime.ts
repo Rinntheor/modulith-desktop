@@ -511,12 +511,12 @@ function buildDeclaredModuleDescriptor(
     children: undefined,
     pluginId,
     iconSvg: resolveInlineIconSvg(pluginId, plugin.manifest),
-    // 清单说它跑在自己的 webview 里。渲染端据此换成一块占位，
-    // 由 `SandboxSurface` 把它量出来交给 Rust。
+    // 清单说它跑在自己的 iframe 里。渲染端据此换成 `SandboxSurface`，
+    // 由它向宿主换令牌并挂出 `<iframe>`。
     sandboxed: plugin.manifest.runtime === 'sandboxed',
     // 这个模块打开的是哪一个界面。缺省是主界面 —— 单界面插件因此不必写它，
-    // 而多界面插件写错一个名字时宿主会在 `open_surface_at` 里拒绝并说清
-    // "清单里没有这个界面"，而不是建出一块服务 404 的空面板。
+    // 而多界面插件写错一个名字时宿主会在 `open_surface` 里拒绝并说清
+    // "清单里没有这个界面"，而不是签出一块服务 404 的令牌。
     surface: contribution.surface,
   };
 }

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>沙箱自检探针</title>
+    <!-- 空图标：没有它，浏览器会去请求根路径的 /favicon.ico -->
+    <link rel="icon" href="data:," />
+    <!--
+      这一份**只在自检页里的一个 iframe 中**运行，不直接面向人。
+
+      它存在的理由：自检页自己跑在一个独立窗口里，而独立窗口的主框架**会**被
+      Tauri 注入 `__TAURI_INTERNALS__`（那是第 1 条要验的事）。插件界面不是那样 ——
+      它是 iframe，而 Tauri 的每一个内部初始化脚本都带 `for_main_frame_only`。
+
+      所以要验"插件界面拿不到 IPC"，必须在**一个 iframe 里**问这个问题。这一份
+      就是那个 iframe 的文档。
+
+      它把结论用 `postMessage` 投回父页面，自己不画任何东西。
+    -->
+  </head>
+  <body>
+    <script>
+      (function () {
+        'use strict';
+
+        // 令牌是本界面请求路径的第一段。回给父页面，让它核对宿主认出来的身份
+        // 是否就是这一块界面。
+        var token = String(location.pathname || '')
+          .replace(/^\/+/, '')
+          .split('/')[0] || '';
+
+        var result = {
+          token: token,
+          internals: typeof window.__TAURI_INTERNALS__ !== 'undefined',
+          tauri: typeof window.__TAURI__ !== 'undefined',
+          isTauri: typeof window.isTauri !== 'undefined',
+          // `window.ipc` 是 Tauri 在 Windows 上那条**不受 CSP 管辖**的原生桥。
+          ipc: typeof window.ipc !== 'undefined',
+          invoke:
+            !!(window.__TAURI_INTERNALS__ &&
+              typeof window.__TAURI_INTERNALS__.invoke === 'function'),
+          protocol: false,
+          protocolDetail: '',
+        };
+
+        function send() {
+          try {
+            parent.postMessage({ __modulithProbe: true, result: result }, '*');
+          } catch (error) {
+            // 够不到父窗口就没有结论。父页面会因此超时并报失败 —— 那是正确的：
+            // 一个连话都传不回来的探针什么都没证明。
+          }
+        }
+
+        // 顺带确认这条协议对这个 iframe 也是通的。
+        //
+        // "没有 IPC" 只是半边结论：插件界面还得**能**读到自己的资源，否则沙箱
+        // 成立的原因是"它整个坏了"。用相对地址，令牌因此不进这个文件。
+        fetch('rpc/ping')
+          .then(function (response) {
+            return response.json();
+          })
+          .then(function (payload) {
+            result.protocol = !!(payload && payload.ok === true && payload.token === token);
+            result.protocolDetail = JSON.stringify(payload);
+            send();
+          })
+          .catch(function (error) {
+            result.protocolDetail = String((error && error.message) || error);
+            send();
+          });
+      })();
+    </script>
+  </body>
+</html>

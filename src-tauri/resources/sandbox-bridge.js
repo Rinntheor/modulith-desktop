@@ -2,7 +2,7 @@
 //
 // 沙箱插件的桥接层。**它是宿主的一部分，不是插件的。**
 //
-// 它由协议处理器直接提供（走 `/<插件 id>/bridge.js`），不来自插件目录 ——
+// 它由协议处理器直接提供（走 `/<令牌>/bridge.js`），不来自插件目录 ——
 // 插件因此改不了它，也无法抢在它前面执行：入口文档由宿主合成，脚本顺序是
 // 桥接层在前、插件入口在后，中间没有第三方能插进来。
 //
@@ -31,12 +31,34 @@
 // 插件自己写错了。`check:sandbox` 第 20 节**从两侧的源码各自推导出成员表**
 // 再逐个比对，差异清单必须恰好是下面那两条（多一条少一条都会打红）。
 //
-// 两侧刻意不同的地方，只有两条：
-//   * `ctx.fileDrop` 不存在（拖放是窗口级事件，沙箱 webview 是子窗口，
-//     主窗口收到的事件到不了这里）；
+// 两侧刻意不同的地方，只有一条：
 //   * `ctx.manifest` 不存在（宿主只送 id / 名称 / 版本 / 权限 / 界面表，
 //     没有送整份清单 —— 见下面的 `Modulith.plugin` 与 `Modulith.surfaces`）。
-// 这两条是**能力差异**，不是"还没做" —— 它们写进插件开发文档。
+// 这是**能力差异**，不是"还没做" —— 它写进插件开发文档。
+//
+// ============================================================
+// `ctx.fileDrop`：从前补不了，现在补得了 —— 但还没补
+// ============================================================
+//
+// 平台迁移到 iframe **顺手解掉了它受阻的原因**，这一点值得写下来，因为
+// 插件开发文档里那句"沙箱里没有 fileDrop"即将作废。
+//
+// wry 在 Windows 上把拖放处理器注册在 **webview 自己的 HWND 及其全部子窗口** 上
+// （`wry-0.55.1/src/webview2/drag_drop.rs:50` 枚举子窗口并按个 `RegisterDragDrop`）。
+// 从前插件界面是一个**子 webview**：它有自己的 HWND，而它没有注册拖放处理器，
+// 于是落在它上面的文件既不进宿主窗口的处理器，也没有任何东西接住 —— 那条路径
+// 从根上是断的。
+//
+// 现在插件界面是宿主 webview 里的一个 iframe：指针底下始终是**主 webview 的
+// HWND**，处理器照常触发，事件里还带指针位置（物理像素）。因此"把文件拖进插件
+// 界面"变成了一件可以在前端做出来的事：按位置命中哪一块界面，就
+// `postMessage`（channel `file-drop`）进去。
+//
+// 它**没有**在这一轮做，理由是权限判定的落点：拖放带来的是**本机路径**，与
+// `filesystem-read` 同类，因此"这个插件能不能收"必须由**宿主**判定，而不是由
+// 桥接层自己查一遍 `PERMISSIONS` —— 后者正是这套设计反复强调不算边界的东西。
+// 那意味着 `sandbox_surface_open` 的返回值要多一个"这个界面能不能收拖放"的位，
+// 是一小块独立的改动。
 //
 // `registerModule` 则**两边都有，但含义不同**：in-process 是"向宿主注册一个组件"，
 // 沙箱是"把我这个组件挂到本界面上"（插件自己就是界面）。名字与入参形状刻意
@@ -68,8 +90,135 @@
   var DATA_AVAILABLE = __PLUGIN_DATA_AVAILABLE__;
   var SURFACES = __PLUGIN_SURFACES__;
 
-  var RPC_ROOT = '/' + PLUGIN_ID + '/rpc/';
-  var DATA_ROOT = '/' + PLUGIN_ID + '/data/';
+  // ============================================================
+  // 我是谁：从**地址**读，不从插件 id 拼
+  // ============================================================
+  //
+  // 令牌是本界面每一条请求的路径第一段（见 sandbox.rs 文件头的"令牌是身份"）。
+  // 它就在 `location.pathname` 里，因此这里不需要宿主再送一个占位符进来 ——
+  // 少一个占位符就少一处能漂的约定。
+  //
+  // **必须用令牌，不能用插件 id。** 协议处理器按令牌查身份，用 id 拼出来的地址
+  // 会被它拒掉，而症状是资源与 RPC **一起** 404。
+  var TOKEN = (function () {
+    var path = String(window.location.pathname || '');
+    return path.replace(/^\/+/, '').split('/')[0] || '';
+  })();
+
+  var RPC_ROOT = '/' + TOKEN + '/rpc/';
+  var DATA_ROOT = '/' + TOKEN + '/data/';
+
+  // ============================================================
+  // 守卫：这个文档里**不该**有宿主的 IPC
+  // ============================================================
+  //
+  // 沙箱依赖 Tauri 一侧的两件事：它不给子框架注入 IPC 初始化脚本，且 IPC 处理器
+  // 要求一个只注入主框架的随机键。这两件事**都会静默失效** —— 哪一天不成立了，
+  // 这里不会报错、不会变慢、没有任何症状，只是插件忽然能 invoke 全部应用命令。
+  //
+  // 所以这里主动查一次，查到就大声说出来。**它不是一道拦截**（插件也不该靠它），
+  // 它是一盏灯：正常运行时什么都不做，边界塌了的时候立刻进日志与自检页。
+  //
+  // 为什么放在这里而不是等插件来问：插件不一定会问，而这件事不该由插件决定
+  // 自己要不要被检查。
+  function assertNoHostIpc() {
+    var found = [];
+
+    if (typeof window.__TAURI_INTERNALS__ !== 'undefined') found.push('__TAURI_INTERNALS__');
+    if (typeof window.__TAURI__ !== 'undefined') found.push('__TAURI__');
+    if (typeof window.isTauri !== 'undefined') found.push('isTauri');
+    // `window.ipc` 是 Tauri 在 Windows 上的那条原生 IPC 桥，**不受 CSP 管辖** ——
+    // 它是"fetch 那条被 connect-src 挡住了"之后还会剩下的那一条路。
+    if (typeof window.ipc !== 'undefined') found.push('ipc');
+
+    if (found.length === 0) return true;
+
+    var detail =
+      '这个插件文档里出现了宿主 IPC（' + found.join('、') + '）。插件界面本应跑在一个' +
+      '拿不到 IPC 的跨源 iframe 里 —— 出现这些名字意味着它不在。';
+    console.error('[Modulith] 沙箱边界失效：' + detail);
+
+    // 也交给宿主写进文件日志：控制台在 release 版里看不到，而这一条恰恰是最不该
+    // 只留在控制台里的。
+    try {
+      rpc('log', { level: 'error', message: '沙箱边界失效：' + detail }).catch(function () {});
+    } catch (error) {
+      /* 上报失败不再抛一次 */
+    }
+
+    return false;
+  }
+
+  /** 这个文档里有没有宿主 IPC。自检页会读它。 */
+  var HOST_IPC_ABSENT = assertNoHostIpc();
+
+  // ============================================================
+  // 同一个来源带来的共享存储：封掉
+  // ============================================================
+  //
+  // 全部插件界面共享 `http://modulith-plugin.localhost` 这一个来源，因此
+  // `localStorage` / `sessionStorage` / `indexedDB` / `caches` 是**公用**的：
+  // 插件 A 写进去的东西插件 B 读得到。插件要持久化就用 `Modulith.storage` 与
+  // `Modulith.dataDir` —— 那两条是宿主按插件分开的。
+  //
+  // **必须用不可重定义的属性。** 插件跑在同一个 realm 里：一个 `configurable: true`
+  // 的覆盖它自己 `delete` 一下就没了，那样封了等于没封。
+  //
+  // 这里选择**抛错**而不是给一个空壳：给空壳的话，插件会以为"写进去了"，
+  // 而数据其实哪里都没到 —— 那比一句明确的拒绝难查得多。
+  function freezeOriginStorage() {
+    var denied = ['localStorage', 'sessionStorage', 'indexedDB', 'caches'];
+
+    denied.forEach(function (name) {
+      var present = false;
+      try {
+        // 有些环境里读一下这个属性本身就会抛（隐私模式、被策略关闭）。
+        present = typeof window[name] !== 'undefined';
+      } catch (error) {
+        present = false;
+      }
+      if (!present) return;
+
+      try {
+        Object.defineProperty(window, name, {
+          configurable: false,
+          enumerable: true,
+          get: function () {
+            throw new Error(
+              '[Modulith] 沙箱插件不能使用 ' +
+                name +
+                '：它与其它插件共享同一个来源。要持久化请用 Modulith.storage 或 Modulith.dataDir。'
+            );
+          },
+        });
+      } catch (error) {
+        // 封不上就说出来 —— 这一条失败的方向是"插件之间能互相看到对方的存储"。
+        console.error('[Modulith] 无法封掉 ' + name + '：' + error);
+      }
+    });
+
+    // `document.cookie` 单独处理：**读**返回空串而不是抛。
+    // 读的人多半是某个捆绑进来的库在做特性探测，让它们抛会把一个无关的插件
+    // 直接打挂；而返回空串同样不泄露任何东西。**写**必须失败 —— 写才是那条
+    // "把数据留给下一个插件"的路。
+    try {
+      Object.defineProperty(document, 'cookie', {
+        configurable: false,
+        get: function () {
+          return '';
+        },
+        set: function () {
+          throw new Error(
+            '[Modulith] 沙箱插件不能写 document.cookie：它与其它插件共享同一个来源。'
+          );
+        },
+      });
+    } catch (error) {
+      console.error('[Modulith] 无法封掉 document.cookie：' + error);
+    }
+  }
+
+  freezeOriginStorage();
 
   function has(permission) {
     return PERMISSIONS.indexOf(permission) !== -1;
@@ -1176,6 +1325,93 @@
    */
   function useModuleActive() {
     return true;
+  }
+
+  // ============================================================
+  // 宿主 → 这里：只能走 postMessage
+  // ============================================================
+  //
+  // 从前宿主能直接 `eval` 一段脚本进这个文档。跨源 iframe 没有那回事 —— 父文档
+  // 拿不到这里的 `window`，`eval` 更不可能。宿主因此改走两跳：一条 Tauri 事件到
+  // 主窗口，前端按令牌找到这个 iframe 再 `postMessage` 进来（见
+  // `src/services/sandboxSurface.ts` 的 `postToSurface`）。
+  //
+  // ============================================================
+  // 为什么认 `__modulith` 这个标记
+  // ============================================================
+  //
+  // 它挡的不是宿主（宿主本来就发得对），而是**别的**能往这个窗口发消息的人：
+  // 浏览器扩展、将来嵌进来的第三方内容、以及插件自己。少了这个标记，任何一条
+  // 能走到这个窗口的消息都可能被当成宿主的命令。
+  //
+  // 身份判据是 `event.source`，不是 `event.origin`：来源字符串是发送方自己声明的，
+  // 而窗口引用不能伪造 —— 只有宿主那个窗口能等于 `window.parent`。
+
+  var PUSH_HANDLERS = {
+    theme: function (payload) {
+      var style = document.getElementById('modulith-theme');
+      if (style && payload && typeof payload.css === 'string') style.textContent = payload.css;
+      if (window.__modulithThemeChanged) {
+        window.__modulithThemeChanged(payload ? payload.described : null);
+      }
+    },
+
+    shortcuts: function (payload) {
+      if (window.__modulithShortcutsChanged) {
+        window.__modulithShortcutsChanged(payload ? payload.table : null);
+      }
+    },
+
+    command: function (payload) {
+      if (window.__modulithCommand && payload) window.__modulithCommand(payload);
+    },
+
+    'download-progress': function (payload) {
+      if (window.__modulithDownloadProgress && payload) {
+        window.__modulithDownloadProgress(payload);
+      }
+    },
+
+    event: function (payload) {
+      if (window.__modulithDeliver && payload) window.__modulithDeliver(payload);
+    },
+  };
+
+  window.addEventListener(
+    'message',
+    function (event) {
+      if (event.source !== window.parent) return;
+
+      var data = event.data;
+      if (!data || data.__modulith !== true) return;
+
+      var handler = PUSH_HANDLERS[data.channel];
+      // 认不出的 channel 一律忽略：宿主将来加一条新的推送时，一个**旧插件**不该
+      // 因此报错，更不该把它当成别的东西。
+      if (!handler) return;
+
+      try {
+        handler(data.payload);
+      } catch (error) {
+        // 一条推送处理失败不该把整块界面带走 —— 但也必须留下来。
+        console.error('[Modulith] 处理宿主推送 ' + String(data.channel) + ' 失败：' + error);
+      }
+    },
+    false
+  );
+
+  // 告诉宿主"我起来了"。
+  //
+  // **这是唯一的就绪信号。** `iframe` 的 `load` 事件在一个加载失败的文档上照样会
+  // 触发（引擎拿它自己画的那张错误页触发它），因此宿主那边不能用它判断成功 ——
+  // 而这段代码跑到这里说明：文档加载了、脚本加载了、协议通了。
+  //
+  // 用 `'*'` 作为目标来源是必需的：这里读不到宿主自己的来源。它不构成泄露 ——
+  // `postMessage` 只投递给 `window.parent` 一个窗口，而那条消息里只有这两个字段。
+  try {
+    window.parent.postMessage({ __modulith: true, channel: 'ready' }, '*');
+  } catch (error) {
+    /* 够不到父窗口时什么都不做：那时连这条日志都不一定出得去 */
   }
 
   var Modulith = {

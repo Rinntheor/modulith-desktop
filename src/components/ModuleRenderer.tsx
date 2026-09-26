@@ -231,13 +231,13 @@ const ModuleRenderer: React.FC<ModuleRendererProps> = memo(({ moduleId, initial 
   // 使用缓存的组件
   const CachedComponent = getCachedModuleComponent(moduleId) || moduleDescriptor.component;
 
-  // 沙箱插件：它的界面在**另一个 webview** 里，DOM 这边只留一块位置正确的空洞。
+  // 沙箱插件：它的界面是一块**跨源 iframe**，由 `SandboxSurface` 挂出来。
   // 走这条分支时**不渲染 `CachedComponent`** —— 那个组件是给 in-process 插件用的，
   // 而在沙箱里没有 React 可跑。
   //
-  // `surface` 一路传下去：一个插件可以声明多个界面，而宿主侧的四条命令都按
-  // `(插件 id, 界面 id)` 定位 webview。不传的话每个界面都会退化成主界面，
-  // 于是第二个界面会去抢第一条标签 —— 而宿主会把它判成标签冲突。
+  // `surface` 一路传下去：一个插件可以声明多个界面，而宿主按
+  // `(插件 id, 界面 id)` 签发令牌。不传的话每个界面都会退化成主界面，
+  // 于是"详情"页显示的是列表。
   if (moduleDescriptor.sandboxed && moduleDescriptor.pluginId) {
     return (
       <ModuleErrorBoundary moduleId={moduleId}>

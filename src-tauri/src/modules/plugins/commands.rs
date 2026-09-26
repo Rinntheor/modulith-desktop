@@ -22,101 +22,70 @@ fn to_msg<E: std::fmt::Display>(err: E) -> String {
 }
 
 // ============================================================
-// 沙箱界面：前端量矩形，宿主建/摆/关 webview
+// 沙箱界面：宿主签发令牌，前端渲染 iframe
 // ============================================================
 //
-// 为什么由**前端**给位置：只有它知道标签栏、分屏、侧边栏当前各占多少。
-// 宿主自己算就要把整套布局再实现一遍，而那两份一定会漂。
+// 这一组命令从前是"前端量矩形、宿主建 / 摆 / 关 webview"四条。现在只剩两条，
+// 因为宿主**不再碰窗口系统**：插件界面是宿主页面上一个 `<iframe>`，位置与尺寸
+// 由 CSS 决定，宿主既不知道也不该知道它被放在哪。
 //
-// 为什么不是"前端画一个 iframe"：插件界面必须是**独立 webview**，`iframe` 拿不到
-// 真正的隔离（见 docs/08-规划/插件沙箱与数据-v2.0范围.md §2.3）。
-// 代价是它盖在 DOM 之上，位置只能由宿主摆 —— 于是有了这三条命令。
+// 宿主唯一还负责的是**身份**：签发一个不可猜的令牌，并把它绑到"哪个插件的哪个
+// 界面"上。没有令牌，那个 iframe 一条资源都取不到。理由见 `sandbox.rs` 文件头。
+//
+// 为什么不是"插件自己在页面里画一个 iframe"：iframe 里能拿到什么，完全由**来源**
+// 决定，而"哪个来源能读哪份数据"只有宿主知道。插件自己建 iframe 等于自己给自己
+// 发通行证。
 
-/// 显示一个沙箱插件的一个界面（不存在就建），并摆到给定矩形。
+/// 给一个已安装插件的某个界面签发令牌，并把该 iframe 的地址一并返回。
 ///
 /// 只对清单里写了 `runtime: "sandboxed"` 的**已安装**插件、且清单里**声明过**的
-/// 界面 id 有效；其余一律拒绝（理由见 `sandbox::open_surface_at`）。
+/// 界面 id 有效；其余一律拒绝（理由见 `sandbox::open_surface`）。
 ///
 /// `surface` 缺省是主界面（`"main"`）。缺省值的意义在于：单界面插件的调用方
-/// （包括已发布的那 9 个）**一个字都不用改** —— 它们的形态与多界面之前逐字节相同。
+/// （包括已发布的那 9 个）**一个字都不用改**。
 ///
-/// **这四条命令必须是 `async`。** 同步命令的函数体在 IPC 线程（也就是主线程）
-/// 上就地执行，而它们最终会创建 / 摆弄 / 销毁真实 webview —— 那正是不能在主线程
-/// 上做的事。把它写回同步的，就是那次整机假死。完整推导见 `surface.rs` 文件头。
+/// **幂等。** 前端会重复调用它（React 重复渲染、宿主布局变化后的重挂载），
+/// 同一个界面永远只拿到一个令牌 —— 理由见 `SandboxSurfaces::issue`。
+///
+/// 它仍然是 `async` 的，因为要读 `PluginManager`（一把 tokio 锁）。这**不是**
+/// 那条"不能在主线程上建 webview"的约束 —— 这条路径根本不碰窗口系统。
 #[tauri::command]
 pub async fn sandbox_surface_open(
     app: AppHandle,
     plugin_id: String,
     surface: Option<String>,
-    bounds: super::surface::SurfaceBounds,
-    visible: Option<bool>,
-) -> Result<(), String> {
+) -> Result<super::sandbox::SurfaceHandle, String> {
     let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
-    // `visible` 缺省是 `true`（正常打开）。传 `false` 是**启动占位**那条路径：
-    // 宿主自己要在那块位置上先画一块 DOM 占位（`ctx.ui.splash`），而原生 webview
-    // 盖在 DOM 之上 —— 因此只能把它建出来但不显示。见 `surface.rs` 的 `Job::Show`。
-    super::sandbox::open_surface_at(&app, &plugin_id, &surface, bounds, visible.unwrap_or(true)).await
+    super::sandbox::open_surface(&app, &plugin_id, &surface).await
 }
 
-/// 隐藏界面但**不销毁**。切标签、宿主浮层盖上来、窗口被收起时走它。
+/// 收回一块界面的令牌。**没开着时静默成功** —— 前端在卸载时无条件调用它，
+/// 把"本来就没开"当成错误只会在日志里堆噪声。
 ///
-/// 与 `close` 分开是有意的：下一节要付的代价差一个数量级 —— 隐藏是即时的，
-/// 而重新创建要重走一遍 WebView2 控制器创建（几百毫秒），插件自己的界面状态
-/// 也会一起丢掉。
+/// 认令牌而不是认 `(插件 id, 界面 id)`：令牌才是那个 iframe 的身份，而一个
+/// 界面在"关掉又打开"之间会拿到**不同的**令牌。按名字关会让一次迟到的卸载
+/// 把新开的那一块关掉。
 #[tauri::command]
-pub async fn sandbox_surface_hide(
-    app: AppHandle,
-    plugin_id: String,
-    surface: Option<String>,
-) -> Result<(), String> {
-    let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
-    super::sandbox::hide_surface(&app, &plugin_id, &surface).await
-}
-
-/// 关闭并销毁一个沙箱插件的界面。没开着时是**静默成功** ——
-/// 前端在卸载时无条件调用它，把"本来就没开"当成错误只会在日志里堆噪声。
-///
-/// 不传 `surface` 时关掉这个插件的**全部**界面。这不是顺手加的：插件被停用或
-/// 卸载时，它开着的每一个界面都必须消失 —— 而那时调用方（前端）只知道插件 id。
-#[tauri::command]
-pub async fn sandbox_surface_close(
-    app: AppHandle,
-    plugin_id: String,
-    surface: Option<String>,
-) -> Result<(), String> {
-    match surface {
-        Some(surface) => super::sandbox::close_surface(&app, &plugin_id, &surface).await,
-        None => super::sandbox::close_all_surfaces(&app, &plugin_id).await,
-    }
-}
-
-/// 重新摆放一个沙箱插件的界面。
-///
-/// 窗口缩放、侧边栏折叠、分屏比例变化、以及**宿主内容滚动**都走它 ——
-/// 原生 webview 不跟着 DOM 走，位置只能由前端量出来再告诉我们。
-#[tauri::command]
-pub async fn sandbox_surface_bounds(
-    app: AppHandle,
-    plugin_id: String,
-    surface: Option<String>,
-    bounds: super::surface::SurfaceBounds,
-) -> Result<(), String> {
-    let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
-    super::sandbox::set_surface_bounds(&app, &plugin_id, &surface, bounds).await
+pub async fn sandbox_surface_close(app: AppHandle, token: String) -> Result<(), String> {
+    super::sandbox::close_surface(&app, &token);
+    Ok(())
 }
 
 /// 运行沙箱自检（诊断用）。**由人显式触发。**
 ///
-/// 它打开一块面板，在一个**真实**的插件 webview 里把四条边界各跑一次：ACL 是否
-/// 真的拒绝、身份是否真的来自浏览器引擎、自定义协议是否可用、CSP 是否真的生效。
-/// 结果同时画在面板上并写进日志。
+/// 它打开一个**独立窗口**，在一个真实 webview 里把几条边界各跑一次：文档里有没有
+/// 宿主 IPC、自定义协议是否可用、CSP 是否真的生效。结果同时画在窗口上并写进日志。
 ///
 /// 它**不再随应用启动自动运行** —— 每次启动都弹一块面板去验一件大多数时候都成立的
 /// 事，代价是一个每天都会遇到的打扰。为什么保留它、以及不再自动跑的理由，
 /// 见 `sandbox::open_selftest`。
+///
+/// **这条命令必须保持 `async`。** 它要建一个真窗口，而同步命令的函数体在 IPC
+/// 线程（也就是主线程）上就地执行 —— 那正是当年整机假死的那条路径。改成同步
+/// 会让点一下"自检"就卡死整个应用。
 #[tauri::command]
 pub async fn sandbox_self_test(app: AppHandle) -> Result<(), String> {
-    super::sandbox::open_selftest(&app).await
+    super::sandbox::open_selftest(&app)
 }
 
 /// 一个插件声明了哪些界面（`contributes.surfaces`）。
@@ -185,7 +154,7 @@ pub async fn set_plugin_theme(
 
     // 只推给**已经打开的**界面。没打开的会在它下一次加载时从入口文档里拿到
     // 最新的那一份，不需要任何额外动作。
-    super::sandbox::apply_theme(&app).await;
+    super::sandbox::apply_theme(&app);
     Ok(true)
 }
 
@@ -225,7 +194,7 @@ pub async fn set_plugin_shortcuts(
         return Ok(false);
     }
 
-    super::sandbox::apply_shortcuts(&app).await;
+    super::sandbox::apply_shortcuts(&app);
     Ok(true)
 }
 
@@ -438,9 +407,9 @@ pub async fn set_plugin_enabled(
     // 卸载、将来的命令行），让每一条都记得做同一件事，迟早会漏掉一条 ——
     // 而漏掉的表现是一个还需要重启才能恢复的状态。
     if !enabled {
-        if let Err(error) = super::sandbox::close_all_surfaces(&app, &id).await {
-            log::warn!("停用 {id} 时关闭它的界面失败：{error}");
-        }
+        // 这一条现在**不会失败**（只收回令牌、再推一条"把这块卸掉"给前端），
+        // 因此没有错误分支了。
+        super::sandbox::close_all_surfaces(&app, &id);
         // 数据库连接也要放掉。**文件不动**（§6：卸载删代码、保留数据），
         // 放掉的只是那个文件句柄 —— 它在 Windows 上会让备份与"数据目录被占用"
         // 的排查变麻烦，而一个被停用的插件本来也不该继续占着它。
@@ -460,9 +429,7 @@ pub async fn uninstall_plugin(app: AppHandle, state: State<'_, PluginState>, id:
     // 与停用同理：被卸载的插件不该留下任何界面。顺序是**先卸再关** ——
     // 反过来的话，`close_all_surfaces` 之后到 `uninstall` 之间那段窗口里，
     // 插件还能重新建出一个界面来。
-    if let Err(error) = super::sandbox::close_all_surfaces(&app, &id).await {
-        log::warn!("卸载 {id} 时关闭它的界面失败：{error}");
-    }
+    super::sandbox::close_all_surfaces(&app, &id);
     close_database(&app, &id);
 
     Ok(())

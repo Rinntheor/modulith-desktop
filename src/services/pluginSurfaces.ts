@@ -98,9 +98,9 @@ export function parseSurfaceModuleId(
 /**
  * 占位组件。
  *
- * **它永远不会被渲染。** `ModuleRenderer` 看见 `sandboxed` 就换成一块空地，
- * 由 `SandboxSurface` 去建真正的 webview。给一个真组件反而危险 —— 将来某处
- * 少判了 `sandboxed`，一个假界面会安静地画出来，而所有人都会以为沙箱生效了。
+ * **它永远不会被渲染。** `ModuleRenderer` 看见 `sandboxed` 就换成 `SandboxSurface`，
+ * 由它挂出真正的 `<iframe>`。给一个真组件反而危险 —— 将来某处少判了 `sandboxed`，
+ * 一个假界面会安静地画出来，而所有人都会以为沙箱生效了。
  */
 const NeverRendered: React.FC = () => null;
 
