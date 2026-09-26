@@ -2993,37 +2993,49 @@ section('两侧的成员表');
   }
   check(parityApi !== null, '沙箱侧可以被实例化（否则这一节无从谈起）');
 
-  // 宿主侧：从 `pluginBoundary.ts` 的 `CONTEXT_MEMBERS` 表里读，**不写死一份字面量** ——
-  // 写死的那一份会与真源漂开，而"漂开"正是这一节要查的事。
+  // 宿主侧：**两张表都要读**。`ctx.*` 是能力，`Modulith.*` 是运行时入口；而沙箱里
+  // 它们被并进了同一个对象（沙箱没有 `ctx` 那个中间层），因此两张表里的成员都得有。
+  //
+  // 只读 `ctx.*` 是这一节**一个真实存在过的盲点**：`kanban` 在 bundle 顶层调用
+  // `Modulith.registerCommand({ id, title, run })`，而沙箱桥接层没有这个成员 ——
+  // 迁过去不是"某个功能失效"，是**整个插件加载时抛 TypeError**。一次针对
+  // "这 8 个插件能不能迁到沙箱"的逐个审计才把它翻出来，而那份审计之所以要做，
+  // 是因为这一节从来没比过 `Modulith.*`。
   const boundarySource = read('../src/services/pluginBoundary.ts');
-  const ctxStart = boundarySource.indexOf('const CONTEXT_MEMBERS');
-  const ctxEnd = boundarySource.indexOf('\n];', ctxStart);
-  check(ctxStart >= 0 && ctxEnd > ctxStart, '能从 pluginBoundary.ts 定位到宿主 ctx 的成员表');
-  const ctxMembers = [
-    ...boundarySource.slice(ctxStart, ctxEnd).matchAll(/\bname: '([A-Za-z_$][\w$]*)'/g),
-  ].map((match) => match[1]);
 
-  // 判据**不能**要求 `{` 与 `name:` 同行：`handle` 形态的成员是多行写的，
-  // 按单行匹配只会捞到 value 那三个，于是整张表看起来像缺了一大半。
+  const tableOf = (name: string): string[] => {
+    const start = boundarySource.indexOf(`const ${name}`);
+    const end = boundarySource.indexOf('\n];', start);
+    check(start >= 0 && end > start, `能从 pluginBoundary.ts 定位到 ${name}`);
+    // 判据**不能**要求 `{` 与 `name:` 同行：`handle` 形态的成员是多行写的，
+    // 按单行匹配只会捞到 value 那三个，于是整张表看起来像缺了一大半。
+    return [...boundarySource.slice(start, end).matchAll(/\bname: '([A-Za-z_$][\w$]*)'/g)].map(
+      (match) => match[1]
+    );
+  };
+
+  const ctxMembers = tableOf('CONTEXT_MEMBERS');
+  const hostMembers = tableOf('HOST_MEMBERS');
+
   check(ctxMembers.length >= 20, `宿主 ctx 表读到 ${ctxMembers.length} 个成员`);
+  check(hostMembers.length >= 13, `宿主 Modulith 表读到 ${hostMembers.length} 个成员`);
 
   const sandboxKeys = parityApi ? Object.keys(parityApi) : [];
 
-  // 沙箱里**必须**与宿主同名的那些（也就是真正会被插件直接读到的成员）
-  const sandboxOnly = sandboxKeys.filter((key) => !ctxMembers.includes(key)).sort();
+  // 沙箱里**必须**与宿主同名的那些（也就是真正会被插件直接读到的成员）。
+  // 基准是两张表的**并集** —— 只用 `ctx.*` 当基准，「沙箱独有」会虚高一整族
+  // （React 那一套本来就在 `Modulith.*` 里，不是沙箱发明的）。
+  const sandboxOnly = sandboxKeys
+    .filter((key) => !ctxMembers.includes(key) && !hostMembers.includes(key))
+    .sort();
   const inProcessOnly = ctxMembers.filter((key) => !sandboxKeys.includes(key)).sort();
+  const hostOnly = hostMembers.filter((key) => !sandboxKeys.includes(key)).sort();
 
   const EXPECTED_SANDBOX_ONLY = [
     // 宿主对象那一族被并进了同一个对象：in-process 的 `Modulith.React` 与
-    // `ctx` 是两个东西，沙箱只有一个 `Modulith`。
-    'Fragment',
-    'React',
-    'createContext',
-    'jsx',
+    // `ctx` 是两个东西，沙箱只有一个 `Modulith`。**因此它们不算"沙箱独有"** ——
+    // 基准是两张表的并集，而它们本来就在 `Modulith.*` 那一张里。
     'jsxDEV',
-    'jsxs',
-    'registerModule',
-    'useModuleActive',
     // 沙箱自己的形状
     'commands',
     'has',
@@ -3035,7 +3047,7 @@ section('两侧的成员表');
     'ui',
   ].sort();
 
-  // **只剩一条真实缺口**，而且是设计选择，不是没做：
+  // `ctx.*` 那一侧的缺口。**只剩一条**，而且是设计选择，不是没做：
   //   * `manifest` —— 宿主没有把整份清单送进沙箱（只送了 id/name/version/permissions）。
   //
   // `fileDrop` 曾经在这张清单里，理由写的是"拖放是窗口级事件、子 webview 收不到、
@@ -3044,10 +3056,20 @@ section('两侧的成员表');
   // 自己的 HWND 且没注册处理器，路径从根上断掉。换成 iframe 之后指针底下始终是
   // 主 webview 的 HWND，事件照常触发且带指针位置 —— 于是它变成"按位置命中哪一块
   // 界面就往哪一块 postMessage"，1.6.0 补上了。
-  //
-  // 剩下这一条写进插件开发文档，因此这里把它钉成"已知且被承认"的清单：
-  // 将来谁不小心弄丢了一个成员，差异清单会变长，这条就红了。
   const EXPECTED_IN_PROCESS_ONLY = ['manifest'].sort();
+
+  // `Modulith.*` 那一侧的缺口。**两条，都是"数据/引导"这一类，不是能力**：
+  //   * `capabilities` —— 那张表由**前端**从 `pluginBoundary.ts` 派生
+  //     （`HOST_CAPABILITIES`），而桥接层是 Rust 渲染的：把它送进去需要
+  //     前端在建界面时把它交给宿主、宿存在令牌旁边、再注入桥接层。可行，
+  //     但还没有人需要它（9 个插件一个都没读 `Modulith.capabilities`）；
+  //   * `run` —— 显式引导入口。它的价值在 in-process 侧是**去掉隐式全局**
+  //     （v1 靠"当前正在加载哪个插件"决定归属，那个全局跨不过 realm），而沙箱里
+  //     这份文档从头到尾只属于一个插件，那个全局根本不存在 —— 于是"引导"这件事
+  //     在沙箱里没有对应的问题要解决。
+  //
+  // 两条都写进插件开发文档，因此这里把它们钉成"已知且被承认"的清单。
+  const EXPECTED_HOST_ONLY = ['capabilities', 'run'].sort();
 
   check(
     sandboxOnly.join(',') === EXPECTED_SANDBOX_ONLY.join(','),
@@ -3058,11 +3080,17 @@ section('两侧的成员表');
   check(
     inProcessOnly.join(',') === EXPECTED_IN_PROCESS_ONLY.join(','),
     inProcessOnly.join(',') === EXPECTED_IN_PROCESS_ONLY.join(',')
-      ? `宿主独有（即沙箱缺失）的 ${inProcessOnly.length} 个成员与预期一致：${inProcessOnly.join('、')}`
-      : `★ 两侧的缺口变了 —— 这会让"同一个插件两侧都能跑"变成假话。\n      预期：${EXPECTED_IN_PROCESS_ONLY.join('、')}\n      实际：${inProcessOnly.join('、') || '（空）'}`
+      ? `ctx 里宿主独有（即沙箱缺失）的 ${inProcessOnly.length} 个成员与预期一致：${inProcessOnly.join('、')}`
+      : `★ ctx.* 两侧的缺口变了 —— 这会让"同一个插件两侧都能跑"变成假话。\n      预期：${EXPECTED_IN_PROCESS_ONLY.join('、')}\n      实际：${inProcessOnly.join('、') || '（空）'}`
+  );
+  check(
+    hostOnly.join(',') === EXPECTED_HOST_ONLY.join(','),
+    hostOnly.join(',') === EXPECTED_HOST_ONLY.join(',')
+      ? `Modulith 里宿主独有（即沙箱缺失）的 ${hostOnly.length} 个成员与预期一致：${hostOnly.join('、')}`
+      : `★ Modulith.* 两侧的缺口变了。**这一条从前根本不存在** —— 少了它，kanban 用的 registerCommand 一直缺着也没人知道，而那个缺口的症状是插件加载时抛 TypeError。\n      预期：${EXPECTED_HOST_ONLY.join('、')}\n      实际：${hostOnly.join('、') || '（空）'}`
   );
 
-  // 光有"差异清单对得上"还不够：两边都空成一个集合也能骗过上面两条。
+  // 光有"差异清单对得上"还不够：两边都空成一个集合也能骗过上面三条。
   const shared = ctxMembers.filter((key) => sandboxKeys.includes(key)).sort();
   check(
     shared.length >= 18,

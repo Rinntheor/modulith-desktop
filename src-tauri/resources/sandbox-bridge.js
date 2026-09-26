@@ -1433,6 +1433,67 @@
     /* 够不到父窗口时什么都不做：那时连这条日志都不一定出得去 */
   }
 
+  // ============================================================
+  // `Modulith.*` 那一张表上的运行时入口
+  // ============================================================
+  //
+  // in-process 里 `Modulith.*` 与 `ctx.*` 是**两个**对象；沙箱里它们被并进了同一个
+  // （沙箱没有 `ctx` 那个中间层）。因此**两张表里的成员这里都得有**。
+  //
+  // 而这件事长期没有被任何东西核对过：`check:sandbox` 的两侧比对只读了
+  // `ctx.*`（`CONTEXT_MEMBERS`），`Modulith.*`（`HOST_MEMBERS`）那一侧从来没比过。
+  // 一次针对"这 8 个插件能不能迁"的审计把它翻了出来 —— 缺了 5 个，
+  // 而其中一个会让插件**根本加载不起来**。
+
+  /** 平台标识。与宿主 `installHostGlobals` 里那个字面量一致。 */
+  var platform = 'tauri';
+
+  /**
+   * 交出一条命令的行为函数。
+   *
+   * **写进与 `ctx.commands.on` 同一张表。** 宿主把命令推下来时，桥接层就是按
+   * `commandHandlers` 找处理器的（见 `window.__modulithCommand`）—— 两条路各写
+   * 一张表的话，`registerCommand` 注册的命令会永远收不到推送。
+   *
+   * ============================================================
+   * 与 in-process 的一处真实差别
+   * ============================================================
+   *
+   * in-process 的 `registerCommand` 在命令**没写进 `contributes.commands`** 时，
+   * 会直接把它加进宿主的命令面板（并给一条警告）。沙箱做不到 —— 命令面板在宿主
+   * 那一个文档里，而这个 iframe 改不了它。
+   *
+   * 因此沙箱里**只有清单声明过的命令**会被面板找到。这是能力差异，不是漏做：
+   * 命令面板按定义是宿主的界面。它与 `ctx.manifest` 一样写进插件开发文档。
+   */
+  function registerCommand(command) {
+    if (!command || !command.id || !command.title || typeof command.run !== 'function') {
+      console.warn('[Modulith] registerCommand 需要 id、title 与 run，调用被忽略');
+      return;
+    }
+
+    commands.on(command.id, command.run);
+  }
+
+  /**
+   * 登记一个"插件被停用/卸载时执行"的清理函数。
+   *
+   * 与 `disposables.add` 是**同一件事的两个入口** —— in-process 侧也是这样
+   * （`onDeactivate` 只是 `addDisposable` 的别名）。因此这里直接转发，
+   * 而不是另起一张表：两张表意味着两种清理时机，而漏掉一种的表现是资源泄漏。
+   *
+   * **触发时机与 in-process 有一处差别。** 那边由宿主在停用/卸载时逐个调用；
+   * 沙箱里这份文档的"停用"就是**它自己要被销毁**（宿主撤销令牌、前端卸掉 iframe），
+   * 而文档消失前会收到 `pagehide` —— 桥接层已经在那条路径上接了 `flush()`。
+   * 也就是说清理**仍然会发生**，但发生在文档消失的那一刻，而不是更早一点。
+   */
+  function onDeactivate(dispose) {
+    if (typeof dispose !== 'function') {
+      throw new TypeError('Modulith.onDeactivate 需要一个函数');
+    }
+    return disposables.add(dispose);
+  }
+
   /** 文件拖放的订阅者。见 `PUSH_HANDLERS['file-drop']`。 */
   var FILE_DROP_HANDLERS = new Set();
 
@@ -1516,6 +1577,20 @@
 
     /** 沙箱里退化成"把自己挂到本界面" —— 见上面的说明 */
     registerModule: registerModule,
+
+    /** 平台标识。与 in-process 的 `Modulith.platform` 同一个字面量。 */
+    platform: platform,
+
+    /**
+     * 交出一条命令的行为函数。见上面 `registerCommand` 的说明 ——
+     * 沙箱里只有清单声明过的命令会被面板找到。
+     */
+    registerCommand: registerCommand,
+
+    /**
+     * 登记清理函数。与 `disposables.add` 同一个入口，触发时机见上面的说明。
+     */
+    onDeactivate: onDeactivate,
 
     /** 恒为 true；理由见上面的说明（沙箱里"别的模块"这个概念不存在） */
     useModuleActive: useModuleActive,
