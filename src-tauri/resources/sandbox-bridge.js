@@ -330,12 +330,23 @@
 
   var dataDir = {
     /**
-     * 数据根目录当前是否可用。
+     * 数据根目录当前是否可用。**异步**，与 in-process 同名同形。
      *
-     * 这个值是**文档加载时**宿主注入的快照，因此它同步可读（插件在顶层就能用它
-     * 决定"先建目录还是先提示用户去配置"）。要拿实时状态用 `status()`。
+     * 这里曾经是一个**同步的布尔值**（宿主在建这个文档时注入的快照）。那是个
+     * 形状差异：in-process 的写法是 `await ctx.dataDir.available()`，而沙箱里
+     * `ctx.dataDir.available` 是个布尔 —— 前者会抛 "not a function"，
+     * 后者在 in-process 里永远为真（函数对象恒真）。两边都错，只是错法不同。
+     *
+     * 快照仍然有用：它说"不可用"时不必往返一趟问宿主 —— 而"不可用"是常见状态
+     * （数据目录还没配置）。要那句话给用户看的理由，用 `status()`（沙箱侧多出来的，
+     * 宿主没有；插件不该依赖它）。
      */
-    available: DATA_AVAILABLE,
+    available: function () {
+      if (!DATA_AVAILABLE) return Promise.resolve(false);
+      return rpc('data.available', {}).then(function (state) {
+        return !!(state && state.available);
+      });
+    },
 
     /**
      * 问一次宿主的**当前**状态：`{available, configured, path, reason}`。
@@ -429,20 +440,54 @@
   // `http://<名字>.localhost` 被浏览器当作**可信来源**，因此不需要 https 就能
   // 用剪贴板 API —— 这是这条自定义协议能承载完整插件界面的一部分原因。
 
-  var clipboard = {
-    read: function () {
-      if (!has('clipboard')) {
-        return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
-      }
-      return navigator.clipboard.readText();
-    },
-    write: function (text) {
-      if (!has('clipboard')) {
-        return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
-      }
-      return navigator.clipboard.writeText(String(text));
-    },
-  };
+  // ============================================================
+  // 剪贴板（`ctx.clipboard`）
+  // ============================================================
+  //
+  // **方法名必须与 in-process 一致**：宿主是 `{ isAvailable, readText, writeText }`，
+  // 这里曾经叫 `{ read, write }`。同一类错误在这次迁移里出现三次（还有
+  // `ctx.notifications` 与 `ctx.events`），根因都是早先的核对只比**成员名**。
+  var clipboard = (function () {
+    var allowed = has('clipboard');
+
+    var warned = false;
+    function warnOnce() {
+      if (warned) return;
+      warned = true;
+      console.warn(
+        '[Modulith] 插件调用了剪贴板，但清单里没有声明 "clipboard" 权限，调用被拒绝（后续同类调用不再重复提示）'
+      );
+    }
+
+    function guard() {
+      if (allowed) return true;
+      warnOnce();
+      return false;
+    }
+
+    return {
+      /** 权限是否已声明（插件据此自行降级，而不必看控制台）。 */
+      isAvailable: function () {
+        return allowed;
+      },
+
+      /**
+       * 读剪贴板文本。
+       *
+       * **可能失败，而且失败不是缺陷**：浏览器要求页面处于聚焦状态、也可能要求
+       * 用户手势，剪贴板还可能被别的程序独占。调用方应当准备好回退路径。
+       */
+      readText: function () {
+        if (!guard()) return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
+        return navigator.clipboard.readText();
+      },
+
+      writeText: function (text) {
+        if (!guard()) return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
+        return navigator.clipboard.writeText(String(text));
+      },
+    };
+  })();
 
   // ============================================================
   // 清理登记
@@ -528,34 +573,72 @@
     });
   };
 
-  var events = {
-    /** 发一条跨插件事件。需要 plugin-communicate 权限。 */
-    emit: function (name, payload) {
-      return rpc('events.emit', { name: String(name), payload: payload });
-    },
+  // ============================================================
+  // 跨插件事件（`ctx.events`）
+  // ============================================================
+  //
+  // **形状必须与 in-process 的 `ctx.events` 逐字一致**：那边是
+  // `{ publish, subscribe, isAvailable }`。这里曾经叫 `{ emit, on }` —— 名字都在
+  // 另一个集合里，于是 `kanban` 调 `ctx.events.publish(...)` 直接 TypeError、
+  // 界面白屏。
+  //
+  // 这正是"只比成员名"这类核对查不出的错误：`ctx.events` **在**，只是它上面挂的
+  // 方法名是另一套。见 `staging/audit-plugin-methods.cjs`。
+  var events = (function () {
+    var allowed = has('plugin-communicate');
 
-    /**
-     * 订阅一条跨插件事件。返回取消订阅的函数。
-     *
-     * 处理器收到 (payload, source) —— **来源是宿主给的**，不是发送方自报的：
-     * 一个插件不该能冒充另一个插件发事件。
-     */
-    on: function (name, handler) {
-      if (typeof handler !== 'function') {
-        throw new Error('ctx.events.on 需要一个函数');
-      }
-      var key = String(name);
-      if (!eventHandlers[key]) eventHandlers[key] = [];
-      eventHandlers[key].push(handler);
+    var warned = false;
+    function warnOnce() {
+      if (warned) return;
+      warned = true;
+      console.warn(
+        '[Modulith] 插件调用了跨模块通信，但清单里没有声明 "plugin-communicate" 权限，调用被忽略（后续同类调用不再重复提示）'
+      );
+    }
 
-      return function () {
-        var list = eventHandlers[key] || [];
-        eventHandlers[key] = list.filter(function (item) {
-          return item !== handler;
-        });
-      };
-    },
-  };
+    return {
+      /** 发一条跨插件事件。需要 `plugin-communicate` 权限。 */
+      publish: function (topic, payload) {
+        if (!allowed) {
+          warnOnce();
+          return;
+        }
+        return rpc('events.emit', { name: String(topic), payload: payload });
+      },
+
+      /**
+       * 订阅一条跨插件事件。返回取消订阅的函数。
+       *
+       * 处理器收到 `(payload, source)` —— **来源是宿主给的**，不是发送方自报的：
+       * 一个插件不该能冒充另一个插件发事件。
+       */
+      subscribe: function (topic, handler) {
+        if (!allowed) {
+          warnOnce();
+          return function () {};
+        }
+        if (typeof handler !== 'function') {
+          throw new Error('ctx.events.subscribe 需要一个函数');
+        }
+
+        var key = String(topic);
+        if (!eventHandlers[key]) eventHandlers[key] = [];
+        eventHandlers[key].push(handler);
+
+        return function () {
+          var list = eventHandlers[key] || [];
+          eventHandlers[key] = list.filter(function (item) {
+            return item !== handler;
+          });
+        };
+      },
+
+      /** 权限是否已声明（插件据此自行降级，而不必看控制台）。 */
+      isAvailable: function () {
+        return allowed;
+      },
+    };
+  })();
 
   // ============================================================
   // 主题
@@ -1626,6 +1709,33 @@
     },
   };
 
+  /**
+   * 把 `post` / `put` 的 `data` 变成 JSON 请求体，并补上 `content-type`。
+   *
+   * 与 in-process 那边"先 `normalize(init)` 再 `JSON.stringify(data)`"是同一件事：
+   * 插件传的是**对象**，序列化由这一层做。
+   *
+   * 调用方已经给了 `content-type` 时**不覆盖** —— 覆盖会让"我明明说了用别的类型"
+   * 变成一句谎话，而那种错误表现为服务端解析失败，离真正的原因很远。
+   */
+  function withJsonBody(data, init) {
+    var options = init || {};
+    if (data === undefined) return options;
+
+    var headers = {};
+    var provided = options.headers || {};
+    Object.keys(provided).forEach(function (key) {
+      headers[key] = provided[key];
+    });
+
+    var hasContentType = Object.keys(headers).some(function (key) {
+      return key.toLowerCase() === 'content-type';
+    });
+    if (!hasContentType) headers['content-type'] = 'application/json';
+
+    return { headers: headers, body: JSON.stringify(data) };
+  }
+
   var Modulith = {
     dataDir: dataDir,
      db: db,
@@ -1829,6 +1939,38 @@
       },
 
       /**
+       * 通用请求：`request(method, url, init?)`。与 in-process 同名同形。
+       *
+       * 下面四个是它的糖，形状与宿主逐字一致 —— 包括 `post` / `put` 收的是
+       * **对象**（序列化由这一层做，插件不必自己 `JSON.stringify`）。
+       */
+      request: function (method, url, init) {
+        var options = init || {};
+        return rpc('http.fetch', {
+          url: url,
+          method: String(method).toUpperCase(),
+          headers: options.headers === undefined ? null : options.headers,
+          body: options.body === undefined ? null : options.body,
+        });
+      },
+
+      get: function (url, init) {
+        return http.request('GET', url, init);
+      },
+
+      post: function (url, data, init) {
+        return http.request('POST', url, withJsonBody(data, init));
+      },
+
+      put: function (url, data, init) {
+        return http.request('PUT', url, withJsonBody(data, init));
+      },
+
+      delete: function (url, init) {
+        return http.request('DELETE', url, init);
+      },
+
+      /**
        * 把一个文件**直接下到数据目录**，不经过 JS 内存。
        *
        *   await Modulith.http.download(url, 'models/model.bin', function (p) {
@@ -1879,18 +2021,66 @@
       },
     },
 
-    notifications: {
-      /** 推一条通知。需要 `notification` 权限。 */
-      notify: function (input) {
-        var input0 = input || {};
+    // ============================================================
+    // 通知（`ctx.notifications`）
+    // ============================================================
+    //
+    // **形状必须与 in-process 的 `ctx.notifications` 逐字一致**：那边是
+    // `{ show, info, success, warn, error, isAvailable }`，参数是**位置参数**
+    // `(title, body, dedupeKey)`。这里曾经是一个 `notify(input)` —— 于是
+    // `pomodoro` 调 `ctx.notifications.isAvailable()` 直接 TypeError、界面白屏。
+    //
+    // 同一条错误在这次迁移里出现两次（还有 `ctx.events`），原因都是同一个：
+    // 早先的核对只比**成员名**。见 `staging/audit-plugin-methods.cjs`。
+    notifications: (function () {
+      var allowed = has('notification');
+
+      var warned = false;
+      function warnOnce() {
+        if (warned) return;
+        warned = true;
+        console.warn(
+          '[Modulith] 插件调用了通知接口，但清单里没有声明 "notification" 权限，调用被忽略（后续同类调用不再重复提示）'
+        );
+      }
+
+      function notify(title, body, level, dedupeKey) {
+        if (!allowed) {
+          warnOnce();
+          // 与 in-process 一样**不抛**：通知是"顺带说一声"，让它失败会拖垮
+          // 一个本来正常的流程。
+          return Promise.resolve();
+        }
         return rpc('notify', {
-          title: input0.title,
-          body: input0.body === undefined ? '' : input0.body,
-          level: input0.level === undefined ? 'info' : input0.level,
-          dedupeKey: input0.dedupeKey === undefined ? null : input0.dedupeKey,
+          title: title,
+          body: body === undefined ? '' : body,
+          level: level,
+          dedupeKey: dedupeKey === undefined ? null : dedupeKey,
         });
-      },
-    },
+      }
+
+      return {
+        show: function (title, body, dedupeKey) {
+          return notify(title, body, 'info', dedupeKey);
+        },
+        info: function (title, body, dedupeKey) {
+          return notify(title, body, 'info', dedupeKey);
+        },
+        success: function (title, body, dedupeKey) {
+          return notify(title, body, 'success', dedupeKey);
+        },
+        warn: function (title, body, dedupeKey) {
+          return notify(title, body, 'warning', dedupeKey);
+        },
+        error: function (title, body, dedupeKey) {
+          return notify(title, body, 'error', dedupeKey);
+        },
+        /** 权限是否已声明（插件据此自行降级，而不必看控制台）。 */
+        isAvailable: function () {
+          return allowed;
+        },
+      };
+    })(),
 
     launcher: {
       launch: function (program, args) {
@@ -1921,6 +2111,17 @@
     },
 
     settings: {
+      /**
+       * 这块界面能不能用设置接口。
+       *
+       * 与 in-process 同名同形（那边是 `pluginSettingsAPI`）。**它曾经缺失** ——
+       * 而 `isAvailable` 正是插件用来"自己降级、而不是去读控制台"的那个方法，
+       * 缺了它插件只能猜。
+       */
+      isAvailable: function () {
+        return has('storage');
+      },
+
       /**
        * 读插件贡献的设置项。
        *

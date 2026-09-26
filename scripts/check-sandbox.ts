@@ -1274,7 +1274,12 @@ section('完整 API 表面');
       ['storage.clear', isFunction],
 
       // 3.2 数据 · 文件目录
-      ['dataDir.available', (value) => typeof value === 'boolean'],
+      //
+      // `available` 是**函数**（与 in-process 同名同形）。它曾经是一个同步布尔值，
+      // 而宿主那边永远是可调用的 —— 于是 `await ctx.dataDir.available()` 在沙箱里
+      // 抛 "not a function"，而 `if (ctx.dataDir.available)` 在 in-process 里恒真
+      // （函数对象恒真）。两边都错，只是错法不同。
+      ['dataDir.available', isFunction],
       ['dataDir.status', isFunction],
       ['dataDir.list', isFunction],
       ['dataDir.stat', isFunction],
@@ -1298,16 +1303,30 @@ section('完整 API 表面');
       ['http.fetch', isFunction],
       ['http.download', isFunction],
 
-      // 3.4 界面（沙箱里没有 registerModule —— 沙箱插件自己就是界面）
-      ['notifications.notify', isFunction],
+      // 3.4 界面 · 通知
+      //
+      // **这一组从前是错的**：这里写的是 `notifications.notify`，而宿主那一侧是
+      // `{show, info, success, warn, error, isAvailable}`。`pomodoro` 因此调
+      // `ctx.notifications.isAvailable()` 抛 TypeError、界面白屏。
+      //
+      // 这一节查的是"成员在不在"，而那次错误里**成员一直在** —— 只是挂了另一个
+      // 方法名。方法形状的权威核对在文件末尾那一节（它才是防这类错误的那道墙）。
+      ['notifications.show', isFunction],
+      ['notifications.info', isFunction],
+      ['notifications.success', isFunction],
+      ['notifications.warn', isFunction],
+      ['notifications.error', isFunction],
+      ['notifications.isAvailable', isFunction],
 
-      // 3.5 输入
-      ['clipboard.read', isFunction],
-      ['clipboard.write', isFunction],
+      // 3.5 输入 · 剪贴板（同样是错过的名字：从前写的是 read / write）
+      ['clipboard.isAvailable', isFunction],
+      ['clipboard.readText', isFunction],
+      ['clipboard.writeText', isFunction],
 
-      // 3.6 系统与集成
-      ['events.emit', isFunction],
-      ['events.on', isFunction],
+      // 3.6 系统与集成 · 跨插件事件（同样是错过的名字：从前写的是 emit / on）
+      ['events.publish', isFunction],
+      ['events.subscribe', isFunction],
+      ['events.isAvailable', isFunction],
 
       // 3.4 界面 · 宿主渲染的浮层
       ['ui.dialog', isFunction],
@@ -3578,6 +3597,152 @@ section('文件拖放（ctx.fileDrop）');
   check(
     /if \(!has\('filesystem-read'\)\)/.test(bridgeBare),
     '未声明权限时降级为空订阅 + 一次告警（与宿主侧 pluginFileDrop 同一条规矩）'
+  );
+}
+
+// ============================================================
+// 服务对象的**方法**必须与 in-process 一致
+// ============================================================
+//
+// ============================================================
+// 为什么要有这一节：成员名对了，方法名可以全错
+// ============================================================
+//
+// 这一节之前，所有核对都只比**成员名**（`ctx.storage` 在不在对象上）。那漏掉了
+// 一整类错误 —— 而它在真机上连续发生了两次：
+//
+//   * `ctx.notifications`：宿主是 `{show, info, success, warn, error, isAvailable}`，
+//     沙箱是 `{notify(input)}`。`pomodoro` 调 `isAvailable()` → TypeError → 白屏；
+//   * `ctx.events`：宿主是 `{publish, subscribe, isAvailable}`，沙箱是 `{emit, on}`。
+//     `kanban` 调 `publish()` → TypeError → 白屏。
+//
+// 两次都是"成员在、东西不对"。集合比对对这种错误**完全无能**。
+//
+// ============================================================
+// 这张表是哪来的
+// ============================================================
+//
+// 从宿主那份源码逐行读出来的，**不是凭印象写的**：方法名与参数顺序都对着
+// `src/services/pluginRuntime.ts` 里那些 `pluginXxx(...)` 工厂的 `return { … }`
+// （`createContextFor` 把它们挂到 `ctx` 上）。
+//
+// 它是一张**表**，因此会与真源漂开。两件事让漂开被发现：
+//   1. 插件那一侧的权威核对在宿主仓库的 `staging/audit-plugin-methods.cjs` ——
+//      它把 9 个插件的每一次 `ctx.x.y()` 与沙箱**真的实例化一次**的结果比对；
+//   2. 下面每一条都写明它对应的宿主工厂，改宿主 API 的人顺手就能核。
+//
+// **沙箱可以比宿主多**（它是另一个运行时），但**绝不能少** ——
+// 少一个就是一个插件在真机上白屏。
+
+section('服务对象的方法（白屏两次都出在这里）');
+
+{
+  const renderedForMethods = bridgeJs
+    .replaceAll("'__PLUGIN_ID__'", '"com.modulith.methods"')
+    .replaceAll("'__PLUGIN_NAME__'", '"方法核对"')
+    .replaceAll("'__PLUGIN_VERSION__'", '"1.0.0"')
+    .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
+    .replaceAll("'__PLUGIN_SURFACE__'", '"main"')
+    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
+    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
+    .replaceAll(
+      '__PLUGIN_PERMISSIONS__',
+      '["storage","notification","plugin-communicate","clipboard","filesystem-read"]'
+    )
+    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
+    .replaceAll('__PLUGIN_SURFACES__', '[]')
+    .replaceAll('__PLUGIN_THEME__', '{}')
+    .replaceAll('__PLUGIN_SHORTCUTS__', '{"entries":[]}');
+
+  let methodsApi: Record<string, Record<string, unknown> | undefined> | null = null;
+  try {
+    methodsApi = new Function(
+      'window',
+      'document',
+      'fetch',
+      'navigator',
+      `${renderedForMethods}\nreturn window.Modulith;`
+    )(
+      {
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+        parent: { postMessage: () => {} },
+        __MODULITH_PLUGIN_REACT__: {
+          version: '19.2.7',
+          reactDomVersion: '19.2.7',
+          React: { createElement: () => null },
+          JsxRuntime: { jsx: () => null, jsxs: () => null, Fragment: Symbol('F') },
+          JsxDevRuntime: { jsxDEV: () => null },
+          ReactDomClient: { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
+        },
+      },
+      { getElementById: () => null, addEventListener: () => {} },
+      () => Promise.reject(new Error('这条检查不发网络')),
+      { clipboard: { readText: async () => '', writeText: async () => {} } }
+    ) as Record<string, Record<string, unknown> | undefined>;
+  } catch {
+    methodsApi = null;
+  }
+  check(methodsApi !== null, '桥接层可以被实例化（否则这一节无从谈起）');
+
+  /** `ctx.<成员>` 上**必须**有的方法，以及它们出自哪个宿主工厂。 */
+  const REQUIRED: readonly (readonly [string, readonly string[], string])[] = [
+    [
+      'notifications',
+      ['show', 'info', 'success', 'warn', 'error', 'isAvailable'],
+      'pluginNotifications',
+    ],
+    ['events', ['publish', 'subscribe', 'isAvailable'], 'pluginEvents'],
+    ['clipboard', ['isAvailable', 'readText', 'writeText'], 'pluginClipboard'],
+    ['fileDrop', ['isAvailable', 'subscribe'], 'pluginFileDrop'],
+    ['audio', ['pick'], 'pluginAudio'],
+    ['icons', ['extract'], 'pluginFileIcons'],
+    ['launcher', ['launch'], 'pluginLauncher'],
+    ['shell', ['revealInFolder'], 'pluginShell'],
+    ['logger', ['debug', 'info', 'warn', 'error', 'trace'], 'pluginLogger'],
+    ['storage', ['get', 'set', 'delete', 'keys'], 'pluginStorage'],
+    ['http', ['fetch', 'request', 'get', 'post', 'put', 'delete', 'download'], 'pluginHttp'],
+    [
+      'dataDir',
+      ['available', 'list', 'stat', 'read', 'readText', 'write', 'writeText', 'mkdir', 'remove', 'used'],
+      'pluginDataDir',
+    ],
+    ['db', ['query', 'queryRaw', 'exec', 'transaction'], 'pluginDatabase'],
+    ['settings', ['isAvailable'], 'pluginSettingsAPI'],
+  ];
+
+  for (const [member, methods, source] of REQUIRED) {
+    const value = methodsApi?.[member];
+    if (!value || typeof value !== 'object') {
+      check(false, `ctx.${member} 存在且是一个对象（宿主是 ${source}）`);
+      continue;
+    }
+    const missing = methods.filter((name) => typeof value[name] !== 'function');
+    check(
+      missing.length === 0,
+      missing.length === 0
+        ? `ctx.${member} 的方法与宿主一致：${methods.join(', ')}（宿主是 ${source}）`
+        : `★ ctx.${member} 缺这些方法：${missing.join(', ')} —— 插件调用它们会抛 "is not a function" 并白屏（宿主是 ${source}）`
+    );
+  }
+
+  // 两个**具体**的方法，它们是两次真实白屏的直接原因。单独钉一遍是因为上面那条
+  // 只在"集合对不上"时才红，而这两条说的是"为什么它必须对"。
+  check(
+    typeof methodsApi?.notifications?.isAvailable === 'function' &&
+      typeof methodsApi?.notifications?.show === 'function',
+    'ctx.notifications.isAvailable / show 是函数（pomodoro 在渲染时读它们）'
+  );
+  check(
+    typeof methodsApi?.events?.publish === 'function' &&
+      typeof methodsApi?.events?.subscribe === 'function',
+    'ctx.events.publish / subscribe 是函数（kanban 在渲染时读它们）'
+  );
+  // 旧名字必须消失：留着它们意味着"同一份插件在两个运行位置上用法不同"。
+  check(
+    typeof methodsApi?.events?.emit === 'undefined' && typeof methodsApi?.events?.on === 'undefined',
+    '旧的 ctx.events.emit / on 已删除（留着就是两套 API）'
   );
 }
 
