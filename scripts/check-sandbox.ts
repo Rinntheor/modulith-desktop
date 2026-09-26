@@ -1130,7 +1130,7 @@ section('前端界面协作');
   // 而症状是一块永远白着的面板。
   check(
     /event\.source !== frame\.current\?\.contentWindow/.test(componentTsx) &&
-      /data\.channel !== 'ready'/.test(componentTsx),
+      /data\.channel === 'ready'/.test(componentTsx),
     '就绪判据是那块 iframe 发回来的 ready（`load` 在加载失败的文档上也会触发）'
   );
   // 两层覆盖：启动占位在下、失败说明在上，都是普通 DOM —— `z-10` / `z-20` 就够了。
@@ -1199,6 +1199,16 @@ section('完整 API 表面');
     // 再据此拼 RPC 与数据的地址。这个假窗口因此必须给一个地址 —— 少了它，
     // 整段脚本会在顶层抛一个 TypeError，而这一节会报成"桥接脚本执行失败"。
     location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+    // 与 §20 同一份理由：不放这个桩，桥接层会（正确地）报"React 没有送到"，
+    // 而那一行会混进门禁输出、看起来像一次真失败。
+    __MODULITH_PLUGIN_REACT__: {
+      version: '19.2.7',
+      reactDomVersion: '19.2.7',
+      React: { createElement: () => null },
+      JsxRuntime: { jsx: () => null, jsxs: () => null, Fragment: Symbol('Fragment') },
+      JsxDevRuntime: { jsxDEV: () => null },
+      ReactDomClient: { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
+    },
   };
 
   let api: Record<string, any> | null = null;
@@ -1206,12 +1216,14 @@ section('完整 API 表面');
   try {
     const factory = new Function(
       'window',
+      'document',
       'fetch',
       'navigator',
       `${rendered}\nreturn window.Modulith;`
     );
     api = factory(
       fakeWindow,
+      { getElementById: () => null, addEventListener: () => {} },
       () => Promise.reject(new Error('这条检查不发网络请求')),
       { clipboard: { readText: async () => '', writeText: async () => {} } }
     );
@@ -2851,10 +2863,45 @@ section('宿主把自己的 React 送给沙箱插件');
 
   // 插件仓库的 shim：`require('react')` → `Modulith.React`，
   // `require('react/jsx-runtime')` → **Modulith 本身**。后者要的就是下面这三个。
-  for (const member of ['React', 'jsx', 'jsxs', 'Fragment', 'createContext']) {
+  //
+  // ⚠️ `createContext` **不在这里**，而它曾经在这里 —— 那条断言是"来自宿主那一份
+  // React"的，也就是 `React.createContext`。**那是个错误，而且这条断言把它钉成了
+  // 规范。** 宿主侧的 `Modulith.createContext()` 返回的是**插件上下文对象**
+  // （`{storage, dataDir, db, http, …}`），不是 React 的 context。
+  //
+  // 后果是一次真实事故：8 个插件全部白屏。插件顶层写
+  // `var ctx = Modulith.createContext()`，拿到一个 React context 对象，
+  // 于是 `ctx.storage.get(...)` 抛 TypeError，bundle 在顶层就炸了，
+  // `registerModule` 从来没被调到。9 个里只有 `hello` 活了下来（它不经过
+  // `createContext`）。它的断言在下面单独写。
+  for (const member of ['React', 'jsx', 'jsxs', 'Fragment']) {
     check(
       new RegExp(`^\\s{4}${member}: PLUGIN_REACT \\? PLUGIN_REACT\\.`, 'm').test(bridgeForReact),
       `桥接层把 ${member} 交给插件（来自宿主那一份 React，不是插件自带的）`
+    );
+  }
+
+  // `createContext` 必须是**返回这个对象自己**，而不是 React 的那一个。
+  //
+  // 判据不能只查"它存在" —— 它一直存在，只是是另一个东西。这里查两件事：
+  // 源码里它不从 `PLUGIN_REACT` 取，且它返回 `Modulith`。
+  check(
+    !/^\s{4}createContext: PLUGIN_REACT/m.test(bridgeForReact),
+    'createContext **不**从 PLUGIN_REACT 取（那是 React 的 createContext，不是 ctx 工厂）'
+  );
+  check(
+    /createContext: function \(\) \{\s*\n\s*return Modulith;\s*\n\s*\}/.test(bridgeForReact),
+    'createContext 返回 Modulith 自己（沙箱里没有 ctx 中间层，两边是同一个对象）'
+  );
+  // 同名必须同义：in-process 的 `createContext()` 造的是 **ctx**，不是 React 的
+  // context。这一条钉住"宿主那一侧是什么"，因为上面两条只有在它成立时才有意义。
+  {
+    const runtime = read('../src/services/pluginRuntime.ts');
+    const start = runtime.indexOf('function createContext(');
+    const body = start < 0 ? '' : runtime.slice(start, start + 400);
+    check(
+      start >= 0 && /createContextFor\(/.test(body),
+      'in-process 的 createContext() 造的是插件上下文（`createContextFor`），不是 React 的 context'
     );
   }
 
@@ -2975,6 +3022,7 @@ section('两侧的成员表');
   try {
     const factory = new Function(
       'window',
+      'document',
       'fetch',
       'navigator',
       `${renderedForParity}\nreturn window.Modulith;`
@@ -2982,9 +3030,25 @@ section('两侧的成员表');
     parityApi = factory(
       {
         addEventListener: () => {},
+        document: { getElementById: () => null, addEventListener: () => {} },
         // 同 §11：令牌从地址里读，没有地址就整段脚本在顶层抛。
         location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+        // **宿主那一份 React 必须在这里放一份桩。**
+        //
+        // 真实文档里 `react.js` 排在桥接层之前，因此 `window.__MODULITH_PLUGIN_REACT__`
+        // 一定在。不放的话 `PLUGIN_REACT` 是 `null`，桥接层会（正确地）报一条
+        // "React 没有送到" —— 那会让门禁输出里混进一行看起来像真失败的错误，
+        // 而且 `React` / `jsx` / `createContext` 这几条也就不是在真实形状下验的。
+        __MODULITH_PLUGIN_REACT__: {
+          version: '19.2.7',
+          reactDomVersion: '19.2.7',
+          React: { createElement: () => null },
+          JsxRuntime: { jsx: () => null, jsxs: () => null, Fragment: Symbol('Fragment') },
+          JsxDevRuntime: { jsxDEV: () => null },
+          ReactDomClient: { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
+        },
       },
+      { getElementById: () => null, addEventListener: () => {} },
       () => Promise.reject(new Error('不发网络')),
       { clipboard: { readText: async () => '', writeText: async () => {} } }
     );
@@ -3095,6 +3159,94 @@ section('两侧的成员表');
   check(
     shared.length >= 18,
     `两侧同名 ${shared.length} 个：${shared.join('、')}`
+  );
+
+  // ============================================================
+  // `createContext()` 返回的**就是**那个对象 —— 这一条是白屏事故的直接产物
+  // ============================================================
+  //
+  // 上面那些差分断言全都查"成员在不在这个对象上"。而那次事故里
+  // `createContext` **就在对象上**，只是它是 React 的 `createContext`——
+  // 于是 8 个插件在顶层拿到一个 React context 对象，`ctx.storage` 是
+  // `undefined`，bundle 直接炸，`registerModule` 从来没被调到。
+  //
+  // 集合比对对这种错误**完全无能**：它只看得见"有没有这个名字"。
+  // 因此这里必须**真的调一次**，并且逐个数一数 ctx 的成员在不在返回值上 ——
+  // 那才是"同名同义"这四个字能被机械核对的形式。
+  if (parityApi) {
+    const ctx = (parityApi as { createContext?: () => unknown }).createContext;
+
+    check(typeof ctx === 'function', 'Modulith.createContext 是一个函数');
+
+    let made: Record<string, unknown> | null = null;
+    try {
+      const value = typeof ctx === 'function' ? ctx() : null;
+      made = value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+    } catch {
+      made = null;
+    }
+    check(made !== null, 'createContext() 返回一个对象（不是一个 React context）');
+
+    // 返回它自己（而不是副本）：插件里有长期持有 `ctx` 的写法。
+    check(made === parityApi, 'createContext() 返回的是 Modulith 自己（沙箱里两者是同一个对象）');
+
+    // `manifest` 是唯一一处**已知且被承认**的缺口（见上面的 EXPECTED_IN_PROCESS_ONLY）。
+    const missingOnCtx = ctxMembers.filter(
+      (member) => member !== 'manifest' && made !== null && !(member in made)
+    );
+    check(
+      missingOnCtx.length === 0,
+      missingOnCtx.length === 0
+        ? `ctx 的 ${ctxMembers.length - 1} 个成员（除 manifest）在 createContext() 的返回值上全都有`
+        : `★ createContext() 的返回值缺了这些 ctx 成员：${missingOnCtx.join('、')} —— 插件用 ctx.xxx 读它们会拿到 undefined`
+    );
+
+    // 具体钉一个最要命的：`ctx.storage` 是 8 个插件里 7 个都会读的那个。
+    const storage = made ? (made as { storage?: { get?: unknown } }).storage : undefined;
+    check(
+      !!storage && typeof storage.get === 'function',
+      'ctx.storage.get 存在（8 个白屏的插件里 7 个在顶层读它）'
+    );
+  }
+
+  // 插件脚本在顶层抛错时，宿主日志里必须留下一句话。
+  //
+  // 白屏那次宿主这一侧**什么日志都没有** —— 错误只存在于 iframe 的控制台里，
+  // 而用户在 release 版看不到控制台。这两个监听器把"插件炸了"变成一条能读的日志。
+  check(
+    /addEventListener\('error'/.test(bridgeJs) && /addEventListener\('unhandledrejection'/.test(bridgeJs),
+    '桥接层监听未捕获的错误与未处理的 Promise 拒绝，并写进宿主日志'
+  );
+
+  // 光写日志还不够 —— 用户看到的是**一块白板**。这条把错误投给前端，由它画在
+  // 那一块界面上。白屏那次真正缺的就是这一条。
+  check(
+    /channel: 'plugin-error'/.test(bridgeJs) &&
+      /window\.parent\.postMessage\(\s*\n?\s*\{ __modulith: true, channel: 'plugin-error'/.test(
+        bridgeJs
+      ),
+    '桥接层把插件错误投给前端（否则用户只能看到白板，一句话都没有）'
+  );
+
+  const surfaceForError = read('../src/components/SandboxSurface.tsx');
+  check(
+    /data\.channel === 'plugin-error'/.test(surfaceForError) &&
+      /setFailure\(message\)/.test(surfaceForError),
+    '前端把 plugin-error 画成那块界面上的错误提示'
+  );
+
+  // **白屏的另一个候选病因**，必须与上面那条分开报：宿主那一份 React 没送到时，
+  // 每个用 React 的插件都会在 `var React = Modulith.React;` 之后立刻炸，
+  // 症状与 createContext 那次一模一样。一条日志就能把两者分开。
+  check(
+    /if \(!PLUGIN_REACT\) \{\s*\n\s*reportUncaught\(/.test(bridgeJs),
+    '桥接层在 PLUGIN_REACT 缺失时主动报一条（否则白屏的两种病因分不开）'
+  );
+  check(
+    /globalThis\.__MODULITH_PLUGIN_REACT__=\{[^}]*ReactDomClient:/.test(
+      read('../src-tauri/resources/react-runtime.js')
+    ),
+    'react.js 那个全局真的带 ReactDomClient（registerModule 靠它挂载；缺了就是白屏）'
   );
 
   // 三条**具体**的成员，它们是这一节存在的直接原因（都曾经是 undefined）。

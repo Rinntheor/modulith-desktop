@@ -346,11 +346,29 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
       // 伪造 —— 只有那块 iframe 的 `contentWindow` 能等于它。
       if (event.source !== frame.current?.contentWindow) return;
 
-      const data = event.data as { __modulith?: unknown; channel?: unknown } | null;
-      if (!data || data.__modulith !== true || data.channel !== 'ready') return;
+      const data = event.data as
+        | { __modulith?: unknown; channel?: unknown; payload?: { message?: unknown } }
+        | null;
+      if (!data || data.__modulith !== true) return;
 
-      readyRef.current = true;
-      setFailure(null);
+      if (data.channel === 'ready') {
+        readyRef.current = true;
+        setFailure(null);
+        return;
+      }
+
+      // 插件脚本在**它自己的文档里**抛了错（桥接层的 error / unhandledrejection
+      // 监听器转过来的）。这条必须画出来：用户看到的是一块白板，而原因在另一个
+      // 进程里 —— 只写宿主日志的话，他仍然只能看到白板。
+      //
+      // 这一次是真的踩过：8 个插件白屏，而屏幕上没有一句话解释。
+      if (data.channel === 'plugin-error') {
+        const message =
+          typeof data.payload?.message === 'string' && data.payload.message.length > 0
+            ? data.payload.message
+            : '插件脚本报错（宿主日志里有完整堆栈）';
+        setFailure(message);
+      }
     };
 
     window.addEventListener('message', onMessage);

@@ -1419,6 +1419,76 @@
     false
   );
 
+  // ============================================================
+  // 插件脚本抛错时，让它留下一句话
+  // ============================================================
+  //
+  // **这是被一次真实事故逼出来的。** 8 个插件白屏那次，宿主这一侧的日志里
+  // 什么都没有：插件脚本在顶层抛了 TypeError，而那个错误只存在于这个 iframe
+  // 的控制台里 —— 用户在 release 版看不到控制台，宿主也拿不到它。于是现象是
+  // "一块白板"，而原因在另一个进程里。
+  //
+  // 这两个监听器把"插件炸了"变成一条**宿主日志**。它们不捕获、不吞掉，
+  // 只是报告 —— 控制台里那条仍然照常出现。
+  function reportUncaught(label, detail) {
+    var message = '[Modulith] ' + label + '：' + detail;
+    console.error(message);
+
+    // 给宿主写进文件日志：控制台在 release 版里看不到。
+    try {
+      rpc('log', { level: 'error', message: message }).catch(function () {});
+    } catch (error) {
+      /* 上报失败不再抛一次 */
+    }
+
+    // **并且投给前端，让它在界面上显示出来。**
+    //
+    // 只写日志不够：白屏那次的教训是"用户看到一块白板，而原因在另一个进程里"。
+    // 前端把这条转成那一块界面上的错误提示，于是下一次失败是**看得见的**。
+    try {
+      window.parent.postMessage(
+        { __modulith: true, channel: 'plugin-error', payload: { message: message } },
+        '*'
+      );
+    } catch (error) {
+      /* 够不到父窗口就算了 */
+    }
+  }
+
+  window.addEventListener('error', function (event) {
+    // `event.error` 有时是 null（跨源脚本、或某些语法错误），因此两条路都取。
+    var detail = event && event.error && event.error.stack
+      ? event.error.stack
+      : String((event && event.message) || '未知错误');
+    reportUncaught('插件脚本抛出未捕获的错误（界面会一直是白的）', detail);
+  });
+
+  window.addEventListener('unhandledrejection', function (event) {
+    var reason = event && event.reason;
+    reportUncaught(
+      '插件里有一个 Promise 被拒绝且没有 catch',
+      reason && reason.stack ? reason.stack : String(reason)
+    );
+  });
+
+  // 宿主那一份 React 到底有没有送到。
+  //
+  // **这一条是"白屏"的另一个候选病因。** 插件文档的三个脚本是
+  // `react.js → bridge.js → asset/main`，而 `PLUGIN_REACT` 是在桥接层**加载时**
+  // 读的那个全局。`react.js` 要是没送到（路由、令牌、CSP 任何一处出问题），
+  // 每个用 React 的插件都会在 `var React = Modulith.React;` 之后立刻炸 ——
+  // 症状与 `createContext` 那次一模一样，都是一块白板。
+  //
+  // 放在这里报，是因为它比插件自己炸得早：它一条日志就能把两者分开。
+  if (!PLUGIN_REACT) {
+    reportUncaught(
+      '宿主那一份 React 没有送到（react.js 没加载成功）',
+      'window.__MODULITH_PLUGIN_REACT__ 是 ' +
+        typeof window.__MODULITH_PLUGIN_REACT__ +
+        '；用 React 的插件会因此整块白屏'
+    );
+  }
+
   // 告诉宿主"我起来了"。
   //
   // **这是唯一的就绪信号。** `iframe` 的 `load` 事件在一个加载失败的文档上照样会
@@ -1572,8 +1642,39 @@
     jsxs: PLUGIN_REACT ? PLUGIN_REACT.JsxRuntime.jsxs : undefined,
     jsxDEV: PLUGIN_REACT ? PLUGIN_REACT.JsxDevRuntime.jsxDEV : undefined,
     Fragment: PLUGIN_REACT ? PLUGIN_REACT.JsxRuntime.Fragment : undefined,
-    /** 与 in-process 同名同义。插件用 `Modulith.createContext(...)` 建自己的 context */
-    createContext: PLUGIN_REACT ? PLUGIN_REACT.React.createContext : undefined,
+
+    /**
+     * 创建插件上下文。**与 in-process 同名同义。**
+     *
+     * ============================================================
+     * 这里曾经接错成 `React.createContext` —— 后果是 8 个插件全部白屏
+     * ============================================================
+     *
+     * 插件在 bundle 顶层写 `var ctx = Modulith.createContext()`，拿到的却是一个
+     * **React context 对象**：于是 `ctx.storage` 是 `undefined`，
+     * `ctx.storage.get(...)` 抛 TypeError，bundle 在顶层就炸了，
+     * `registerModule` **从来没有被调到** —— 屏幕上就是一块白的，而且宿主这一侧
+     * 什么日志都没有。
+     *
+     * 9 个插件里只有 `hello` 活了下来，因为它直接用 `Modulith.storage`，不经过
+     * `createContext`。这个错误因此躲过了当时所有的静态断言：那些断言查的是
+     * "成员在不在对象上"，而 `createContext` **确实在** —— 只是它是另一个东西。
+     *
+     * ============================================================
+     * 正确的做法：返回 `Modulith` 自己
+     * ============================================================
+     *
+     * in-process 有**两个**对象（`Modulith` 是运行时入口，`ctx` 是能力），而
+     * `createContext()` 就是从前者造出后者。沙箱里没有那个中间层 —— 两边被并进了
+     * 同一个对象 —— 因此"造一个 ctx"在这里就是"返回我自己"。
+     *
+     * 返回**同一个对象**而不是副本：插件里有 `var ctx = Modulith.createContext()`
+     * 然后长期持有它的写法，副本会让"往 `Modulith` 上加的东西在 `ctx` 上看不见"，
+     * 而那种不同步没有任何症状。
+     */
+    createContext: function () {
+      return Modulith;
+    },
 
     /** 沙箱里退化成"把自己挂到本界面" —— 见上面的说明 */
     registerModule: registerModule,
