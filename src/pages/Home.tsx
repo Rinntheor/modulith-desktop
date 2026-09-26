@@ -82,6 +82,7 @@ import {
 } from '../services/appSettings';
 import { getReduceMotion, subscribeTheme } from '../services/theme';
 import { getBootResult } from '../services/boot';
+import { requestAppUpdateCheck } from '../services/appUpdater';
 import { useTabs } from '../hooks/useTabs';
 import { useCatalog } from '../hooks/useCatalog';
 import {
@@ -426,6 +427,13 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
         return;
       }
       if (action === 'update') {
+        // **先记下"要检查"，再打开分页。**
+        //
+        // 顺序是有意的：打开分页是异步的（设置面板要挂载、要切到「关于」），
+        // 而 `requestAppUpdateCheck` 会把请求**记下来**，组件挂载时再取走。
+        // 反过来的话有一次真实的竞争 —— 请求发出时卡片还没挂载，事件丢掉，
+        // 用户看到的就是"点了检查更新，弹出一个窗口让我再点一次"。
+        requestAppUpdateCheck();
         openSettings('about');
         return;
       }

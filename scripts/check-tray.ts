@@ -155,13 +155,107 @@ check(
   /hide\(\)[\s\S]{0,400}?app\.exit\(0\)/.test(closeRs),
   '隐藏失败时改为真的退出（否则窗口会停在"没关也没藏"的半死状态）'
 );
+// ============================================================
+// 对 `close_behavior.rs` 做文本断言之前，**必须先把注释去掉**
+// ============================================================
+//
+// 这一条是踩了三次之后才写下来的（`validator.rs` 的报错文案、插件文档里的一句说明、
+// 以及这里）：对源码做"某段代码里有没有这句话"的断言时，**注释会把断言喂饱**。
+//
+// 具体到这里：`「直接退出」` 那一档的注释里正当地写着
+// "理由是 `app.exit(0)` 会跳过 Tauri 的正常关闭流程" —— 于是把那一行真正的
+// `app.exit(0);` 删掉，判据照样通过（变异 T1 抓出来的）。
+//
+// 去掉 `//` 到行尾即可：Rust 的块注释在本文件里没有，写一个简单的状态机
+// 不值得 —— 但**行注释必须去掉**，否则这一节守的是一段散文。
+function stripRustLineComments(source: string): string {
+  return source
+    .split(/\r?\n/)
+    .map((line) => {
+      const index = line.indexOf('//');
+      return index >= 0 ? line.slice(0, index) : line;
+    })
+    .join('\n');
+}
+
+const closeCode = stripRustLineComments(closeRs);
+
 check(
-  /!settings::load\(&app\)\.close_to_tray[\s\S]{0,200}?return;/.test(closeRs),
-  '「直接退出」这一档不拦截关闭，走 Tauri 的正常关闭流程'
+  // 判据**必须夹在那条分支之内**，而且要看**代码**不是注释。
+  // 写成 `!close_to_tray[\s\S]{0,600}?app.exit\(0\)` 有两重错：
+  // `[\s\S]` 会越过分支结尾命中下面那句兜底；而注释里那行说明本身也算命中。
+  closeCode
+    .slice(closeCode.indexOf('if !settings::load'), closeCode.indexOf('api.prevent_close()'))
+    .includes('app.exit(0)'),
+  '「直接退出」这一档**显式**结束进程，而不是只"不拦截关闭"'
+);
+// ============================================================
+// 为什么这一条曾经写反了
+// ============================================================
+//
+// 上面那条断言原先写的是"「直接退出」这一档不拦截关闭，走 Tauri 的正常关闭流程"，
+// 下面还有一条**明确禁止**这一档调用 `app.exit`，理由是"那会跳过窗口销毁事件
+// 与将来的收尾钩子"。
+//
+// 那个理由本身是错的（`lib.rs` 用 `run_return`，`RunEvent::Exit` 照常触发，
+// 模块收尾与 `cleanup_before_exit` 都在那里），而且它把一个真实缺陷**钉成了规范**：
+// 用户选了"直接退出"，主窗口确实关了，但**进程还活着、托盘图标还在** ——
+// 从用户的角度看就是"还是最小化到托盘"。用户实际报上来了这一条。
+//
+// 根因是本应用不只有主窗口。因此这里补一条断言盯住那个前提：一旦
+// `tauri.conf.json` 里不再有额外的隐藏窗口，"窗口全关就退出"才会重新成立，
+// 这一档才可以退回成不显式 exit。
+const declaredWindows = [
+  ...read('src-tauri/tauri.conf.json').matchAll(/"label":\s*"([^"]+)"/g),
+].map((m) => m[1]);
+check(
+  declaredWindows.length >= 2,
+  `tauri.conf.json 声明了 ${declaredWindows.length} 个窗口（${declaredWindows.join('、')}）—— ` +
+    '多于一个时"关掉主窗口"不等于"进程结束"，这正是「直接退出」必须显式 exit 的原因'
 );
 check(
-  !closeRs.includes('app.exit(0)') || /hide\(\)[\s\S]*?app\.exit\(0\)/.test(closeRs),
-  '「直接退出」那一档不调用 app.exit（那会跳过窗口销毁事件与将来的收尾钩子）'
+  declaredWindows.includes('tray-menu') && declaredWindows.includes('overlay'),
+  '两个隐藏的辅助窗口仍然存在（它们让事件循环在主窗口关闭后继续转）'
+);
+
+// ============================================================
+// 切换开关之后必须自己回读状态
+// ============================================================
+//
+// 这是用户报出来的另一条：在托盘里点「关闭窗口时最小化到托盘」，**没有任何反馈**
+// —— 圆点与副标题都不变，用户不知道它是开了还是关了。
+//
+// 原因是那条动作成功之后既不刷新、也不关菜单（后者是刻意的：要让用户看到结果），
+// 于是窗口始终没有失去过焦点，而刷新只挂在 `focus` 上。
+const trayMenuSource = read('src/tray-menu/TrayMenu.tsx');
+const runFn = /const run = useCallback\([\s\S]*?\n  \);/.exec(trayMenuSource)?.[0] ?? '';
+check(runFn.length > 0, '能定位到托盘菜单的 run 函数体');
+check(
+  /action === 'toggle_close_to_tray'[\s\S]{0,120}?await refresh\(\)/.test(runFn),
+  '切换开关成功后**自己回读状态**（只靠 focus 刷新会漏掉"菜单没关过"的情形）'
+);
+check(
+  /if \(error\) \{[\s\S]{0,220}?return;/.test(runFn),
+  '动作失败时提前返回 —— 否则失败也会去刷新，把失败原因冲掉'
+);
+// 「直接退出」那一档**先退出、且不 prevent_close**：撤销关闭只该发生在
+// "隐藏到托盘"那一档 —— 先 prevent 再 exit 会让窗口先被拦下来一次，
+// 那条路径下用户会看到窗口闪一下。
+//
+// 判据取"从 `if !settings::load` 到第一处 `prevent_close`"这一段：
+// 它就是"直接退出"分支的全部代码。用整个文件做匹配会让下面那条
+// "隐藏失败时改为退出"的兜底把断言喂饱（这里踩过一次）。
+const beforeFirstPrevent = closeCode.slice(
+  closeCode.indexOf('if !settings::load'),
+  closeCode.indexOf('api.prevent_close()')
+);
+// 判据写成 `api.prevent_close()`（带接收者的**调用**形式），不是裸的 `prevent_close`：
+// 上面那段解释里正当地写着"不调 `prevent_close`"，裸词匹配会被那句话本身判成违规。
+// 对源码做文本断言时，模式必须比"出现过的词"更精确 —— 这个坑在本仓库踩过不止一次。
+check(
+  beforeFirstPrevent.includes('app.exit(0)') &&
+    !beforeFirstPrevent.includes('api.prevent_close()'),
+  '「直接退出」那一档先结束进程、且不撤销关闭请求'
 );
 check(
   closeRs.includes('on_window_event'),

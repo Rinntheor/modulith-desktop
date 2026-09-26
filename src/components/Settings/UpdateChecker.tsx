@@ -18,9 +18,11 @@ import { AlertCircle, CheckCircle, Download, FileText, Globe, RefreshCw } from '
 
 import {
   checkForAppUpdate,
+  consumePendingUpdateCheck,
   describeUpdateError,
   installPendingAppUpdate,
   noteUpdateCheckCompleted,
+  subscribeAppUpdateCheck,
   type AvailableUpdate,
   type DownloadProgress,
 } from '../../services/appUpdater';
@@ -89,6 +91,23 @@ const UpdateChecker: React.FC<Props> = ({ onOpenNetwork, onOpenLogs }) => {
       setStatus('error');
     }
   }, []);
+
+  /**
+   * 托盘菜单点了「检查更新」时，**自动开始检查**。
+   *
+   * 两件事都要做，缺一不可：
+   *   * 挂载时取走待办 —— 用户点托盘那一刻这个组件可能还没挂载（设置面板正在
+   *     打开），只发事件会把那一次请求丢掉，症状是"偶发：点了没反应"；
+   *   * 之后订阅 —— 这个卡片已经开着的时候再点托盘。
+   *
+   * 判据是 `consumePendingUpdateCheck()` **读一次就清掉**，因此重挂载不会重复查。
+   */
+  useEffect(() => {
+    if (consumePendingUpdateCheck()) void runCheck();
+    return subscribeAppUpdateCheck(() => {
+      if (consumePendingUpdateCheck()) void runCheck();
+    });
+  }, [runCheck]);
 
   const updateAutoCheck = useCallback(async (next: boolean) => {
     try {

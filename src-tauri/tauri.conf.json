@@ -39,8 +39,8 @@
         "skipTaskbar": true,
         "visible": false,
         "dataDirectory": "webview-tray-menu",
-        "width": 268,
-        "height": 316
+        "width": 256,
+        "height": 304
       },
       {
         "label": "overlay",

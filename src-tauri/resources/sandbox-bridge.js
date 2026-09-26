@@ -56,6 +56,7 @@
   var PLUGIN_ID = '__PLUGIN_ID__';
   var PLUGIN_NAME = '__PLUGIN_NAME__';
   var PLUGIN_VERSION = '__PLUGIN_VERSION__';
+  var PLUGIN_HOST_VERSION = '__PLUGIN_HOST_VERSION__';
   var PLUGIN_SURFACE = '__PLUGIN_SURFACE__';
   var PLUGIN_RUNTIME = '__PLUGIN_RUNTIME__';
   var ACTIVATION_EVENT = '__PLUGIN_ACTIVATION__';
@@ -1074,6 +1075,29 @@
       },
     };
 
+  /**
+   * 计时。in-process 的 `ctx.logger.trace(label)` 返回一个"结束计时"的函数。
+   *
+   * 沙箱里**能完整实现它** —— 它是纯本地逻辑（读一次时钟、返回一个闭包），
+   * 不涉及任何跨 realm 的引用。因此这里不造假、也不省略：省略会让插件在
+   * 沙箱里报 `logger.trace is not a function`，而那个错误看起来像插件自己写错了。
+   */
+  function trace(label) {
+    var started = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    return function () {
+      var ended = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      log('debug')(String(label) + '：' + (ended - started).toFixed(1) + ' ms');
+    };
+  }
+
+  var logger = {
+    debug: log('debug'),
+    info: log('info'),
+    warn: log('warn'),
+    error: log('error'),
+    trace: trace,
+  };
+
   // ============================================================
   // React：宿主那一份，经 `/<id>/react.js` 送过来
   // ============================================================
@@ -1174,6 +1198,21 @@
 
     /** 恒为 true；理由见上面的说明（沙箱里"别的模块"这个概念不存在） */
     useModuleActive: useModuleActive,
+
+    // ---- 与 in-process ctx 同名的三个别名 ----
+    //
+    // 它们与下面的 `plugin` 是**同一份数据**，只是换了个形状。留着两份形状
+    // 不是为了好看：in-process 插件读的是 `ctx.pluginId` / `ctx.pluginVersion` /
+    // `ctx.version`，而沙箱这一侧原来只有 `plugin.id` / `plugin.version`。
+    // 那意味着**同一个插件在两侧要改代码** —— 与这个文件开头"切换运行位置不改
+    // 一行代码"的承诺直接矛盾，而且不一致的那一侧拿到的只是 `undefined`。
+    //
+    // `version` 是**宿主**版本（不是插件版本）：in-process 的 `ctx.version` 就是它，
+    // 插件用它做特性探测之外的事都很容易搞混，因此注释写清楚。
+    pluginId: PLUGIN_ID,
+    pluginVersion: PLUGIN_VERSION,
+    version: PLUGIN_HOST_VERSION,
+
     /** 沙箱插件的身份。**宿主给出的**，不是插件自报的。 */
     plugin: {
       id: PLUGIN_ID,
@@ -1209,12 +1248,13 @@
      */
     has: has,
 
-    log: {
-      debug: log('debug'),
-      info: log('info'),
-      warn: log('warn'),
-      error: log('error'),
-    },
+    /**
+     * 日志。**两个名字指向同一个对象**：in-process 叫 `ctx.logger`，沙箱历史上
+     * 叫 `Modulith.log`。留两个名字是因为"同一个插件两侧都能跑"这个承诺 ——
+     * 而只留一个会让一半插件在另一侧拿到 `undefined`。
+     */
+    log: logger,
+    logger: logger,
 
     storage: {
       /** 读一个键。不存在时返回 `fallback`。值以 JSON 存储，对象与数组原样取回。 */

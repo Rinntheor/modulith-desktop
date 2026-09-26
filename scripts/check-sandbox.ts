@@ -64,7 +64,7 @@ const bridgeJs = read('../src-tauri/resources/sandbox-bridge.js');
 section('桥接层的占位符');
 
 {
-  const quoted = ['__PLUGIN_ID__', '__PLUGIN_NAME__', '__PLUGIN_VERSION__', '__PLUGIN_RUNTIME__', '__PLUGIN_ACTIVATION__'];
+  const quoted = ['__PLUGIN_ID__', '__PLUGIN_NAME__', '__PLUGIN_VERSION__', '__PLUGIN_HOST_VERSION__', '__PLUGIN_RUNTIME__', '__PLUGIN_ACTIVATION__'];
   for (const token of quoted) {
     const occurrences = bridgeJs.split(`'${token}'`).length - 1;
     check(occurrences === 1, `${token} 恰好出现一次（带引号的形式）`);
@@ -80,6 +80,7 @@ section('桥接层的占位符');
     .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
     .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
     .replaceAll("'__PLUGIN_VERSION__'", '"1.0.0"')
+    .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
     .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
     .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
     .replaceAll('__PLUGIN_PERMISSIONS__', '["storage"]')
@@ -97,6 +98,7 @@ section('桥接层的占位符');
     '__PLUGIN_ID__',
     '__PLUGIN_NAME__',
     '__PLUGIN_VERSION__',
+    '__PLUGIN_HOST_VERSION__',
     '__PLUGIN_RUNTIME__',
     '__PLUGIN_ACTIVATION__',
     '__PLUGIN_PERMISSIONS__',
@@ -108,8 +110,7 @@ section('桥接层的占位符');
   check(
     leftover.length === 0,
     leftover.length === 0
-      ? '替换之后没有残留的占位符（注释里也没有）'
-      : `替换之后仍有残留：${leftover.join('、')} —— 插件会读到字面量而不是自己的 id`
+      ? '替换之后没有残留的占位符（注释里也没有）'      : `替换之后仍有残留：${leftover.join('、')} —— 插件会读到字面量而不是自己的 id`
   );
 
   // 替换后的脚本必须是能解析的 JS。`new Function` 只解析不执行。
@@ -121,6 +122,45 @@ section('桥接层的占位符');
     parses = false;
   }
   check(parses, '替换之后的桥接脚本仍然是合法的 JavaScript');
+
+  // ---- 上面那几条是**在门禁里自己模拟替换**的，因此查不到"Rust 忘了替换" ----
+  //
+  // 变异 M18 就是这么漏过去的：把 `bridge_script` 里那一行 `.replace(...)` 删掉，
+  // 上面每一条照样绿 —— 因为替换是门禁自己做的。而真实后果是那段脚本会把
+  // 字面量 `'__PLUGIN_HOST_VERSION__'` 原样发给插件（debug 构建里 `debug_assert!`
+  // 会 panic，release 构建里**静默**）。
+  //
+  // 判据因此改成"从桥接层**推导**出占位符全集，再要求 `bridge_script` 逐个替换"：
+  // 将来加一个新占位符却忘了在 Rust 侧接线时，这条会直接点名。
+  const declaredTokens = new Set(
+    [...bridgeJs.matchAll(/__PLUGIN_[A-Z_]+__/g)].map((match) => match[0])
+  );
+  check(declaredTokens.size >= 11, `桥接层里声明了 ${declaredTokens.size} 个占位符`);
+
+  const sandboxRsForTokens = read('../src-tauri/src/modules/plugins/sandbox.rs');
+  const bridgeScriptFn =
+    /fn bridge_script<R: Runtime>\([\s\S]*?\n\}/.exec(sandboxRsForTokens)?.[0] ?? '';
+  check(bridgeScriptFn.length > 0, '能定位到 bridge_script 的函数体');
+
+  // 判据必须锚在**真正的 `.replace(` 调用**上，而不是"这个函数体里出现过这个记号"。
+  //
+  // 变异 M18 教的一次：`bridge_script` 尾部那条 `debug_assert!` 里也写着
+  // `!source.contains("__PLUGIN_HOST_VERSION__")` —— 于是把 `.replace(...)` 整行删掉
+  // 之后，函数体里**仍然**有那个记号，宽松的判据照样绿。
+  // 一个占位符被"提到"不等于被"替换"。
+  const substituted = new Set(
+    [...bridgeScriptFn.matchAll(/\.replace\(\s*["']?['"]?(__PLUGIN_[A-Z_]+__)/g)].map(
+      (match) => match[1]
+    )
+  );
+
+  const notSubstituted = [...declaredTokens].filter((token) => !substituted.has(token));
+  check(
+    notSubstituted.length === 0,
+    notSubstituted.length === 0
+      ? `bridge_script 逐个替换了全部 ${declaredTokens.size} 个占位符`
+      : `★ bridge_script 没有替换这些占位符：${notSubstituted.join('、')} —— release 构建下它们会被原样发给插件`
+  );
 }
 
 // ============================================================
@@ -869,6 +909,7 @@ section('完整 API 表面');
       .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
       .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
       .replaceAll("'__PLUGIN_VERSION__'", '"1.2.3"')
+      .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
       .replaceAll("'__PLUGIN_SURFACE__'", '"detail"')
       .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
       .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
@@ -2546,6 +2587,214 @@ section('宿主把自己的 React 送给沙箱插件');
   check(
     /legalComments: 'inline'/.test(buildScript),
     '压缩时保留版权声明（React 是 MIT，分发必须带上）'
+  );
+}
+
+// ============================================================
+// 20. 两侧的成员表真的对得上吗
+// ============================================================
+//
+// 这一节是补一个**说了很久但没人守**的承诺。`sandbox-bridge.js` 开头写着
+// "同一个插件可以在 in-process 与 sandboxed 之间切换，而它的代码不该因此改一行"，
+// 第 11 节也确实"逐项比对两份清单"——**但它比的是 §3 那份文档表，不是宿主里
+// 真正的 `ctx`**。于是两处名字对不上时没有任何东西会响。
+//
+// 实测（`staging/audit-plugin-surfaces.cjs` 是同一件事的独立脚本）当时的结果是：
+//   * `ctx.logger` 在沙箱里叫 `log`；
+//   * `ctx.pluginId` / `pluginVersion` / `version` 在沙箱里根本没有；
+//   * `Modulith.version`（宿主版本）也没有 —— 而 kanban 与 typing-practice 都在读它。
+// 三处都是**静默**的：插件拿到 `undefined`，报错看起来像插件自己写错了。
+//
+// 因此这一节的判据是"**差异清单必须恰好是这些**"：多一个少一个都打红。
+// 差异本身分两类，混在一起会让人以为沙箱"少了一半能力"：
+//   * 宿主侧独有 —— 宿主对象的成员（React 那一族、registerModule、useModuleActive）
+//     在沙箱里被并进了同一个对象，因此不算"缺失"；
+//   * 沙箱独有 —— 沙箱没有 `ctx` 这个包装，只有一个 `Modulith`。
+// 真正算缺失的只有 `IN_PROCESS_ONLY` 里那几个。
+
+section('两侧的成员表');
+
+{
+  // 沙箱侧：**真的把它实例化一次**再读挂上去的对象。文本匹配查不到
+  // "这个成员真的挂在对象上" —— 删掉一行字面量它照样绿。
+  const renderedForParity = bridgeJs
+    .replaceAll("'__PLUGIN_ID__'", '"com.modulith.parity"')
+    .replaceAll("'__PLUGIN_NAME__'", '"对齐检查"')
+    .replaceAll("'__PLUGIN_VERSION__'", '"9.9.9"')
+    .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
+    .replaceAll("'__PLUGIN_SURFACE__'", '"main"')
+    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
+    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
+    .replaceAll('__PLUGIN_PERMISSIONS__', '[]')
+    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
+    .replaceAll('__PLUGIN_SURFACES__', '[]')
+    .replaceAll('__PLUGIN_THEME__', '{}')
+    .replaceAll('__PLUGIN_SHORTCUTS__', '{}');
+
+  let parityApi: Record<string, unknown> | null = null;
+  try {
+    const factory = new Function(
+      'window',
+      'fetch',
+      'navigator',
+      `${renderedForParity}\nreturn window.Modulith;`
+    );
+    parityApi = factory(
+      { addEventListener: () => {} },
+      () => Promise.reject(new Error('不发网络')),
+      { clipboard: { readText: async () => '', writeText: async () => {} } }
+    );
+  } catch {
+    parityApi = null;
+  }
+  check(parityApi !== null, '沙箱侧可以被实例化（否则这一节无从谈起）');
+
+  // 宿主侧：从 `pluginBoundary.ts` 的 `CONTEXT_MEMBERS` 表里读，**不写死一份字面量** ——
+  // 写死的那一份会与真源漂开，而"漂开"正是这一节要查的事。
+  const boundarySource = read('../src/services/pluginBoundary.ts');
+  const ctxStart = boundarySource.indexOf('const CONTEXT_MEMBERS');
+  const ctxEnd = boundarySource.indexOf('\n];', ctxStart);
+  check(ctxStart >= 0 && ctxEnd > ctxStart, '能从 pluginBoundary.ts 定位到宿主 ctx 的成员表');
+  const ctxMembers = [
+    ...boundarySource.slice(ctxStart, ctxEnd).matchAll(/\bname: '([A-Za-z_$][\w$]*)'/g),
+  ].map((match) => match[1]);
+
+  // 判据**不能**要求 `{` 与 `name:` 同行：`handle` 形态的成员是多行写的，
+  // 按单行匹配只会捞到 value 那三个，于是整张表看起来像缺了一大半。
+  check(ctxMembers.length >= 20, `宿主 ctx 表读到 ${ctxMembers.length} 个成员`);
+
+  const sandboxKeys = parityApi ? Object.keys(parityApi) : [];
+
+  // 沙箱里**必须**与宿主同名的那些（也就是真正会被插件直接读到的成员）
+  const sandboxOnly = sandboxKeys.filter((key) => !ctxMembers.includes(key)).sort();
+  const inProcessOnly = ctxMembers.filter((key) => !sandboxKeys.includes(key)).sort();
+
+  const EXPECTED_SANDBOX_ONLY = [
+    // 宿主对象那一族被并进了同一个对象：in-process 的 `Modulith.React` 与
+    // `ctx` 是两个东西，沙箱只有一个 `Modulith`。
+    'Fragment',
+    'React',
+    'createContext',
+    'jsx',
+    'jsxDEV',
+    'jsxs',
+    'registerModule',
+    'useModuleActive',
+    // 沙箱自己的形状
+    'commands',
+    'has',
+    'log',
+    'plugin',
+    'surfaces',
+    'theme',
+    'shortcuts',
+    'ui',
+  ].sort();
+
+  // **这几条是真实的缺口**，不是设计选择：
+  //   * `manifest` —— 宿主没有把整份清单送进沙箱（只送了 id/name/version/permissions）；
+  //   * `fileDrop` —— 拖放是窗口级事件，子 webview 收不到，**补不了**。
+  // 两条都写进插件开发文档，因此这里把它们钉成"已知且被承认"的清单：
+  // 将来谁不小心弄丢了一个成员，差异清单会变长，这条就红了。
+  const EXPECTED_IN_PROCESS_ONLY = ['fileDrop', 'manifest'].sort();
+
+  check(
+    sandboxOnly.join(',') === EXPECTED_SANDBOX_ONLY.join(','),
+    sandboxOnly.join(',') === EXPECTED_SANDBOX_ONLY.join(',')
+      ? `沙箱独有的 ${sandboxOnly.length} 个成员与预期一致`
+      : `★ 沙箱独有的成员变了。\n      预期：${EXPECTED_SANDBOX_ONLY.join('、')}\n      实际：${sandboxOnly.join('、') || '（空）'}`
+  );
+  check(
+    inProcessOnly.join(',') === EXPECTED_IN_PROCESS_ONLY.join(','),
+    inProcessOnly.join(',') === EXPECTED_IN_PROCESS_ONLY.join(',')
+      ? `宿主独有（即沙箱缺失）的 ${inProcessOnly.length} 个成员与预期一致：${inProcessOnly.join('、')}`
+      : `★ 两侧的缺口变了 —— 这会让"同一个插件两侧都能跑"变成假话。\n      预期：${EXPECTED_IN_PROCESS_ONLY.join('、')}\n      实际：${inProcessOnly.join('、') || '（空）'}`
+  );
+
+  // 光有"差异清单对得上"还不够：两边都空成一个集合也能骗过上面两条。
+  const shared = ctxMembers.filter((key) => sandboxKeys.includes(key)).sort();
+  check(
+    shared.length >= 18,
+    `两侧同名 ${shared.length} 个：${shared.join('、')}`
+  );
+
+  // 三条**具体**的成员，它们是这一节存在的直接原因（都曾经是 undefined）。
+  // 单独钉住是因为差异清单那两条只说明"集合没变"，不说明"值是对的"。
+  for (const [member, expected] of [
+    ['version', '1.6.0'],
+    ['pluginVersion', '9.9.9'],
+    ['pluginId', 'com.modulith.parity'],
+  ] as const) {
+    check(
+      parityApi?.[member] === expected,
+      `Modulith.${member} 是宿主注入的那一份（${String(parityApi?.[member])}）`
+    );
+  }
+  check(
+    typeof (parityApi?.logger as Record<string, unknown> | undefined)?.trace === 'function',
+    'logger 与 log 是同一个对象，且带 trace（in-process 的 logger 有它）'
+  );
+}
+
+// ============================================================
+// 21. 遮挡判断是"按比例采样"，不是"只看中心点"
+// ============================================================
+//
+// 这一节守的是一次**由用户报出来的**缺陷。沙箱界面是原生层，它会盖住宿主 DOM；
+// 因此宿主必须判断"我现在是不是被别的东西盖住了"，被盖住就让位。
+//
+// 原来的判据只量**矩形中心**一个点，而它有一个写下来的已知限制：
+// "浮层只盖住一角时不会被发现"。那条限制变成了两个可见的缺陷 ——
+// 标题栏的搜索下拉从上方盖进来、侧边栏那一侧的边缘压在矩形一侧，
+// 两者都**不在中心**，于是插件界面照样盖在上面。
+//
+// 改法是按比例：5×5 网格采样 + 覆盖率阈值。这一节把那个形状钉住，
+// 因为退化成"一个点"在代码上只是少几行，而症状只在特定浮层出现时才看得见。
+
+section('遮挡判断的采样');
+
+{
+  const surfaceTsx = read('../src/components/SandboxSurface.tsx');
+  const coveredFn = /function isCovered\([\s\S]*?\n\}/.exec(surfaceTsx)?.[0] ?? '';
+
+  check(coveredFn.length > 0, '能定位到 isCovered 的函数体');
+  check(
+    /for \(let row = 0; row < STEPS; row \+= 1\)/.test(coveredFn) &&
+      /for \(let column = 0; column < STEPS; column \+= 1\)/.test(coveredFn),
+    '采样是**网格**而不是单个点（单点无法发现"只盖住一角"的浮层）'
+  );
+  check(
+    /const STEPS = (\d+);/.test(coveredFn) && Number(/const STEPS = (\d+);/.exec(coveredFn)?.[1]) >= 3,
+    `网格步长至少 3（实际 ${/const STEPS = (\d+);/.exec(coveredFn)?.[1] ?? '读不到'}）`
+  );
+  check(
+    /covered \/ sampled >= COVERAGE_THRESHOLD/.test(coveredFn),
+    '判据是**覆盖率**与阈值比较，而不是"任意一点被盖住就让位"'
+  );
+  check(
+    /if \(!hit\) continue;/.test(coveredFn),
+    '视口之外的点跳过而不是算进分母（否则界面滚出视口会被判成整块被盖）'
+  );
+  check(
+    /if \(sampled === 0\) return false;/.test(coveredFn),
+    '一个点都采不到时不判定被盖住（把界面藏起来是代价最大的反应）'
+  );
+
+  const threshold = /const COVERAGE_THRESHOLD = ([0-9.]+);/.exec(surfaceTsx)?.[1];
+  check(
+    threshold !== undefined && Number(threshold) > 0 && Number(threshold) < 1,
+    `阈值是 (0,1) 之间的比例（实际 ${threshold ?? '读不到'}）—— 取 0 或 1 都会让判据退化`
+  );
+
+  const pollFn =
+    /const interval = window\.setInterval\(\(\) => \{[\s\S]*?\}, POLL_MS\);/.exec(surfaceTsx)?.[0] ?? '';
+  check(
+    /const now = isCovered\(element, bounds\);/.test(pollFn),
+    '轮询里调用的就是那个按比例的判据（而不是又写了一份单点判断）'
+  );
+  check(
+    /CONFIRMATIONS/.test(pollFn) && /agreed < CONFIRMATIONS/.test(pollFn),
+    '改判要两次确认（一次命中测试可能落在过渡动画的中间帧上）'
   );
 }
 

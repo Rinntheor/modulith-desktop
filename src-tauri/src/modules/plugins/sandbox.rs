@@ -684,6 +684,10 @@ fn bridge_script<R: Runtime>(
         .replace("'__PLUGIN_ID__'", &js_string(&plugin.id))
         .replace("'__PLUGIN_NAME__'", &js_string(&plugin.name))
         .replace("'__PLUGIN_VERSION__'", &js_string(&plugin.version))
+        // **宿主**版本（不是插件版本）。in-process 的 `ctx.version` 与
+        // `Modulith.version` 都是它，而插件用它做特性探测很常见 ——
+        // 少了这一条，`Modulith.version` 在沙箱里是 `undefined`。
+        .replace("'__PLUGIN_HOST_VERSION__'", &js_string(env!("CARGO_PKG_VERSION")))
         .replace("'__PLUGIN_SURFACE__'", &js_string(surface_id))
         .replace("'__PLUGIN_RUNTIME__'", &js_string(runtime_wire(&plugin.runtime)))
         .replace("__PLUGIN_PERMISSIONS__", &permissions)
@@ -717,6 +721,7 @@ fn bridge_script<R: Runtime>(
         !source.contains("__PLUGIN_ID__")
             && !source.contains("__PLUGIN_NAME__")
             && !source.contains("__PLUGIN_VERSION__")
+            && !source.contains("__PLUGIN_HOST_VERSION__")
             && !source.contains("__PLUGIN_SURFACE__")
             && !source.contains("__PLUGIN_PERMISSIONS__")
             && !source.contains("__PLUGIN_DATA_AVAILABLE__")
