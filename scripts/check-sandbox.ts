@@ -1194,12 +1194,40 @@ section('前端界面协作');
     '容器是 absolute inset-0（`h-full` 会因父级高度为 0 而塌掉）'
   );
   // **iframe 的 `sandbox` 属性是这一层的安全边界。** 没写出来的那些默认全部拒绝：
-  // 表单提交、弹窗、模态框、顶层跳转、下载、指针锁定、自动播放。两条必须放开：
-  // `allow-scripts`（插件代码本身）与 `allow-same-origin`（否则文档退化成不透明
-  // 来源，连它自己那份 fetch 都算跨源）。少了 `sandbox` 属性 = 全部放开。
+  // 表单提交、模态框、顶层跳转、下载、指针锁定、自动播放。三条是明确要放开的：
+  //   * `allow-scripts` —— 插件代码本身；
+  //   * `allow-same-origin` —— 否则文档退化成不透明来源，连它自己那份 fetch
+  //     都算跨源；
+  //   * `allow-modals` —— ★ **这一条是补的**，见下面的说明。
+  //
+  // 判据按**逐条 token** 写，不写成整串字面量：整串匹配会在加一条权限时把断言
+  // 打红，于是"该不该加"这件事被压成了"要不要改断言"。真要防的是**少**了必需项，
+  // 以及 **多**了危险项（`allow-top-navigation` / `allow-popups` / `allow-forms`
+  // 之类），因此这两侧分别断言。
+  const sandboxAttr = /sandbox="([^"]*)"/.exec(componentTsx)?.[1] ?? '';
+  const sandboxTokens = sandboxAttr.split(/\s+/).filter(Boolean);
   check(
-    /sandbox="allow-scripts allow-same-origin"/.test(componentTsx),
-    'iframe 带着 sandbox="allow-scripts allow-same-origin"（少了它插件拿回弹窗/表单/顶层跳转）'
+    sandboxTokens.includes('allow-scripts') && sandboxTokens.includes('allow-same-origin'),
+    `iframe 的 sandbox 带着 allow-scripts 与 allow-same-origin（实际：${sandboxAttr || '（没有 sandbox 属性 = 全部放开）'}）`
+  );
+  check(
+    !sandboxTokens.some((token) =>
+      ['allow-top-navigation', 'allow-top-navigation-by-user-activation', 'allow-popups', 'allow-forms', 'allow-downloads', 'allow-pointer-lock'].includes(
+        token
+      )
+    ),
+    `iframe 没有放开顶层跳转 / 弹窗 / 表单提交 / 下载 / 指针锁定（实际：${sandboxAttr}）`
+  );
+
+  // ★ `allow-modals`：少了它，`alert` / `confirm` / `prompt` 会被**静默**挡掉 ——
+  // `confirm` 直接返回 `false`、`prompt` 直接返回 `null`，不抛错、不弹窗。调用方
+  // 看到的是"用户取消了"，于是那个按钮**点了毫无反应**，而控制台里一个错都没有。
+  //
+  // 实测：本仓库的 `notes` / `pomodoro` / `quick-launch` 三个插件都用了
+  // `prompt` / `confirm`，因此它们各自的某个按钮在沙箱里都是死的。
+  check(
+    sandboxTokens.includes('allow-modals'),
+    'iframe 放开了 allow-modals（否则插件里的 confirm/prompt 静默返回取消，"按钮点了没反应"）'
   );
   // 就绪信号必须是桥接层发回来的 `ready`，不是 iframe 的 `load`。
   // `load` 在一个**加载失败**的文档上照样会触发（引擎拿自己画的错误页触发它），

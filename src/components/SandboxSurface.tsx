@@ -415,7 +415,7 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
           // "allow-scripts + allow-same-origin" 那条经典警告在这里**不适用**：
           // 它说的是"被嵌的文档与父文档同源"，而插件来源与宿主**不同源**，
           // 因此插件够不到 `parent`，也就删不掉这个属性。
-          sandbox="allow-scripts allow-same-origin"
+          sandbox="allow-scripts allow-same-origin allow-modals"
           /*
            * ============================================================
            * 剪贴板必须由**父文档显式委派**，否则插件那一侧根本拿不到它
@@ -443,6 +443,27 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
            * 那是坏掉。
            */
           allow="clipboard-read; clipboard-write"
+          /*
+           * ============================================================
+           * `allow-modals` —— 少了它，alert / confirm / prompt 会被**静默**挡掉
+           * ============================================================
+           *
+           * `sandbox` 里没有 `allow-modals` 时，这三个函数不会抛错、也不会弹窗：
+           * `confirm` 直接返回 `false`、`prompt` 直接返回 `null`。调用方看到的是
+           * "用户取消了"。
+           *
+           * 于是一个 `if (!confirm('确定删除？')) return;` 的按钮**点了毫无反应**，
+           * 而控制台里一个错都没有 —— 这类"看起来像按钮坏了"的现象，根因在宿主
+           * 少给了一个 sandbox 权限。
+           *
+           * 实测：本仓库的 `notes` / `pomodoro` / `quick-launch` 三个插件都用了
+           * `prompt` / `confirm`，因此它们各自的某个按钮在沙箱里都是死的。
+           *
+           * ⚠️ 这是**让功能恢复**，不是最佳形态。原生弹窗不跟随主题、还会阻塞整个
+           * 应用；宿主有更好的接口（`ctx.ui.dialog` —— 由宿主渲染、走浮层窗口）。
+           * 长期做法是那三个插件改用 `ctx.ui.dialog`，那时这个 sandbox 权限就可以
+           * 收回去。收不收得等它们先改完 —— 先放开再改，而不是先禁着让按钮坏着。
+           */
         />
       )}
 
