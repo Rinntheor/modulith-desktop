@@ -86,6 +86,11 @@
   var PERMISSIONS = __PLUGIN_PERMISSIONS__;
   var DATA_AVAILABLE = __PLUGIN_DATA_AVAILABLE__;
   var SURFACES = __PLUGIN_SURFACES__;
+  // 整份清单与设置项快照。两者都是 **JSON 字面量**（源文件里不带引号，宿主直接
+  // 把序列化结果替换进来）—— 与上面那几条字符串占位符的区别就在这里：包成字符串
+  // 再 parse 是多一次解析，而且给了"插件能在解析前碰到原文"这一步。
+  var PLUGIN_MANIFEST = __PLUGIN_MANIFEST__;
+  var PLUGIN_SETTINGS = __PLUGIN_SETTINGS__;
 
   // ============================================================
   // 我是谁：从**地址**读，不从插件 id 拼
@@ -1862,6 +1867,53 @@
     pluginVersion: PLUGIN_VERSION,
     version: PLUGIN_HOST_VERSION,
 
+    /**
+     * 整份清单。宿主解析好之后原样送进来的（见 `sandbox.rs` 的 `bridge_script`）。
+     *
+     * in-process 的 `ctx.manifest` 是**规范化之后**的对象（缺省值已填、缺失字段是
+     * `undefined`），这里给的是清单文件本身的忠实投影。**这个差别是有意的**：
+     * "一份被宿主填过默认值的清单"与"作者写的那份"是两件不同的事，而插件读
+     * `manifest` 绝大多数时候是为了自己的 `contributes`，那里不该看到被裁过的版本。
+     * 代价是少数缺省字段在这里是**缺席**而不是 `undefined` —— 用 `?.` 或
+     * `in` 判断，不要用 `=== undefined` 之外的隐式假设。
+     */
+    manifest: PLUGIN_MANIFEST,
+
+    /**
+     * **显式引导入口**（`api: 2`）：宿主把插件身份与数据作为**参数**交进去。
+     *
+     * 沙箱里这个入口本来是多余的 —— `createContext()` 已经能拿到身份了。留着它
+     * 只为一句承诺：**同一个插件在两个运行位置上不改一行代码**。缺了它，一个
+     * 用 `Modulith.run(function (bootstrap) { ... })` 写的插件在 in-process 下能跑、
+     * 搬进沙箱就抛 `Modulith.run is not a function` —— 而那个报错指向的是插件自己。
+     *
+     * **回调同步跑完**，与 in-process 一致（它不是"延迟到激活事件"的钩子；
+     * 什么时候执行整段 bundle 仍由清单的 `activationEvents` 决定）。返回值被忽略。
+     *
+     * `bootstrap.settings` 是**宿主在入口文档里就注入好的快照**（见上面
+     * `PLUGIN_SETTINGS` 的声明）：in-process 的它就是同步的，而桥接层先于插件脚本
+     * 加载，因此这是唯一能同步给出的位置 —— RPC 是异步的，等它回来时插件顶层
+     * 早就跑完了。它与 `ctx.settings.all()` 读的是同一份数据、同一个函数。
+     */
+    run: function (entry) {
+      if (typeof entry !== 'function') {
+        throw new Error('Modulith.run() 需要一个函数参数');
+      }
+
+      // `Modulith` 在这里只在**调用时**求值，那时这个对象已经装配完了。
+      // `capabilities` 是装配之后才挂上去的（它要枚举自己，见文件末尾）。
+      entry({
+        pluginId: PLUGIN_ID,
+        pluginVersion: PLUGIN_VERSION,
+        hostVersion: PLUGIN_HOST_VERSION,
+        manifest: PLUGIN_MANIFEST,
+        activationEvent: ACTIVATION_EVENT,
+        settings: PLUGIN_SETTINGS,
+        ctx: Modulith,
+        capabilities: Modulith.capabilities,
+      });
+    },
+
     /** 沙箱插件的身份。**宿主给出的**，不是插件自报的。 */
     plugin: {
       id: PLUGIN_ID,
@@ -2205,6 +2257,60 @@
       add: disposables.add,
       size: disposables.size,
     },
+  };
+
+  // ============================================================
+  // 宿主能力表（`Modulith.capabilities`）
+  // ============================================================
+  //
+  // ============================================================
+  // 为什么是**自描述**的，而不是照抄宿主那份契约名单
+  // ============================================================
+  //
+  // in-process 的 `HOST_CAPABILITIES` 报的是 `pluginBoundary.ts` 里那两份**契约
+  // 名单**（`Modulith.*` 与 `ctx.*` 各自的成员）。沙箱里那两份名单是**同一个对象**
+  // —— `createContext()` 返回的就是 `Modulith` —— 因此照抄它等于抄一份对不上现实
+  // 的清单，而"某一行说的是不是真的"就没人能保证了。
+  //
+  // 这里改成**枚举自己**：`capabilities.host` / `capabilities.context` 就是此刻
+  // 这个对象上真实存在的成员。它是唯一一种**不可能漂**的实现 —— 因为答案就是从
+  // 被测对象本身读出来的。插件问 `capabilities` 本来就是在问"我这里能用什么"，
+  // 而这个问题只有自描述能如实回答。
+  //
+  // 代价与边界（如实写下）：
+  //   * `host` 与 `context` 会是**同一个列表**。在沙箱里它们本来就是一个对象，
+  //     报成一样的是事实，不是偷懒。in-process 下两者不同，那里的插件若按
+  //     "两个列表必须不同"来写判断，会在这边失效 —— 但那种判断本身没有意义。
+  //   * 它可能比 in-process 的名单**多**（沙箱多出的成员，见门禁的
+  //     `EXPECTED_SANDBOX_ONLY`）。多报不会让插件少用能力；而少报才会。
+  //   * `contributions` / `activationEvents` 不是"这个文档有什么"，而是宿主支持
+  //     哪些贡献点与激活事件 —— 那两样枚举不出来，因此是字面量，由
+  //     `scripts/check-sandbox.ts` 对着 `pluginContributions.ts` 逐字核对。
+
+  /**
+   * 这个对象上真实存在的成员名。
+   *
+   * ⚠️ **它不含 `capabilities` 自己，靠的是"调用时机"，不是一个过滤条件：**
+   * 这次枚举发生在 `Modulith.capabilities = { … }` 的**右值求值期间**，那一刻
+   * `capabilities` 这个键还不存在。
+   *
+   * 这里原本写过一个 `name !== 'capabilities'` 的过滤 —— 变异测试证明它
+   * **永远不会命中**（把过滤改成恒真，门禁照旧全绿）。一个不可能生效的守卫比
+   * 没有守卫更坏：它让人以为"这件事被处理过了"，而实际处理它的是赋值顺序。
+   * 因此删掉过滤，把这个依赖**写在这里**：谁要是把 `capabilities` 挪进上面那个
+   * 对象字面量、或把这次枚举挪到赋值之后，就必须回来重新处理这件事。
+   */
+  function memberNames() {
+    return Object.keys(Modulith).sort();
+  }
+
+  Modulith.capabilities = {
+    /** 这张表自身的版本，字段集变化时 +1（与 in-process 的 `HOST_CAPABILITIES.api` 对齐） */
+    api: 1,
+    host: memberNames(),
+    context: memberNames(),
+    contributions: ['modules', 'commands', 'settings', 'contextMenus'],
+    activationEvents: ['onStartup', 'onModule', 'onCommand', 'onContextMenu'],
   };
 
   Object.defineProperty(window, 'Modulith', {

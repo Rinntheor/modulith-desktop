@@ -579,6 +579,19 @@ pub struct SandboxView {
     /// 解析在**这里**做而不是让沙箱那边自己读清单：清单只有一个读者，
     /// 而"这个插件有哪些界面"是清单的事实之一 —— 与根目录、权限同一个来源。
     pub surfaces: super::surfaces::SurfaceSet,
+    /// **整份清单**（序列化形式），给 `ctx.manifest` 与 `Modulith.run()` 用。
+    ///
+    /// 为什么是 `Value` 而不是 `PluginManifest`：注入到桥接层时要的就是一段
+    /// JSON 字面量，桥接层那边的形状由插件侧的类型定义管，宿主这边再解释一遍
+    /// 只会多出一处会漂的映射。`Value` 同时也把"清单里有而宿主不认识的字段"
+    /// 原样保留下来 —— 插件读自己的 `contributes` 时不该看到被宿主裁过的版本。
+    ///
+    /// in-process 的 `ctx.manifest` 给的是**规范化之后**的对象（有缺省值、
+    /// 有 `undefined`）。这里给的是清单文件本身的忠实投影，因此少数缺省字段
+    /// 在沙箱里可能是缺席而不是 `undefined` —— 这是**有意的差别**，因为
+    /// "一份被宿主填过默认值的清单"与"作者写的那份"是两件不同的事，而插件
+    /// 读 `manifest` 多半是为了自己的 `contributes`。
+    pub manifest: serde_json::Value,
 }
 
 impl SandboxView {
@@ -662,6 +675,10 @@ impl PluginManager {
                 .collect(),
             runtime: manifest.runtime,
             surfaces,
+            // 序列化失败只能是"清单类型与它自己的 Serialize 实现不一致"，那在编译期
+            // 就该挡住。真发生了就给 `null` 而不是整块界面建不出来 —— 清单这一项
+            // 缺了会让 `ctx.manifest` 是 `null`（可见），而界面白屏是不可见的。
+            manifest: serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
         })
     }
 

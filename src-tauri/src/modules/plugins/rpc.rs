@@ -595,23 +595,7 @@ pub async fn dispatch<R: Runtime>(
 
         "settings.all" => {
             let manager = locked!(app);
-            let keys = match manager.storage_keys(plugin_id) {
-                Ok(keys) => keys,
-                Err(e) => return rpc_error(&e.to_string()),
-            };
-
-            let mut result = serde_json::Map::new();
-            for key in keys {
-                let Some(id) = key.strip_prefix(SETTING_KEY_PREFIX) else {
-                    continue;
-                };
-                if let Ok(Some(raw)) = manager.storage_get(plugin_id, &key) {
-                    if let Some(value) = parse_stored(&raw) {
-                        result.insert(id.to_string(), value);
-                    }
-                }
-            }
-            json_value(serde_json::json!(result))
+            json_value(Value::Object(setting_values(&manager, plugin_id)))
         }
 
         "settings.set" => {
@@ -1383,6 +1367,44 @@ fn deliver_to_surfaces<R: Runtime>(
 /// 与 `notifications` 的事件名同一个风格。前端 `pluginRuntime` 订阅它，
 /// 再交给自己的事件总线 —— 总线的订阅者包括 in-process 插件与沙箱界面插件。
 pub const PLUGIN_EVENT: &str = "modulith://plugin-event";
+
+/// 读一个插件**设置项**的当前值快照。
+///
+/// 设置项就是插件存储里带宿主保留前缀的那些键，前缀在写入时被 `settings.set`
+/// 加上，因此"哪些键算设置项"这句话只有一个定义。
+///
+/// **抽出来是为了让两个调用方共用它**：`settings.all` 那条 RPC，以及入口文档里
+/// 注入给 `Modulith.run()` 的引导快照（`bootstrap.settings`）。后者是 in-process
+/// 的同步快照，而沙箱里唯一能在插件 bundle 执行**之前**拿到它的位置就是入口文档
+/// —— 两边各写一遍的话，"哪些键算设置项"就有了两个答案，而漂开的表现是
+/// `ctx.settings.all()` 与 `bootstrap.settings` 给出不同的键集。
+///
+/// 存储层出错（未声明 `storage`、存储不可用）时返回空表而不是抛错：调用方
+/// `settings.all` 把它当作"没有设置"，与 `pluginRuntime.ts` 里缺权限时降级为
+/// 空对象是同一条规矩。
+pub(super) fn setting_values(
+    manager: &super::manager::PluginManager,
+    plugin_id: &str,
+) -> serde_json::Map<String, Value> {
+    let mut result = serde_json::Map::new();
+
+    let Ok(keys) = manager.storage_keys(plugin_id) else {
+        return result;
+    };
+
+    for key in keys {
+        let Some(id) = key.strip_prefix(SETTING_KEY_PREFIX) else {
+            continue;
+        };
+        if let Ok(Some(raw)) = manager.storage_get(plugin_id, &key) {
+            if let Some(value) = parse_stored(&raw) {
+                result.insert(id.to_string(), value);
+            }
+        }
+    }
+
+    result
+}
 
 #[cfg(test)]
 mod tests {

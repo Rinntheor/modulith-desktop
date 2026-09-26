@@ -888,6 +888,24 @@ fn bridge_script<R: Runtime>(
         })
         .collect();
 
+    // `Modulith.run()` 的引导快照里那份 `settings`。
+    //
+    // in-process 的 `bootstrap.settings` 是**同步**快照（`createBootstrap` 在
+    // bundle 执行前从已加载的设置值里拷一份），而沙箱里唯一能在插件 bundle
+    // 执行之前拿到它的位置就是**这里** —— 桥接层先于插件脚本加载，而 RPC 是异步的，
+    // 等它回来时插件的顶层早就跑完了。
+    //
+    // 读的是与 `settings.all` 同一个函数（见 `rpc::setting_values`），因此
+    // "哪些键算设置项"只有一处定义。
+    let settings = plugin_manager(app)
+        .and_then(|handle| {
+            handle
+                .try_read()
+                .ok()
+                .map(|manager| super::rpc::setting_values(&manager, &plugin.id))
+        })
+        .unwrap_or_default();
+
     let source = BRIDGE_JS
         .replace("'__PLUGIN_ID__'", &js_string(&plugin.id))
         .replace("'__PLUGIN_NAME__'", &js_string(&plugin.name))
@@ -920,6 +938,17 @@ fn bridge_script<R: Runtime>(
             &app.try_state::<super::shortcuts::PluginShortcuts>()
                 .map(|state| state.describe().to_string())
                 .unwrap_or_else(|| r#"{"entries":[]}"#.to_string()),
+        )
+        // 整份清单。`ctx.manifest` 要它，`Modulith.run()` 的引导快照也要它。
+        //
+        // 桥接层读不到清单文件（它在插件目录之外，而且读文件是异步的），因此
+        // 只能是宿主把**已经解析好的那一份**送进来。送 `Value` 而不是重新拼一个
+        // 对象：插件读 `manifest.contributes` 时应当看到作者写的原样。
+        .replace("__PLUGIN_MANIFEST__", &plugin.manifest.to_string())
+        // 设置项快照。同样必须在 bundle 执行前就绪。
+        .replace(
+            "__PLUGIN_SETTINGS__",
+            &serde_json::Value::Object(settings).to_string(),
         );
 
     // 占位符没被替换掉 = 桥接层与这里的约定漂了。那时交给插件的会是一段
@@ -937,7 +966,9 @@ fn bridge_script<R: Runtime>(
             && !source.contains("__PLUGIN_RUNTIME__")
             && !source.contains("__PLUGIN_ACTIVATION__")
             && !source.contains("__PLUGIN_THEME__")
-            && !source.contains("__PLUGIN_SHORTCUTS__"),
+            && !source.contains("__PLUGIN_SHORTCUTS__")
+            && !source.contains("__PLUGIN_MANIFEST__")
+            && !source.contains("__PLUGIN_SETTINGS__"),
         "桥接脚本里的占位符没有被全部替换 —— sandbox-bridge.js 与 bridge_script 的约定漂了"
     );
 

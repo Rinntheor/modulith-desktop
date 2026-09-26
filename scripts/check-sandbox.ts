@@ -65,6 +65,95 @@ const strip = stripComments;
 const sandboxRs = read('../src-tauri/src/modules/plugins/sandbox.rs');
 const bridgeJs = read('../src-tauri/resources/sandbox-bridge.js');
 
+/**
+ * 桥接层里的**全部**占位符。
+ *
+ * `quoted` 是字符串形式（`.replace("'__X__'", …)`），`json` 是 JSON 字面量形式
+ * （不带引号，宿主把序列化结果直接放进去）。两份名单都要在这里维护 ——
+ * 散在断言里的话，加一个占位符就得记得改四五处。
+ */
+const BRIDGE_QUOTED = [
+  '__PLUGIN_ID__',
+  '__PLUGIN_NAME__',
+  '__PLUGIN_VERSION__',
+  '__PLUGIN_HOST_VERSION__',
+  '__PLUGIN_SURFACE__',
+  '__PLUGIN_RUNTIME__',
+  '__PLUGIN_ACTIVATION__',
+];
+
+const BRIDGE_JSON = [
+  '__PLUGIN_PERMISSIONS__',
+  '__PLUGIN_DATA_AVAILABLE__',
+  '__PLUGIN_SURFACES__',
+  '__PLUGIN_THEME__',
+  '__PLUGIN_SHORTCUTS__',
+  '__PLUGIN_MANIFEST__',
+  '__PLUGIN_SETTINGS__',
+];
+
+/**
+ * 把桥接脚本渲染成**可执行**的样子 —— **只有这一处做替换**。
+ *
+ * ============================================================
+ * 为什么收成一个函数（而不是每处实例化各抄一份）
+ * ============================================================
+ *
+ * 从前这份替换清单在门禁里有**四份副本**。占位符从 6 个长到 14 个的过程中，
+ * 每加一个就要记得改四处；漏掉一处的症状不是"门禁报错说少替换了"，
+ * 而是**桥接脚本执行失败**（`__X__ is not defined`），然后二十多条成员断言
+ * 一起变红 —— 看起来像桥接层坏了，实际是门禁自己少替换了一个记号。
+ * 那正是这次加 `__PLUGIN_MANIFEST__` 时发生的事。
+ *
+ * 值由调用方给：不同断言关心不同的权限与主题。
+ */
+function renderBridge(
+  options: {
+    pluginId?: string;
+    pluginName?: string;
+    pluginVersion?: string;
+    surface?: string;
+    permissions?: string;
+    dataAvailable?: string;
+    surfaces?: string;
+    theme?: string;
+    shortcuts?: string;
+    manifest?: string;
+    settings?: string;
+  } = {}
+): string {
+  return bridgeJs
+    .replaceAll("'__PLUGIN_ID__'", `"${options.pluginId ?? 'com.modulith.sandbox-demo'}"`)
+    .replaceAll("'__PLUGIN_NAME__'", `"${options.pluginName ?? '沙箱演示插件'}"`)
+    .replaceAll("'__PLUGIN_VERSION__'", `"${options.pluginVersion ?? '1.0.0'}"`)
+    .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
+    .replaceAll("'__PLUGIN_SURFACE__'", `"${options.surface ?? 'main'}"`)
+    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
+    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
+    .replaceAll('__PLUGIN_PERMISSIONS__', options.permissions ?? '["storage"]')
+    .replaceAll('__PLUGIN_DATA_AVAILABLE__', options.dataAvailable ?? 'true')
+    .replaceAll(
+      '__PLUGIN_SURFACES__',
+      options.surfaces ?? '[{"id":"main","name":"主界面","primary":true}]'
+    )
+    .replaceAll(
+      '__PLUGIN_THEME__',
+      options.theme ??
+        '{"resolved":"dark","reduceMotion":false,"glass":true,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
+    )
+    .replaceAll(
+      '__PLUGIN_SHORTCUTS__',
+      options.shortcuts ??
+        '{"entries":[{"id":"host.search","combo":"mod+k","normalized":"mod+k","description":"搜索","allowInInput":true}]}'
+    )
+    .replaceAll(
+      '__PLUGIN_MANIFEST__',
+      options.manifest ??
+        '{"name":"com.modulith.sandbox-demo","displayName":"沙箱演示插件","version":"1.0.0","permissions":["storage"]}'
+    )
+    .replaceAll('__PLUGIN_SETTINGS__', options.settings ?? '{}');
+}
+
 // ============================================================
 // 1. 桥接层的占位符必须被替换干净
 // ============================================================
@@ -79,48 +168,20 @@ const bridgeJs = read('../src-tauri/resources/sandbox-bridge.js');
 section('桥接层的占位符');
 
 {
-  const quoted = ['__PLUGIN_ID__', '__PLUGIN_NAME__', '__PLUGIN_VERSION__', '__PLUGIN_HOST_VERSION__', '__PLUGIN_RUNTIME__', '__PLUGIN_ACTIVATION__'];
-  for (const token of quoted) {
+  for (const token of BRIDGE_QUOTED) {
     const occurrences = bridgeJs.split(`'${token}'`).length - 1;
     check(occurrences === 1, `${token} 恰好出现一次（带引号的形式）`);
   }
 
-  for (const token of ['__PLUGIN_PERMISSIONS__', '__PLUGIN_DATA_AVAILABLE__', '__PLUGIN_THEME__', '__PLUGIN_SHORTCUTS__']) {
+  for (const token of BRIDGE_JSON) {
     const occurrences = bridgeJs.split(token).length - 1;
     check(occurrences === 1, `${token} 恰好出现一次`);
   }
 
   // 模拟 `bridge_script` 的替换（Rust 侧用的是"替换全部"），确认一个记号都不剩。
-  const rendered = bridgeJs
-    .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
-    .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
-    .replaceAll("'__PLUGIN_VERSION__'", '"1.0.0"')
-    .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
-    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
-    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
-    .replaceAll('__PLUGIN_PERMISSIONS__', '["storage"]')
-    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
-    .replaceAll(
-      '__PLUGIN_THEME__',
-      '{"resolved":"dark","reduceMotion":false,"glass":true,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
-    )
-    .replaceAll(
-      '__PLUGIN_SHORTCUTS__',
-      '{"entries":[{"id":"host.search","combo":"mod+k","normalized":"mod+k","description":"搜索","allowInInput":true}]}'
-    );
+  const rendered = renderBridge();
 
-  const leftover = [
-    '__PLUGIN_ID__',
-    '__PLUGIN_NAME__',
-    '__PLUGIN_VERSION__',
-    '__PLUGIN_HOST_VERSION__',
-    '__PLUGIN_RUNTIME__',
-    '__PLUGIN_ACTIVATION__',
-    '__PLUGIN_PERMISSIONS__',
-    '__PLUGIN_DATA_AVAILABLE__',
-    '__PLUGIN_THEME__',
-    '__PLUGIN_SHORTCUTS__',
-  ].filter((token) => rendered.includes(token));
+  const leftover = [...BRIDGE_QUOTED, ...BRIDGE_JSON].filter((token) => rendered.includes(token));
 
   check(
     leftover.length === 0,
@@ -1185,28 +1246,18 @@ section('前端界面协作');
 section('完整 API 表面');
 
 {
-    const rendered = bridgeJs
-      .replaceAll("'__PLUGIN_ID__'", '"com.modulith.sandbox-demo"')
-      .replaceAll("'__PLUGIN_NAME__'", '"沙箱演示插件"')
-      .replaceAll("'__PLUGIN_VERSION__'", '"1.2.3"')
-      .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
-      .replaceAll("'__PLUGIN_SURFACE__'", '"detail"')
-      .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
-      .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
-      .replaceAll('__PLUGIN_PERMISSIONS__', '["storage","plugin-data","clipboard"]')
-      .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
-      .replaceAll(
-        '__PLUGIN_SURFACES__',
-        '[{"id":"main","name":"列表","primary":true},{"id":"detail","name":"详情","primary":false}]'
-      )
-      .replaceAll(
-        '__PLUGIN_THEME__',
-        '{"resolved":"light","reduceMotion":true,"glass":false,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}'
-      )
-      .replaceAll(
-        '__PLUGIN_SHORTCUTS__',
-        '{"entries":[{"id":"host.search","combo":"mod+k","normalized":"mod+k","description":"搜索","allowInInput":true}]}'
-      );
+  // 这一处故意用**与其它处不同**的值（版本 1.2.3、界面 detail、多一块界面、
+  // 浅色主题），因为下面要断言"宿主注入的那一份"确实被读进来了 —— 各处都用
+  // 同一组常量的话，一条把注入值写死的实现也能全绿。
+  const rendered = renderBridge({
+    pluginVersion: '1.2.3',
+    surface: 'detail',
+    permissions: '["storage","plugin-data","clipboard"]',
+    surfaces:
+      '[{"id":"main","name":"列表","primary":true},{"id":"detail","name":"详情","primary":false}]',
+    theme:
+      '{"resolved":"light","reduceMotion":true,"glass":false,"tokens":{"--accent-500":"hsl(243 80% 55%)"}}',
+  });
 
   const fakeWindow: Record<string, unknown> = {
     // 桥接层在文档消失时要跑清理函数；这条检查里没有真实的页面生命周期。
@@ -3146,19 +3197,17 @@ section('两侧的成员表');
 {
   // 沙箱侧：**真的把它实例化一次**再读挂上去的对象。文本匹配查不到
   // "这个成员真的挂在对象上" —— 删掉一行字面量它照样绿。
-  const renderedForParity = bridgeJs
-    .replaceAll("'__PLUGIN_ID__'", '"com.modulith.parity"')
-    .replaceAll("'__PLUGIN_NAME__'", '"对齐检查"')
-    .replaceAll("'__PLUGIN_VERSION__'", '"9.9.9"')
-    .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
-    .replaceAll("'__PLUGIN_SURFACE__'", '"main"')
-    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
-    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
-    .replaceAll('__PLUGIN_PERMISSIONS__', '[]')
-    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
-    .replaceAll('__PLUGIN_SURFACES__', '[]')
-    .replaceAll('__PLUGIN_THEME__', '{}')
-    .replaceAll('__PLUGIN_SHORTCUTS__', '{}');
+  const renderedForParity = renderBridge({
+    // 这三个值下面会被逐个断言（"是宿主注入的那一份"）—— 用一组**只在这里出现**
+    // 的值，才能区分"读到了注入值"与"某处写死了一个常量"。
+    pluginId: 'com.modulith.parity',
+    pluginName: '对齐检查',
+    pluginVersion: '9.9.9',
+    permissions: '[]',
+    surfaces: '[]',
+    theme: '{}',
+    shortcuts: '{}',
+  });
 
   let parityApi: Record<string, unknown> | null = null;
   try {
@@ -3253,29 +3302,21 @@ section('两侧的成员表');
     'ui',
   ].sort();
 
-  // `ctx.*` 那一侧的缺口。**只剩一条**，而且是设计选择，不是没做：
-  //   * `manifest` —— 宿主没有把整份清单送进沙箱（只送了 id/name/version/permissions）。
+  // `ctx.*` 那一侧的缺口：**空了**。
   //
-  // `fileDrop` 曾经在这张清单里，理由写的是"拖放是窗口级事件、子 webview 收不到、
-  // 补不了"。那个理由**只对了一半**：wry 把拖放处理器注册在 webview 自己的 HWND
-  // 及其全部子窗口上（`wry-0.55.1/src/webview2/drag_drop.rs:50`），子 webview 有
-  // 自己的 HWND 且没注册处理器，路径从根上断掉。换成 iframe 之后指针底下始终是
-  // 主 webview 的 HWND，事件照常触发且带指针位置 —— 于是它变成"按位置命中哪一块
-  // 界面就往哪一块 postMessage"，1.6.0 补上了。
-  const EXPECTED_IN_PROCESS_ONLY = ['manifest'].sort();
+  // `manifest` 曾经是这里的唯一一条（宿主只送 id/name/version/permissions，
+  // 没送整份清单）。现在 `bridge_script` 会把**已解析好的清单**原样注入
+  // （`__PLUGIN_MANIFEST__`），因此这一侧没有缺口了 —— 清单写在这里而不是删掉，
+  // 是因为"缺口为零"本身就是要被守住的结论：下一次有人搬走一个成员时，
+  // 这张空清单会让门禁红，而不是安静地多出一个洞。
+  const EXPECTED_IN_PROCESS_ONLY: string[] = [];
 
-  // `Modulith.*` 那一侧的缺口。**两条，都是"数据/引导"这一类，不是能力**：
-  //   * `capabilities` —— 那张表由**前端**从 `pluginBoundary.ts` 派生
-  //     （`HOST_CAPABILITIES`），而桥接层是 Rust 渲染的：把它送进去需要
-  //     前端在建界面时把它交给宿主、宿存在令牌旁边、再注入桥接层。可行，
-  //     但还没有人需要它（9 个插件一个都没读 `Modulith.capabilities`）；
-  //   * `run` —— 显式引导入口。它的价值在 in-process 侧是**去掉隐式全局**
-  //     （v1 靠"当前正在加载哪个插件"决定归属，那个全局跨不过 realm），而沙箱里
-  //     这份文档从头到尾只属于一个插件，那个全局根本不存在 —— 于是"引导"这件事
-  //     在沙箱里没有对应的问题要解决。
+  // `Modulith.*` 那一侧的缺口：**也空了**。
   //
-  // 两条都写进插件开发文档，因此这里把它们钉成"已知且被承认"的清单。
-  const EXPECTED_HOST_ONLY = ['capabilities', 'run'].sort();
+  //   * `capabilities` —— 沙箱侧改成**自描述**（枚举自己），因此它与 in-process
+  //     报的名单可能不同，但成员本身在了；
+  //   * `run` —— 补上了，`bootstrap.settings` 由入口文档注入（同步快照）。
+  const EXPECTED_HOST_ONLY: string[] = [];
 
   check(
     sandboxOnly.join(',') === EXPECTED_SANDBOX_ONLY.join(','),
@@ -3407,6 +3448,214 @@ section('两侧的成员表');
     typeof (parityApi?.logger as Record<string, unknown> | undefined)?.trace === 'function',
     'logger 与 log 是同一个对象，且带 trace（in-process 的 logger 有它）'
   );
+}
+
+// ============================================================
+// 20.5 补齐的三个成员：manifest / capabilities / run
+// ============================================================
+//
+// 这三个在补上之前是**承认的缺口**（钉在 `EXPECTED_IN_PROCESS_ONLY` /
+// `EXPECTED_HOST_ONLY` 里）。上面那一节只证明"集合里的洞没了"，而集合相等是
+// 一个很弱的结论 —— 补一个**值为 undefined 的成员**也能让集合相等。
+// 因此这里逐个把值取出来看。
+//
+// 三者的补法不同，因此判据的重点也不同：
+//   * `manifest` —— 宿主注入整份清单。判据是**注入值真的被读到了**（用一组
+//     只在这里出现的值），而不是某个常量；
+//   * `capabilities` —— **自描述**（枚举自己）。判据因此必须证明"它真的是枚举
+//     出来的"：往对象上加一个成员，能力表要跟着变。写死一份名单的实现会在这条上红；
+//   * `run` —— 引导快照。判据是**同步**、`ctx` 是同一个对象、`settings` 是注入的
+//     那一份快照（in-process 的它就是同步的，晚一步就是"插件顶层读到空对象"）。
+
+section('补齐的三个成员（manifest / capabilities / run）');
+
+{
+  // 用一组**只在这一节出现**的值：任何一处写死常量都会在这里暴露。
+  const MANIFEST =
+    '{"name":"com.modulith.parity","displayName":"对齐检查","version":"9.9.9","contributes":{"commands":[{"id":"only-here"}]}}';
+  const SETTINGS = '{"theme":"solarized","size":12}';
+
+  const rendered = renderBridge({
+    pluginId: 'com.modulith.parity',
+    pluginName: '对齐检查',
+    pluginVersion: '9.9.9',
+    permissions: '["storage"]',
+    surfaces: '[{"id":"main","name":"主界面","primary":true}]',
+    theme: '{}',
+    shortcuts: '{}',
+    manifest: MANIFEST,
+    settings: SETTINGS,
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- 动态求值的桥接层没有类型
+  let api: any = null;
+  let bootFailure: string | null = null;
+
+  try {
+    const factory = new Function(
+      'window',
+      'document',
+      'fetch',
+      'navigator',
+      `${rendered}\nreturn window.Modulith;`
+    );
+
+    const fakeWindow: Record<string, unknown> = {
+      addEventListener: () => {},
+      document: { getElementById: () => null, addEventListener: () => {} },
+      location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+      __MODULITH_PLUGIN_REACT__: {
+        version: '19.2.7',
+        reactDomVersion: '19.2.7',
+        React: { createElement: () => null },
+        JsxRuntime: { jsx: () => null, jsxs: () => null, Fragment: Symbol('Fragment') },
+        JsxDevRuntime: { jsxDEV: () => null },
+        ReactDomClient: { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
+      },
+    };
+
+    api = factory(
+      fakeWindow,
+      { getElementById: () => null, addEventListener: () => {} },
+      () => Promise.reject(new Error('这一节不发网络')),
+      { clipboard: { readText: async () => '', writeText: async () => {} } }
+    );
+  } catch (error) {
+    bootFailure = error instanceof Error ? error.message : String(error);
+  }
+
+  check(api !== null, `三个成员的桥接层可以被实例化（${bootFailure ?? 'ok'}）`);
+
+  // ---- manifest ----
+  check(
+    api?.manifest !== undefined && api?.manifest !== null,
+    'ctx.manifest 存在（它曾经是 ctx 那一侧唯一的缺口）'
+  );
+  check(
+    api?.manifest?.name === 'com.modulith.parity' && api?.manifest?.version === '9.9.9',
+    'ctx.manifest 是宿主注入的那一份（不是某个写死的常量）'
+  );
+  check(
+    // **清单原样送进来**，因此宿主不认识的字段也必须还在 —— 插件读自己的
+    // `contributes` 时不该看到被宿主裁过的版本。
+    api?.manifest?.contributes?.commands?.[0]?.id === 'only-here',
+    'ctx.manifest 保留了清单的原样（宿主不认识的字段没有被裁掉）'
+  );
+
+  // ---- capabilities ----
+  const capabilities = api?.capabilities;
+  check(
+    capabilities !== undefined && capabilities !== null,
+    'Modulith.capabilities 存在（它曾经是 Modulith 那一侧的缺口之一）'
+  );
+  check(
+    capabilities?.api === 1,
+    'capabilities.api 是 1（与 in-process 的 HOST_CAPABILITIES.api 对齐）'
+  );
+  check(
+    Array.isArray(capabilities?.host) && capabilities.host.length > 10,
+    `capabilities.host 是一份非空的成员名单（读到 ${capabilities?.host?.length ?? 0} 个）`
+  );
+  // **自描述的核心判据**：名单必须与"此刻对象上真实存在的成员"一致。
+  //
+  // 这一条是这一节最要紧的断言。写死一份名单的实现能满足上面所有断言，
+  // 而它正是要被排除的那种做法 —— 那份名单必然会漂。
+  const actualMembers = Object.keys(api ?? {})
+    .filter((name) => name !== 'capabilities')
+    .sort();
+  check(
+    JSON.stringify(capabilities?.host) === JSON.stringify(actualMembers),
+    capabilities?.host === undefined
+      ? 'capabilities.host 缺失'
+      : JSON.stringify(capabilities.host) === JSON.stringify(actualMembers)
+        ? 'capabilities.host 就是"这个对象上真实存在的成员"（自描述，不可能漂）'
+        : `★ capabilities.host 与真实成员不一致 —— 它是一份写死的名单。\n      实际成员：${actualMembers.join('、')}\n      表里报的：${(capabilities.host as string[]).join('、')}`
+  );
+  check(
+    !(capabilities?.host as string[] | undefined)?.includes('capabilities'),
+    // 这一条**不是**靠一个过滤器成立的 —— 那是曾经写过的写法，被变异测试证明
+    // 是死代码（改成恒真也全绿）。它成立是因为枚举发生在赋值**之前**。
+    // 断言留着是为了钉住那个顺序依赖：谁把枚举挪到赋值之后，这里就红。
+    'capabilities 不把自己列进名单（靠赋值顺序成立，不是靠过滤器）'
+  );
+  check(
+    // 快照式断言：它与 pluginContributions.ts 的 CONTRIBUTION_KINDS / ACTIVATION_EVENT_NAMES
+    // 必须逐字一致（那两条在下面单独核对）。
+    JSON.stringify(capabilities?.contributions) ===
+      JSON.stringify(['modules', 'commands', 'settings', 'contextMenus']) &&
+      JSON.stringify(capabilities?.activationEvents) ===
+        JSON.stringify(['onStartup', 'onModule', 'onCommand', 'onContextMenu']),
+    'capabilities 的 contributions / activationEvents 是宿主支持的那两组'
+  );
+
+  // 与 TS 侧的字面量对账 —— 这两组名字是这张表里**唯一**不是枚举出来的部分，
+  // 因此也是唯一会漂的部分。
+  const contributionsTs = read('../src/services/pluginContributions.ts');
+  for (const literal of [
+    "export const CONTRIBUTION_KINDS = ['modules', 'commands', 'settings', 'contextMenus'] as const;",
+  ]) {
+    check(contributionsTs.includes(literal), `CONTRIBUTION_KINDS 与桥接层一致：${literal}`);
+  }
+  check(
+    /export const ACTIVATION_EVENT_NAMES = \[\s*'onStartup',\s*'onModule',\s*'onCommand',\s*'onContextMenu',\s*\] as const;/.test(
+      contributionsTs
+    ),
+    'ACTIVATION_EVENT_NAMES 与桥接层一致（四个名字，顺序也一样）'
+  );
+
+  // ---- run ----
+  check(typeof api?.run === 'function', 'Modulith.run 存在（它曾经是 Modulith 那一侧的缺口之一）');
+
+  let bootstrap: any = null;
+  let order = 'not-called';
+  try {
+    // **同步**：调用返回之后，回调必须已经跑完。in-process 的 `run` 就是这样，
+    // 而"晚一步执行"会让插件在顶层读 `bootstrap.settings` 时拿到空对象。
+    api?.run?.((received: unknown) => {
+      bootstrap = received;
+      order = 'called-synchronously';
+    });
+  } catch (error) {
+    order = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    order === 'called-synchronously',
+    order === 'called-synchronously'
+      ? 'run 的回调在调用返回前就跑完了（同步，与 in-process 一致）'
+      : `★ run 的回调没有同步执行：${order}`
+  );
+  check(
+    bootstrap?.ctx === api,
+    'bootstrap.ctx 与 Modulith 是同一个对象（in-process 的注释就是这么承诺的）'
+  );
+  check(
+    bootstrap?.pluginId === 'com.modulith.parity' && bootstrap?.pluginVersion === '9.9.9',
+    'bootstrap 带着宿主注入的身份'
+  );
+  check(
+    bootstrap?.hostVersion === '1.6.0',
+    'bootstrap.hostVersion 是**宿主**版本（不是插件版本）'
+  );
+  check(
+    bootstrap?.manifest?.name === 'com.modulith.parity',
+    'bootstrap.manifest 与 ctx.manifest 是同一份'
+  );
+  check(
+    bootstrap?.settings?.theme === 'solarized' && bootstrap?.settings?.size === 12,
+    'bootstrap.settings 是注入的那一份同步快照（不是空对象、也不是 Promise）'
+  );
+  check(
+    bootstrap?.capabilities === api?.capabilities,
+    'bootstrap.capabilities 与 Modulith.capabilities 是同一个对象'
+  );
+
+  let threw = false;
+  try {
+    api?.run?.('不是函数');
+  } catch {
+    threw = true;
+  }
+  check(threw, 'run 收到非函数参数时抛错（而不是安静地什么都不做）');
 }
 
 // ============================================================
@@ -3760,22 +4009,15 @@ section('文件拖放（ctx.fileDrop）');
 section('服务对象的方法（白屏两次都出在这里）');
 
 {
-  const renderedForMethods = bridgeJs
-    .replaceAll("'__PLUGIN_ID__'", '"com.modulith.methods"')
-    .replaceAll("'__PLUGIN_NAME__'", '"方法核对"')
-    .replaceAll("'__PLUGIN_VERSION__'", '"1.0.0"')
-    .replaceAll("'__PLUGIN_HOST_VERSION__'", '"1.6.0"')
-    .replaceAll("'__PLUGIN_SURFACE__'", '"main"')
-    .replaceAll("'__PLUGIN_RUNTIME__'", '"sandboxed"')
-    .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
-    .replaceAll(
-      '__PLUGIN_PERMISSIONS__',
-      '["storage","notification","plugin-communicate","clipboard","filesystem-read"]'
-    )
-    .replaceAll('__PLUGIN_DATA_AVAILABLE__', 'true')
-    .replaceAll('__PLUGIN_SURFACES__', '[]')
-    .replaceAll('__PLUGIN_THEME__', '{}')
-    .replaceAll('__PLUGIN_SHORTCUTS__', '{"entries":[]}');
+  const renderedForMethods = renderBridge({
+    // 权限**要给全**：缺哪一项，对应那个服务对象就会降级成空壳，
+    // 于是"方法名对不对"这件事在那个成员上根本没被测到。
+    permissions:
+      '["storage","notification","plugin-communicate","clipboard","filesystem-read"]',
+    surfaces: '[]',
+    theme: '{}',
+    shortcuts: '{"entries":[]}',
+  });
 
   let methodsApi: Record<string, Record<string, unknown> | undefined> | null = null;
   try {
