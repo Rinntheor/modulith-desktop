@@ -661,26 +661,69 @@ fn entry_document<R: Runtime>(
     surface: &super::surfaces::SurfaceDecl,
     token: &str,
 ) -> http::Response<Cow<'static, [u8]>> {
-    let style = match &surface.style {
+    // **取一次快照，CSS 与类名都从它算。** 各取一次的话，两次读取之间可以插进
+    // 一次主题变更 —— 那样渲染出的文档会同时带着新令牌和旧类名，一个自相矛盾的
+    // 页面，而且只在"用户刚好在打开插件的同时切主题"时才出现。
+    let snapshot = app
+        .try_state::<super::theme::PluginTheme>()
+        .map(|state| state.get());
+
+    let theme_css = snapshot
+        .as_ref()
+        .map(|theme| theme.to_css())
+        .unwrap_or_default();
+    let root_class = snapshot
+        .as_ref()
+        .map(|theme| theme.root_class_attr())
+        .unwrap_or_default();
+
+    let body = entry_document_html(
+        &surface.name,
+        surface.style.as_deref(),
+        &theme_css,
+        &root_class,
+        &surface.entry,
+        token,
+    );
+
+    page(body, "script-src 'self'; style-src 'self' 'unsafe-inline'")
+}
+
+/// 入口文档的 HTML。
+///
+/// ============================================================
+/// 为什么把它抽成一个**纯函数**
+/// ============================================================
+///
+/// 主题根类名那一环出的是一次**静默到极点**的错误：模板里有 `{root_class}`，
+/// 看起来什么都对，而 8 个插件的 `:root.dark …` 规则一条都不生效。
+///
+/// 文本级门禁能回答"模板里有没有那个占位符"，回答不了"拼出来到底长什么样"。
+/// 抽成不碰 `app`、不碰状态的纯函数之后，渲染结果可以被逐条断言 —— 这是这次
+/// 唯一能把"我以为它渲染对了"变成"它确实渲染成了这样"的办法。
+///
+/// 转义留在**函数内部**：调用方只负责把原始值交进来。放在调用方会让"某个调用点
+/// 忘了转义"变成一种可能，而那种缺陷的方向是注入。
+fn entry_document_html(
+    name: &str,
+    style: Option<&str>,
+    theme_css: &str,
+    root_class: &str,
+    entry: &str,
+    token: &str,
+) -> String {
+    let style_tag = match style {
         Some(rel) => format!(
             r#"  <link rel="stylesheet" href="/{token}/asset/{rel}">"#,
+            token = token,
             rel = escape_attr(rel)
         ),
         None => String::new(),
     };
 
-    // 主题在**入口文档里**就注入，而不是等桥接层起来之后再改。
-    //
-    // 顺序很重要：先注入后渲染，插件的第一帧就是对的。反过来（先渲染再改）
-    // 在深色主题下会白闪一帧，而那一下很显眼。理由详见 `theme.rs` 的文件头。
-    let theme = app
-        .try_state::<super::theme::PluginTheme>()
-        .map(|state| state.get().to_css())
-        .unwrap_or_default();
-
-    let body = format!(
+    format!(
         r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN"{root_class}>
   <head>
     <meta charset="utf-8">
     <title>{name}</title>
@@ -711,6 +754,10 @@ fn entry_document<R: Runtime>(
     <!--
       宿主的主题令牌。**这一段由 `theme.rs` 生成**，插件的 CSS 可以直接用
       与宿主同名的变量（`var(--accent-500)`），不需要任何前缀或改名。
+
+      ⚠️ 令牌**不是**主题的全部。令牌靠"重新声明"生效，而插件 CSS 里那些
+      `:root.dark …` 规则靠**属性匹配**生效 —— 明暗类名挂在上面那个 `<html>`
+      标签上（`{root_class}`），少了它这些规则一条都不匹配。两者必须一起给。
     -->
     <style id="modulith-theme">
 {theme}    </style>
@@ -730,14 +777,13 @@ fn entry_document<R: Runtime>(
   </body>
 </html>
 "#,
-        name = escape_html(&surface.name),
-        style = style,
-        main = escape_attr(&surface.entry),
-        theme = theme,
+        name = escape_html(name),
+        style = style_tag,
+        main = escape_attr(entry),
+        theme = theme_css,
+        root_class = root_class,
         token = token,
-    );
-
-    page(body, "script-src 'self'; style-src 'self' 'unsafe-inline'")
+    )
 }
 
 
@@ -957,6 +1003,11 @@ pub(super) fn push_to<R: Runtime>(
 /// 因此桥接层只替换 `<style id="modulith-theme">` 的**文本**。插件的 CSS 里
 /// 那些 `var(--accent-500)` 会自动重新求值，因为变量是在 `:root` 上重新声明的。
 ///
+/// **但它还要换一次根类名。** 这是两件不同的事，少做一半的症状很隐蔽：
+/// `var(--x)` 靠变量重新声明就生效，而 `.dark` 那种类选择器靠**属性匹配** ——
+/// 属性不变，规则就永远不匹配。实测 9 个插件里有 8 个用 `:root.dark …` 写深色，
+/// 只换样式文本时它们全部静默失效（令牌是对的，深色规则一条不生效）。
+///
 /// 顺带调一次 `__modulithThemeChanged`，让订阅了 `ctx.theme.onChange` 的插件
 /// 能在需要用 JS 拿颜色（canvas、SVG）时重新取一次。
 pub fn apply_theme<R: Runtime>(app: &AppHandle<R>) {
@@ -967,9 +1018,27 @@ pub fn apply_theme<R: Runtime>(app: &AppHandle<R>) {
         return;
     };
 
+    // **取一次快照，三条字段都从它算**，而不是各调一次 `theme.get()`。
+    //
+    // `get()` 返回的是一个 `Arc` 克隆，三次调用之间理论上可以插进一次 `set` ——
+    // 那样推出去的 CSS 与类名会来自**两个不同的主题**，而表现是"改了主题之后
+    // 颜色是新的、明暗类名还是旧的"，一种看起来完全随机的错位。
+    let snapshot = theme.get();
+
     let payload = serde_json::json!({
-        "css": theme.get().to_css(),
-        "described": theme.describe(),
+        "css": snapshot.to_css(),
+        "described": {
+            "resolved": snapshot.resolved,
+            "reduceMotion": snapshot.reduce_motion,
+            "glass": snapshot.glass,
+            "tokens": snapshot.tokens,
+        },
+        // 根类名与 CSS 一起推，**不能只推 CSS**。
+        //
+        // 只换 `<style>` 的文本能让 `var(--x)` 重新求值，但 `.dark` 那种
+        // 类选择器是靠属性匹配的 —— 属性不变，规则就永远不生效。这里漏掉的
+        // 表现是"改了主题，令牌都对了，插件的深色规则一条都没生效"。
+        "rootClasses": snapshot.root_classes(),
     });
 
     for (token, _key) in surfaces.live() {
@@ -1646,6 +1715,121 @@ pub async fn deliver_command<R: Runtime>(
 mod tests {
     use super::*;
     use crate::modules::plugins::surfaces::PRIMARY_SURFACE;
+
+    /// 入口文档在深色主题下必须把 `class="dark"` 挂到 `<html>` 上。
+    ///
+    /// ============================================================
+    /// 这是那个真实故障的回归测试
+    /// ============================================================
+    ///
+    /// 插件的 CSS 与宿主一样用 `:root.dark .foo` 写深色规则（实测 9 个插件里
+    /// 8 个这样写），而宿主挂在自己 `documentElement` 上的 `.dark` **不会继承到
+    /// 插件文档**。令牌注入得再对，这些规则也一条都不匹配。
+    ///
+    /// 这一条之所以要在 Rust 里测（而不是只写一条文本门禁）：故障的形态是
+    /// **模板里有占位符、拼出来却是空的**，只有真的把字符串拼出来才看得见。
+    #[test]
+    fn the_entry_document_carries_the_dark_class_when_the_theme_is_dark() {
+        let mut theme = crate::modules::plugins::theme::ThemeSnapshot::default();
+        theme.resolved = "dark".to_string();
+
+        let html = entry_document_html(
+            "笔记",
+            None,
+            &theme.to_css(),
+            &theme.root_class_attr(),
+            "index.js",
+            &"a".repeat(32),
+        );
+
+        assert!(
+            html.contains(r#"<html lang="zh-CN" class="dark">"#),
+            "深色主题下入口文档的 <html> 上没有 .dark —— 插件的深色规则会全部失效"
+        );
+        // 令牌块与类名**在同一个文档里**：只给其中一个都是半成品。
+        assert!(html.contains("color-scheme: dark;"));
+        assert!(html.contains(r#"id="modulith-theme""#));
+    }
+
+    /// 没有任何类名可说时，文档里不该留下 `class` 属性。
+    ///
+    /// **必须走快照，而不是直接塞一个空串进来。** 直接塞空串只测到"渲染器怎么
+    /// 处理空串"，测不到"快照真的会给出空串" —— 而变异打回的恰好是后者：
+    /// 去掉 `root_class_attr` 里那个空判据之后，渲染出来的是
+    /// `<html lang="zh-CN" class="">`，一个空的 `class` 属性。
+    ///
+    /// 它与"没有这个属性"在 CSS 上等价，但在**对账**时不等价：将来有人检查
+    /// "类名对不对"时，一个空属性会让判据看起来通过了。
+    #[test]
+    fn the_entry_document_omits_the_class_attribute_when_there_is_nothing_to_say() {
+        // 浅色 + 不减少动效 + 毛玻璃开着 —— 三个类名一个都不成立。
+        let mut theme = crate::modules::plugins::theme::ThemeSnapshot::default();
+        theme.resolved = "light".to_string();
+
+        let html = entry_document_html(
+            "笔记",
+            None,
+            &theme.to_css(),
+            &theme.root_class_attr(),
+            "index.js",
+            &"a".repeat(32),
+        );
+
+        assert!(
+            theme.root_classes().is_empty(),
+            "这个快照本就不该有类名；前提不成立的话下面两条断言没有意义"
+        );
+        assert!(html.contains(r#"<html lang="zh-CN">"#));
+        assert!(
+            !html.contains(" class="),
+            "没有类名时不该留下 class 属性 —— 空的 class 属性会让对账看起来通过了"
+        );
+    }
+
+    /// 浅色主题下**不能**有 `.dark` —— 否则深色规则会在亮色主题里生效。
+    #[test]
+    fn a_light_theme_leaves_no_dark_class_behind() {
+        let mut theme = crate::modules::plugins::theme::ThemeSnapshot::default();
+        theme.resolved = "light".to_string();
+
+        let html = entry_document_html(
+            "笔记",
+            None,
+            &theme.to_css(),
+            &theme.root_class_attr(),
+            "index.js",
+            &"a".repeat(32),
+        );
+
+        assert!(!html.contains("class=\"dark"));
+        assert!(html.contains("color-scheme: light;"));
+    }
+
+    /// 抽成纯函数之后，转义仍然在**函数内部**。
+    ///
+    /// 把转义挪到调用方会让"某个调用点忘了转义"变成一种可能，而那个缺陷的方向
+    /// 是注入。这条测试是抽取重构的护栏：它保证这次拆分没有顺手丢掉转义。
+    #[test]
+    fn the_entry_document_still_escapes_its_inputs() {
+        let html = entry_document_html(
+            "<script>alert(1)</script>",
+            Some("a\".js"),
+            "",
+            "",
+            "x\" onload=\"alert(1)",
+            &"a".repeat(32),
+        );
+
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "插件名里的标签被原样写进了文档"
+        );
+        assert!(
+            !html.contains(r#"onload="alert(1)""#),
+            "入口路径里的引号没被转义 —— 那是一个属性注入"
+        );
+        assert!(html.contains("&quot;"), "转义后的引号应当以实体形式出现");
+    }
 
     /// 令牌的形状判据。它挡的是"路径第一段是一段任意字符串"这件事。
     ///

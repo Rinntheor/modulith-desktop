@@ -305,7 +305,23 @@ section('文档的 CSP');
 section('入口文档的脚本顺序');
 
 {
-  const entryFn = /fn entry_document(?:<[^>]*>)?\([\s\S]*?\n}/.exec(sandboxRs);
+  // 断言的对象是**拼出文档的那个函数**（`entry_document_html`），不是它的调用方。
+  //
+  // 这里曾经指向 `entry_document`，因为 HTML 当时就写在那里面。把拼接抽成纯函数
+  // 之后（理由见 `sandbox.rs` 上那段注释：模板里的占位符"看起来对"而拼出来是空的，
+  // 只有把字符串拼出来才测得到），模板搬走了 —— 而这两条断言**立刻全部变红**。
+  // 那正是它们该有的反应：它们守的是"入口文档里有什么"，因此必须跟着文档走。
+  const entryFn = /fn entry_document_html\([\s\S]*?\n\}/.exec(sandboxRs);
+  check(!!entryFn, '能定位到 entry_document_html 的函数体（入口文档由它拼出来）');
+
+  // 而"被断言的这一份"必须真的是"被用的那一份"，否则上面全部断言都可以被
+  // 悄悄地绕过去：把拼接写回 `entry_document` 里，纯函数留着不用，门禁照样全绿。
+  const entryCaller = /fn entry_document(?:<[^>]*>)?\([\s\S]*?\n\}/.exec(sandboxRs)?.[0] ?? '';
+  check(
+    /entry_document_html\(/.test(entryCaller),
+    'entry_document 真的调用 entry_document_html（否则被断言的那份文档根本不是被用的那份）'
+  );
+
   if (entryFn) {
     const body = entryFn[0];
     const bridge = body.indexOf('bridge.js');
@@ -1578,6 +1594,113 @@ section('主题链路');
   check(
     /color-scheme: \{\}/.test(themeRs),
     '注入里带了 color-scheme（否则深色主题下插件的滚动条是白的）'
+  );
+
+  // ---- 环 5：根类名 ------------------------------------------------------
+  //
+  // ============================================================
+  // 这是链路上**原本完全缺失的一环**，不是加固
+  // ============================================================
+  //
+  // 上面"环 3 注入令牌块"与"推送换样式文本"两条断言都在，链路上看起来是通的，
+  // 而它们只覆盖了**令牌**那一半。插件 CSS 与宿主一样用 `:root.dark .foo` 写
+  // 深色规则，而宿主挂在自己 `documentElement` 上的 `.dark` 不会继承到插件文档。
+  //
+  // 后果不是"颜色差一点"，是那些规则一条都不匹配。实测 9 个插件里 8 个这样写
+  // （kanban 116 处、pomodoro 30、notes 25、encode-lab 26…），唯一正常的 `hello`
+  // 恰好一条都没有 —— 症状因此是"只有 hello 好看"。
+  //
+  // 变量与类名是两种机制：`var(--x)` 靠重新声明生效，类选择器靠**属性匹配**
+  // 生效。只断言前者是这次漏掉整整一环的原因。
+  const themeTs = read('../src/services/theme.ts');
+  const glassTs = read('../src/utils/glassPreference.ts');
+
+  // 名字的唯一来源在 Rust。两处常量必然漂开，因此逐字对账。
+  check(
+    /ROOT_CLASS_DARK: &str = "dark"/.test(themeRs) &&
+      /classList\.toggle\('dark'/.test(themeTs),
+    '根类名 dark 在宿主与插件两侧是同一个字面量（漂开的表现是深色规则静默失效）'
+  );
+  check(
+    /ROOT_CLASS_REDUCE_MOTION: &str = "lc-reduce-motion"/.test(themeRs) &&
+      /'lc-reduce-motion'/.test(themeTs),
+    '根类名 lc-reduce-motion 两侧一致'
+  );
+  check(
+    /ROOT_CLASS_NO_GLASS: &str = "lc-no-glass"/.test(themeRs) &&
+      /NO_GLASS_CLASS = 'lc-no-glass'/.test(glassTs),
+    '根类名 lc-no-glass 两侧一致（它是一个**否定式**的类名，写反了看不出来）'
+  );
+
+  // 快照要能算出类名，且**否定式那一项**的方向必须对。
+  check(
+    /pub fn root_classes\(&self\)/.test(themeRs),
+    '主题快照能给出根类名（只给令牌是不够的）'
+  );
+  check(
+    /if !self\.glass \{[\s\S]{0,80}?ROOT_CLASS_NO_GLASS/.test(themeRs),
+    'lc-no-glass 只在**关掉**毛玻璃时挂（写反的表现是开了毛玻璃反而被关）'
+  );
+
+  // 入口文档：类名要挂到 `<html>` 上，而且是**通过格式参数**进去的。
+  //
+  // 判据落在 `root_class = root_class` 这一个格式参数上：只断言
+  // `{root_class}` 出现在模板里会漏掉"参数没传"那一半 —— 那样渲染出来的
+  // 是字面量 `{root_class}`，插件 CSS 一条都不匹配，而 HTML 仍然"有类名"。
+  check(
+    /<html lang="zh-CN"\{root_class\}>/.test(sandboxRs) &&
+      /root_class = root_class,/.test(sandboxRs),
+    '入口文档把主题类名挂到 <html> 上（模板与格式参数两处都要在）'
+  );
+
+  // 推送里必须带类名。只推 css 是那个"令牌对了、深色规则一条不生效"的写法。
+  check(
+    /"rootClasses": snapshot\.root_classes\(\)/.test(sandboxRs),
+    '主题推送里带上了根类名（只换样式文本时类选择器永远不匹配）'
+  );
+  check(
+    /let snapshot = theme\.get\(\);/.test(sandboxRs) &&
+      !/theme\.get\(\)\.to_css\(\)/.test(sandboxRs),
+    'css 与类名取自**同一份**快照（各取一次会推出两个主题拼起来的结果）'
+  );
+
+  // 桥接层：应用类名，且只动自己管的那几个。
+  check(
+    /function applyRootClasses\(classes\)/.test(bridgeJs) &&
+      /applyRootClasses\(payload\.rootClasses\)/.test(bridgeJs),
+    '桥接层在主题推送里应用根类名（而不是只换样式文本）'
+  );
+  check(
+    /if \(!Array\.isArray\(classes\)\) return;/.test(bridgeJs),
+    '根类名不是数组时直接返回（推送是跨边界数据，形状不能假定）'
+  );
+  check(
+    !/className\s*=/.test(bridgeJs.slice(bridgeJs.indexOf('function applyRootClasses'))),
+    'applyRootClasses 只增删自己管的类名，不整份重写 className（那会抹掉插件自己挂的类）'
+  );
+
+  // 白名单三处一致：Rust 的名单、桥接层的名单、以及各自会返回的名字。
+  const whitelist =
+    /var ROOT_CLASS_NAMES = \['dark', 'lc-reduce-motion', 'lc-no-glass'\];/.test(bridgeJs);
+  check(
+    whitelist && /ROOT_CLASS_NAMES: \[&str; 3\]/.test(themeRs),
+    '根类名白名单在 Rust 与桥接层逐字一致（漏一个的表现是那个类名被安静丢掉）'
+  );
+  // 两趟遍历**都必须按白名单**，且循环体要逐字钉住。
+  //
+  // 这里曾经写成"窗口内出现 `ROOT_CLASS_NAMES.forEach` 且窗口内出现
+  // `classList.add`" —— 那种写法被变异打回过：把**第二趟**换成
+  // `classes.forEach(...)` 之后，`add` 仍然落在第一个 `forEach` 起点的 200 字符
+  // 窗口里，于是门禁全绿而任意属性已经能挂到根元素上了。窗口跨得过两个循环，
+  // 就是它没在测任何东西。因此循环体必须精确匹配。
+  check(
+    /ROOT_CLASS_NAMES\.forEach\(function \(name\) \{\s*if \(classes\.indexOf\(name\) === -1\) root\.classList\.remove\(name\);\s*\}\)/.test(
+      bridgeJs
+    ) &&
+      /ROOT_CLASS_NAMES\.forEach\(function \(name\) \{\s*if \(classes\.indexOf\(name\) !== -1\) root\.classList\.add\(name\);\s*\}\)/.test(
+        bridgeJs
+      ),
+    '摘掉与挂上两趟都**按白名单**遍历，且循环体精确（直接遍历 payload 会让推送能往根元素上挂任意属性）'
   );
 }
 
@@ -2858,8 +2981,8 @@ section('宿主把自己的 React 送给沙箱插件');
   //
   // 地址的第一段是**令牌**（不再是插件 id）：协议处理器只认令牌，因此这里的
   // 判据也必须按令牌的形式写 —— 否则"地址被换回 id 拼"这件事不会有任何东西发现。
-  const entryDoc = /fn entry_document<R: Runtime>\([\s\S]*?\n\}/.exec(sandboxRsForReact)?.[0] ?? '';
-  check(entryDoc.length > 0, '能定位到 entry_document 的函数体');
+  const entryDoc = /fn entry_document_html\([\s\S]*?\n\}/.exec(sandboxRsForReact)?.[0] ?? '';
+  check(entryDoc.length > 0, '能定位到 entry_document_html 的函数体');
   const reactAt = entryDoc.indexOf('<script src="/{token}/react.js">');
   const bridgeAt = entryDoc.indexOf('<script src="/{token}/bridge.js">');
   // 锚在**脚本标签**上，不是裸的 `/asset/`：同一个函数体里还有一行

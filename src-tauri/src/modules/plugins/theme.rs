@@ -92,6 +92,39 @@ fn default_true() -> bool {
     true
 }
 
+/// 插件文档根元素上要挂的类名。
+///
+/// ============================================================
+/// 为什么光注入令牌不够（这是真实故障，不是预防性的补丁）
+/// ============================================================
+///
+/// 插件的 CSS 与宿主一样用 `:root.dark .foo` 写深色规则。而插件文档是
+/// **另一个文档** —— 宿主挂在自己 `documentElement` 上的 `.dark` 不会继承过去，
+/// 于是那些规则一条都不匹配，插件在深色主题下仍然是亮色。
+///
+/// 实测的分布很能说明问题：9 个插件里有 8 个这样写（kanban 116 处、pomodoro 30、
+/// notes 25、encode-lab 26、typing-practice 60+），而唯一一直正常的 `hello`
+/// 恰好一条都没有。症状因此是"只有 hello 好看"，而不是"插件全都不好看" ——
+/// 那种分布最容易被误判成"某个插件的样式写坏了"。
+///
+/// `to_css()` 只解决了令牌那一半。类名必须由这里给出，否则就是在承诺
+/// "与宿主同名同值"的同时少给一半：变量对得上，而依赖类的规则全部静默失效。
+///
+/// 名字必须与宿主 `src/services/theme.ts` 与 `src/utils/glassPreference.ts`
+/// 里的字面量逐字相同。两处常量由 `scripts/check-sandbox.ts` 对账。
+pub const ROOT_CLASS_DARK: &str = "dark";
+pub const ROOT_CLASS_REDUCE_MOTION: &str = "lc-reduce-motion";
+pub const ROOT_CLASS_NO_GLASS: &str = "lc-no-glass";
+
+/// 上面三个类名的全体。桥接层用它做白名单（见 `sandbox-bridge.js` 的
+/// `applyRootClasses`），因此**新增类名时这里必须同步** —— 漏了的表现是
+/// 那个类名推到了浏览器里却被丢掉，而丢掉的这一侧只会安静地什么都不做。
+pub const ROOT_CLASS_NAMES: [&str; 3] = [
+    ROOT_CLASS_DARK,
+    ROOT_CLASS_REDUCE_MOTION,
+    ROOT_CLASS_NO_GLASS,
+];
+
 impl ThemeSnapshot {
     /// 渲染成一段注入插件文档的 CSS。
     ///
@@ -161,6 +194,44 @@ impl ThemeSnapshot {
         } else {
             "dark"
         }
+    }
+
+    /// 插件文档根元素上应当出现的类名。
+    ///
+    /// 顺序是**固定的**（深色在前）：同一个主题两次渲染出的 HTML 必须逐字节相同，
+    /// 否则每次打开界面都会在 `<html>` 上产生一次无意义的属性变更，而这类噪声
+    /// 正是将来"属性变了所以 DOM 变了"这类误判的来源。
+    pub fn root_classes(&self) -> Vec<&'static str> {
+        let mut classes = Vec::with_capacity(ROOT_CLASS_NAMES.len());
+
+        // 用 `color_scheme()` 而不是直接比 `resolved == "dark"`：不认识的取值
+        // 在那一处已经被兜底成深色，两处各写一遍必然漂开 —— 而漂开的表现是
+        // `color-scheme: dark` 与缺 `.dark` 同时出现，那是最难解释的一种组合。
+        if self.color_scheme() == "dark" {
+            classes.push(ROOT_CLASS_DARK);
+        }
+        if self.reduce_motion {
+            classes.push(ROOT_CLASS_REDUCE_MOTION);
+        }
+        // 与宿主一致：**关掉**毛玻璃才挂类。这是一个否定式的类名，写反了的
+        // 表现是"开了毛玻璃反而被关掉"，而光看类名根本看不出对错。
+        if !self.glass {
+            classes.push(ROOT_CLASS_NO_GLASS);
+        }
+
+        classes
+    }
+
+    /// 上面那份类名的 `class="…"` 属性串（**含前导空格**，可直接拼进标签）。
+    ///
+    /// 没有任何类名时返回空串，而不是 `class=""`：让"没有类名"与"有一个空
+    /// class 属性"在 HTML 上看起来不一样，否则将来对账时两者会被当成同一个东西。
+    pub fn root_class_attr(&self) -> String {
+        let classes = self.root_classes();
+        if classes.is_empty() {
+            return String::new();
+        }
+        format!(" class=\"{}\"", classes.join(" "))
     }
 }
 
@@ -291,6 +362,130 @@ mod tests {
         let mut odd = snapshot();
         odd.resolved = "solarized".to_string();
         assert!(odd.to_css().contains("color-scheme: dark;"));
+    }
+
+    /// 深色主题必须体现在**根类名**上，而不只是令牌值上。
+    ///
+    /// 这是那个真实故障的回归测试：插件 CSS 用 `:root.dark .foo` 写深色规则，
+    /// 而宿主挂在另一个文档的 `documentElement` 上的 `.dark` 不会继承过来。
+    /// 令牌注入得再对，这些规则也一条都不匹配。
+    #[test]
+    fn the_dark_theme_reaches_the_root_class_not_just_the_tokens() {
+        let dark = snapshot();
+        assert!(dark.root_classes().contains(&"dark"));
+        assert!(dark.root_class_attr().contains("class=\"dark"));
+
+        let mut light = snapshot();
+        light.resolved = "light".to_string();
+        assert!(
+            !light.root_classes().contains(&"dark"),
+            "浅色主题下挂了 .dark，插件的深色规则会在亮色主题里生效"
+        );
+    }
+
+    /// 不认识的 `resolved` 与 `color-scheme` 走同一条兜底。
+    ///
+    /// 两处各写一遍必然漂开，而漂开的表现是 `color-scheme: dark` 与缺 `.dark`
+    /// 同时出现 —— 滚动条是深的、界面是浅的，最难被归因的一种组合。
+    #[test]
+    fn an_unknown_theme_falls_back_to_dark_on_both_paths() {
+        let mut odd = snapshot();
+        odd.resolved = "solarized".to_string();
+
+        assert!(odd.to_css().contains("color-scheme: dark;"));
+        assert!(odd.root_classes().contains(&"dark"));
+    }
+
+    /// `lc-no-glass` 是**否定式**的：关掉毛玻璃才挂。
+    #[test]
+    fn the_glass_class_is_only_present_when_glass_is_off() {
+        let on = snapshot();
+        assert!(!on.root_classes().contains(&"lc-no-glass"));
+
+        let mut off = snapshot();
+        off.glass = false;
+        assert!(off.root_classes().contains(&"lc-no-glass"));
+    }
+
+    #[test]
+    fn reduce_motion_also_reaches_the_root_class() {
+        let mut quiet = snapshot();
+        quiet.reduce_motion = true;
+        assert!(quiet.root_classes().contains(&"lc-reduce-motion"));
+
+        let normal = snapshot();
+        assert!(!normal.root_classes().contains(&"lc-reduce-motion"));
+    }
+
+    /// 类名顺序固定 —— 同一个主题两次渲染必须是逐字节相同的属性串。
+    #[test]
+    fn the_class_attribute_is_stable_and_well_formed() {
+        let mut busy = snapshot();
+        busy.reduce_motion = true;
+        busy.glass = false;
+
+        assert_eq!(busy.root_class_attr(), " class=\"dark lc-reduce-motion lc-no-glass\"");
+        // 前缀空格不是装饰：它要被直接拼进 `<html lang="zh-CN"` 后面。
+        assert!(busy.root_class_attr().starts_with(' '));
+        assert_eq!(busy.root_class_attr(), busy.root_class_attr());
+    }
+
+    /// `root_class_attr` 必须与 `root_classes` 一致 —— 两份输出同源。
+    #[test]
+    fn the_attribute_is_derived_from_the_class_list() {
+        for (resolved, reduce_motion, glass) in [
+            ("dark", false, true),
+            ("light", false, true),
+            ("dark", true, false),
+            ("light", true, false),
+        ] {
+            let mut snapshot = snapshot();
+            snapshot.resolved = resolved.to_string();
+            snapshot.reduce_motion = reduce_motion;
+            snapshot.glass = glass;
+
+            let classes = snapshot.root_classes();
+            let attr = snapshot.root_class_attr();
+
+            for name in &classes {
+                assert!(attr.contains(name), "{name} 在类名表里，却不在属性串里");
+            }
+            // 属性串里空格恰好等于类名个数：一个前导空格 + (n-1) 个分隔符。
+            // 多一个或少一个都说明拼接漏了或串了。
+            assert_eq!(
+                attr.matches(' ').count(),
+                classes.len(),
+                "属性串里的空格数与 root_classes() 对不上：{attr}"
+            );
+        }
+    }
+
+    /// `ROOT_CLASS_NAMES` 必须覆盖 `root_classes()` 可能返回的每一个名字。
+    ///
+    /// 桥接层用这份名单做白名单：漏一个的表现是那个类名被安静地丢掉，
+    /// 而丢掉的那一侧什么都不会报。
+    #[test]
+    fn the_whitelist_covers_every_class_the_snapshot_can_emit() {
+        for (resolved, reduce_motion, glass) in [
+            ("dark", false, true),
+            ("light", false, true),
+            ("dark", true, false),
+            ("light", true, false),
+            ("dark", true, true),
+            ("light", false, false),
+        ] {
+            let mut snapshot = snapshot();
+            snapshot.resolved = resolved.to_string();
+            snapshot.reduce_motion = reduce_motion;
+            snapshot.glass = glass;
+
+            for name in snapshot.root_classes() {
+                assert!(
+                    ROOT_CLASS_NAMES.contains(&name),
+                    "{name} 会被渲染进 HTML，却不在 ROOT_CLASS_NAMES 里 —— 桥接层会把它丢掉"
+                );
+            }
+        }
     }
 
     /// 减少动效由宿主压掉，而不是指望每个插件自己判断。

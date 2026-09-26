@@ -1427,10 +1427,52 @@
   // 身份判据是 `event.source`，不是 `event.origin`：来源字符串是发送方自己声明的，
   // 而窗口引用不能伪造 —— 只有宿主那个窗口能等于 `window.parent`。
 
+  // ============================================================
+  // 根类名
+  // ============================================================
+  //
+  // 插件的 CSS 与宿主一样用 `:root.dark .foo` 写深色规则，而宿主挂在它自己
+  // `documentElement` 上的 `.dark` **不会继承到这个文档**。入口文档里已经带了
+  // 初始的那一份；这里负责换主题时把它改掉。
+  //
+  // 为什么令牌（`var(--x)`）对得上还不够：变量靠"重新声明"生效，类选择器靠
+  // **属性匹配**生效。只换样式文本时，8 个插件的深色规则会全部静默失效。
+  //
+  // 白名单在这里是必要的，不只是防御：`classList` 被写进一个跨边界传过来的
+  // 数组时，没有白名单就等于允许"用一条推送往根元素上挂任意属性"。
+  var ROOT_CLASS_NAMES = ['dark', 'lc-reduce-motion', 'lc-no-glass'];
+
+  /**
+   * 把根元素上的主题类名换成宿主说的那一份。
+   *
+   * **只动自己管的那三个名字**，绝不整份重写 `className` —— 插件可能在根元素上
+   * 挂了自己的类，整份重写会把它们一起抹掉，而那种损失是静默的。
+   */
+  function applyRootClasses(classes) {
+    if (!Array.isArray(classes)) return;
+
+    var root = document.documentElement;
+
+    // 先摘掉"该消失的"，再挂上"该出现的"。顺序无所谓（两个集合不相交），
+    // 但固定下来能让这里的行为可预测。
+    ROOT_CLASS_NAMES.forEach(function (name) {
+      if (classes.indexOf(name) === -1) root.classList.remove(name);
+    });
+
+    ROOT_CLASS_NAMES.forEach(function (name) {
+      if (classes.indexOf(name) !== -1) root.classList.add(name);
+    });
+  }
+
   var PUSH_HANDLERS = {
     theme: function (payload) {
       var style = document.getElementById('modulith-theme');
       if (style && payload && typeof payload.css === 'string') style.textContent = payload.css;
+
+      // 类名与样式文本**必须一起换**。只做上面那一步的表现是：令牌全对，
+      // 而所有 `:root.dark …` 规则一条都不生效。
+      if (payload) applyRootClasses(payload.rootClasses);
+
       if (window.__modulithThemeChanged) {
         window.__modulithThemeChanged(payload ? payload.described : null);
       }
