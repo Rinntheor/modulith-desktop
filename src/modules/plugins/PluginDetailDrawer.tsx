@@ -15,6 +15,8 @@ import {
   FileText,
   Info,
   Power,
+  SlidersHorizontal,
+  ArrowRight,
 } from 'lucide-react';
 import { openPath } from '@tauri-apps/plugin-opener';
 import PluginIcon from './PluginIcon';
@@ -36,6 +38,8 @@ import {
   type BackgroundContribution,
   type BackgroundPluginStatus,
 } from '../../services/backgroundPlugins';
+import { getPluginSettingContributions } from '../../services/pluginSettings';
+import { requestPluginSettings } from '../../services/pluginSettingsFocus';
 
 interface PluginDetailDrawerProps {
   plugin: InstalledPlugin | null;
@@ -112,6 +116,14 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
       contribution: BackgroundContribution;
       status: BackgroundPluginStatus | null;
     } | null>(null);
+
+    /**
+     * 这个插件声明了几个设置项（`contributes.settings`）。
+     *
+     * 与 `backend` 一样**同步读**：设置项来自清单声明，`pluginSettings` 已经把它
+     * 解析并缓存好了（它自己订阅插件列表），因此这里不需要异步取、也不会闪。
+     */
+    const settingCount = plugin ? getPluginSettingContributions(plugin.id).length : 0;
 
     useEffect(() => {
       if (!plugin) {
@@ -335,6 +347,35 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
                         </span>
                       ))}
                     </div>
+                  </section>
+                )}
+
+                {/*
+                  有设置项才显示这个入口。
+
+                  **它尤其重要**：无界面（后台）插件没有侧边栏项、没有标签页，
+                  「设置 → 插件设置」是它唯一露脸的地方。而用户是在插件列表里找到
+                  这个插件的，那就该在同一个地方找到它的设置 —— 否则他得先知道
+                  "插件设置"那一页存在、再在里面把十几个插件挨个认一遍。
+                */}
+                {settingCount > 0 && (
+                  <section>
+                    <button
+                      type="button"
+                      onClick={() => requestPluginSettings(plugin.id)}
+                      className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-gray-200/70 bg-white/60 hover:bg-gray-50 transition-colors text-left"
+                    >
+                      <SlidersHorizontal className="w-3.5 h-3.5 text-gray-500 shrink-0" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-xs font-medium text-gray-800">
+                          这个插件有 {settingCount} 项设置
+                        </span>
+                        <span className="block text-[11px] text-gray-400">
+                          去「设置 → 插件设置」里改它
+                        </span>
+                      </span>
+                      <ArrowRight className="w-3.5 h-3.5 text-gray-400 shrink-0" />
+                    </button>
                   </section>
                 )}
 

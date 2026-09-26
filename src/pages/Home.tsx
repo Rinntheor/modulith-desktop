@@ -67,6 +67,7 @@ import SettingsDialog, { type SettingsSectionId } from '../components/Settings/S
 import GlobalContextMenu, { type GlobalMenuEntry } from '../components/GlobalContextMenu';
 import ModuleIcon from '../components/ModuleIcon';
 import { moduleManager } from '../services/moduleManager';
+import { subscribePluginSettingsRequest } from '../services/pluginSettingsFocus';
 import {
   getPluginContextMenuEntries,
   reloadPluginRuntime,
@@ -348,6 +349,20 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
   }, []);
 
   const handleOpenSettings = useCallback(() => openSettings('general'), [openSettings]);
+
+  /**
+   * 有人请求「打开某个插件的设置」（插件详情抽屉里的那个按钮）。
+   *
+   * 抽屉在插件模块里，设置对话框在外壳里 —— 两者没有共同祖先，因此走一个
+   * 模块级的一次性意图（见 `services/pluginSettingsFocus.ts`）。
+   *
+   * 这里**只负责把对话框打开到那一页**；"定位到哪个插件"由
+   * `PluginSettingsSection` 自己去取那个意图。分开的理由：意图是**取走即清空**的，
+   * 两边都去取的话，后取的那一个什么也拿不到。
+   */
+  useEffect(() => {
+    return subscribePluginSettingsRequest(() => openSettings('plugin-settings'));
+  }, [openSettings]);
 
   /**
    * 更新通知的去处。
