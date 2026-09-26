@@ -3659,8 +3659,193 @@ section('补齐的三个成员（manifest / capabilities / run）');
 }
 
 // ============================================================
-// 21. 桥接层的运行时守卫与推送通道
+// 20.6 缺权限时**降级**，而不是让每次调用撞权限错误
 // ============================================================
+//
+// `modulith.d.ts` 写下的契约是："未声明权限时宿主**不抛错**（除了
+// `ctx.settings.set`），而是降级为空实现"。in-process 的 `pluginDataDir` 照做了
+// （一份明确的 stub：`available` 恒 false、`list` 空数组、读写抛一句能照做的话）。
+//
+// 桥接层从前没有那一段 —— 同一份插件在 in-process 下安静降级、在沙箱里每次调用
+// 都拿到 `权限不足: plugin-data`。**这正是这次迁移反复栽的那个坑**（两次白屏都
+// 出在"同一个插件在两个运行位置上表现不同"）。
+//
+// 两条判据缺一不可：
+//   1. 降级后的返回值是那一组**具体**的降级值（不是一个笼统的 rejection）；
+//   2. 降级前后的**方法集合完全相同** —— 否则插件看到的能力形状取决于它声明了
+//      什么权限，那是一个新的、更难发现的形状分歧。
+
+section('缺权限时降级（dataDir）');
+
+{
+  const boot = (permissions: string): Record<string, any> | null => {
+    const rendered = renderBridge({ permissions, surfaces: '[]', theme: '{}', shortcuts: '{}' });
+    try {
+      const factory = new Function(
+        'window',
+        'document',
+        'fetch',
+        'navigator',
+        `${rendered}\nreturn window.Modulith;`
+      );
+      return factory(
+        {
+          addEventListener: () => {},
+          document: { getElementById: () => null, addEventListener: () => {} },
+          location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+          __MODULITH_PLUGIN_REACT__: {
+            version: '19.2.7',
+            reactDomVersion: '19.2.7',
+            React: { createElement: () => null },
+            JsxRuntime: { jsx: () => null, jsxs: () => null, Fragment: Symbol('Fragment') },
+            JsxDevRuntime: { jsxDEV: () => null },
+            ReactDomClient: { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
+          },
+        },
+        { getElementById: () => null, addEventListener: () => {} },
+        // 这一节**不许发网络**：一个真的 RPC 会走进 `rpc()` 然后被拒绝 ——
+        // 而"被拒绝"与"我们根本没发"在结果上很像。因此 fetch 直接抛，
+        // 让"降级分支还在发请求"这件事立刻暴露成一条不同的错误。
+        () => {
+          throw new Error('降级分支不该发 RPC');
+        },
+        { clipboard: { readText: async () => '', writeText: async () => {} } }
+      );
+    } catch {
+      return null;
+    }
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const without = boot('[]') as any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const with_ = boot('["plugin-data"]') as any;
+
+  check(without !== null && with_ !== null, '两种权限下桥接层都能被实例化');
+
+  const degradedKeys = Object.keys(without?.dataDir ?? {}).sort();
+  const fullKeys = Object.keys(with_?.dataDir ?? {}).sort();
+
+  check(fullKeys.length >= 10, `dataDir 有 ${fullKeys.length} 个方法（有权限那一份）`);
+  check(
+    JSON.stringify(degradedKeys) === JSON.stringify(fullKeys),
+    JSON.stringify(degradedKeys) === JSON.stringify(fullKeys)
+      ? `降级前后的方法集合完全相同（${fullKeys.length} 个）—— 插件看到的能力形状与权限无关`
+      : `★ dataDir 的方法集合随权限变了。\n      有权限：${fullKeys.join('、')}\n      无权限：${degradedKeys.join('、')}`
+  );
+
+  // 那一组**具体**的降级值。笼统地"全部 reject"过不了这几条 ——
+  // 而 `list` 返回空数组与返回一个 rejection，对插件是两个完全不同的世界：
+  // 前者让"列出我的文件"这个界面画出一个空列表，后者让它整块崩掉。
+  //
+  // `settle` 而不是裸 `await`：降级写坏时这些调用会 reject，而裸 `await` 会让
+  // **整份门禁**炸在一个未捕获异常上 —— 那时输出里没有哪一条断言是红的，
+  // 排查的人只会看到一段堆栈。变异测试正是这么打回这一版的。
+  //
+  // 收的是**函数**而不是 Promise：同步抛（例如降级整段没了、调用直接走进 RPC
+  // 而那一步就炸）也会被这里接住。收 Promise 的话，抛出发生在参数求值时就逃出去了。
+  const settle = async (
+    run: () => Promise<unknown>
+  ): Promise<{ ok: true; value: unknown } | { ok: false; error: unknown }> => {
+    try {
+      return { ok: true, value: await run() };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  };
+
+  const available = await settle(() => without.dataDir.available());
+  const list = await settle(() => without.dataDir.list());
+  const stat = await settle(() => without.dataDir.stat());
+  const used = await settle(() => without.dataDir.used());
+
+  check(
+    available.ok && available.value === false,
+    `降级后 available() 是 false（实际 ${available.ok ? JSON.stringify(available.value) : '抛错'})`
+  );
+  check(
+    list.ok && Array.isArray(list.value) && list.value.length === 0,
+    list.ok
+      ? `降级后 list() 是空数组而不是 rejection（实际 ${JSON.stringify(list.value)}）`
+      : '★ 降级后 list() 抛错了 —— 插件列自己的文件时会整块崩掉'
+  );
+  check(
+    stat.ok && stat.value === null,
+    `降级后 stat() 是 null（实际 ${stat.ok ? JSON.stringify(stat.value) : '抛错'})`
+  );
+  check(used.ok && used.value === 0, `降级后 used() 是 0（实际 ${used.ok ? JSON.stringify(used.value) : '抛错'})`);
+
+  // 改不了的那几条必须**抛**，而且抛的话要能照做 —— in-process 的措辞是
+  // "插件未声明 "plugin-data" 权限，无法访问数据目录"。静默成功会让插件以为
+  // 存好了，而东西根本没落盘（那是比抛错难查得多的一类缺陷）。
+  const writeOutcome = await settle(() => without.dataDir.write('a.txt', 'x'));
+  const deniedMessage = writeOutcome.ok
+    ? ''
+    : writeOutcome.error instanceof Error
+      ? writeOutcome.error.message
+      : String(writeOutcome.error);
+
+  check(
+    !writeOutcome.ok && deniedMessage.includes('plugin-data'),
+    !writeOutcome.ok
+      ? `降级后 write() 抛错且话里有"plugin-data"，能照做：${deniedMessage}`
+      : '★ 降级后 write() 没有抛错 —— 静默成功会让插件以为东西存好了'
+  );
+  check(
+    !writeOutcome.ok && !deniedMessage.includes('降级分支不该发 RPC'),
+    '降级分支没有真的发 RPC（发了的话这里的错误会是"降级分支不该发 RPC"）'
+  );
+
+  // 有权限那一份必须**真的走 RPC** —— 否则上面对"降级值"的断言可以用一个
+  // "永远返回 stub"的实现蒙过去，而那个实现等于把有权限的插件也一起关了。
+  let rpcAttempts = 0;
+  const renderedFull = renderBridge({
+    permissions: '["plugin-data"]',
+    surfaces: '[]',
+    theme: '{}',
+    shortcuts: '{}',
+  });
+  const factoryFull = new Function(
+    'window',
+    'document',
+    'fetch',
+    'navigator',
+    `${renderedFull}\nreturn window.Modulith;`
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const full = factoryFull(
+    {
+      addEventListener: () => {},
+      document: { getElementById: () => null, addEventListener: () => {} },
+      location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+      __MODULITH_PLUGIN_REACT__: {
+        version: '19.2.7',
+        reactDomVersion: '19.2.7',
+        React: { createElement: () => null },
+        JsxRuntime: { jsx: () => null, jsxs: () => null, Fragment: Symbol('Fragment') },
+        JsxDevRuntime: { jsxDEV: () => null },
+        ReactDomClient: { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
+      },
+    },
+    { getElementById: () => null, addEventListener: () => {} },
+    () => {
+      rpcAttempts += 1;
+      // `rpc()` 走的是真实 fetch 的形状（`.ok` / `.status` / `.json()`），
+      // 因此这个假货也必须长成那样 —— 只给一个 `{ok:true}` 会在 `.json()` 上炸。
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ ok: true, result: [] }),
+      });
+    },
+    { clipboard: { readText: async () => '', writeText: async () => {} } }
+  ) as Record<string, any>;
+
+  await full.dataDir.list();
+  check(rpcAttempts === 1, `有权限时 list() 真的发了 RPC（发了 ${rpcAttempts} 次）`);
+}
+
+
 //
 // 这一节从前守的是**遮挡判断的采样**（5×5 网格 + 覆盖率阈值）。
 //

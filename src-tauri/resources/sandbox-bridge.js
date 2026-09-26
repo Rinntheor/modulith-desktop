@@ -333,7 +333,77 @@
     );
   }
 
-  var dataDir = {
+  // ============================================================
+  // 数据目录（`ctx.dataDir`）
+  // ============================================================
+  //
+  // ============================================================
+  // 没声明 `plugin-data` 时**降级**，不是让每次调用都撞权限错误
+  // ============================================================
+  //
+  // `pluginRuntime.ts` 的 `pluginDataDir` 有一份明确的 stub：`available` 恒 false、
+  // `list` 空数组、`stat` null、`used` 0，而读写那几条抛一句**能照做的话**
+  // （"插件未声明 plugin-data 权限，无法访问数据目录"）。
+  //
+  // 这个桥接层从前没有那一段 —— 于是同一份插件在 in-process 下安静降级、在沙箱里
+  // 每次调用都拿到 `权限不足: plugin-data`。**同一个插件在两个运行位置上表现不同**
+  // 正是这次迁移反复栽的那个坑（白屏两次都出在同类分歧上）。
+  //
+  // 为什么降级成"处处失败的空实现"而不是静默成功：后者会让插件以为存好了，
+  // 而东西根本没落盘 —— 那是比抛错难查得多的一类缺陷。这一点 in-process 的
+  // 注释里已经写过，这里照抄它的行为，包括"只提示一次"。
+  var dataDir = (function () {
+    if (!has('plugin-data')) {
+      var warnedMissingDataDir = false;
+      function warnOnce() {
+        if (warnedMissingDataDir) return;
+        warnedMissingDataDir = true;
+        console.warn(
+          '[Modulith] 插件使用了 ctx.dataDir，但清单里没有声明 "plugin-data" 权限，' +
+            '调用被忽略（后续同类调用不再重复提示）'
+        );
+      }
+
+      var denied = function () {
+        warnOnce();
+        return Promise.reject(
+          new Error('插件未声明 "plugin-data" 权限，无法访问数据目录')
+        );
+      };
+
+      return {
+        available: function () {
+          warnOnce();
+          return Promise.resolve(false);
+        },
+        status: function () {
+          warnOnce();
+          return Promise.resolve({ available: false, configured: false, path: null, reason: '未声明 "plugin-data" 权限' });
+        },
+        list: function () {
+          warnOnce();
+          return Promise.resolve([]);
+        },
+        stat: function () {
+          warnOnce();
+          return Promise.resolve(null);
+        },
+        read: denied,
+        readText: denied,
+        readBase64: denied,
+        write: denied,
+        writeText: denied,
+        writeBase64: denied,
+        mkdir: denied,
+        remove: denied,
+        used: function () {
+          warnOnce();
+          return Promise.resolve(0);
+        },
+      };
+    }
+
+    return {
     /**
      * 数据根目录当前是否可用。**异步**，与 in-process 同名同形。
      *
@@ -431,7 +501,8 @@
     writeBase64: function (rel, base64) {
       return rpc('data.write', { rel: rel, content: String(base64) });
     },
-  };
+    };
+  })();
 
   // ============================================================
   // 剪贴板
@@ -2234,6 +2305,17 @@
       },
 
       set: function (id, value) {
+        // 与 in-process **同一条规矩**：`ctx.settings.set` 是唯一一个在缺 `storage`
+        // 权限时**抛错**的能力（静默丢掉一次写入会让插件以为设置存上了）。
+        //
+        // 从前这里直接发 RPC，于是插件拿到的是宿主那句 `权限不足: storage` ——
+        // 意思对，但它是权限模型的话，不是"这一次写入没生效"。抛错这一侧必须说清
+        // **发生了什么**，因为那句话就是插件要显示给用户的内容。
+        if (!has('storage')) {
+          return Promise.reject(
+            new Error('插件没有声明 "storage" 权限，设置 "' + id + '" 无法保存')
+          );
+        }
         return rpc('settings.set', { id: id, value: value });
       },
     },
