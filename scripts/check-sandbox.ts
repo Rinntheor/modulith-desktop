@@ -3035,14 +3035,19 @@ section('两侧的成员表');
     'ui',
   ].sort();
 
-  // **这几条是真实的缺口**，不是设计选择：
-  //   * `manifest` —— 宿主没有把整份清单送进沙箱（只送了 id/name/version/permissions）；
-  //   * `fileDrop` —— 拖放是**窗口级**事件，而插件界面是一块 iframe：落到它上面的
-  //     拖放不会冒泡到宿主文档，宿主窗口收到的那一次也不带"指针落在哪一块界面上"
-  //     的信息，**补不了**。
-  // 两条都写进插件开发文档，因此这里把它们钉成"已知且被承认"的清单：
+  // **只剩一条真实缺口**，而且是设计选择，不是没做：
+  //   * `manifest` —— 宿主没有把整份清单送进沙箱（只送了 id/name/version/permissions）。
+  //
+  // `fileDrop` 曾经在这张清单里，理由写的是"拖放是窗口级事件、子 webview 收不到、
+  // 补不了"。那个理由**只对了一半**：wry 把拖放处理器注册在 webview 自己的 HWND
+  // 及其全部子窗口上（`wry-0.55.1/src/webview2/drag_drop.rs:50`），子 webview 有
+  // 自己的 HWND 且没注册处理器，路径从根上断掉。换成 iframe 之后指针底下始终是
+  // 主 webview 的 HWND，事件照常触发且带指针位置 —— 于是它变成"按位置命中哪一块
+  // 界面就往哪一块 postMessage"，1.6.0 补上了。
+  //
+  // 剩下这一条写进插件开发文档，因此这里把它钉成"已知且被承认"的清单：
   // 将来谁不小心弄丢了一个成员，差异清单会变长，这条就红了。
-  const EXPECTED_IN_PROCESS_ONLY = ['fileDrop', 'manifest'].sort();
+  const EXPECTED_IN_PROCESS_ONLY = ['manifest'].sort();
 
   check(
     sandboxOnly.join(',') === EXPECTED_SANDBOX_ONLY.join(','),
@@ -3301,6 +3306,98 @@ section('桥接层的运行时守卫');
       read('../src-tauri/src/modules/plugins/rpc.rs')
     ),
     '跨插件事件也走 push_to 的 event 通道（它是同步的，不再拼脚本）'
+  );
+}
+
+// ============================================================
+// 文件拖放（ctx.fileDrop）
+// ============================================================
+//
+// 它长期记在"沙箱里没有"那一栏，理由是"拖放是窗口级事件，子 webview 收不到"。
+// 核对 wry 之后发现那个理由只对了一半：wry 把拖放处理器注册在 **webview 自己的
+// HWND 及其全部子窗口**上（wry-0.55.1/src/webview2/drag_drop.rs:50 枚举子窗口
+// 并按个 RegisterDragDrop）。子 webview 有自己的 HWND，而它**没有**注册处理器 ——
+// 于是落在它上面的文件既不进宿主窗口的处理器，也没有东西接住。那条路径从根上是
+// 断的。换成 iframe 之后指针底下始终是**主 webview 的 HWND**，事件照常触发，
+// 而且带指针位置。
+//
+// 这一节守的是那条新链路：**宿主判定权限 → 前端按位置筛 → 桥接层扇出**。
+// 三处缺一，插件就收不到拖放 —— 而三种缺法的症状一模一样："拖进去没反应"。
+
+section('文件拖放（ctx.fileDrop）');
+
+{
+  const bare = strip(sandboxRs);
+
+  // ---- 1. 权限由宿主判定，不由前端 ----
+  check(
+    /pub const FILE_DROP_PERMISSION: &str = "filesystem-read"/.test(bare),
+    '拖放要的权限是一个有名字的常量（写成字面量就有了几处会漂的地方）'
+  );
+  check(
+    /file_drop:\s*view\s*\.permissions\s*\.iter\(\)\s*\.any\(\|p\|\s*p\s*==\s*FILE_DROP_PERMISSION\)/.test(
+      bare
+    ),
+    '签发界面时由**宿主**算出"这一界面能不能收拖放"（前端不自己查清单）'
+  );
+  check(
+    /pub file_drop: bool/.test(bare),
+    'SurfaceHandle 把这一位交给前端（少了它前端只能广播，后台插件会收到别人的拖放）'
+  );
+
+  // ---- 2. 前端按位置筛 ----
+  const surfaceTsx = strip(read('../src/components/SandboxSurface.tsx'));
+
+  check(
+    /current\.fileDrop/.test(surfaceTsx),
+    '前端按宿主给的那一位判断要不要转（自己查清单就是又一处会漂的权限映射）'
+  );
+  check(
+    /devicePixelRatio/.test(surfaceTsx),
+    '把拖放的**物理像素**换算成 CSS 像素（不换算的话，缩放不是 100% 时命中的是另一块区域）'
+  );
+  check(
+    /getBoundingClientRect\(\)[\s\S]{0,240}?rect\.left/.test(surfaceTsx),
+    '按矩形命中测试决定这次拖放归谁（Home 里各标签面板是叠在一起、靠 visibility 藏的，只按 active 判会让下面那一摞都收到）'
+  );
+  check(
+    /'file-drop'/.test(surfaceTsx),
+    '转交走 file-drop 通道（另写一条消息类型会绕开桥接层那张处理器表）'
+  );
+  check(
+    /dragInsideRef/.test(surfaceTsx),
+    'leave 靠"上一次真的进来了"认领 —— 那一条不带指针位置，命中测试对它无效'
+  );
+
+  // ---- 3. 坐标本身要真的被带过来 ----
+  const fileDropTs = strip(read('../src/services/fileDrop.ts'));
+  check(
+    /position\?: \{ x: number; y: number \}/.test(fileDropTs),
+    'FileDropEvent 带着指针位置（少了它前端只能广播）'
+  );
+  check(
+    /Number\.isFinite/.test(fileDropTs),
+    '位置只在两个分量都是有限数时才带上（NaN 的比较永远为假，症状是拖放静默失效）'
+  );
+
+  // ---- 4. 桥接层扇出，且形态与 in-process 一致 ----
+  const bridgeBare = strip(bridgeJs);
+  check(
+    /'file-drop': function \(payload\)/.test(bridgeBare),
+    '桥接层有 file-drop 通道的处理器'
+  );
+  check(
+    /fileDrop: fileDrop/.test(bridgeBare),
+    'Modulith.fileDrop 存在（不在的话同一份插件代码在两侧要改一行）'
+  );
+  check(
+    /isAvailable: function \(\)/.test(bridgeBare) &&
+      /subscribe: function \(handler\)/.test(bridgeBare),
+    'fileDrop 的形态与 in-process 一致（isAvailable + subscribe）'
+  );
+  check(
+    /if \(!has\('filesystem-read'\)\)/.test(bridgeBare),
+    '未声明权限时降级为空订阅 + 一次告警（与宿主侧 pluginFileDrop 同一条规矩）'
   );
 }
 

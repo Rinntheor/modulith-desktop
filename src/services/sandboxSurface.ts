@@ -41,6 +41,14 @@ export interface SandboxSurfaceHandle {
   token: string;
   /** 这个 iframe 该加载的地址（由宿主拼好，前端不自己拼）。 */
   url: string;
+  /**
+   * 这块界面能不能收到文件拖放。
+   *
+   * **由宿主算出来**（清单里有没有 `filesystem-read`），前端不自己查。
+   * 拖放带来的是本机路径，"这个插件能不能收"必须由宿主判定 —— 让前端再实现
+   * 一遍"哪个权限管哪个能力"，就是又一处会漂的东西。
+   */
+  fileDrop: boolean;
 }
 
 /**

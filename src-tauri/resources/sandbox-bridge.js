@@ -37,28 +37,25 @@
 // 这是**能力差异**，不是"还没做" —— 它写进插件开发文档。
 //
 // ============================================================
-// `ctx.fileDrop`：从前补不了，现在补得了 —— 但还没补
+// `ctx.fileDrop` 曾经"补不了"，平台迁移顺手解掉了它
 // ============================================================
 //
-// 平台迁移到 iframe **顺手解掉了它受阻的原因**，这一点值得写下来，因为
-// 插件开发文档里那句"沙箱里没有 fileDrop"即将作废。
-//
-// wry 在 Windows 上把拖放处理器注册在 **webview 自己的 HWND 及其全部子窗口** 上
-// （`wry-0.55.1/src/webview2/drag_drop.rs:50` 枚举子窗口并按个 `RegisterDragDrop`）。
-// 从前插件界面是一个**子 webview**：它有自己的 HWND，而它没有注册拖放处理器，
-// 于是落在它上面的文件既不进宿主窗口的处理器，也没有任何东西接住 —— 那条路径
-// 从根上是断的。
+// 它长期记在"沙箱里没有"那一栏，理由是拖放是窗口级事件、子 webview 收不到。
+// 核对 wry 之后发现那个理由只对了一半：wry 在 Windows 上把拖放处理器注册在
+// **webview 自己的 HWND 及其全部子窗口**上（`wry-0.55.1/src/webview2/drag_drop.rs:50`
+// 枚举子窗口并按个 `RegisterDragDrop`）。子 webview 有自己的 HWND，而它**没有**
+// 注册处理器 —— 于是落在它上面的文件既不进宿主窗口的处理器，也没有东西接住。
+// 那条路径从根上是断的，与权限无关。
 //
 // 现在插件界面是宿主 webview 里的一个 iframe：指针底下始终是**主 webview 的
-// HWND**，处理器照常触发，事件里还带指针位置（物理像素）。因此"把文件拖进插件
-// 界面"变成了一件可以在前端做出来的事：按位置命中哪一块界面，就
-// `postMessage`（channel `file-drop`）进去。
+// HWND**，处理器照常触发，事件里还带指针位置（物理像素）。于是它变成一件能在
+// 前端做出来的事：按位置命中哪一块界面，就 `postMessage`（channel `file-drop`）
+// 进去。宿主侧只转给清单里声明了 `filesystem-read` 的界面 —— 判定在
+// `sandbox_surface_open` 返回值的那一位上，**不在这一层**。
 //
-// 它**没有**在这一轮做，理由是权限判定的落点：拖放带来的是**本机路径**，与
-// `filesystem-read` 同类，因此"这个插件能不能收"必须由**宿主**判定，而不是由
-// 桥接层自己查一遍 `PERMISSIONS` —— 后者正是这套设计反复强调不算边界的东西。
-// 那意味着 `sandbox_surface_open` 的返回值要多一个"这个界面能不能收拖放"的位，
-// 是一小块独立的改动。
+// 与 in-process 的一处**语义差别**（更好的那种）：in-process 的拖放是窗口级的，
+// 插件必须自己用 `useModuleActive()` 判断当前可不可见；沙箱里宿主已经按位置筛过，
+// 收到就是"拖到了我这一块上"。
 //
 // `registerModule` 则**两边都有，但含义不同**：in-process 是"向宿主注册一个组件"，
 // 沙箱是"把我这个组件挂到本界面上"（插件自己就是界面）。名字与入参形状刻意
@@ -1375,6 +1372,28 @@
     event: function (payload) {
       if (window.__modulithDeliver && payload) window.__modulithDeliver(payload);
     },
+
+    // 文件拖放。**与别的通道不同，这一条不是"转发给某个全局钩子"，而是扇出给
+    // 插件自己注册的那些处理器** —— 因为 `ctx.fileDrop` 的形态就是这样：
+    // `subscribe(handler)` 收一个回调，而不是让插件去挂一个全局名字。
+    //
+    // 权限**不在这里判**。宿主只把拖放转给清单里声明了 `filesystem-read` 的界面
+    // （`sandbox_surface_open` 的返回值里带这一位），因此走到这里的每一条都是
+    // 该收的。在这里再查一遍 `PERMISSIONS` 只会让人以为那是一道边界。
+    'file-drop': function (payload) {
+      if (!payload) return;
+
+      // 快照后再遍历：处理器里退订是合法用法，边遍历边删会让 Set 的迭代行为
+      // 变得难以推理（某些实现会因此跳过一项）。
+      Array.from(FILE_DROP_HANDLERS).forEach(function (handler) {
+        try {
+          handler(payload);
+        } catch (error) {
+          // 与宿主侧的前端扇出同一条规矩：一个处理器出错不该让别的收不到。
+          console.error('[Modulith] fileDrop 处理器抛出异常，已隔离：' + error);
+        }
+      });
+    },
   };
 
   window.addEventListener(
@@ -1413,6 +1432,68 @@
   } catch (error) {
     /* 够不到父窗口时什么都不做：那时连这条日志都不一定出得去 */
   }
+
+  /** 文件拖放的订阅者。见 `PUSH_HANDLERS['file-drop']`。 */
+  var FILE_DROP_HANDLERS = new Set();
+
+  // ============================================================
+  // 文件拖放（`ctx.fileDrop`）
+  // ============================================================
+  //
+  // **形态必须与 in-process 的 `ctx.fileDrop` 完全一致**（`isAvailable` +
+  // `subscribe`），否则同一个插件在两侧要改代码 —— 那正是这个文件开头那条承诺
+  // 要防的事。
+  //
+  // 它为什么在 1.6.0 才出现：从前插件界面是一个**子 webview**，而 wry 在
+  // Windows 上把拖放处理器注册在 webview 自己的 HWND 及其全部子窗口上
+  // （wry-0.55.1/src/webview2/drag_drop.rs:50）。子 webview 有自己的 HWND 且没有
+  // 注册处理器，于是落在它上面的文件既进不了宿主窗口的处理器、也没有东西接住。
+  // 换成 iframe 之后，指针底下始终是**主 webview 的 HWND**，事件照常触发，
+  // 而且带指针位置 —— 宿主据此只把它转给指针底下那一块界面。
+  //
+  // 与 in-process 的一处**语义差别**（更好的那种，写进文档）：in-process 的拖放是
+  // **窗口级**的，插件必须自己用 `Modulith.useModuleActive()` 判断当前可不可见，
+  // 否则后台插件会抢走本该属于别人的拖放。沙箱里不用 —— 宿主已经按位置筛过了，
+  // 收到就是"拖到了我这一块上"。
+  var fileDrop = {
+    /**
+     * 现在能不能收到拖放。
+     *
+     * 为假只有一种原因：清单里没有 `filesystem-read`。那时宿主根本不会把拖放转
+     * 过来（判定在 `sandbox_surface_open` 里，见 `SurfaceHandle::file_drop`），
+     * 因此这里的答案与"实际收不收得到"是一致的。
+     */
+    isAvailable: function () {
+      return has('filesystem-read');
+    },
+
+    /**
+     * 订阅拖放。返回取消订阅函数。
+     *
+     * 事件形状与 in-process 一致：`{ type: 'enter' | 'over' | 'drop' | 'leave',
+     * paths: string[] }`。**没有指针位置** —— 那是宿主用来筛"该转给谁"的，
+     * 对插件没有意义（它只可能收到落在自己身上那些）。
+     */
+    subscribe: function (handler) {
+      if (typeof handler !== 'function') {
+        throw new TypeError('fileDrop.subscribe 需要一个函数');
+      }
+      if (!has('filesystem-read')) {
+        // 与宿主侧 `pluginFileDrop` 同一条规矩：未声明权限时降级为空订阅 +
+        // 一次告警，而不是抛异常。拖放通常只是"再加一个条目"的便捷入口，
+        // 让整个模块因为一个可选入口而不可用并不划算。
+        console.warn(
+          '[Modulith] 插件订阅了文件拖放，但清单里没有声明 "filesystem-read" 权限，订阅被忽略'
+        );
+        return function () {};
+      }
+
+      FILE_DROP_HANDLERS.add(handler);
+      return function () {
+        FILE_DROP_HANDLERS.delete(handler);
+      };
+    },
+  };
 
   var Modulith = {
     dataDir: dataDir,
@@ -1687,6 +1768,9 @@
     },
 
     clipboard: clipboard,
+
+    /** 文件拖放。形态与 in-process 一致，语义差别见上面的 `fileDrop`。 */
+    fileDrop: fileDrop,
 
     events: events,
 

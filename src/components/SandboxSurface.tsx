@@ -37,6 +37,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 
 import { useModuleActive } from '../hooks/useModuleActive';
+import { subscribeFileDrop } from '../services/fileDrop';
 import {
   closeSandboxSurface,
   openSandboxSurface,
@@ -110,6 +111,14 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
    * 放进 state 会让那个每秒都在跑的判断把组件重渲染一遍。
    */
   const readyRef = useRef(false);
+
+  /**
+   * 指针底下的这一块界面现在算不算"正在被拖着文件"。
+   *
+   * 只用来处理 `leave`：那一条**不带指针位置**（拖放已经离开窗口了），因此没法
+   * 命中测试。持有它的应该是"上一次真的进来了的那一块"，靠这个标记认出来。
+   */
+  const dragInsideRef = useRef(false);
 
   // 「标签是否被选中」+「窗口是否可见」。
   //
@@ -217,6 +226,69 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
       if (current) void closeSandboxSurface(current.token).catch(() => {});
     };
   }, [pluginId, surfaceId]);
+
+  // ---- 窗口级的文件拖放 → 转给**指针底下那一块界面** ----
+  //
+  // ============================================================
+  // 为什么要按位置筛，而不是广播
+  // ============================================================
+  //
+  // 拖放是**窗口级**事件：文件被拖进窗口就会触发，与指针落在哪一块界面上无关。
+  // 而 `Home.tsx` 里各个标签面板是 `absolute inset-y-0` **叠在一起**、靠
+  // `visibility: hidden` 藏起来的 —— 非激活的那几块矩形与激活的那一块**重合**。
+  // 只按矩形命中过滤的话，一次拖放会同时转给屏幕上看得见的那一块和所有藏在
+  // 它下面的那一摞，于是插件 A 会收到本该属于插件 B 的文件路径。
+  //
+  // 所以这里有两个条件：`active`（这一块正被看着）**且**指针落在它的矩形里。
+  //
+  // ============================================================
+  // 为什么权限不在这里判
+  // ============================================================
+  //
+  // `handle.fileDrop` 是宿主在签发令牌时算好的（清单里有没有
+  // `filesystem-read`）。前端不自己查清单 —— 拖放带来的是**本机路径**，
+  // "这个插件能不能收"必须由宿主判定，而不是由一个还能被插件影响的层判定。
+  useEffect(() => {
+    if (!active) return;
+
+    return subscribeFileDrop((event) => {
+      const current = handleRef.current;
+      const element = holder.current;
+      if (!current || !current.fileDrop || !element) return;
+
+      const send = (payload: unknown) =>
+        postToSurface(frame.current, current.url, {
+          token: current.token,
+          channel: 'file-drop',
+          payload,
+        });
+
+      // `leave` 不带位置，只能靠"上一次真的进来了"这个标记认领。
+      if (event.type === 'leave') {
+        if (!dragInsideRef.current) return;
+        dragInsideRef.current = false;
+        send({ type: 'leave', paths: [] });
+        return;
+      }
+
+      if (!event.position) return;
+
+      // Tauri 给的是**物理像素**，而 DOM 的矩形是 CSS 像素。不换算的话，
+      // 在缩放不是 100% 的屏幕上命中的是另一块区域（而且看起来毫无规律）。
+      const scale = window.devicePixelRatio || 1;
+      const x = event.position.x / scale;
+      const y = event.position.y / scale;
+
+      const rect = element.getBoundingClientRect();
+      const inside = x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+      if (!inside) return;
+
+      dragInsideRef.current = true;
+      // 指针位置**不再往下传**：那是宿主用来筛"该转给谁"的，对插件没有意义
+      // （它只可能收到落在自己身上那些）。传下去只会变成第二个会漂的约定。
+      send({ type: event.type, paths: event.paths });
+    });
+  }, [active]);
 
   // ---- 宿主推来的消息 → postMessage ----
   //

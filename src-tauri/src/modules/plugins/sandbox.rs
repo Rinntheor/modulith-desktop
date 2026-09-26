@@ -1391,6 +1391,13 @@ pub fn open_selftest<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
+/// 决定一块界面能不能收文件拖放的权限。
+///
+/// 现在只有一处用它，但**它必须是一个有名字的常量**：这个字符串在清单、权限表、
+/// 前端 `ctx.fileDrop` 与文档里各出现一次，写成字面量就有了四处会漂的地方，
+/// 而漂开的那一处不会报错 —— 只会让某个插件"拖进去没反应"。
+pub const FILE_DROP_PERMISSION: &str = "filesystem-read";
+
 /// 签发出去的一块界面：前端拿它去渲染 iframe。
 ///
 /// `url` 由宿主拼好、而不是让前端自己拼：地址的形状（来源、路径分段、结尾那个
@@ -1400,6 +1407,16 @@ pub fn open_selftest<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 pub struct SurfaceHandle {
     pub token: String,
     pub url: String,
+    /// 这块界面能不能收到文件拖放。
+    ///
+    /// **为什么由宿主给，而不是前端自己查权限**：拖放带来的是**本机路径**，与
+    /// `filesystem-read` 属于同一类信息。前端要自己判断就得再拿一份清单、再实现
+    /// 一遍"哪个权限管哪个能力"—— 而那正是这套设计反复强调不算边界的东西。
+    /// 宿主在读 `sandbox_view` 时顺手把结论算出来，前端只负责按位置转交。
+    ///
+    /// 它为假时前端**一条拖放都不转**，因此插件那边 `fileDrop.isAvailable()`
+    /// 为假时是真的收不到东西，而不是"收得到但要自己忽略"。
+    pub file_drop: bool,
 }
 
 /// 给一个**已安装**的插件签发一块沙箱界面。这是真插件界面唯一的入口。
@@ -1463,6 +1480,7 @@ pub async fn open_surface<R: Runtime>(
     Ok(SurfaceHandle {
         url: format!("{ORIGIN}/{token}/"),
         token,
+        file_drop: view.permissions.iter().any(|p| p == FILE_DROP_PERMISSION),
     })
 }
 
