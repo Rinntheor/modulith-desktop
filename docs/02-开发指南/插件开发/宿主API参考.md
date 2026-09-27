@@ -131,7 +131,9 @@ var ctx = Modulith.createContext();
 | `pluginVersion` | string | 当前插件版本 |
 | `manifest` | object | 解析后的清单 |
 | `version` | string | 宿主版本号 |
-| `storage` | object | 插件私有存储 |
+| `storage` | object | 插件私有存储（键值） |
+| `dataDir` | object | 插件私有文件目录（需 `plugin-data` 权限） |
+| `db` | object | 每插件一个 SQLite（需 `plugin-data` 权限） |
 | `http` | object | 网络请求 |
 | `logger` | object | 带插件前缀的日志 |
 | `notifications` | object | 应用内通知（需 `notification` 权限） |
@@ -265,6 +267,89 @@ var keys = await ctx.storage.keys();
 注意 `get` 在内部捕获 JSON 解析错误并返回默认值，因此数据损坏不会导致调用方抛出异常。
 
 **不要用 localStorage 保存插件数据**。`storage` 会随插件卸载而清理，且按插件隔离；`localStorage` 既不隔离也不清理。
+
+## 2.1 db
+
+结构化数据。**每插件一个 SQLite 文件**（数据目录里的 `plugin.db`）。
+**需要 `plugin-data` 权限**（与 `ctx.dataDir` 同一项）。
+
+三层数据的分工：
+
+| | 装什么 | 上限 | 能查询吗 |
+| --- | --- | --- | --- |
+| `ctx.storage` | 一键一个 JSON | 单值 1 MB、总量 8 MB | 不能 |
+| `ctx.dataDir` | 文件与目录 | 单文件 256 MB、总量 1 GiB | 不能 |
+| `ctx.db` | 表与索引 | 与数据目录共用配额（数据库占一半） | **能** |
+
+关键在于最后一行：要"按标签筛、按更新时间排、取第 3 页"时，前两层能做的只有
+把所有数据拉进 JS 自己过滤 —— 而那正是"一千条以后就开始卡"的来源。
+
+```js
+// 建表（DDL 也是 exec）
+await ctx.db.exec(`
+  CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '[]',
+    updated_at INTEGER NOT NULL
+  )
+`);
+await ctx.db.exec('CREATE INDEX IF NOT EXISTS notes_updated ON notes (updated_at DESC)');
+
+// 写入。参数用 ?1 / ?2 占位，按数组顺序绑定 —— 不要自己拼字符串
+await ctx.db.exec('INSERT INTO notes (title, tags, updated_at) VALUES (?1, ?2, ?3)', [
+  '第一条',
+  JSON.stringify(['demo']),
+  Date.now(),
+]);
+
+// 查询：返回对象数组
+const recent = await ctx.db.query('SELECT id, title FROM notes ORDER BY updated_at DESC LIMIT ?1', [20]);
+
+// 一批语句，全成功或全回滚
+await ctx.db.transaction([
+  { sql: 'UPDATE notes SET title = ?1 WHERE id = ?2', params: ['改过的', 1] },
+  { sql: 'DELETE FROM notes WHERE id = ?1', params: [2] },
+]);
+
+// 需要重名列或原始数组时
+const raw = await ctx.db.queryRaw('SELECT 1 AS id, 2 AS id');
+// { columns: ['id','id'], rows: [[1, 2]] }
+```
+
+### 值的形状
+
+* 对象与数组会被存成 **JSON 文本**（读回来是一段字符串，自己 `JSON.parse`）；
+* 二进制用 `{ $blob: '<base64>' }` 表示，**两个方向都是**。裸 base64 字符串与
+  一段恰好是合法 base64 的文本分不开，那样"读回来的文本变成了字节"要到很后面
+  才会被发现；
+* 整数与浮点数保持数值类型，`null` 保持 `null`；
+* `BigInt` **不支持** —— 宿主侧收的是 JSON，没有 int64 那种类型，而悄悄截断会
+  让一个 id 变成另一个 id。
+
+### 边界（都由 SQLite 引擎执行，不是字符串过滤）
+
+* `ATTACH` / `DETACH` **被拒绝** —— 那是唯一一条能在同一个连接里打开别的文件的
+  SQL，也就是唯一一条能跨出你数据目录的路；
+* `PRAGMA max_page_count` / `page_size` / `journal_mode` / `locking_mode` /
+  `writable_schema` / `mmap_size` 的**设值**被拒绝（读取照常）；
+* `load_extension` 被拒绝；
+* **一次调用只编译一条语句**。`exec('SELECT 1; SELECT 2')` 会直接失败 ——
+  一个"最后一条失败、前几条已经生效"的调用没法被正确处理。多条要一起成功或
+  一起失败，用 `transaction`；
+* 外键**默认是开的**（SQLite 的历史缺省是关，而"删了父行子行还在"看起来像
+  数据库不守规矩）；
+* `plugin.db` 是**保留名**：`ctx.dataDir.write` / `remove` 碰不到它（读可以 ——
+  备份应当在损坏之前就能做）。
+
+### 没有 `begin()` / `commit()`
+
+跨调用的显式事务是**会泄漏的状态**：你的代码在 `begin` 之后抛异常、插件被禁用、
+或者你只是忘了提交，那条写事务就一直挂着，而这个连接会被下一个打开数据库的实例
+继续用 —— 于是"我什么都没干，它却说数据库被锁住了"。更要命的是浏览器/宿主这一侧
+没有一个"无论发生什么都会执行"的 `finally`。
+
+因此事务的边界必须落在**这一次** `transaction()` 调用里。
 
 ## 3. http
 
@@ -645,7 +730,7 @@ try {
   "displayName": "我的插件",
   "version": "1.0.0",
   "description": "示例插件",
-  "engines": { "loopcore": ">=1.0.0" },
+  "engines": { "modulith": ">=1.6.0" },
   "main": "dist/index.js"
 }
 ```

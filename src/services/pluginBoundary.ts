@@ -261,6 +261,18 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     note: '键值存储。需要 storage 权限，Rust 侧强制',
   },
   {
+    name: 'dataDir',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '插件私有文件目录。需要 plugin-data 权限，Rust 侧强制；路径严格锁在该插件自己的目录内',
+  },
+  {
+    name: 'db',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '每插件一个 SQLite 文件。同样需要 plugin-data 权限；ATTACH/DETACH 与危险 PRAGMA 由引擎的 authorizer 拒绝',
+  },
+  {
     name: 'http',
     kind: 'handle',
     migration: 'rpc',
@@ -359,12 +371,56 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
     { name: 'usage', io: 'value', migration: 'as-is', note: '返回 PluginStorageUsage（totalBytes / keyCount）' },
     { name: 'all', io: 'value', migration: 'as-is', note: '返回 Record<string, unknown>，值由插件自己写进去' },
   ],
+  dataDir: [
+    // `ctx.dataDir` 是插件自己的文件目录。跨边界方式与 `storage` 同类（全是值），
+    // 但有两处必须写清楚：
+    //
+    //   * `read` / `write` 传的是**二进制**，而消息只能带结构化克隆能表达的东西。
+    //     今天的实际通道是 base64（`invoke` 的参数走 JSON），代价是 33% 体积与一次
+    //     字符串拷贝。这里标 `re-encode` 是如实描述**今天**的形态，而不是它该有的
+    //     形态 —— Tauri 支持把 `Uint8Array` 直接作为请求体，那才是终点。
+    //   * `list` / `stat` 返回的是普通对象，没有任何不可克隆的东西。
+    { name: 'available', io: 'value', migration: 'as-is', note: '返回 boolean：数据目录现在能不能用' },
+    { name: 'list', io: 'value', migration: 'as-is', note: '返回 DataEntry[]（name / isDir / size / modified），纯数据' },
+    { name: 'stat', io: 'value', migration: 'as-is', note: '返回 DataStat 或 null' },
+    { name: 'read', io: 'value', migration: 'as-is', note: '返回 Uint8Array；今天经 base64 过 JSON，有 33% 膨胀' },
+    { name: 'readText', io: 'value', migration: 'as-is', note: '同上，解码成字符串' },
+    { name: 'write', io: 'value', migration: 'as-is', note: '入参 Uint8Array；今天经 base64 过 JSON' },
+    { name: 'writeText', io: 'value', migration: 'as-is', note: '同上' },
+    { name: 'mkdir', io: 'value', migration: 'as-is', note: '返回 void' },
+    { name: 'remove', io: 'value', migration: 'as-is', note: '返回 void；目录会递归删除' },
+    { name: 'used', io: 'value', migration: 'as-is', note: '返回 number：数据目录当前占用字节数' },
+  ],
+  db: [
+    // `ctx.db` 是每插件一个 SQLite。跨边界方式与 `storage` / `dataDir` 同类
+    // （来回都是 JSON 能表达的值），但有一处必须写清楚：
+    //
+    //   BLOB 在**两个方向**上都用 `{"$blob": "<base64>"}` 表示。裸 base64 字符串
+    //   与一段恰好是合法 base64 的文本分不开，而"我从数据库里读回一段文本，
+    //   它却变成了字节"是那种要到很后面才会被发现的问题。
+    //
+    // 边界本身（`ATTACH` 被 authorizer 拒绝、页数上限、一次调用只编译一条语句）
+    // 全在 Rust 侧的 `db.rs`，与这条跨界描述无关 —— 这里说的是**数据怎么过去**。
+    { name: 'query', io: 'value', migration: 'as-is', note: '返回对象数组；重名列只保留最后一个（要全部用 queryRaw）' },
+    { name: 'queryRaw', io: 'value', migration: 'as-is', note: '返回 { columns, rows }，重名列也在' },
+    { name: 'exec', io: 'value', migration: 'as-is', note: '返回 { changes, lastInsertRowId }；一次调用只允许一条语句' },
+    { name: 'transaction', io: 'value', migration: 'as-is', note: '入参是一批语句，全成功或全回滚；**没有跨调用的 begin/commit**' },
+  ],
   http: [
     { name: 'fetch', io: 'host-object', migration: 'pass-data', note: '**返回原生 Response**：带方法、body 是 ReadableStream，不可克隆' },
     { name: 'get', io: 'host-object', migration: 'pass-data', note: '同上' },
     { name: 'post', io: 'host-object', migration: 'pass-data', note: '同上。data 会被 JSON.stringify，因此入参是值' },
     { name: 'put', io: 'host-object', migration: 'pass-data', note: '同上' },
     { name: 'delete', io: 'host-object', migration: 'pass-data', note: '同上' },
+    // 与上面四个**刻意不同**：它不返回 Response，也不带任何字节回来。
+    // 内容直接落进插件数据目录，返回值只有 `{ rel, bytes, contentType, status }`
+    // —— 全部是值。进度走回调，因此那一项是 `callable`。
+    {
+      name: 'download',
+      io: 'value',
+      migration: 'as-is',
+      note: '返回 { rel, bytes, contentType, status }；进度由宿主推过来（回调是 callable，不跨边界）',
+    },
   ],
   logger: [
     { name: 'debug', io: 'value', migration: 'as-is', note: '返回 void，参数是字符串与任意值' },

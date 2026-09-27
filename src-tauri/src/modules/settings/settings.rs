@@ -68,6 +68,33 @@ pub struct AppSettings {
     /// 继续加载其余插件。取值需大于正常插件的加载耗时。
     #[serde(default = "default_plugin_load_timeout_ms")]
     pub plugin_load_timeout_ms: u32,
+    /// 是否允许安装**未隔离**（`runtime` 缺省或 `in-process`）的插件。
+    ///
+    /// ============================================================
+    /// 为什么这是一个设置项，而不是一条硬规则
+    /// ============================================================
+    ///
+    /// 沙箱插件（`runtime: "sandboxed"`）跑在自己的来源里，拿不到宿主的能力；
+    /// 未隔离插件与宿主跑在同一个 JS 上下文里，**权限列表是它的声明，不是对它
+    /// 的约束**。两者不是"安全系数的差别"，是"边界存不存在"的差别。
+    ///
+    /// 但一刀切地禁掉未隔离插件是错的：插件生态里必然有只做纯计算、或者必须先
+    /// 用宿主能力才能活的东西，而那些插件的作者不该被永久挡在门外。因此这里给出的
+    /// 是**一个显式的、由用户做的取舍**，而不是宿主替他做的决定。
+    ///
+    /// ============================================================
+    /// 默认关闭，而且只管**安装**
+    /// ============================================================
+    ///
+    /// 默认 `false`：装未隔离插件之后，那套沙箱对这个插件就完全不存在了，而这件事
+    /// **没有任何界面症状**。默认开着等于让"点一下安装"静默地等于"放弃隔离"。
+    /// 默认关着，用户要装就显式打开，那一刻他知道自己在放弃什么 —— 这是最短路。
+    ///
+    /// 它**不影响已经装上的插件**：这一项只被安装路径读取（
+    /// `PluginManager::install_from_root`）。做成"关掉就禁用/卸载"会让升级应用
+    /// 变成一次静默的插件下线，那比它要防的问题更糟 —— 用户会以为是插件坏了。
+    #[serde(default = "default_allow_unsandboxed_plugins")]
+    pub allow_unsandboxed_plugins: bool,
     /// 主题配色 id（强调色）
     ///
     /// 与 `theme`（深/浅）正交：`theme` 决定明暗，本字段决定品牌色相。
@@ -358,6 +385,16 @@ fn default_defer_plugin_loading() -> bool {
     true
 }
 
+/// 未隔离插件默认**不允许安装**。
+///
+/// 与 `default_performance_mode` 同一取向：它是一次有代价的取舍（用户想要某个
+/// 未隔离插件时会先撞上一道门），因此只能是用户**主动**打开的结果。默认打开
+/// 等于替所有用户做了这个取舍，而代价由他们承担且不可见。
+/// 理由见 `allow_unsandboxed_plugins` 字段上的说明。
+fn default_allow_unsandboxed_plugins() -> bool {
+    false
+}
+
 /// 标签栏默认可见。理由见 `tab_bar_visible` 字段上的说明。
 fn default_tab_bar_visible() -> bool {
     true
@@ -538,6 +575,11 @@ impl Default for AppSettings {
             reduce_motion: false,
             defer_plugin_loading: default_defer_plugin_loading(),
             plugin_load_timeout_ms: default_plugin_load_timeout_ms(),
+            // 与 `default_allow_unsandboxed_plugins()` 保持一致 —— 理由同上面
+            // `restore_last_module` 那段：`impl Default` 与 serde 缺省值不一致时，
+            // 「全新安装」与「字段缺失的老文件」会得到相反的默认行为。
+            // `impl_default_matches_serde_defaults` 测试把两处钉在一起。
+            allow_unsandboxed_plugins: default_allow_unsandboxed_plugins(),
             accent: default_accent(),
             open_tabs: Vec::new(),
             active_tab: None,
@@ -920,6 +962,9 @@ mod tests {
         // 插件默认后台加载；超时为默认值
         assert!(defaults.defer_plugin_loading);
         assert_eq!(defaults.plugin_load_timeout_ms, DEFAULT_PLUGIN_LOAD_TIMEOUT_MS);
+        // 未隔离插件默认**不允许安装**：装上去之后沙箱对这个插件就不存在了，
+        // 而这件事没有任何界面症状 —— 不能靠"点一下安装"顺带发生。
+        assert!(!defaults.allow_unsandboxed_plugins);
         // 标签页默认为空：首次启动不该凭空打开任何标签
         assert!(defaults.open_tabs.is_empty());
         assert_eq!(defaults.active_tab, None);

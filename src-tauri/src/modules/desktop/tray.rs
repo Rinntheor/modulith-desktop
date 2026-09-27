@@ -44,9 +44,6 @@ const MENU_SHOW: &str = "tray.show";
 const MENU_CLOSE_TO_TRAY: &str = "tray.close_to_tray";
 const MENU_EXIT: &str = "tray.exit";
 
-/// 主窗口标签（与 `tauri.conf.json` 的窗口配置一致）
-const MAIN_WINDOW: &str = "main";
-
 /// 托管起来的那一个"关闭时最小化到托盘"菜单项。
 ///
 /// **为什么要托管句柄，而不是去菜单树里查：** `TrayIcon` 没有读取菜单的接口
@@ -65,7 +62,7 @@ fn error_text(error: impl std::fmt::Display) -> String {
 /// 三步一个都不能少：隐藏的窗口 `set_focus` 无效，而最小化的窗口需要先
 /// `unminimize`。少任何一步的表现都是"点了菜单里的显示，但没有反应"。
 pub fn show_main_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+    let Some(window) = crate::core::window::main(app) else {
         log::warn!("托盘：找不到主窗口，无法显示");
         return;
     };
@@ -84,7 +81,7 @@ pub fn show_main_window(app: &AppHandle) {
 
 /// 隐藏窗口到托盘
 pub fn hide_main_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+    let Some(window) = crate::core::window::main(app) else {
         return;
     };
     if let Err(error) = window.hide() {

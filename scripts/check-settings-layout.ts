@@ -305,6 +305,61 @@ check(
   `全部分页的外层内边距都是响应式的（${sectionFiles.length} 个文件）`
 );
 
+// ============================================================
+// 插件设置必须是**两级**，而且能搜索
+// ============================================================
+//
+// 这一页从前把**所有**插件的**所有**设置项一次铺开。插件少时没问题，而功能性
+// （无界面）插件一多就不成立了 —— 它们没有侧边栏项、没有标签页，这一页是它们
+// 唯一露脸的地方，于是"一屏里挤着十几个插件的设置"会让人**找不到**某一个。
+// 那不是难看，是找不到。
+//
+// 每条判据对应设计里的一件事，缺任何一条都退回到原来那个形态。
+const pluginSettingsTsx = read('src/components/Settings/PluginSettingsSection.tsx');
+check(
+  /openedPluginId/.test(pluginSettingsTsx) && /setOpenedPluginId\(null\)/.test(pluginSettingsTsx),
+  '插件设置是两级的（有"进去"也有"返回"，否则仍然是一屏铺开）'
+);
+check(
+  /placeholder="按插件名或 id 过滤…"/.test(pluginSettingsTsx) &&
+    /group\.pluginId\.toLowerCase\(\)\.includes\(needle\)/.test(pluginSettingsTsx),
+  '可以按**名字与 id**过滤（只匹配其中一个会让一部分人搜不到）'
+);
+check(
+  /HeadlessBadge/.test(pluginSettingsTsx) && /hasBackgroundContribution\(/.test(pluginSettingsTsx),
+  '标出「后台」插件（无界面插件的设置就是它的全部交互，改完不会有即时反馈）'
+);
+// 反面：不许按市场分类分组。那是"作者怎么描述它"，而导航要按"用户怎么找到它"。
+//
+// 判据**必须对着剥掉注释的代码做**：上面那句设计说明里就写着 `categories`
+// 这个词（为了解释为什么不按它分组），不剥注释的话这条断言会被自己的解释打红 ——
+// 而这个坑本仓库已经踩过好几次了。
+check(
+  !/\bcategories\b/.test(pluginSettingsTsx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')),
+  '没有按清单里的 categories 分组（那是市场分类，做导航会让人在两个目录之间猜）'
+);
+
+// 详情页 → 设置的入口：无界面插件唯一的发现路径。
+const drawerTsx = read('src/modules/plugins/PluginDetailDrawer.tsx');
+check(
+  /requestPluginSettings\(plugin\.id\)/.test(drawerTsx) &&
+    /getPluginSettingContributions\(plugin\.id\)/.test(drawerTsx),
+  '插件详情页有「设置」入口（有设置项时才显示）—— 无界面插件只能靠它被发现'
+);
+check(
+  /subscribePluginSettingsRequest\(\(\) => openSettings\('plugin-settings'\)\)/.test(
+    read('src/pages/Home.tsx')
+  ),
+  '外壳收到请求时打开到「插件设置」那一页（抽屉与对话框之间没有共同祖先）'
+);
+
+// 意图是**一次性**的：取走即清空。做成共享状态会让普通入口也定位到上次那个插件。
+const focusTs = read('src/services/pluginSettingsFocus.ts');
+check(
+  /export function consumePluginSettingsFocus/.test(focusTs) && /pending = null;/.test(focusTs),
+  '焦点意图是**取走即清空**的（做成共享状态会让每次打开都落在上次那个插件上）'
+);
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

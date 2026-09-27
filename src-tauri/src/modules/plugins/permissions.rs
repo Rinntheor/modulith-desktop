@@ -201,6 +201,18 @@ impl PluginPermission {
                 enforcement: F::Host,
                 risk_override: None,
             },
+            Self::PluginData => Spec {
+                label: "插件数据目录",
+                // 措辞的重点是**边界**而不是"能写文件"：用户看到"写文件"会以为
+                // 它能碰自己的任何文件，而实际它只能碰自己那一块目录。
+                // 权限说明写歪的方向会让用户高估或低估风险，两者都是错的。
+                description: "在插件自己的数据目录里读写文件（图片、文档、缓存），出不了这个目录",
+                effect: E::Write,
+                scope: S::Plugin,
+                reversible: true,
+                enforcement: F::Host,
+                risk_override: None,
+            },
             Self::Network => Spec {
                 label: "本机网络",
                 description: "请求本机地址（127.0.0.1 / localhost）上的服务",
@@ -364,6 +376,7 @@ mod tests {
     /// "风险等级会随属性变化而自动更新"，而不是"风险等级不会变"。
     const EXPECTED: &[(&str, E, S, bool, R, F)] = &[
         ("storage", E::None, S::Plugin, true, R::Low, F::Host),
+        ("plugin-data", E::Write, S::Plugin, true, R::Low, F::Host),
         ("network", E::Network, S::App, true, R::Low, F::Host),
         (
             "network-external",
@@ -552,7 +565,9 @@ mod tests {
                 .count()
         };
 
-        assert_eq!(count(F::Host), 5, "后端强制的权限数量变化");
+        // 5 → 6：新增 `plugin-data`（`ctx.dataDir`），它是 Host 强制的
+        // —— 每一次文件操作都经过 `PluginManager::checked_data_dir`。
+        assert_eq!(count(F::Host), 6, "后端强制的权限数量变化");
         assert_eq!(count(F::Frontend), 3, "前端强制的权限数量变化");
         assert_eq!(count(F::None), 4, "未强制的权限数量变化");
     }

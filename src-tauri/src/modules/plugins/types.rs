@@ -246,6 +246,13 @@ impl VersionRequirement {
 #[serde(rename_all = "kebab-case")]
 pub enum PluginPermission {
     Storage,
+    /// 读写插件**自己的数据目录**（`ctx.dataDir`）：文件、图片、文档。
+    ///
+    /// 与 `storage` 分开而不是合并，尽管两者的作用域都是"插件自己"：合并的话，
+    /// 一个只想要几个键值配置的插件会顺带拿到一整个可写目录 —— 而权限列表就不再是
+    /// "它能做什么"的如实描述。这一条的边界是**目录之内**，不是"任意写"
+    /// （`filesystem-write` 仍然是拒绝的，见规划 §8）。
+    PluginData,
     Network,
     NetworkExternal,
     Notification,
@@ -269,6 +276,7 @@ impl PluginPermission {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Storage => "storage",
+            Self::PluginData => "plugin-data",
             Self::Network => "network",
             Self::NetworkExternal => "network-external",
             Self::Notification => "notification",
@@ -287,8 +295,9 @@ impl PluginPermission {
     ///
     /// 新增枚举值时必须一并加入 —— 否则上面那个一致性测试覆盖不到新值，
     /// 而"测试通过"会给人已经覆盖了的错觉。
-    pub const ALL: [PluginPermission; 12] = [
+    pub const ALL: [PluginPermission; 13] = [
         Self::Storage,
+        Self::PluginData,
         Self::Network,
         Self::NetworkExternal,
         Self::Notification,
@@ -331,7 +340,42 @@ pub struct PluginRepository {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginEngines {
     #[serde(default = "default_engine_range")]
-    pub loopcore: String,
+    pub modulith: String,
+}
+
+/// 插件代码运行在哪里。
+///
+/// 两个取值都对应**宿主真能核实的**一件事，不是插件自己说了算的等级：
+///
+///   * `in-process` —— 与宿主同一个 webview、同一个 JS 上下文。今天全部插件都是
+///     这一档，也是缺省值。宿主**区分不了**它的调用与宿主自己的调用；
+///   * `sandboxed` —— 插件自己的 webview。独立 realm、没有 IPC 权限、身份与资源
+///     都由宿主按 webview 标签决定。见 `modules/plugins/sandbox.rs`。
+///
+/// 名字里刻意不带 `sandboxLevel` 那类"等级"字样：等级是一个宿主无法核实的量，
+/// 而这里是一个二元的、可核实的位置。见 `PluginManifest::runtime` 上的说明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginRuntime {
+    /// 与宿主同一个 webview（缺省）
+    #[default]
+    InProcess,
+    /// 插件自己的 webview
+    Sandboxed,
+}
+
+impl PluginRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcess => "in-process",
+            Self::Sandboxed => "sandboxed",
+        }
+    }
+
+    /// 是否需要宿主为它建一个独立 webview
+    pub fn needs_own_webview(self) -> bool {
+        matches!(self, Self::Sandboxed)
+    }
 }
 
 pub fn default_engine_range() -> String {
@@ -341,7 +385,7 @@ pub fn default_engine_range() -> String {
 impl Default for PluginEngines {
     fn default() -> Self {
         Self {
-            loopcore: default_engine_range(),
+            modulith: default_engine_range(),
         }
     }
 }
@@ -411,6 +455,24 @@ pub struct PluginManifest {
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
 
+    // ---- 运行位置 ----
+    //
+    // 上面那一段说的是"**等级**"（L0..L3）为什么被删：宿主无法按等级限制一个同 realm
+    // 的插件，那是一个自己声明、宿主核实不了的字段。
+    //
+    // 这一项不是等级，是**位置**：插件代码跑在宿主这个 webview 里，还是跑在它自己的
+    // webview 里。后者宿主**能核实** —— 插件 webview 的标签不匹配任何 capability，
+    // 它在 IPC 入口就被拒绝；身份与资源访问都由宿主按标签决定。
+    // 见 `modules/plugins/sandbox.rs` 与 docs/04-安全/应用命令的访问控制.md。
+    //
+    // 缺省是 `in-process`：不写就等于今天的行为，不给已发布的插件制造意外。
+    //
+    // **这里刻意不做"未知值退化成缺省"。** 一个写了 `sandboxed`、却被旧宿主当成
+    // `in-process` 跑起来的插件，是一次**静默的安全降级** —— 它声明了隔离，实际没有。
+    // 枚举反序列化失败会让整份清单不合法、安装直接失败，那正是这里想要的失败方式。
+    #[serde(default)]
+    pub runtime: PluginRuntime,
+
     // ---- 激活事件 ----
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_events: Option<Vec<String>>,
@@ -448,6 +510,9 @@ impl PluginManifest {
             icon: None,
             icon_svg: None,
             permissions: Vec::new(),
+            // 兜底清单永远是 `in-process`：这份清单来自"读不出来"，
+            // 把一个读不出来的插件当成沙箱插件会更糟 —— 它连界面都建不起来。
+            runtime: PluginRuntime::InProcess,
             activation_events: None,
             contributes: None,
             preview: None,
@@ -464,8 +529,8 @@ impl PluginManifest {
         if self.main.trim().is_empty() {
             self.main = default_main_entry();
         }
-        if self.engines.loopcore.trim().is_empty() {
-            self.engines.loopcore = default_engine_range();
+        if self.engines.modulith.trim().is_empty() {
+            self.engines.modulith = default_engine_range();
         }
     }
 }
@@ -485,7 +550,7 @@ pub enum PluginStatus {
 
 /// 引擎兼容性提示（不阻止安装与加载）
 ///
-/// 背景：`engines.loopcore` 曾经是**高度脆弱**的约束。在 0.x 阶段，
+/// 背景：`engines.modulith` 曾经是**高度脆弱**的约束。在 0.x 阶段，
 /// `^0.2.0` 按 semver 的 caret 规则（见 `VersionRequirement::matches`，
 /// 与 npm 一致）等价于 `>=0.2.0 <0.3.0` —— 宿主只要升一个小版本，
 /// 所有写了 `^0.2.x` 的插件就都不再满足声明范围。
@@ -635,6 +700,24 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// 一次流式下载的结果（`ctx.http.download`）。
+///
+/// **没有 body。** 字节已经落在磁盘上那个文件里了 —— 把它们的长度报出来是为了让
+/// 调用方能核对"下下来的和预期的一样大"，而不是提示它把内容读回内存。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadOutcome {
+    /// 落盘路径，相对插件数据根。**与调用方传进来的那个一致** ——
+    /// 回传它是为了让调用方不必自己记（下载可能是并发发起的）。
+    pub rel: String,
+    /// 实际写入了多少字节。它与 `Content-Length` 不一致时（分块传输、服务器撒谎）
+    /// 以这个为准。
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub status: u16,
+}
+
 // ============================================================
 // 错误
 // ============================================================
@@ -655,6 +738,34 @@ pub enum PluginError {
 
     #[error("沙箱限制: {0}")]
     SandboxViolation(String),
+
+    /// 宿主的安全策略拒绝安装这个插件（它没有隔离，而用户没有允许安装未隔离插件）。
+    ///
+    /// **单独一个变体而不是并进 `PermissionDenied`。** 两者的可行动性完全不同：
+    /// "权限不足"听起来像应用缺了某个系统授权，用户唯一能做的就是重试；
+    /// 这一条有一个**明确的下一步**（去「设置 → 插件」打开那个开关），
+    /// 而消息里就写着它。混进前者的后果是那句指引永远不会出现在界面上。
+    ///
+    /// 消息由 `manager.rs` 生成，已经包含"哪个插件、为什么、下一步怎么做"，
+    /// 因此这里直接透传（与 `DataRootUnavailable` / `QuotaExceeded` 同一写法）。
+    #[error("{0}")]
+    UnsafePluginRejected(String),
+
+    /// 数据根目录当前不可用（外置盘没插、网络盘断开、路径被删…）。
+    ///
+    /// **单独一个变体，而且是错误而不是"空数据"。** 这是整个数据层里最危险的一条的
+    /// 落地：如果这时返回一个空的目录，插件与用户都会把它读成"这个插件还没有数据"，
+    /// 然后开始重建 —— 而真正的数据只是在另一块没插上的盘里。界面上必须显示这个原因。
+    #[error("{0}")]
+    DataRootUnavailable(String),
+
+    /// `ctx.dataDir` 的路径越界或名字非法。
+    ///
+    /// 与 `SandboxViolation` 分开：后者是"插件碰了插件系统之外的东西"，
+    /// 这里是"插件在自己那一亩地里写了一个不合法/越界的路径" —— 对一个正在写文件
+    /// 的插件来说，这两句话给出的下一步动作完全不同。
+    #[error("数据目录限制: {0}")]
+    DataDirViolation(String),
 
     /// 超出该插件的资源配额（存储用量、单键大小、键数量）。
     ///

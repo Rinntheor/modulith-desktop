@@ -43,6 +43,23 @@ export interface AppSettings {
   /** 单个插件加载的超时时间（毫秒） */
   pluginLoadTimeoutMs: number;
   /**
+   * 是否允许安装**未隔离**的插件（清单里 `runtime` 缺省或为 `in-process`）。
+   *
+   * 默认 `false`。沙箱插件跑在自己的来源里、拿不到宿主的能力；未隔离插件与宿主
+   * 跑在同一个 JS 上下文里，**权限列表是它的声明，不是对它的约束** —— 两者不是
+   * "安全系数的差别"，是"边界存不存在"的差别。因此安装它必须是一次显式选择，
+   * 而不是"点一下安装"顺带发生的事（那件事没有任何界面症状）。
+   *
+   * **只管安装**：已经装上的未隔离插件不受影响。做成"关掉就禁用"会让升级应用
+   * 变成一次静默的插件下线，用户只会以为插件坏了。
+   *
+   * **判定不在这里**：真正的强制在 Rust 的 `check_install_policy`
+   * （`src-tauri/src/modules/plugins/manager.rs`），那一个函数是四条安装路径
+   * 唯一的汇合点。这里存值并驱动界面（市场里灰掉按钮、说清原因），
+   * 与 `networkPolicy` 同一分工。
+   */
+  allowUnsandboxedPlugins: boolean;
+  /**
    * 主题配色 id（强调色），与 `theme`（深/浅）正交。
    *
    * 取值由 `src/config/accentTheme.ts` 注册。后端只校验格式、不校验是否为
@@ -287,6 +304,10 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   // 与后端 default_defer_plugin_loading() / default_plugin_load_timeout_ms() 一致
   deferPluginLoading: true,
   pluginLoadTimeoutMs: 5000,
+  // 与后端 `default_allow_unsandboxed_plugins()` 保持一致：默认关。
+  // 理由见接口上那段说明。两处不一致时，"全新安装"与"字段缺失的老文件"
+  // 会得到相反的默认行为 —— 而这一项相反意味着策略静默失效。
+  allowUnsandboxedPlugins: false,
   // 与后端 default_accent() 及 config/accentTheme.ts 的 DEFAULT_ACCENT_ID 一致
   accent: 'indigo',
   // 首次启动不该凭空打开任何标签
@@ -377,6 +398,11 @@ function normalize(raw: Partial<AppSettings> | null | undefined): AppSettings {
     // 上下界必须与后端 settings.rs 的校验区间 [500, 60000] 一致：
     // 此前这里只有下界，手工改坏的 settings.json 可以把超大值透传给 setTimeout。
     pluginLoadTimeoutMs: clampPluginTimeout(raw?.pluginLoadTimeoutMs),
+    // 只有显式写成 `true` 才放行；缺失、非法值、以及老设置文件都回到「不放行」。
+    // 这里刻意与 `fileLoggingEnabled` 那类 `!== false` 的写法相反：那些开关的
+    // 默认是开，而这一项默认必须关 —— 一个被手工改坏的 settings.json
+    // （或一份读了一半的文件）不该变成一次静默的策略放宽。
+    allowUnsandboxedPlugins: raw?.allowUnsandboxedPlugins === true,
     // 未知配色 id 不在这里纠正：accentTheme 的 getAccentTheme() 会回退到默认值，
     // 且保留原值可以避免「用户手工改了 settings.json，被静默改回」
     accent: typeof raw?.accent === 'string' && raw.accent ? raw.accent : DEFAULT_APP_SETTINGS.accent,

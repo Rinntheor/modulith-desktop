@@ -12,6 +12,29 @@ interface SidebarItemProps {
   module: ModuleDescriptor;
 }
 
+/**
+ * 插件徽标的语气 → 一组类名。
+ *
+ * 与 `TabBar` 里那一份**刻意重复**：它只有四行，而抽成公共模块会把这个组件与
+ * 标签栏绑在一起 —— 它们之间本来没有别的关系。真正需要保持一致的**是形状**
+ * （圆角/字号/内边距），而那两处都写在各自的 className 里，`check:theme` 与
+ * 逐条抄过来的类名已经让它们看起来一样了。
+ *
+ * 语气是 Rust 侧白名单过的；这里不认识的取值一律落到 `info`。
+ */
+function badgeToneClasses(tone: string | undefined): string {
+  switch (tone) {
+    case 'success':
+      return 'bg-emerald-100 text-emerald-700';
+    case 'warning':
+      return 'bg-amber-100 text-amber-700';
+    case 'error':
+      return 'bg-rose-100 text-rose-700';
+    default:
+      return 'bg-gray-100 text-gray-600';
+  }
+}
+
 const SidebarItem: React.FC<SidebarItemProps> = memo(({ module }) => {
   const { activeModule, setActiveModule, expandedModules, toggleExpandModule, ensureExpanded } = useSidebar();
   const hasChildren = module.children && module.children.length > 0;
@@ -132,10 +155,13 @@ const SidebarItem: React.FC<SidebarItemProps> = memo(({ module }) => {
             {module.badge && (
               <motion.span
                 className={`px-2 py-0.5 text-xs font-medium rounded-full whitespace-nowrap ${
-                  isActive ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 text-gray-600'
+                  isActive
+                    ? 'bg-indigo-100 text-indigo-600'
+                    : badgeToneClasses(module.badgeTone)
                 }`}
                 animate={{ scale: isActive ? 1.05 : 1 }}
                 transition={{ duration: 0.2 }}
+                title={`来自插件：${module.badge}`}
               >
                 {module.badge}
               </motion.span>
@@ -155,6 +181,31 @@ const SidebarItem: React.FC<SidebarItemProps> = memo(({ module }) => {
         )}
       </div>
       
+      {/* 插件进度（`ctx.ui.progress`）。铺在这一行的**底边**上 ——
+          它说的是"这个模块正在忙"，而模块在侧边栏里就是这一行。
+
+          `value === null` 是**不定量**：一条来回跑的短条。它与定量条的区别是
+          "还要多久"这件事插件自己也不知道。 */}
+      {module.progress && (
+        <span
+          className="pointer-events-none absolute inset-x-2 bottom-0.5 h-0.5 overflow-hidden rounded-full bg-indigo-100"
+          title={module.progress.label ?? '插件正在处理'}
+        >
+          <span
+            className={`block h-full rounded-full bg-indigo-500 ${
+              module.progress.value === null
+                ? 'w-1/3 animate-pulse'
+                : 'transition-[width] duration-200'
+            }`}
+            style={
+              module.progress.value === null
+                ? undefined
+                : { width: `${Math.round(module.progress.value * 100)}%` }
+            }
+          />
+        </span>
+      )}
+
       {/* 活跃指示器小球 - 无子模块时 */}
       {isActive && !hasChildren && (
         <motion.div

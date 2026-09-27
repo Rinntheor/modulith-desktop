@@ -32,6 +32,10 @@ export default defineConfig(async () => ({
       input: {
         main: path.resolve(__dirname, 'index.html'),
         'tray-menu': path.resolve(__dirname, 'tray-menu.html'),
+        // 宿主浮层（对话框与右键菜单）。与托盘菜单一样是**独立窗口**，
+        // 因此同样必须是第二个入口 —— 漏登记时开发模式一切正常（Vite 按 URL
+        // 提供任意 HTML），而**发布版里这个窗口是空白的**。
+        overlay: path.resolve(__dirname, 'overlay.html'),
       },
     },
   },

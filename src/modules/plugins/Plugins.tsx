@@ -24,10 +24,12 @@ import {
   Puzzle,
   Box,
   Trash2,
+  ShieldCheck,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { moduleManager } from '../../services/moduleManager';
-import { getCachedSettings } from '../../services/appSettings';
+import { getCachedSettings, saveAppSettings, subscribeSettings } from '../../services/appSettings';
+import Toggle from '../../components/Settings/Toggle';
 import { getPluginModuleIds, isPluginCatalogLoading, subscribeCatalog } from '../../services/moduleCatalog';
 import {
   getInstalledPlugins,
@@ -40,8 +42,12 @@ import {
   installPluginFromUrl,
   setPluginEnabled,
   uninstallPlugin,
+  clearPluginData,
+  getPluginDataUsage,
+  listOrphanPluginData,
   subscribePlugins,
   type InstalledPlugin,
+  type OrphanPluginData,
   type PluginLoadState,
 } from '../../services/pluginRuntime';
 import {
@@ -57,6 +63,8 @@ import DevGuide from './DevGuide';
 import IconPlate from '../../components/icons/IconPlate';
 import { subscribeFileDrop, isFileDropAvailable } from '../../services/fileDrop';
 import { useModuleActive } from '../../hooks/useModuleActive';
+import { runSandboxSelfTest } from '../../services/sandboxSurface';
+import { formatBytes } from '../../utils/format';
 
 type FilterTab = 'all' | 'enabled' | 'disabled' | 'error';
 type SortMode = 'name' | 'version' | 'installed' | 'status';
@@ -174,9 +182,17 @@ const ConfirmDialog: React.FC<{
   message: React.ReactNode;
   confirmLabel: string;
   busy: boolean;
+  /**
+   * 消息与按钮之间的附加内容（复选框之类）。
+   *
+   * 加这个插槽是为了"卸载时要不要连数据一起删"：那是一个**必须由用户在当场做出**的
+   * 选择，而不是一个可以被默认掉的开关。放在对话框里，用户看到的是"这条数据现在
+   * 会怎样"；放进设置里，他下次点卸载时已经忘了自己开过什么。
+   */
+  extra?: React.ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
-}> = ({ open, title, message, confirmLabel, busy, onConfirm, onCancel }) => (
+}> = ({ open, title, message, confirmLabel, busy, extra, onConfirm, onCancel }) => (
   <AnimatePresence>
     {open && (
       <>
@@ -202,6 +218,8 @@ const ConfirmDialog: React.FC<{
               <div className="text-sm text-gray-600 mt-1.5 leading-relaxed">{message}</div>
             </div>
           </div>
+
+          {extra}
 
           <div className="flex justify-end gap-2 mt-5">
             <button
@@ -360,11 +378,99 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const [installBusy, setInstallBusy] = useState(false);
   /** 有文件正被拖到窗口上方（控制拖放提示层的显隐） */
   const [dropActive, setDropActive] = useState(false);
+  /** 沙箱自检面板正在打开（防连点） */
+  const [selfTestBusy, setSelfTestBusy] = useState(false);
+  /**
+   * 卸载确认框里的"连数据一起删"。
+   *
+   * **每次打开都重置为假。** 它是一个不可撤销的选择，默认必须是"不删"；
+   * 记住上一次的勾选等于让用户在不知情的情况下销毁数据。
+   */
+  const [deleteDataOnUninstall, setDeleteDataOnUninstall] = useState(false);
+  /** 被点卸载那个插件的数据占用。打开确认框时现取 —— 见 `getPluginDataUsage`。 */
+  const [pendingUninstallBytes, setPendingUninstallBytes] = useState<number | null>(null);
+  /** 已卸载插件留下的数据目录。 */
+  const [orphans, setOrphans] = useState<OrphanPluginData[]>([]);
+  const [orphanCleanupOpen, setOrphanCleanupOpen] = useState(false);
+  const [orphanCleanupBusy, setOrphanCleanupBusy] = useState(false);
 
   const flash = useCallback((kind: Feedback['kind'], message: string, ms = 5000) => {
     setFeedback({ kind, message });
     setTimeout(() => setFeedback(null), ms);
   }, []);
+
+  /**
+   * 安装策略开关（"允许安装未隔离插件"）的镜像。
+   *
+   * 唯一的真值在后端设置里（`PluginManager::install_from_root` 每次安装都去读它），
+   * 这里的 state 只是它的投影：订阅设置变化，别的入口（设置文件被外部改动后
+   * 前端重新读一次、或将来的其它界面）改了它，这里跟着变。
+   */
+  const [allowUnsandboxed, setAllowUnsandboxed] = useState(
+    () => getCachedSettings().allowUnsandboxedPlugins
+  );
+  useEffect(
+    () => subscribeSettings(() => setAllowUnsandboxed(getCachedSettings().allowUnsandboxedPlugins)),
+    []
+  );
+
+  const handleToggleUnsandboxed = useCallback(
+    (next: boolean) => {
+      // 乐观更新：设置写入要过一次 IPC 再落盘，等它回来再改开关会让点击有延迟感。
+      // 失败时**回滚并说出来** —— 一个点了没反应的开关比一个报错的开关更糟。
+      setAllowUnsandboxed(next);
+      void saveAppSettings({ allowUnsandboxedPlugins: next }).catch((error) => {
+        setAllowUnsandboxed(!next);
+        flash('error', `保存设置失败：${String(error)}`);
+      });
+    },
+    [flash]
+  );
+
+  /**
+   * 当前**已经装在本机**的未隔离插件。
+   *
+   * ============================================================
+   * 为什么必须把这件事显示出来
+   * ============================================================
+   *
+   * 上面那个开关是**安装策略**，它只在"从外面装进来"那一刻起作用。而已装的未隔离
+   * 插件可以来自别处：
+   *
+   *   · 它是**装这个版本的应用之前**就装上的；
+   *   · 或者它是随一次**备份恢复**回来的 —— 备份包含整个 `plugins/` 目录，
+   *     那条路不经过安装策略（它是"用户把自己机器上的状态整份恢复回来"，
+   *     不是"从一个来源装一个插件"，两者不是同一件事）。
+   *
+   * 无论来源是什么，**"未隔离"这件事必须有一个看得见的地方** —— 那正是这个策略
+   * 要解决的问题本身：装了未隔离插件之后不会有任何症状，而用户以为沙箱在保护他。
+   * 因此这里如实数出来、列出来，哪怕开关是关的。
+   *
+   * 判据直接用清单里的 `runtime`，不在前端再推一遍"哪些情况算未隔离"：那是后端
+   * `check_install_policy` 的判据，两处各写一遍必然漂。
+   */
+  const unsandboxed = useMemo(
+    () => plugins.filter((plugin) => plugin.manifest.runtime !== 'sandboxed'),
+    [plugins]
+  );
+
+  /**
+   * 打开沙箱自检面板。
+   *
+   * 只有两件事会失败：界面线程还没起来，或者找不到主窗口。两种都由后端给出可读的
+   * 原因，这里原样转达 —— 自检本身就是拿来排查问题的，把它的失败藏起来毫无意义。
+   */
+  const handleSelfTest = useCallback(async () => {
+    setSelfTestBusy(true);
+    try {
+      await runSandboxSelfTest();
+      flash('success', '自检面板已打开：四项检查会在那个面板里各跑一次，结果同时写进日志。');
+    } catch (error) {
+      flash('error', `沙箱自检打不开：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSelfTestBusy(false);
+    }
+  }, [flash]);
 
   const sync = useCallback(() => {
     setPlugins([...getInstalledPlugins()]);
@@ -588,15 +694,35 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     [afterMutation, flash]
   );
 
+  /**
+   * 卸载。
+   *
+   * `alsoDeleteData` **默认为假**，而且这个默认是有意的：仅卸载插件本身是"我不要它了"，
+   * 删数据是"我要销毁它存的东西"——后者必须有一个人当场做出的选择。
+   *
+   * 注意 `confirmBeforeUninstall` 关掉时走的是同一条函数、同样保留数据。
+   * 以前那条路径连对话框都没有，却会把数据一起删掉：那是这个系统里唯一一处
+   * **静默且不可逆地销毁用户数据**的地方。
+   */
   const handleUninstall = useCallback(
-    async (target: InstalledPlugin) => {
+    async (target: InstalledPlugin, alsoDeleteData = false) => {
+      const name = target.manifest.displayName || target.id;
       setBusyId(target.id);
       try {
         await uninstallPlugin(target.id);
+        if (alsoDeleteData) {
+          // 删除走**另一条**命令：它不要求插件仍然安装，因此卸载之后才调得动。
+          await clearPluginData(target.id);
+        }
         setPendingUninstall(null);
         setDetail(null);
         afterMutation();
-        flash('success', `已卸载插件「${target.manifest.displayName || target.id}」`);
+        flash(
+          'success',
+          alsoDeleteData
+            ? `已卸载插件「${name}」，它的数据也已删除。`
+            : `已卸载插件「${name}」。它的数据已保留 —— 重装同一个插件就能拿回来。`
+        );
       } catch (err) {
         flash('error', `卸载失败：${err instanceof Error ? err.message : String(err)}`);
       } finally {
@@ -610,13 +736,62 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const requestUninstall = useCallback(
     (plugin: InstalledPlugin) => {
       if (getCachedSettings().confirmBeforeUninstall) {
+        setDeleteDataOnUninstall(false);
+        setPendingUninstallBytes(null);
         setPendingUninstall(plugin);
+        // 现取占用：递归统计有点慢，不值得让插件列表每次都为它付钱。
+        // 取不到就当"没说"—— 一个拿不到的数字不该挡住卸载。
+        void getPluginDataUsage(plugin.id)
+          .then((bytes) => setPendingUninstallBytes(bytes))
+          .catch(() => setPendingUninstallBytes(null));
       } else {
+        // 这条路径**同样保留数据**（`alsoDeleteData` 默认为假）。
+        // 以前它连对话框都没有，却会把数据一起删掉。
         void handleUninstall(plugin);
       }
     },
     [handleUninstall]
   );
+
+  /** 重新读一遍残留数据目录。安装/卸载之后都要刷。 */
+  const refreshOrphans = useCallback(() => {
+    void listOrphanPluginData()
+      .then(setOrphans)
+      .catch(() => setOrphans([]));
+  }, []);
+
+  useEffect(() => {
+    refreshOrphans();
+  }, [refreshOrphans, plugins]);
+
+  /**
+   * 清理全部残留数据。
+   *
+   * **逐条调用同一个 `plugin_data_clear`**，而不是加一条"全清"命令：后者会是一个
+   * 一次调用删掉多个目录的接口，而它的 ID 守卫就只剩下"这是 data_dir 的子目录"
+   * 这一条 —— 一条命令能删多少东西，应当与它做过的校验成正比。
+   *
+   * 逐条失败不中断：能清多少清多少，剩下的下一次还能清。把失败原样报出来。
+   */
+  const handleOrphanCleanup = useCallback(async () => {
+    setOrphanCleanupBusy(true);
+    const failures: string[] = [];
+    for (const orphan of orphans) {
+      try {
+        await clearPluginData(orphan.id);
+      } catch (error) {
+        failures.push(orphan.id);
+      }
+    }
+    setOrphanCleanupBusy(false);
+    setOrphanCleanupOpen(false);
+    refreshOrphans();
+    if (failures.length === 0) {
+      flash('success', `已清理 ${orphans.length} 个插件的残留数据。`);
+    } else {
+      flash('error', `这些插件的残留数据没能清理：${failures.join('、')}`);
+    }
+  }, [orphans, refreshOrphans, flash]);
 
   const handleExport = useCallback(
     async (plugin: InstalledPlugin) => {
@@ -755,6 +930,26 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
           )}
 
           <div className={`flex items-center gap-2 ${embedded ? 'ml-auto' : ''}`}>
+            {/*
+              沙箱自检。**它是唯一的"边界本身"验证入口。**
+
+              它曾经随应用启动自动运行，但那意味着每次启动都多一块挡在界面上的面板，
+              去验一件绝大多数时候都成立的事 —— 用户的反馈是"它很打扰"。改的是
+              什么时候跑，不是跑不跑：它验的四件事（ACL 真的拒绝、身份真的来自浏览器
+              引擎、自定义协议通道可用、CSP 真的生效）没有别的触发点，自检页也是仓库里
+              唯一会去**故意违规**的地方。
+
+              结果画在自检面板上，同时写进日志 —— 面板不会自己关掉，结论需要一个出口。
+            */}
+            <button
+              onClick={handleSelfTest}
+              disabled={selfTestBusy}
+              title="在一个独立的插件 webview 里验证沙箱的四条边界：ACL 拒绝、身份识别、协议通道、CSP。结果同时写进日志。"
+              className="flex items-center gap-2 px-3.5 py-2 bg-white border border-gray-200 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors disabled:opacity-50"
+            >
+              <ShieldCheck className="w-4 h-4" />
+              <span>沙箱自检</span>
+            </button>
             <button
               onClick={() => setDevGuideOpen(true)}
               className="flex items-center gap-2 px-3.5 py-2 bg-white border border-gray-200 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors"
@@ -812,6 +1007,34 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
         )}
       </AnimatePresence>
 
+      {/*
+        已卸载插件的残留数据。
+
+        卸载**保留数据**之后必须有这一块：否则"数据不会丢"的另一面就是
+        "占用的空间没人知道、也没人删得掉"。它只在真的有残留时出现。
+      */}
+      {orphans.length > 0 && (
+        <div className="mb-5 p-3.5 rounded-xl flex items-start gap-3 border border-amber-200 bg-amber-50">
+          <AlertTriangle className="w-4 h-4 text-amber-500 mt-0.5 shrink-0" />
+          <div className="flex-1 min-w-0 text-sm text-amber-800">
+            <p>
+              有 <strong>{orphans.length}</strong> 个已卸载插件留下了数据，共{' '}
+              <strong>{formatBytes(orphans.reduce((sum, o) => sum + o.bytes, 0))}</strong>。
+              卸载不会删数据（重装同一个插件就能拿回来），所以它们会留在这里。
+            </p>
+            <p className="mt-1 text-xs text-amber-700 break-all">
+              {orphans.map((o) => `${o.id}（${formatBytes(o.bytes)}）`).join('、')}
+            </p>
+          </div>
+          <button
+            onClick={() => setOrphanCleanupOpen(true)}
+            className="shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white border border-amber-300 text-amber-800 hover:bg-amber-100 transition-colors"
+          >
+            清理
+          </button>
+        </div>
+      )}
+
       {/* 统计 */}
       <div className="grid grid-cols-2 @3xl:grid-cols-4 gap-3 mb-6">
         <StatCard label="已安装" value={counts.all} icon={Package} tone="bg-indigo-50 text-indigo-600" index={0} />
@@ -819,6 +1042,75 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
         <StatCard label="已禁用" value={counts.disabled} icon={PowerOff} tone="bg-gray-100 text-gray-500" index={2} />
         <StatCard label="加载异常" value={counts.error} icon={AlertTriangle} tone="bg-red-50 text-red-600" index={3} />
       </div>
+
+      {/*
+        ============================================================
+        安装策略：未隔离插件
+        ============================================================
+        这一块存在的理由，是"沙箱"这件事只有在**装之前**能拦得住：装上一个未隔离
+        插件之后，它与宿主共享同一个 JS 上下文，权限列表对它就不再是约束 ——
+        而界面上不会有任何症状。因此它必须是一个**用户显式做的选择**，
+        而不是"点一下安装"顺带发生的事。
+
+        放在这一页而不是「设置 → 安全」：安全页管的是应用的登录与访问密钥，
+        与插件是两个世界；用户遇到这个问题时人就在这里（装插件失败）。
+
+        文案刻意**不夸张**：不写成"危险"，而是说清未隔离到底意味着什么，
+        以及打开之后会失去什么。恐吓式的措辞会让人永远不敢打开它，
+        而那不是更安全，那只是让一个真实存在的取舍变得不可用。
+      */}
+      <section className="mb-6 rounded-2xl border border-gray-200 bg-white px-5 py-2">
+        <div className="flex items-start justify-between gap-6 py-3.5">
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-gray-800 flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-gray-400" />
+              允许安装未隔离插件
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-gray-500">
+              Modulith 的插件有两种运行方式。<span className="text-gray-700">已隔离</span>
+              的插件跑在自己的来源里，拿不到宿主的能力，只能通过它申请的权限工作。
+              <span className="text-gray-700">未隔离</span>
+              的插件与宿主跑在同一个上下文里 —— 它申请的权限只是它的<b>声明</b>，
+              不是对它的约束，它可以做到比清单上写的更多。
+            </p>
+            <p className="mt-1.5 text-xs leading-relaxed text-gray-500">
+              默认关闭：插件市场里未隔离的插件会显示原因、但不允许安装。
+              打开之后它们可以安装，安装前仍会再向你确认一次。
+              <span className="text-gray-700">这个开关只管安装</span>
+              —— 已经装上的插件不受影响，也不会被禁用。
+            </p>
+          </div>
+
+          <div className="shrink-0 pt-0.5">
+            <Toggle checked={allowUnsandboxed} onChange={handleToggleUnsandboxed} />
+          </div>
+        </div>
+
+        {allowUnsandboxed && (
+          <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+            <p className="text-[11px] leading-relaxed text-amber-800">
+              当前<b>允许</b>安装未隔离插件。装上的那些插件与宿主共享同一个上下文 ——
+              沙箱对它们不起作用，卸载是撤销它的唯一办法。
+            </p>
+          </div>
+        )}
+
+        {/*
+          已装未隔离插件的清单。**开关关着时也要显示** —— 那些插件可能来自备份恢复
+          或更早的版本，而"我明明关着这个开关，为什么有一个未隔离插件"必须有一个
+          地方能回答，否则用户只能把它读成开关坏了。
+        */}
+        {unsandboxed.length > 0 && (
+          <div className="mb-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+            <p className="text-[11px] leading-relaxed text-gray-600">
+              当前已安装的 <b>{plugins.length}</b> 个插件里有 <b>{unsandboxed.length}</b>{' '}
+              个未隔离：{unsandboxed.map((plugin) => plugin.manifest.displayName || plugin.id).join('、')}。
+              它们与宿主共享同一个上下文，<b>沙箱对它们不起作用</b> ——
+              装它们时同意过什么、以及它们能做什么，与上面这个开关无关（它只管安装）。
+            </p>
+          </div>
+        )}
+      </section>
 
       {showSpinner ? (
         <div className="flex items-center justify-center py-20">
@@ -1107,16 +1399,67 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
             <>
               确定要卸载「
               <strong>{pendingUninstall.manifest.displayName || pendingUninstall.id}</strong>
-              」吗？插件的文件与存储数据都会被删除，此操作不可撤销。
+              」吗？插件的文件会被删除。
+              <br />
+              <span className="text-emerald-700">
+                它的数据会<strong>保留</strong>
+                —— 重装同一个插件就能拿回来。
+              </span>
             </>
+          )
+        }
+        extra={
+          pendingUninstall && (
+            <label className="flex items-start gap-2.5 mt-4 p-3 rounded-lg border border-red-200 bg-red-50 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={deleteDataOnUninstall}
+                onChange={(event) => setDeleteDataOnUninstall(event.target.checked)}
+                className="mt-0.5 accent-red-600"
+              />
+              <span className="text-xs text-red-800 leading-relaxed">
+                连同它的数据一起删除
+                {pendingUninstallBytes !== null && pendingUninstallBytes > 0 && (
+                  <> （{formatBytes(pendingUninstallBytes)}）</>
+                )}
+                。
+                <strong>此操作不可撤销，也不会进回收站。</strong>
+              </span>
+            </label>
           )
         }
         confirmLabel="卸载"
         busy={pendingUninstall ? busyId === pendingUninstall.id : false}
         onConfirm={() => {
-          if (pendingUninstall) void handleUninstall(pendingUninstall);
+          if (pendingUninstall) void handleUninstall(pendingUninstall, deleteDataOnUninstall);
         }}
-        onCancel={() => setPendingUninstall(null)}
+        onCancel={() => {
+          setPendingUninstall(null);
+          setDeleteDataOnUninstall(false);
+          setPendingUninstallBytes(null);
+        }}
+      />
+
+      {/* 残留数据清理确认 */}
+      <ConfirmDialog
+        open={orphanCleanupOpen}
+        title="清理残留数据"
+        message={
+          <>
+            将删除这 <strong>{orphans.length}</strong> 个已卸载插件留下的全部数据，共{' '}
+            <strong>{formatBytes(orphans.reduce((sum, o) => sum + o.bytes, 0))}</strong>。
+            这些插件当前没有安装，因此这些数据
+            <strong>不会再有任何界面用到它们</strong>。
+            <br />
+            <span className="text-red-700">
+              <strong>此操作不可撤销，也不会进回收站。</strong>
+            </span>
+          </>
+        }
+        confirmLabel="删除"
+        busy={orphanCleanupBusy}
+        onConfirm={() => void handleOrphanCleanup()}
+        onCancel={() => setOrphanCleanupOpen(false)}
       />
 
       {/* URL 安装 */}

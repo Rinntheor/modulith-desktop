@@ -37,7 +37,7 @@
 // 反过来，任何读窗口状态的调用（`is_visible`、`is_minimized`）都会经
 // dispatcher 等回复 —— 这个文件里一处都没有用，这不是巧合。
 
-use tauri::{PhysicalPosition, WebviewWindow};
+use tauri::PhysicalPosition;
 
 use crate::prelude::*;
 
@@ -101,9 +101,8 @@ pub fn position_for(
 }
 
 /// 找到菜单窗口（不存在时返回 `None`）
-fn menu_window(app: &AppHandle) -> Option<WebviewWindow> {
-    use tauri::Manager;
-    app.get_webview_window(TRAY_MENU_LABEL)
+fn menu_window(app: &AppHandle) -> Option<tauri::Window> {
+    crate::core::window::get(app, TRAY_MENU_LABEL)
 }
 
 /// 在光标处显示菜单。

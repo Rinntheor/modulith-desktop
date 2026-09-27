@@ -473,6 +473,23 @@ interface EngineAdvisory {
 
 用 DOM 事件而不是状态或 Context：触发方是挂在 `window` 上的全局快捷键（不在 React 树内），接收方是标题栏里的搜索框。让快捷键持有搜索框的 ref 会引入跨组件的命令式耦合。
 
+## 19b. contextMenuBridge
+
+| 导出 | 签名 | 说明 |
+| --- | --- | --- |
+| `GLOBAL_CONTEXT_MENU_EVENT` | 常量 | 事件名 `'modulith:global-context-menu'`（**只有这一条**） |
+| `requestGlobalContextMenu(x, y)` | `void` | 请求在**宿主文档坐标** `(x, y)` 弹出外壳右键菜单 |
+| `dismissGlobalContextMenu()` | `void` | 请求关掉外壳右键菜单（没开着时是无操作） |
+| `subscribeGlobalContextMenu(listener)` | `() => void` | 订阅打开 / 关闭请求，返回退订函数。`listener` 收到 `null` 表示关闭 |
+
+与 `searchFocus` 同一取向（DOM 事件 + 带类型的包装函数），因为发起方 `SandboxSurface` 与接收方 `Home` 在 React 树里隔了好几层。
+
+**坐标必须已经是宿主文档的视口坐标。** 插件文档给的是它自己的视口坐标，发起方负责加上那块 iframe 的矩形偏移（跨源 iframe 读不到父文档，插件那边算不出这个偏移）。非有限数一律丢弃 —— `left: NaN` 的菜单表现为"右键之后什么都没出现"，而原因那时已经看不出来。
+
+**开与关刻意走同一条事件**（`{x, y} | null`）。分开成两条通道时，只要一方漏了或两边判据不一致，结果就是**一个关不掉的菜单** —— 这正是一次真实的缺陷（`docs/06-项目/已知问题与技术债.md` §7.53）。合成一种取值之后，只有一处会写菜单的位置，`null` 就是关闭。
+
+存在的原因是**事件边界**：插件界面是跨源 iframe，它内部派发的 `contextmenu` / `mousedown` / `keydown` 永远冒泡不到宿主文档 —— 而外壳菜单的**打开与关闭两条路径**都挂在宿主文档上。这也是 §7.53 的教训：转发一个交互时，N 个事件要逐个过一遍，不能只做打开那个。
+
 ## 20. lazyLoad
 
 | 导出 | 签名 |

@@ -17,8 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tauri::AppHandle;
-use tauri::Manager;
+use tauri::{AppHandle, Manager, Runtime};
 
 /// 通知存储的文件名（位于 `app_data_dir()` 下）
 pub const NOTIFICATIONS_FILE_NAME: &str = "notifications.json";
@@ -249,7 +248,7 @@ pub fn prune(list: &mut Vec<Notification>, max: usize) {
 }
 
 /// 通知文件的完整路径（必要时创建应用数据目录）
-pub fn notifications_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn notifications_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     let app_dir = app
         .path()
         .app_data_dir()
@@ -311,7 +310,7 @@ pub fn save_to(path: &Path, list: &[Notification]) -> Result<(), String> {
 }
 
 /// 读取通知（面向 `AppHandle` 的封装）
-pub fn load(app: &AppHandle) -> Vec<Notification> {
+pub fn load<R: Runtime>(app: &AppHandle<R>) -> Vec<Notification> {
     match notifications_path(app) {
         Ok(path) => load_from(&path),
         Err(e) => {
@@ -322,7 +321,7 @@ pub fn load(app: &AppHandle) -> Vec<Notification> {
 }
 
 /// 持久化通知
-pub fn save(app: &AppHandle, list: &[Notification]) -> Result<(), String> {
+pub fn save<R: Runtime>(app: &AppHandle<R>, list: &[Notification]) -> Result<(), String> {
     let path = notifications_path(app)?;
     save_to(&path, list)
 }

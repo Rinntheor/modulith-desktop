@@ -29,6 +29,7 @@
 // 界面据此显示"后台功能需要 Node 运行时，当前未找到"，
 // 而不是让用户看到一串 invoke 失败。
 
+pub mod plugins;
 pub mod protocol;
 
 use std::collections::HashMap;
@@ -98,10 +99,32 @@ pub struct CallOutcome {
 /// 而调用方正在等读任务递来的响应，直接死锁。
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<protocol::Response>>>>;
 
+/// 子进程发来的一条请求（插件的 `ctx.*` 调用）。
+///
+/// 与 `Response` 相对：那个是"它对我们的回答"，这个是"它问我们的话"。
+/// 读循环不认识业务，因此把这类消息**转发**给注册它的那个任务去处理
+/// （见 `BackgroundHost::inbound`）—— 读循环里塞进业务分派的话，
+/// 它就得先认识 `PluginManager`、权限模型、通知中心，而它本该只认识字节。
+#[derive(Debug, Clone)]
+pub struct Inbound {
+    pub id: u64,
+    pub method: String,
+    pub params: Option<serde_json::Value>,
+}
+
 /// 子进程的运行时状态
 struct State {
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    /// 写入端。
+    ///
+    /// 用 `tokio::sync::Mutex` 包起来而不是 `Option<ChildStdin>` 直接挪进挪出：
+    /// **两个地方都要写它** —— 调用方发请求，读循环回答子进程的请求。原来那种
+    /// "取出来、写、放回去"的写法在只有一个写入者时够用，多一个写入者就会出现
+    /// "另一个写入者看到 `None` 然后报错"的窗口。
+    ///
+    /// `tokio` 的守卫是 `Send` 的，因此跨 `await` 持有它是合法的 ——
+    /// 这正是 `std::sync::MutexGuard` 做不到、以致于原来要绕一圈的那件事。
+    writer: Option<Arc<tokio::sync::Mutex<ChildStdin>>>,
     /// 上一次有请求的时刻，用于空闲回收
     last_used: Instant,
     /// 最近一次失败的原因（成功一次后清空）
@@ -126,6 +149,35 @@ pub struct BackgroundHost {
     /// 否则用户在设置里换了一个路径之后，我们仍然拿旧路径去启动子进程 ——
     /// 表现为"改完设置没生效，重启才好"。
     configured_node: Mutex<String>,
+    /// 子进程**问我们**的请求往哪里送。
+    ///
+    /// `None` = 不处理（纯粹的通道模式，`hello`/`ping`/`status`/`shutdown`）。
+    /// `Some` = 有一个任务在等着处理它们（插件模式）。
+    inbound: Mutex<Option<tokio::sync::mpsc::Sender<Inbound>>>,
+    /// 启动这个子进程时要附加的参数与环境。
+    ///
+    /// 与 `BackgroundHost` 分开保存而不是塞进 `State`：它是**配置**，
+    /// 在一次子进程的整个生命周期里不变，也不参与任何状态转换。
+    spec: Mutex<HostSpec>,
+}
+
+/// 一次子进程启动的**形状**：多给哪些参数、给什么样的环境。
+///
+/// 抽出来是为了让"插件进程"与"探测用的进程"共用同一套进程管理与协议 ——
+/// 两者的区别只有这两样，而复制一份进程管理代码意味着以后每修一个死锁都要修两处。
+#[derive(Debug, Clone, Default)]
+pub struct HostSpec {
+    /// 附加的命令行参数（放在脚本路径**之前**，即 Node 自己的开关）
+    pub node_args: Vec<String>,
+    /// 附加的环境变量。**每一项都在这个列表之外被清掉**（见 `ensure_started`）
+    pub env: Vec<(String, String)>,
+    /// 是否清空继承来的环境变量。
+    ///
+    /// **插件进程必须清空**：`process.env` 在 `--permission` 之下**仍然可读**
+    /// （实测 60 个变量，包括应用自己的 `DSH_*`）。不清理的话，一个逃出 `vm`
+    /// 的插件能把整份环境变量读走并随一次请求送出去 —— 而环境变量里常常有
+    /// 令牌与密钥。这条不是加固，是补一个已知的洞。
+    pub clear_env: bool,
 }
 
 impl BackgroundHost {
@@ -133,7 +185,7 @@ impl BackgroundHost {
         Self {
             state: Mutex::new(State {
                 child: None,
-                stdin: None,
+                writer: None,
                 last_used: Instant::now(),
                 last_error: None,
                 requests: 0,
@@ -142,7 +194,25 @@ impl BackgroundHost {
             next_id: AtomicU64::new(1),
             node: Mutex::new(None),
             configured_node: Mutex::new(String::new()),
+            inbound: Mutex::new(None),
+            spec: Mutex::new(HostSpec::default()),
         }
+    }
+
+    /// 设定子进程的启动形状。**下次拉起时生效**，对已经在跑的子进程无效。
+    ///
+    /// 不自动重启正在跑的子进程：那会让"改一个配置"变成一次静默的进程替换，
+    /// 而插件在那一刻的状态（定时器、内存里的数据）会无声地消失。
+    pub fn set_spec(&self, spec: HostSpec) {
+        *self.spec.lock().unwrap() = spec;
+    }
+
+    /// 注册"子进程问我们的话"的处理者。
+    ///
+    /// 同一个宿主只需要注册一次：读循环在写下这段逻辑时已经把发送端固定下来了。
+    /// 重复注册会**顶掉**前一个 —— 与"插件上下文被替换"的语义一致。
+    pub fn set_inbound(&self, sender: tokio::sync::mpsc::Sender<Inbound>) {
+        *self.inbound.lock().unwrap() = Some(sender);
     }
 
     /// 当前状态（不启动任何东西）
@@ -271,26 +341,20 @@ impl BackgroundHost {
 
         let (sender, receiver) = oneshot::channel();
 
-        // ============================================================
-        // 关于这一段的锁：**不允许跨 await 持有 `MutexGuard`**
-        // ============================================================
+        // 关于这一段的锁：`std::sync::MutexGuard` 不是 `Send`，而 Tauri 命令的
+        // future 必须是 —— 因此**不允许跨 await 持有它**。这里只在锁里做两件
+        // 同步的事（改计数、克隆一个 `Arc`），然后在锁外 `await` 写入锁。
         //
-        // `std::sync::MutexGuard` 不是 `Send`，而 Tauri 命令的 future 必须是。
-        // 因此这里把写入端**从状态里取出来**（`Option::take`），在锁之外完成
-        // 异步写入，再放回去。
-        //
-        // 这与"只能有一个在飞的请求"是兼容的：取出期间其它调用会看到 `None`
-        // 并立刻返回"后台宿主未在运行" —— 而实际上更早的那次调用会把它放回去。
-        // 为了不给这个窗口留下真实的错误，取出失败时**不放请求进待处理表**：
-        // 一条永远等不到响应的请求比一次立刻失败更糟。
-        let mut stdin = {
+        // 克隆而不是把写入端取出来：取出来会让另一个写入者（读循环回答子进程的
+        // 请求时）看到一个 `None`，而那会表现成一次随机的"后台宿主未在运行"。
+        let writer = {
             let mut state = self.state.lock().unwrap();
             state.requests += 1;
             state.last_used = Instant::now();
-            state.stdin.take()
+            state.writer.clone()
         };
 
-        let Some(stdin_ref) = stdin.as_mut() else {
+        let Some(writer) = writer else {
             return CallOutcome {
                 ok: false,
                 result: None,
@@ -302,14 +366,14 @@ impl BackgroundHost {
         // 而那时读任务会找不到等待者、把响应丢掉。
         self.pending.lock().unwrap().insert(id, sender);
 
-        let write_result = async {
-            stdin_ref.write_all(line.as_bytes()).await?;
-            stdin_ref.flush().await
-        }
-        .await;
-
-        // 把写入端放回去（无论写入成功与否 —— 它仍然是我们唯一的写入端）
-        self.state.lock().unwrap().stdin = stdin;
+        let write_result = {
+            let mut guard = writer.lock().await;
+            async {
+                guard.write_all(line.as_bytes()).await?;
+                guard.flush().await
+            }
+            .await
+        };
 
         if let Err(error) = write_result {
             // 写失败意味着管道断了（子进程死了）。把请求清掉，
@@ -359,6 +423,48 @@ impl BackgroundHost {
         }
     }
 
+    /// 回答子进程的一条请求。
+    ///
+    /// 由处理 `ctx.*` 的那个任务调用。写失败**只记日志**：那意味着子进程已经
+    /// 不在了，而调用方（那个任务）本来就无法为此做任何事 —— 它手里没有
+    /// 重试的依据，重复投递一个可能已经执行过的副作用调用更糟。
+    pub async fn respond(&self, id: u64, result: Result<serde_json::Value, String>) {
+        let writer = {
+            let state = self.state.lock().unwrap();
+            state.writer.clone()
+        };
+        let Some(writer) = writer else {
+            return;
+        };
+
+        let response = match result {
+            Ok(value) => protocol::Response {
+                v: PROTOCOL_VERSION,
+                id,
+                result: Some(value),
+                error: None,
+            },
+            Err(message) => protocol::Response {
+                v: PROTOCOL_VERSION,
+                id,
+                result: None,
+                error: Some(message),
+            },
+        };
+
+        let Ok(line) = protocol::encode_response(&response) else {
+            log::warn!("无法编码对后台请求 {id} 的回答");
+            return;
+        };
+
+        let mut guard = writer.lock().await;
+        if let Err(error) = guard.write_all(line.as_bytes()).await {
+            log::debug!("回答后台请求 {id} 失败（子进程可能已经退出）：{error}");
+            return;
+        }
+        let _ = guard.flush().await;
+    }
+
     /// 确保子进程在运行（已运行则直接返回）
     async fn ensure_started(&self, node: &PathBuf) -> Result<(), String> {
         {
@@ -369,9 +475,14 @@ impl BackgroundHost {
         }
 
         let script = host_script_path()?;
+        let spec = self.spec.lock().unwrap().clone();
 
         let mut command = tokio::process::Command::new(node);
         command
+            // 附加参数放在脚本路径**之前**：它们是 Node 自己的开关
+            // （`--permission`、`--allow-fs-read=…`），放在脚本之后就变成
+            // 传给脚本的参数了 —— 而那个错误的表现是"权限一条都没生效"。
+            .args(&spec.node_args)
             .arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -379,6 +490,25 @@ impl BackgroundHost {
             // 而不是被吞掉。这条通道只有 stdout 是协议专用的。
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+
+        if spec.clear_env {
+            // 见 `HostSpec::clear_env`：`process.env` 在 `--permission` 之下
+            // 仍然可读，因此"不清环境变量"等于把宿主的令牌交给插件。
+            command.env_clear();
+
+            // 但完全不给环境变量会让 Node 在一些平台上起不来
+            // （Windows 需要 `SystemRoot` 才能解析系统 DLL，`TEMP` 是临时目录）。
+            // 因此留最小的那一组，它们都不含用户信息。
+            for key in ["SystemRoot", "SystemDrive", "windir", "TEMP", "TMP", "PATHEXT"] {
+                if let Ok(value) = std::env::var(key) {
+                    command.env(key, value);
+                }
+            }
+        }
+
+        for (key, value) in &spec.env {
+            command.env(key, value);
+        }
 
         let mut child = command
             .spawn()
@@ -437,7 +567,7 @@ impl BackgroundHost {
         {
             let mut state = self.state.lock().unwrap();
             state.child = Some(child);
-            state.stdin = Some(stdin);
+            state.writer = Some(Arc::new(tokio::sync::Mutex::new(stdin)));
             state.last_error = None;
         }
 
@@ -452,6 +582,9 @@ impl BackgroundHost {
     /// 全程没有阻塞式系统调用，因此不需要独占一个线程。
     fn spawn_reader(&self, mut reader: BufReader<ChildStdout>) {
         let pending = Arc::clone(&self.pending);
+        // 读循环只把这类消息**转发**出去：它不认识业务，也不该认识 ——
+        // 认识 `PluginManager` 的那部分是 `plugins.rs` 里的一个独立任务。
+        let inbound = self.inbound.lock().unwrap().clone();
 
         tokio::spawn(async move {
             let mut line = String::new();
@@ -472,8 +605,8 @@ impl BackgroundHost {
                     }
                 }
 
-                let response = match protocol::decode_response(&line) {
-                    Ok(response) => response,
+                let incoming = match protocol::decode_incoming(&line) {
+                    Ok(incoming) => incoming,
                     Err(error) => {
                         // 一行解析不了**不终止**读循环：对面可能只是写了一条垃圾，
                         // 而它之后的消息仍然是好的。终止会让一次格式错误变成
@@ -481,6 +614,37 @@ impl BackgroundHost {
                         //
                         // 但要把待处理的请求放掉 —— 否则调用方会一直等到超时。
                         log::warn!("后台宿主返回了无法解析的一行：{error}");
+                        continue;
+                    }
+                };
+
+                let response = match incoming {
+                    protocol::Incoming::Response(response) => response,
+                    protocol::Incoming::Request(request) => {
+                        // 子进程在问我们（插件的 `ctx.*`）。
+                        //
+                        // 没有处理者时**必须回答一句错误**，而不是把这条消息丢掉：
+                        // 插件那边正 await 着，丢掉的话它只能等到 10 秒超时，
+                        // 然后报一句"宿主没有响应" —— 而真相是"这个进程没有
+                        // 注册处理者，它本来就不该发起调用"。
+                        match &inbound {
+                            Some(sender) => {
+                                let inbound_request = Inbound {
+                                    id: request.id,
+                                    method: request.method,
+                                    params: request.params,
+                                };
+                                if sender.send(inbound_request).await.is_err() {
+                                    log::warn!("处理后台请求的任务已经不在了");
+                                }
+                            }
+                            None => {
+                                log::warn!(
+                                    "后台宿主发来了请求（{}），但这个进程没有注册处理者",
+                                    request.method
+                                );
+                            }
+                        }
                         continue;
                     }
                 };
@@ -553,9 +717,9 @@ impl BackgroundHost {
     /// 只强制结束会让子进程来不及落盘与清理定时器，而只等待它自己退出
     /// 则可能永远等下去（脚本里有死循环时）。
     pub async fn shutdown(&self) {
-        let (mut child, stdin) = {
+        let (mut child, writer) = {
             let mut state = self.state.lock().unwrap();
-            (state.child.take(), state.stdin.take())
+            (state.child.take(), state.writer.take())
         };
 
         // 任何还在等待的请求都不可能再有响应了
@@ -569,7 +733,7 @@ impl BackgroundHost {
         };
 
         // 优雅请求：给它一点时间自己退出
-        if let Some(mut stdin) = stdin {
+        if let Some(writer) = writer {
             let request = protocol::Request {
                 v: PROTOCOL_VERSION,
                 id: self.next_id.fetch_add(1, Ordering::SeqCst),
@@ -577,10 +741,13 @@ impl BackgroundHost {
                 params: None,
             };
             if let Ok(line) = protocol::encode_request(&request) {
-                let _ = stdin.write_all(line.as_bytes()).await;
-                let _ = stdin.flush().await;
+                let mut guard = writer.lock().await;
+                let _ = guard.write_all(line.as_bytes()).await;
+                let _ = guard.flush().await;
             }
-            drop(stdin);
+            // 丢掉写入锁 = 关掉子进程的 stdin。脚本把它当作"宿主走了"的信号：
+            // 即便那条 shutdown 请求因为任何原因没被处理，stdin 一关它也会退出。
+            drop(writer);
         }
 
         // 等它自己走；超时就强制结束
@@ -1111,8 +1278,7 @@ mod live_tests {
     }
 
     /// 缺 Node 时必须给出**可读的原因**，而不是"操作失败"。
-    ///
-    /// 这条路径在真实用户机器上会发生（打包遗漏、杀毒软件隔离）。
+    ///    /// 这条路径在真实用户机器上会发生（打包遗漏、杀毒软件隔离）。
     /// 界面上要显示的是"为什么不可用"，而不是一个异常。
     ///
     /// **这条测试必须显式清掉 PATH。** 加了"PATH 自动查找"之后，一个只是
@@ -1242,4 +1408,218 @@ mod live_tests {
         assert_eq!(status.requests, 0, "没有发过请求就不该有请求计数");
     }
 
+    // ============================================================
+    // 反向通道：插件 → 宿主
+    // ============================================================
+    //
+    // 这一组是整个后台插件能力的**端到端**验证，也是这台机器上能做的
+    // 最接近"真的跑起来"的检查 —— 它真的启动一个 Node 子进程、真的加载一段
+    // 插件代码、真的让那段代码发一次 `ctx.*` 调用回来。
+    //
+    // 它守的是协议里最容易写错、而错了之后最难定位的一件事：**方向**。
+    // 两个方向共用同一条管道、同一组字段名，唯一的判别式是"有没有 `method`"。
+    // 判错的表现是插件永远等不到回答（它只知道"没反应"），而宿主那边只会
+    // 留下一条"收到没有等待者的响应"的 debug 日志。
+
+    /// 起一个真的后台宿主，加载一段真的插件代码，并回答它发出的 `ctx.*` 调用。
+    ///
+    /// 返回 `None` 表示这个环境里没有可用的 Node（跳过而不是失败 ——
+    /// 与 `a_real_node_host_answers_a_ping` 同一个约定）。
+    fn run_reverse_channel_probe(script_source: &str) -> Option<(Vec<String>, bool)> {
+        let node = find_node()?;
+        let host_script = host_script();
+        assert!(host_script.is_file(), "宿主脚本不存在：{}", host_script.display());
+
+        // 插件代码写进一个临时目录，并**只把这个目录**放进 `--allow-fs-read`。
+        // 这正是生产路径上的放行范围（见 `plugins.rs`）。
+        let dir = std::env::temp_dir().join(format!(
+            "modulith-bg-probe-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("应当能建临时目录");
+        let entry = dir.join("probe-bg.mjs");
+        std::fs::write(&entry, script_source).expect("应当能写探针脚本");
+
+        std::env::set_var("MODULITH_NODE", &node);
+        std::env::set_var("MODULITH_BACKGROUND_HOST", &host_script);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试用的运行时应当能建立");
+
+        let result = runtime.block_on(async {
+            let host = Arc::new(BackgroundHost::new());
+            host.set_spec(HostSpec {
+                node_args: vec![
+                    "--permission".to_string(),
+                    format!("--allow-fs-read={}", dir.display()),
+                ],
+                env: Vec::new(),
+                clear_env: true,
+            });
+
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Inbound>(16);
+            host.set_inbound(sender);
+
+            // 处理子进程发来的请求：把方法名记下来，回一个"有内容"的答案。
+            //
+            // 必须回一个**非 null** 的结果：`null` 与"没有结果"在协议上不可区分
+            // （见 protocol.rs 的那条测试），插件那边会因此判成通道故障。
+            let handler = tokio::spawn({
+                let host = Arc::clone(&host);
+                async move {
+                    let mut seen = Vec::new();
+                    while let Some(request) = receiver.recv().await {
+                        seen.push(request.method.clone());
+                        host.respond(
+                            request.id,
+                            Ok(serde_json::json!({ "answered": request.method })),
+                        )
+                        .await;
+                        if seen.len() >= 3 {
+                            break;
+                        }
+                    }
+                    seen
+                }
+            });
+
+            let load = host
+                .call(
+                    BackgroundMethod::PluginLoad,
+                    Some(serde_json::json!({
+                        "id": "probe",
+                        "entry": entry,
+                        "name": "探针",
+                        "version": "1.0.0",
+                        "permissions": ["storage"],
+                    })),
+                )
+                .await;
+
+            let dispatch = host
+                .call(
+                    BackgroundMethod::PluginDispatch,
+                    Some(serde_json::json!({ "id": "probe", "type": "start" })),
+                )
+                .await;
+
+            // 给插件一点时间把它的 ctx 调用发出来。
+            let seen = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+                .await
+                .expect("探针没有在 5 秒内发出 ctx 调用")
+                .unwrap_or_default();
+
+            let unload = host
+                .call(
+                    BackgroundMethod::PluginUnload,
+                    Some(serde_json::json!({ "id": "probe" })),
+                )
+                .await;
+
+            host.shutdown().await;
+
+            (seen, load, dispatch, unload)
+        });
+
+        std::env::remove_var("MODULITH_NODE");
+        std::env::remove_var("MODULITH_BACKGROUND_HOST");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (seen, load, dispatch, unload) = result;
+
+        assert!(load.ok, "插件加载应当成功，实际：{:?}", load.error);
+        assert!(dispatch.ok, "投递 start 应当成功，实际：{:?}", dispatch.error);
+        assert!(unload.ok, "卸载应当成功，实际：{:?}", unload.error);
+
+        let answered = seen.len() >= 3;
+        Some((seen, answered))
+    }
+
+    /// 后台插件发出的 `ctx.*` 调用**必须到达宿主**，并且带着正确的方法名。
+    ///
+    /// 这是"反向通道通了"的唯一证据。它顺带验证了三件事：
+    ///   · `--permission` 之下子进程仍然能读自己的入口文件；
+    ///   · `clear_env` 之下它仍然能启动（留下的那几个变量够 Node 起来）；
+    ///   · 插件代码真的在 `vm` 上下文里跑了起来（它调用了 `ctx.*`）。
+    #[test]
+    fn a_background_plugin_can_call_back_into_the_host() {
+        if find_node().is_none() {
+            eprintln!("跳过：环境里没有可用的 Node 运行时");
+            return;
+        }
+
+        // 三个成员分属三组：存储、数据目录、日志。
+        let source = r#"
+Modulith.logger.info('probe 已加载');
+ctx.background.on('start', async () => {
+  await ctx.storage.get('k', null);
+  await ctx.dataDir.used();
+  ctx.logger.info('三个都发完了');
+});
+"#;
+
+        let Some((seen, answered)) = run_reverse_channel_probe(source) else {
+            eprintln!("跳过：环境里没有可用的 Node 运行时");
+            return;
+        };
+
+        assert!(
+            seen.contains(&"ctx.log".to_string()),
+            "插件在加载期与处理期间的日志都应当到达宿主，实际收到：{seen:?}"
+        );
+        assert!(
+            seen.contains(&"ctx.storage.get".to_string()),
+            "ctx.storage.get 应当到达宿主，实际收到：{seen:?}"
+        );
+        assert!(
+            seen.contains(&"ctx.data.used".to_string()),
+            "ctx.dataDir.used 应当到达宿主（线上的名字是 ctx.data.used），实际收到：{seen:?}"
+        );
+        assert!(answered, "宿主应当回答了这些调用（否则插件会一直挂着）");
+    }
+
+    /// `clear_env` 之下子进程仍然能起来。
+    ///
+    /// 这条测试的理由是一个很容易踩的坑：**清空环境变量会让 Node 在某些平台上
+    /// 起不来**（Windows 靠 `SystemRoot` 解析系统 DLL）。因此 `clear_env` 里
+    /// 留了最小的一组 —— 而"留得够不够"只能靠真的起一次来证明。
+    ///
+    /// 它与上一条的分工：上一条证明"能通过协议做事"，这一条只证明"进程能起来"。
+    /// 分开是因为它们会在不同的改动下坏掉（一个是协议，一个是启动参数）。
+    #[test]
+    fn a_cleared_environment_still_starts_node() {
+        if find_node().is_none() {
+            eprintln!("跳过：环境里没有可用的 Node 运行时");
+            return;
+        }
+
+        let node = find_node().expect("已经确认有 Node");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试用的运行时应当能建立");
+
+        let started = runtime.block_on(async {
+            let mut command = tokio::process::Command::new(&node);
+            command.arg("--version").env_clear();
+            // 与 `ensure_started` 里那一组完全一致 —— 它变了这条测试就该变。
+            for key in ["SystemRoot", "SystemDrive", "windir", "TEMP", "TMP", "PATHEXT"] {
+                if let Ok(value) = std::env::var(key) {
+                    command.env(key, value);
+                }
+            }
+            command.output().await
+        });
+
+        match started {
+            Ok(output) => assert!(
+                output.status.success(),
+                "清空环境变量之后 Node 起不来了 —— 说明留下的那几个变量不够。stderr：{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => panic!("清空环境变量之后无法启动 Node：{error}"),
+        }
+    }
 }

@@ -104,7 +104,7 @@ pub fn level_for_visibility(hidden: bool) -> MemoryLevel {
 /// 从未生效的开关。
 ///
 /// `Err` 只用于真正的失败（投递不到界面线程、引擎拒绝、超时）。
-pub fn apply(window: &tauri::WebviewWindow, level: MemoryLevel) -> Result<bool, String> {
+pub fn apply(window: &tauri::Webview, level: MemoryLevel) -> Result<bool, String> {
     #[cfg(windows)]
     {
         windows_impl::apply(window, level)
@@ -121,7 +121,7 @@ pub fn apply(window: &tauri::WebviewWindow, level: MemoryLevel) -> Result<bool, 
 ///
 /// 判据是"能不能取到那个接口"，而不是版本号比较：版本号是间接证据，
 /// 而接口本身才是真正决定成败的东西。
-pub fn is_supported(window: &tauri::WebviewWindow) -> bool {
+pub fn is_supported(window: &tauri::Webview) -> bool {
     #[cfg(windows)]
     {
         windows_impl::is_supported(window)
@@ -134,10 +134,8 @@ pub fn is_supported(window: &tauri::WebviewWindow) -> bool {
 }
 
 /// 取主窗口，取不到时才报错
-fn main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
-    use tauri::Manager;
-    app.get_webview_window("main")
-        .ok_or_else(|| "主窗口不存在".to_string())
+fn main_window(app: &AppHandle) -> Result<tauri::Webview, String> {
+    crate::core::window::main_webview(app).ok_or_else(|| "主窗口不存在".to_string())
 }
 
 /// 按可见性套用内存目标等级（前端在 `visibilitychange` 上调用）
@@ -255,7 +253,7 @@ mod windows_impl {
     /// 返回值：`Some(true)` 生效、`Some(false)` 接口取不到（运行时太旧）、
     /// `None` 投递失败或超时。
     fn run_on_ui_thread<S>(
-        window: &tauri::WebviewWindow,
+        window: &tauri::Webview,
         what: &'static str,
         action: S,
     ) -> Option<bool>
@@ -287,7 +285,7 @@ mod windows_impl {
     }
 
     pub(super) fn apply(
-        window: &tauri::WebviewWindow,
+        window: &tauri::Webview,
         level: MemoryLevel,
     ) -> Result<bool, String> {
         let target = match level {
@@ -309,7 +307,7 @@ mod windows_impl {
         }
     }
 
-    pub(super) fn is_supported(window: &tauri::WebviewWindow) -> bool {
+    pub(super) fn is_supported(window: &tauri::Webview) -> bool {
         // 只要接口取得到就算支持；调用一个无副作用的读取来确认它真的可用。
         run_on_ui_thread(window, "探测", |_core| true) == Some(true)
     }

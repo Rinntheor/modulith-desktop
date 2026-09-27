@@ -263,6 +263,92 @@ check(
   '服务实现与插件面向的类型都加了 list()'
 );
 
+// ============================================================
+// 卸载不许删数据
+// ============================================================
+//
+// 这里原来是 `remove_dir_all(&plugin_dir)` 紧接着
+// `remove_dir_all(&plugin_data_dir)` —— 而且「卸载前二次确认」关掉时整条路径
+// **连一个对话框都没有**。也就是说：点一下卸载，插件攒了几个月的数据就没了，
+// 没有提示、不进回收站。那是这个插件系统里唯一一处**静默且不可逆地销毁用户数据**
+// 的地方。
+//
+// 它一直没被当成缺陷，是因为在"每个插件只有几 KB 配置"的时代损失小到没人注意；
+// 一旦插件开始存文档、图片、数据库，同一个行为就从"无所谓"变成"灾难"。
+//
+// 现在的语义是：**卸载只删代码，数据默认留下**，删数据是单独一步、要确认。
+// Rust 侧测不了它（`uninstall` 需要 AppHandle），因此由这条断言守着。
+
+{
+  const managerRs = readFileSync(
+    join(PROJECT_ROOT, 'src-tauri/src/modules/plugins/manager.rs'),
+    'utf8'
+  );
+
+  /** 取出一个函数的函数体（到第一个顶格 `}` 为止）。 */
+  const fnBody = (name: string): string => {
+    const match = new RegExp(`pub fn ${name}\\([\\s\\S]*?\\n    \\}`).exec(managerRs);
+    return match ? match[0] : '';
+  };
+
+  const uninstall = fnBody('uninstall');
+  check(uninstall.length > 0, 'manager.rs 里有 uninstall()');
+
+  // `uninstall` 里出现 `remove_dir_all` 只允许一次，而且目标是插件目录。
+  // 判据写成"数一数有几处"而不是"找找有没有" —— 因为保留数据的那段注释里
+  // 本来就写着 `remove_dir_all(&data_dir)`（它在解释"以前是这样、现在不是"），
+  // 只匹配字符串会被自己的注释骗过去。
+  const removals = (uninstall.match(/remove_dir_all\(/g) ?? []).length;
+  check(
+    removals === 1 && /remove_dir_all\(&plugin_dir\)/.test(uninstall),
+    `卸载只删插件目录这一处（实际有 ${removals} 处 remove_dir_all）`
+  );
+
+  // 保留数据之后，必须存在一条**够得着它**的删除路径 —— 否则"数据不会丢"
+  // 只是换成"空间删不掉"。`storage_clear` 走 `checked_storage_dir`，它要求插件
+  // 仍然安装且声明了 `storage`，因此**卸载之后够不着**。
+  check(/pub fn clear_data\(/.test(managerRs), '存在一条不要求插件仍安装的删除路径（clear_data）');
+  check(
+    /pub fn data_usage\(/.test(managerRs),
+    '能问出数据目录占了多少（卸载确认框要用它把选择说清楚）'
+  );
+  check(
+    /pub fn orphan_data\(/.test(managerRs) && /fn scan_orphan_dirs\(/.test(managerRs),
+    '残留数据可被发现（否则保留数据等于静默的空间泄漏）'
+  );
+
+  // 前后端都要真的接上：判断"接通了没有"正是这个脚本最该查的一类问题。
+  //
+  // 判据要允许 `invoke<T>('…')` 这种带类型参数的写法 —— 第一版只匹配
+  // `invoke('plugin_data_usage'`，而它实际写的是 `invoke<number>('plugin_data_usage'`，
+  // 于是断言把一段**完全正确**的代码判成了没接上。
+  const runtimeTs = readFileSync(join(PROJECT_ROOT, 'src/services/pluginRuntime.ts'), 'utf8');
+  const invokes = (command: string): boolean =>
+    new RegExp(`invoke(?:<[^>]*>)?\\('${command}'`).test(runtimeTs);
+  check(
+    invokes('plugin_data_clear') &&
+      invokes('plugin_data_usage') &&
+      invokes('plugin_data_orphans'),
+    '前端三个命令都接了'
+  );
+
+  // 卸载确认框必须把"数据会留下"写出来，并提供当场删除的选项。
+  const pluginsTsx = readFileSync(
+    join(PROJECT_ROOT, 'src/modules/plugins/Plugins.tsx'),
+    'utf8'
+  );
+  check(pluginsTsx.includes('它的数据会<strong>保留</strong>'), '卸载确认框说明了数据会保留');
+  check(
+    /deleteDataOnUninstall/.test(pluginsTsx) &&
+      /setDeleteDataOnUninstall\(false\)/.test(pluginsTsx),
+    '有"连数据一起删"的显式选项，且每次打开都重置为不删'
+  );
+  check(
+    /handleUninstall\(plugin\)/.test(pluginsTsx),
+    '关闭二次确认时的直接卸载路径也走同一个函数（即同样保留数据）'
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

@@ -17,6 +17,17 @@ export interface FileDropEvent {
   type: 'enter' | 'over' | 'drop' | 'leave';
   /** 拖入的文件或目录的绝对路径；非 `drop` 阶段可能是空数组 */
   paths: string[];
+  /**
+   * 指针位置，**物理像素**、相对窗口客户区左上角。
+   *
+   * `leave` 没有这一项（拖放已经离开窗口了）。
+   *
+   * 它为什么在这里：沙箱插件界面是宿主页面里的一块 iframe，而拖放是**窗口级**
+   * 事件 —— 宿主必须自己判断"指针底下是哪一块界面"，才能只把它转给那一块。
+   * 少了这个坐标就只能广播，而广播会让后台标签页里的插件也收到本该属于别人的
+   * 拖放。见 `SandboxSurface.tsx`。
+   */
+  position?: { x: number; y: number };
 }
 
 type Handler = (event: FileDropEvent) => void;
@@ -29,11 +40,29 @@ let started = false;
 let startError: string | null = null;
 
 function normalize(payload: unknown): FileDropEvent {
-  const raw = (payload ?? {}) as { type?: string; paths?: string[] };
+  const raw = (payload ?? {}) as {
+    type?: string;
+    paths?: string[];
+    position?: { x?: number; y?: number };
+  };
   const type = (raw.type ?? 'over') as FileDropEvent['type'];
+
+  // 位置只在两个分量都是有限数时才带上。Tauri 在 `leave` 上不给位置，某些版本
+  // 也可能给一个 `{x: null, y: null}` —— 那种值传给命中测试会算出 NaN，
+  // 而 NaN 的比较**永远为假**，症状是"拖放静默失效"。
+  const position =
+    raw.position &&
+    typeof raw.position.x === 'number' &&
+    typeof raw.position.y === 'number' &&
+    Number.isFinite(raw.position.x) &&
+    Number.isFinite(raw.position.y)
+      ? { x: raw.position.x, y: raw.position.y }
+      : undefined;
+
   return {
     type,
     paths: Array.isArray(raw.paths) ? raw.paths : [],
+    ...(position ? { position } : {}),
   };
 }
 

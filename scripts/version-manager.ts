@@ -132,7 +132,7 @@ function assertValidSemVer(version: string, where: string): void {
 }
 
 /**
- * 校验插件 `engines.loopcore` 的写法。这里只做提示，不阻断 ——
+ * 校验插件 `engines.modulith` 的写法。这里只做提示，不阻断 ——
  * 实际匹配由后端 `VersionRequirement` 负责，且**不匹配也不再阻止安装**。
  *
  * 背景（两条都必须记住，否则会写出误导人的建议）：
@@ -210,7 +210,7 @@ function checkPluginEngineRanges(): number {
       } else if (entry === 'manifest.json') {
         try {
           const json = JSON.parse(readFileSync(full, 'utf-8'));
-          const range = json?.engines?.loopcore;
+          const range = json?.engines?.modulith;
           if (typeof range === 'string' && range.trim()) {
             results.push({
               source: toPosix(relative(PROJECT_ROOT, full)),
@@ -1070,7 +1070,7 @@ function checkVersion(): void {
     failures += pending.length;
   }
 
-  // 插件清单的 engines.loopcore 写法。范围过窄或语法后端不支持时只提示，
+  // 插件清单的 engines.modulith 写法。范围过窄或语法后端不支持时只提示，
   // 不计入失败 —— 安装阶段会给出权威判定。
   const manifestCount = checkPluginEngineRanges();
   if (manifestCount > 0) {

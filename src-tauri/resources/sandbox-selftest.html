@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>插件沙箱自检</title>
+    <!-- 空图标：没有它，浏览器会去请求根路径的 /favicon.ico，而那与插件的路径规则冲突 -->
+    <link rel="icon" href="data:," />
+    <!--
+      这份页面由宿主通过 modulith-plugin 协议提供（见 src-tauri/src/modules/plugins/sandbox.rs），
+      并带上一条由宿主写死的 CSP。它跑在一个**独立的窗口**里 —— 那是全宿主唯一
+      一个"插件侧"的真 webview（插件界面本身是 iframe，见下）。
+
+      它的职责是把五件事各跑一次，并把结果投回宿主写进日志：
+
+        1. __TAURI_INTERNALS__ 存在吗   —— 否则第 2 条"被拒绝"证明不了任何事
+        2. 调一条应用命令会被拒绝吗     —— ACL 真的生效的正面证据
+        3. 自定义协议的 RPC 通吗         —— 通道可用，且宿主认得出是谁发的
+        4. CSP 生效吗                   —— 网络与资源边界是不是引擎在执行
+        5. **一个 iframe 里还有没有 IPC** —— 真插件界面用的就是那个模型
+
+      第 5 条是 v1.6.0 加的，而它才是在验"插件界面"本身：这一页所在的那个窗口是
+      主框架，Tauri 会给它注入引导脚本；插件界面是一个 iframe，子框架什么都拿不到。
+      只验前者会把"自检窗口被 ACL 挡住了"误当成"插件界面拿不到 IPC"。
+
+      第 4 条用的是 **data: 地址**这种不需要网络的探针，不看"请求是否失败"。
+      这个判据换过一次：最初测的是 fetch example.com 是否被挡下，而断网时它同样会
+      被挡下 —— 第一次真机运行就撞上了这个歧义（那台机器直连外网本来就不通）。
+    -->
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        padding: 16px 18px;
+        font: 13px/1.6 "Segoe UI", system-ui, sans-serif;
+        background: #ffffff;
+        color: #1f2328;
+      }
+      h1 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+      .sub { margin: 0 0 14px; color: #656d76; font-size: 12px; }
+      ol { margin: 0; padding-left: 20px; }
+      li { margin-bottom: 8px; }
+      .name { font-weight: 600; }
+      .detail { color: #656d76; font-size: 12px; word-break: break-all; }
+      .pass .name::before { content: "通过  "; color: #1a7f37; font-weight: 700; }
+      .fail .name::before { content: "失败  "; color: #cf222e; font-weight: 700; }
+      .wait .name::before { content: "…     "; color: #9a6700; font-weight: 700; }
+      .verdict {
+        margin-top: 14px; padding: 10px 12px; border-radius: 6px;
+        background: #f6f8fa; border: 1px solid #d0d7de; font-weight: 600;
+      }
+      button {
+        margin-top: 12px; padding: 6px 14px; font: inherit; cursor: pointer;
+        border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; color: inherit;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background: #0d1117; color: #e6edf3; }
+        .sub, .detail { color: #8b949e; }
+        .verdict, button { background: #161b22; border-color: #30363d; }
+        .pass .name::before { color: #3fb950; }
+        .fail .name::before { color: #f85149; }
+        .wait .name::before { color: #d29922; }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>插件沙箱自检</h1>
+    <p class="sub">
+      这一页跑在一个独立窗口里，五项都由它自己跑、自己报。第 5 项探的是插件界面
+      实际使用的那个模型（跨源 iframe）。
+    </p>
+
+    <ol id="list"></ol>
+    <div class="verdict" id="verdict">正在检查…</div>
+    <button id="close" type="button" hidden>关闭这个自检面板</button>
+
+    <script>
+      (function () {
+        'use strict';
+
+        var CHECKS = [
+          { id: 'internals', name: '__TAURI_INTERNALS__ 是否被注入（本窗口）' },
+          { id: 'invoke_denied', name: '调用应用命令是否被拒绝' },
+          { id: 'rpc', name: '自定义协议 RPC 是否可用' },
+          { id: 'csp_active', name: 'CSP 是否真的生效' },
+          { id: 'iframe_no_ipc', name: 'iframe 里是否真的没有 IPC（真插件界面）' },
+        ];
+
+        // 不计入总成绩的附加观察。它是环境相关的，不能用来判定沙箱成不成立。
+        var INFO = [{ id: 'network_reachable', name: '（参考）能否直连外网' }];
+
+        var required = {};
+        CHECKS.forEach(function (check) {
+          required[check.id] = true;
+        });
+
+        var results = {};
+        var list = document.getElementById('list');
+        var verdict = document.getElementById('verdict');
+
+        // 我自己那一块界面的令牌。地址的第一段就是它（见 sandbox.rs 的"令牌是身份"）。
+        var OWN_TOKEN = String(location.pathname || '')
+          .replace(/^\/+/, '')
+          .split('/')[0] || '';
+
+        CHECKS.concat(INFO).forEach(function (check) {
+          var li = document.createElement('li');
+          li.className = 'wait';
+          li.id = 'row-' + check.id;
+          li.innerHTML = '<span class="name"></span><div class="detail"></div>';
+          li.querySelector('.name').textContent = check.name;
+          list.appendChild(li);
+        });
+
+        /** 把一项结果画出来，并投回宿主 —— 日志才是结论的出口。 */
+        function report(id, ok, detail) {
+          results[id] = ok;
+
+          var row = document.getElementById('row-' + id);
+          if (row) {
+            row.className = ok === null ? 'wait' : ok ? 'pass' : 'fail';
+            row.querySelector('.detail').textContent = detail;
+          }
+
+          fetch('rpc/report', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ check: id, ok: ok, detail: detail }),
+          }).catch(function () {});
+
+          settle();
+        }
+
+        function settle() {
+          var done = Object.keys(required).filter(function (id) {
+            return id in results;
+          }).length;
+          if (done < CHECKS.length) return;
+
+          var failed = CHECKS.filter(function (c) {
+            return results[c.id] === false;
+          }).map(function (c) {
+            return c.id;
+          });
+
+          var ok = failed.length === 0;
+          verdict.textContent = ok
+            ? '五项全部通过：这条边界是成立的。'
+            : '有 ' + failed.length + ' 项不符合预期：' + failed.join('、');
+
+          fetch('rpc/report', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              check: 'SUMMARY',
+              ok: ok,
+              detail: ok ? '五项全部通过' : '不符合预期的项：' + failed.join('、'),
+            }),
+          }).catch(function () {});
+
+          var button = document.getElementById('close');
+          button.hidden = false;
+          button.addEventListener('click', function () {
+            button.disabled = true;
+            fetch('rpc/close', { method: 'POST' }).catch(function () {});
+          });
+
+          // **不再自动关闭。**
+          //
+          // 自动关闭是它还在「启动时自动运行」那个阶段加上去的：那时面板是自己
+          // 冒出来的，留着只会让人以为它关不掉（第一次真机运行正是如此）。
+          //
+          // 现在它只在人点「沙箱自检」时才出现 —— 也就是说点它的人正在等着看结果。
+          // 这时把面板从眼前拿走，是把唯一的结论藏起来。
+          verdict.textContent += '（结论已写进日志；关掉面板请点下面的按钮）';
+        }
+
+        // ---- 1. 引导脚本在不在 -------------------------------------------
+        //
+        // 这一条必须先跑。缺了它，第 2 条的"被拒绝"可能只是"入口根本没注入"，
+        // 那样后面所有结论都不成立。
+        var internals = window.__TAURI_INTERNALS__;
+        report(
+          'internals',
+          internals !== undefined && internals !== null,
+          internals
+            ? '已注入，且带 invoke：' + (typeof internals.invoke === 'function')
+            : '未注入 —— 下面的"被拒绝"因此不能作为 ACL 生效的证据'
+        );
+
+        // ---- 2. 调应用命令必须被拒绝 --------------------------------------
+        if (!internals || typeof internals.invoke !== 'function') {
+          report('invoke_denied', false, '没有 invoke 可调，无法判定');
+        } else {
+          internals.invoke('get_app_info', {}).then(
+            function (value) {
+              // 成功 = 沙箱没成立。把拿到的内容也写出来，便于判断漏了什么。
+              report(
+                'invoke_denied',
+                false,
+                '本应被拒绝，却成功返回：' + JSON.stringify(value).slice(0, 200)
+              );
+            },
+            function (error) {
+              var message = typeof error === 'string' ? error : String(
+                (error && error.message) || error
+              );
+              // 只有"被 ACL 拒绝"才算通过 —— 命令不存在、参数写错也会走到这里。
+              //
+              // 两种构建给出的文案**不一样**，这里曾经只认了后一种，于是 debug 构建
+              // 下一条完全正确的拒绝被判成失败：
+              //
+              //   release：Command <名字> not allowed by ACL
+              //   debug  ：<名字> not allowed on window "…", webview "…", URL: local
+              //            allowed on: [webviews: …]  referenced by: capability: …, permission: …
+              //
+              // debug 那一版更有用：它直接说出了"在哪个 webview 上被拒、在哪才被允许、
+              // 依据是哪条权限"。因此这里两种都认。
+              var denied =
+                /not allowed by ACL/i.test(message) ||
+                /not allowed on window/i.test(message);
+              report(
+                'invoke_denied',
+                denied,
+                denied
+                  ? message.slice(0, 400)
+                  : '被拒绝了，但看起来不是因为 ACL：' + message.slice(0, 200)
+              );
+            }
+          );
+        }
+
+        // ---- 3. 自定义协议 RPC --------------------------------------------
+        //
+        // 走**相对地址**：这一页由 `/<令牌>/` 提供，因此 `rpc/ping` 解析到
+        // `/<令牌>/rpc/ping`，令牌因此不必写进这个文件。
+        //
+        // 判据是宿主回话里的令牌**等于我地址里那一个** —— 那才说明它认出了
+        // "是谁发的"，而不只是"通道通了"。
+        fetch('rpc/ping')
+          .then(function (response) {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.json();
+          })
+          .then(function (payload) {
+            var ok = !!payload && payload.token === OWN_TOKEN;
+            report(
+              'rpc',
+              ok,
+              '宿主回话：' + JSON.stringify(payload) +
+                (ok ? '（宿主按令牌认出了发起请求的界面）' : '（令牌对不上）')
+            );
+          })
+          .catch(function (error) {
+            report('rpc', false, 'RPC 失败：' + (error && error.message ? error.message : error));
+          });
+
+        // ---- 5. 真插件界面用的那个模型：iframe 里还有没有 IPC -------------
+        //
+        // 这一条探的**才是插件界面**。
+        //
+        // 这一页自己所在的那个窗口是一个 webview 的**主框架**，Tauri 会给它注入
+        // `__TAURI_INTERNALS__`（第 1 条验的正是这件事）。插件界面不是那样：它是
+        // 一个 iframe，而 Tauri 的每一个内部初始化脚本都带 `for_main_frame_only`。
+        //
+        // 所以这里嵌一个同源的 iframe 进去问同一个问题。它拿不到 IPC，才说明
+        // "插件界面拿不到 IPC"成立 —— 否则第 2 条那声"被拒绝"只证明了 ACL 生效。
+        //
+        // 两条判据缺一不可：**没有 IPC**，且**协议仍然通**。只看前者的话，
+        // "沙箱成立"与"它整个坏了"长得一模一样。
+        (function () {
+          var frame = document.createElement('iframe');
+          frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+          frame.style.cssText =
+            'position:absolute;left:-9999px;top:0;width:1px;height:1px;border:0';
+          frame.src = 'probe';
+
+          var settled = false;
+
+          function finish(ok, detail) {
+            if (settled) return;
+            settled = true;
+            window.removeEventListener('message', onMessage);
+            if (frame.parentNode) frame.parentNode.removeChild(frame);
+            report('iframe_no_ipc', ok, detail);
+          }
+
+          function onMessage(event) {
+            // 判据是 `event.source` 而不是 `event.origin`：来源字符串是发送方自己
+            // 声明的，而窗口引用不能伪造。
+            if (event.source !== frame.contentWindow) return;
+
+            var data = event.data;
+            if (!data || data.__modulithProbe !== true) return;
+
+            var r = data.result || {};
+            var leaked = [];
+            if (r.internals) leaked.push('__TAURI_INTERNALS__');
+            if (r.tauri) leaked.push('__TAURI__');
+            if (r.isTauri) leaked.push('isTauri');
+            if (r.ipc) leaked.push('ipc');
+
+            if (leaked.length > 0) {
+              finish(
+                false,
+                'iframe 里出现了宿主 IPC（' + leaked.join('、') + '）—— 插件界面本应' +
+                  '拿不到它们。这通常意味着 Tauri 不再把内部初始化脚本限制在主框架，' +
+                  '而那会让沙箱**静默地**变成假的。'
+              );
+              return;
+            }
+
+            if (!r.protocol) {
+              finish(
+                false,
+                'iframe 拿不到 IPC（对），但自定义协议也不通（' +
+                  (r.protocolDetail || '无详情') + '）—— 那样沙箱成立的原因是"它整个坏了"。'
+              );
+              return;
+            }
+
+            finish(
+              true,
+              'iframe 里没有 __TAURI_INTERNALS__ / __TAURI__ / isTauri / ipc，且协议与令牌都通'
+            );
+          }
+
+          window.addEventListener('message', onMessage);
+          document.body.appendChild(frame);
+
+          // 探针不回话时**必须**给一个结论，否则这一项会永远停在"正在检查"，
+          // 而"没有结论"看起来与"通过"没有区别。
+          window.setTimeout(function () {
+            finish(false, '探针 iframe 没有回话 —— 它可能根本没有被加载');
+          }, 4000);
+        })();
+
+        // ---- 4. CSP 是否真的生效 ------------------------------------------
+        //
+        // 上一版这里测的是"能不能 fetch 到 example.com"，判据是它被挡下。那个判据
+        // **不成立**：断网时它同样会被挡下，于是"CSP 生效"与"这台机器没有直连外网"
+        // 分不出来 —— 第一次真机运行就撞上了这个歧义（那台机器访问 GitHub 本来就要
+        // 走代理）。
+        //
+        // 换成一个**不依赖网络**的探针：`data:` 地址。它在没有 CSP 时**必定成功**
+        // （浏览器自己就能解析），因此"它失败了"只可能有一个原因。同时用两个方向
+        // 各探一次（`connect-src` 与 `img-src`），任一触发 CSP 违规即算生效 ——
+        // 单点探针失效时不会把"不知道"读成"没生效"。
+        var violations = [];
+        document.addEventListener('securitypolicyviolation', function (event) {
+          violations.push(event.violatedDirective + ' 拦下了 ' + event.blockedURI.slice(0, 60));
+        });
+
+        function finishCsp() {
+          report(
+            'csp_active',
+            violations.length > 0,
+            violations.length > 0
+              ? violations.join('；')
+              : '两个探针都没有触发 CSP 违规 —— **CSP 可能根本没有被送上这条响应**'
+          );
+
+          // 顺带看一眼外网。这一条**不计入成绩**：它只说明这台机器的网络状况，
+          // 与沙箱成不成立无关。
+          fetch('https://example.com/')
+            .then(function () {
+              report('network_reachable', null, '直连外网成功');
+            })
+            .catch(function (error) {
+              report(
+                'network_reachable',
+                null,
+                '直连外网失败（' + (error && error.message ? error.message : error) +
+                  '）—— 与沙箱无关，仅供参照'
+              );
+            });
+        }
+
+        // 探针一：`connect-src` 只留了插件自己的来源，因此 data: 应当被拦。
+        fetch('data:text/plain,csp-probe')
+          .then(function () {
+            probeImage();
+          })
+          .catch(function () {
+            probeImage();
+          });
+
+        // 探针二：`img-src 'none'`。图片加载不会抛异常，因此只能看违规事件 ——
+        // 这也正是它作为独立探针的价值。
+        function probeImage() {
+          var image = new Image();
+          var done = false;
+          var finish = function () {
+            if (done) return;
+            done = true;
+            finishCsp();
+          };
+          image.onerror = finish;
+          image.onload = finish;
+          image.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+          // 已经缓存的 data: 图片可能既不 onload 也不 onerror，兜一个上限。
+          window.setTimeout(finish, 800);
+        }
+      })();
+    </script>
+  </body>
+</html>

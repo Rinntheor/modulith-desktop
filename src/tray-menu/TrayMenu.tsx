@@ -144,33 +144,78 @@ const TrayMenu: React.FC = () => {
    * 后端返回一句失败原因（成功时为空）。失败时**不隐藏菜单** ——
    * 隐藏了用户就看不到出了什么事，只会觉得"点了没用"。
    */
-  const run = useCallback(async (action: TrayAction) => {
-    if (busy) return;
-    setBusy(true);
-    setFailure(null);
-    try {
-      const error = await invoke<string | null>('tray_menu_action', { action });
-      if (error) {
-        setFailure({ action, message: error });
+  const run = useCallback(
+    async (action: TrayAction) => {
+      if (busy) return;
+      setBusy(true);
+      setFailure(null);
+      try {
+        const error = await invoke<string | null>('tray_menu_action', { action });
+        if (error) {
+          setFailure({ action, message: error });
+          window.setTimeout(() => setFailure(null), 1600);
+          return;
+        }
+
+        /*
+         * ============================================================
+         * 动作成功之后**必须自己回读状态**
+         * ============================================================
+         *
+         * 这里曾经什么都不做，理由是"`focus` 事件会刷新"。那条理由漏掉了一个
+         * 具体情况：**切换开关之后菜单并不会关闭**（成功路径不隐藏窗口，
+         * 那是刻意的，好让用户看到结果），于是窗口从头到尾没有失去过焦点，
+         * `focus` 再也不会触发。
+         *
+         * 症状正是用户报的那一条：在托盘里点「关闭窗口时最小化到托盘」，
+         * **没有任何反馈** —— 圆点不变、副标题不变，用户根本不知道它是开了还是关了。
+         *
+         * 因此凡是会改状态的动作，成功后自己刷新一次。这样"看到的"永远等于
+         * "后端里的"，不依赖任何时序。
+         */
+        if (action === 'toggle_close_to_tray') {
+          await refresh();
+        }
+
+        // 其余动作成功后**不主动隐藏**：后端在处理它们时会隐藏这个窗口
+        // （例如"显示主窗口"会顺带把它收起来）。在这里再隐藏一次是重复的，
+        // 而且会让"点了设置但设置没打开"这类错误更难发现。
+      } catch (error) {
+        setFailure({ action, message: typeof error === 'string' ? error : String(error) });
         window.setTimeout(() => setFailure(null), 1600);
+      } finally {
+        setBusy(false);
       }
-      // 成功时**不主动隐藏**：后端在处理这个动作时会隐藏这个窗口
-      // （例如"显示主窗口"会顺带把它收起来）。在这里再隐藏一次是重复的，
-      // 而且会让"点了设置但设置没打开"这类错误更难发现。
-    } catch (error) {
-      setFailure({ action, message: typeof error === 'string' ? error : String(error) });
-      window.setTimeout(() => setFailure(null), 1600);
-    } finally {
-      setBusy(false);
-    }
-  }, [busy]);
+    },
+    [busy, refresh]
+  );
 
   const closeToTray = state?.closeToTray ?? false;
   const trayAvailable = state?.trayAvailable ?? false;
 
   return (
-    /* 外框留出投影空间；窗口本身是透明的，圆角由这一层画 */
-    <div className="h-full w-full p-1.5">
+    /*
+     * ============================================================
+     * 没有外框内边距，也**没有投影**
+     * ============================================================
+     *
+     * 这里原来是 `p-1.5` 加容器上的 `shadow-2xl`，本意是"给投影留出空间"。
+     * 那个做法在这个窗口里**不可能成立**：
+     *
+     *   * 窗口是 `transparent: true` + `shadow: false`，尺寸是**固定**的
+     *     （`tauri.conf.json` 里写死），前端改不了；
+     *   * 而 `shadow-2xl` 的模糊半径是 25px，远大于留下的 6px。
+     *
+     * 于是投影的绝大部分被窗口边界裁掉，剩下的一小圈在浅色背景上看起来像
+     * 一条脏边 —— 用户的原话是"阴影超出了窗口尺寸，被裁切"。**一个画不完整的
+     * 投影比没有投影更难解释**，因此直接去掉：外层不再留边距，圆角与边框由
+     * 容器自己画到边上。
+     *
+     * 代价是菜单没有悬浮感。要让投影成立得把窗口开大一圈并让投影落在窗口内，
+     * 而那需要窗口尺寸随内容变化 —— 这个窗口的尺寸是配置里写死的，
+     * 不在这一轮的范围里。
+     */
+    <div className="h-full w-full">
       {/*
         ============================================================
         颜色只用**普通**工具类，不写 `dark:` 变体
@@ -189,7 +234,7 @@ const TrayMenu: React.FC = () => {
         ============================================================
       */}
       <div
-        className="h-full w-full rounded-xl border border-gray-200 bg-white/95 shadow-2xl backdrop-blur-md
+        className="h-full w-full rounded-xl border border-gray-200 bg-white/95 backdrop-blur-md
                    menu-enter overflow-hidden flex flex-col"
         role="menu"
         aria-label="Modulith Desktop 菜单"

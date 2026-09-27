@@ -49,6 +49,49 @@ export interface ModuleDescriptor {
    * 因此把结果固化到描述符里，渲染端保持纯同步。
    */
   iconSvg?: string;
+  /**
+   * 这个模块的界面跑在一个**跨源 iframe** 里（插件清单写了 `runtime: "sandboxed"`）。
+   *
+   * 有它时 `component` 不再被渲染 —— `ModuleRenderer` 改为渲染 `SandboxSurface`，
+   * 由它向宿主换一个令牌，再把 `<iframe>` 挂出来。
+   *
+   * 为什么不干脆不给 `component`：描述符的形状保持统一，调用方少一堆分支；
+   * 而且旧式插件仍走 `component` 那条路，两者要能共存。
+   */
+  sandboxed?: boolean;
+  /**
+   * 这个沙箱模块对应插件清单里的**哪一个界面**（`contributes.surfaces[].id`）。
+   *
+   * 缺省是主界面。`SandboxSurface` 靠它决定向宿主开口要**哪一块界面**的令牌 ——
+   * 少了它，同一插件的两个界面会去要同一个主界面，于是"详情"页显示的是列表。
+   */
+  surface?: string;
+  /**
+   * **不进任何模块列表**，但可以被按 id 打开。
+   *
+   * 用途只有一个：插件用 `ctx.ui.openSurface('detail')` 打开的次级界面。
+   * 它们必须能开成标签（那正是"宿主决定位置"的实现），但**不该**出现在侧边栏、
+   * 仪表盘或命令面板里 —— 用户没有从那里打开它们的入口，而列出来会让人以为
+   * 那是一堆独立的模块。
+   *
+   * 与 `visible: false` 的区别是刻意的：`visible: false` 仍然收进「隐藏模块」
+   * 面板（用户能找到并固定出来），而 `hidden` 连那里都不进。
+   */
+  hidden?: boolean;
+  /**
+   * 徽标的语气（`ctx.ui.badge` 的 `tone`）。
+   *
+   * 只用来选一组颜色类名，**不参与任何判定** —— 它是插件的一句自我描述。
+   * 白名单在 Rust 那一侧；这里认不出来的值一律按 `info` 渲染。
+   */
+  badgeTone?: string;
+  /**
+   * 进度（`ctx.ui.progress`）。`undefined` = 没有进度。
+   *
+   * `value` 为 `null` 表示**不定量**（转圈），而不是"0"。两者在界面上完全不同，
+   * 折成同一个值会让"我在忙"要么一直显示、要么从来不显示。
+   */
+  progress?: { value: number | null; label?: string };
 }
 
 export interface ModuleTomlChild {

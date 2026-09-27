@@ -21,7 +21,7 @@ use super::store::{
     self, Notification, NotificationCategory, NotificationLevel, MAX_STORED_NOTIFICATIONS,
 };
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 
 /// 通知列表发生变化时广播的事件名。
 ///
@@ -151,7 +151,7 @@ pub fn summarize(list: &[Notification]) -> NotificationSummary {
 ///
 /// `pub` 是给 `desktop::events` 用的：后台提醒到点时会直接改动这份状态，
 /// 而它必须走**同一条**广播路径 —— 各写一份 emit 迟早会漏掉一处。
-pub fn broadcast_changed(app: &AppHandle) {
+pub fn broadcast_changed<R: Runtime>(app: &AppHandle<R>) {
     if let Err(error) = app.emit(NOTIFICATIONS_CHANGED_EVENT, ()) {
         log::debug!("广播通知变化事件失败（不影响数据本身）：{error}");
     }
@@ -176,6 +176,22 @@ pub fn push_notification(
     state: State<'_, NotificationsState>,
     input: PushNotificationInput,
 ) -> Result<Vec<Notification>, String> {
+    push(&app, state.inner(), input)
+}
+
+/// 推送的**实现**，与命令壳分开。
+///
+/// 分开的理由是沙箱插件也需要它：插件界面里没有 Tauri IPC（零 capability），
+/// 它发的每一条请求都由宿主的协议处理器代为执行。那条路径拿不到 `State<_>`，
+/// 只能拿到 `AppHandle`，因此真正干活的部分必须接受 `&NotificationsState`。
+///
+/// 这个函数是**所有非界面来源**推送通知的唯一入口，因此"来源"字段与广播
+/// 行为只有一处定义 —— 复制一份到沙箱那边去，两边迟早会不一致。
+pub fn push<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &NotificationsState,
+    input: PushNotificationInput,
+) -> Result<Vec<Notification>, String> {
     let incoming = store::sanitize(
         &input.title,
         &input.body,
@@ -186,13 +202,13 @@ pub fn push_notification(
     )?;
 
     let snapshot = {
-        let mut list = state.inner().0.lock().map_err(|e| e.to_string())?;
+        let mut list = state.0.lock().map_err(|e| e.to_string())?;
         store::insert(&mut list, incoming);
-        store::save(&app, &list)?;
+        store::save(app, &list)?;
         list.clone()
     };
 
-    broadcast_changed(&app);
+    broadcast_changed(app);
     Ok(snapshot)
 }
 

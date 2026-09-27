@@ -630,8 +630,15 @@ check(
   '浮层与提示音在同一个函数里成对出现'
 );
 check(
-  (notifications.match(/presentNotification\(/g) ?? []).length === 3,
-  '两处调用点 + 一处定义（新增调用点必须落在 silent / willMerge 的早退之后）'
+  (notifications.match(/presentNotification\(/g) ?? []).length === 4,
+  // 1 处定义 + 3 处调用：`pushNotification` 里的两条（落盘失败仍弹、正常推送）
+  // 与 `loadNotifications` 里的一处（**后端产生的通知**，例如插件推的）。
+  //
+  // 第三处调用点是补上的，它对应一次真实故障：插件通知只进了列表、没有提醒也
+  // 没有提示音。新增调用点时**必须**确认它落在各自那条路的早退之后 ——
+  // `pushNotification` 那条要求过了 `silent` / `willMerge`，`loadNotifications`
+  // 那条要求过了 `hadLoadedOnce`（否则启动时会把历史未读一起弹一遍）。
+  '一处定义 + 三处调用点（新增的必须落在各自那条路的早退之后）'
 );
 
 check(

@@ -35,21 +35,26 @@ import { DRAWER_ENTER, DRAWER_EXIT } from '../../utils/motionCurves';
 import Markdown from '../../components/Markdown';
 import { getPermissionDescriptor, type PermissionRisk } from '../../services/permissionRegistry';
 import {
+  installGate,
   installMarketVersion,
+  isSandboxConfirmed,
   latestVersionOf,
   loadIndex,
   loadMarketIcon,
   loadReadme,
   marketPluginShape,
+  marketVersionIsolation,
   planUpdate,
   updateStateFor,
   type MarketIconResult,
   type MarketIndex,
   type MarketPlugin,
+  type MarketVersion,
   type UpdatePlan,
   type UpdateState,
 } from '../../services/pluginMarket';
 import { reloadPluginRuntime, subscribePlugins, getPluginContract } from '../../services/pluginRuntime';
+import { getCachedSettings, subscribeSettings } from '../../services/appSettings';
 import { getPluginModuleIds } from '../../services/moduleCatalog';
 import {
   SHAPE_HINTS,
@@ -100,6 +105,40 @@ const PermissionChips: React.FC<{ permissions: string[]; max?: number }> = ({
         </span>
       )}
     </div>
+  );
+};
+
+/**
+ * 隔离徽章。卡片与详情抽屉共用。
+ *
+ * ============================================================
+ * 为什么它必须出现在**市场**里，而不是只在装完之后
+ * ============================================================
+ *
+ * 用户判断"这个插件会不会碰我的东西"的时机只有**安装之前**。装完再在详情页里
+ * 看到"未隔离"，那时已经来不及了 —— 而"卸载"并不能撤销一次已经发生过的越权。
+ *
+ * ============================================================
+ * 为什么三档都要显示
+ * ============================================================
+ *
+ * `未隔离`和`隔离状态未知`两档显然要显示。`已隔离`同样要 —— 它是这个插件系统
+ * 最值得被看见的一件事，而"看不见"的后果是用户以为所有插件都一样危险，
+ * 于是那个徽章存在的意义（让人愿意装）也就没了。
+ *
+ * 第三档（未知）的说辞刻意不写成"未隔离"：那是在冤枉一个老老实实写了
+ * `sandboxed`、只是索引还没更新的插件。它有自己的说法，见
+ * `marketVersionIsolation`。
+ */
+const IsolationBadge: React.FC<{ version: MarketVersion }> = ({ version }) => {
+  const isolation = marketVersionIsolation(version);
+  return (
+    <span
+      title={isolation.detail}
+      className={`px-1.5 py-0.5 text-[10px] font-medium rounded border ${isolation.tone}`}
+    >
+      {isolation.label}
+    </span>
   );
 };
 
@@ -171,6 +210,11 @@ const InstallConfirm: React.FC<{
 }> = ({ plugin, plan, busy, onCancel, onConfirm }) => {
   const version = plan?.version ?? latestVersionOf(plugin);
 
+  // 这个版本有没有隔离。**这是这次确认里最重的一件事**（比权限列表更重）：
+  // 权限列表只对隔离的插件有约束力。
+  const isolation = marketVersionIsolation(version);
+  const isolated = isSandboxConfirmed(version);
+
   // 更新时只关心**新增**的权限：既有的那些用户已经同意过了，把它们一并算进"需要注意"
   // 只会稀释真正新增的那几项 —— 而那个判断正是这次确认要用户做的。
   const noteworthy = plan ? plan.added : version.permissions;
@@ -193,11 +237,70 @@ const InstallConfirm: React.FC<{
           <p className="mt-1 text-xs text-gray-500">
             {plan?.downgrade
               ? '这是退回到更旧的版本 —— 本机当前版本比仓库里的更新。'
-              : '插件代码会以本应用的权限运行，能访问这台机器上的东西。'}
+              : isolated
+                ? '插件代码会跑在自己的来源里，拿不到宿主的能力 —— 它只能通过你下面看到的这些权限工作。'
+                : '插件代码会以本应用的权限运行，能访问这台机器上的东西。'}
           </p>
         </div>
 
         <div className="px-5 py-4 max-h-80 overflow-y-auto">
+          {/*
+            未隔离 / 隔离状态未知时的提示。**排在权限列表之前**，因为它是更靠前的
+            一件事：权限列表只对隔离的插件构成约束，而对未隔离插件，那下面的每一个
+            勾选都不代表它做不到什么。
+          */}
+          {!isolated && (
+            <div
+              className={`mb-4 rounded-lg border px-3 py-2 ${
+                isolation.kind === 'in-process'
+                  ? 'border-red-300 bg-red-50'
+                  : 'border-amber-300 bg-amber-50'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <ShieldAlert
+                  className={`w-4 h-4 shrink-0 ${
+                    isolation.kind === 'in-process' ? 'text-red-600' : 'text-amber-600'
+                  }`}
+                />
+                <span
+                  className={`text-xs font-medium ${
+                    isolation.kind === 'in-process' ? 'text-red-900' : 'text-amber-900'
+                  }`}
+                >
+                  {isolation.label}
+                </span>
+              </div>
+              <p
+                className={`mt-1.5 text-[11px] leading-relaxed ${
+                  isolation.kind === 'in-process' ? 'text-red-800' : 'text-amber-800'
+                }`}
+              >
+                {isolation.detail}
+              </p>
+              {/*
+                接下来那句必须与**这个版本到底属于哪一档**对上。
+
+                `in-process` 是已经判定了的：装上去之后沙箱对这个插件就不存在了，
+                而这件事在界面上不会留下任何痕迹 —— 所以这句话是用户唯一会被告知
+                自己放弃了什么的地方。
+
+                `unknown` 则是"宿主还不知道"。这时说"沙箱不存在"是在编：
+                那份包可能明明写着 `sandboxed`（而这在旧索引里是常态）。
+                正确的话是"下一步会发生什么" —— 宿主会在写盘之前读包内清单，
+                不是沙箱插件就拒绝，拒绝的原因会带着下一步一起给出来。
+              */}
+              <p
+                className={`mt-1.5 text-[11px] leading-relaxed ${
+                  isolation.kind === 'in-process' ? 'text-red-800' : 'text-amber-800'
+                }`}
+              >
+                {isolation.kind === 'in-process'
+                  ? '装上去之后，这套沙箱对这个插件就不存在了。权限列表仍然会显示，但它约束不了它。'
+                  : '宿主会在写入磁盘之前打开这个包、读它的清单来核实 —— 不是沙箱插件的话，安装会被拒绝并说明原因。先点市场的「刷新」通常也值得一试。'}
+              </p>
+            </div>
+          )}
           {plan && plan.added.length > 0 && (
             <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
               <div className="text-xs font-medium text-amber-900">
@@ -381,6 +484,9 @@ const MarketDetailDrawer: React.FC<{
   onAction: () => void;
 }> = ({ plugin, state, onClose, onAction }) => {
   const version = useMemo(() => latestVersionOf(plugin), [plugin]);
+  // 安装策略判定。**不与卡片各判一遍**：同一个插件在两处说不同的话，
+  // 用户会以为它们是两件事。
+  const gate = installGate(version);
   const [readme, setReadme] = useState<'loading' | string | null>('loading');
 
   useEffect(() => {
@@ -422,6 +528,7 @@ const MarketDetailDrawer: React.FC<{
                   v{version.version}
                 </span>
                 <StateBadge state={state} />
+                <IsolationBadge version={version} />
               </div>
               <p className="text-xs text-gray-500 mt-0.5 font-mono truncate">{plugin.id}</p>
             </div>
@@ -443,13 +550,23 @@ const MarketDetailDrawer: React.FC<{
                 更新。这里也不提供更新：那会把它换成安装目录里的副本，丢掉开发链接。
               </p>
             ) : (
+              /*
+                与列表卡片同一个判据、同一套文案：同一个插件在两个地方说不同的话，
+                用户会以为它们是两件事。被拦下时按钮仍然是可点的 —— 点下去给出的
+                是完整原因与下一步，比一个灰按钮有用。
+              */
               <button
                 type="button"
                 onClick={onAction}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-900 text-white hover:bg-gray-800"
+                title={gate.allowed ? undefined : gate.reason}
+                className={
+                  gate.allowed
+                    ? 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-900 text-white hover:bg-gray-800'
+                    : 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100'
+                }
               >
                 <Download className="w-3.5 h-3.5" />
-                {actionLabel(state)}
+                {gate.allowed ? actionLabel(state) : '不允许安装'}
               </button>
             )}
             {plugin.source && (
@@ -471,6 +588,27 @@ const MarketDetailDrawer: React.FC<{
           {plugin.summary && (
             <p className="text-xs leading-relaxed text-gray-600">{plugin.summary}</p>
           )}
+
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+              <ShieldAlert className="w-3.5 h-3.5" />
+              隔离
+            </h3>
+            {/*
+              这一节排在权限之前，顺序是刻意的：权限列表只对隔离的插件有约束力。
+              把"未隔离"写在权限下面，读起来像一句补充说明；写在上面，它才是前提。
+            */}
+            <div
+              className={`rounded-lg border px-3 py-2 ${marketVersionIsolation(version).tone}`}
+            >
+              <div className="text-xs font-medium">
+                {marketVersionIsolation(version).label}
+              </div>
+              <div className="mt-0.5 text-[11px] leading-relaxed">
+                {marketVersionIsolation(version).detail}
+              </div>
+            </div>
+          </section>
 
           <section>
             <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
@@ -521,7 +659,11 @@ const MarketDetailDrawer: React.FC<{
             <div className="rounded-xl border border-gray-100 divide-y divide-gray-100">
               <DetailRow label="版本" value={version.version} mono />
               <DetailRow label="仓库 tag" value={version.tag} mono />
-              <DetailRow label="需要宿主" value={version.engines.loopcore} mono />
+              <DetailRow
+                label="需要宿主"
+                value={version.engines.modulith ?? '未声明'}
+                mono={version.engines.modulith !== null}
+              />
               <DetailRow label="包体积" value={formatBytes(version.package.size)} />
               <DetailRow label="SHA-256" value={version.package.sha256} mono />
               <DetailRow label="作者" value={plugin.author.name || '未知作者'} />
@@ -587,6 +729,25 @@ const PluginMarket: React.FC = () => {
   const [installedTick, setInstalledTick] = useState(0);
 
   useEffect(() => subscribePlugins(() => setInstalledTick((n) => n + 1)), []);
+
+  /**
+   * 安装策略开关的**实时镜像**。
+   *
+   * 必须订阅而不是读一次：用户完全可能在这个页面开着的时候切到「设置 → 插件」
+   * 打开那个开关再切回来（同一个设置对话框，两个分页）。读一次的话，他会看到
+   * 一个"我明明刚打开"却仍然不让装的界面 —— 而那种表现会被归因到插件本身上。
+   *
+   * 初值取缓存（而不是 `false`）：设置是后台加载的，市场可能先渲染出来。
+   * 缓存里没有时（还没加载完）`getCachedSettings()` 给的是默认值，也就是"关"，
+   * 与真实默认一致，不会出现一个先亮后灰的闪动。
+   */
+  const [allowUnsandboxed, setAllowUnsandboxed] = useState(
+    () => getCachedSettings().allowUnsandboxedPlugins
+  );
+  useEffect(
+    () => subscribeSettings(() => setAllowUnsandboxed(getCachedSettings().allowUnsandboxedPlugins)),
+    []
+  );
 
   const refresh = useCallback(async (force: boolean) => {
     setStatus('loading');
@@ -761,9 +922,32 @@ const PluginMarket: React.FC = () => {
    *
    * 只有**首次安装**和**新增了中/高风险权限的更新**需要确认。权限变少、不变、或只新增
    * 低风险权限时直接装，结果写进提示里（见 performInstall）。
+   *
+   * ============================================================
+   * 安装策略先于其它一切判断
+   * ============================================================
+   *
+   * 被策略拦下的版本**不打开确认对话框**：那会给出一个"再确认一次就能装"的错觉，
+   * 而这里拒绝的是安装这个动作本身。正确的下一步是去设置里打开那道开关，因此
+   * 这里把原因当成一条**可见的提示**给出来（而不是静默把按钮灰掉 —— 灰按钮
+   * 只会让人以为插件坏了，而 `title` 提示在触屏上根本不出现）。
+   *
+   * 这一层只是体验：真正的强制在 Rust（`check_install_policy`），那一个是四条
+   * 安装路径唯一的汇合点，也覆盖"绕过市场直接调命令"。前端判一次是为了让用户
+   * 不必撞上那个错误才知道原因，不是因为它可信 —— in-process 插件与宿主共享
+   * 上下文，前端本来就拦不住它。
    */
   const requestAction = useCallback(
     (plugin: MarketPlugin) => {
+      const version = latestVersionOf(plugin);
+
+      const gate = installGate(version);
+      if (!gate.allowed) {
+        setPending(null);
+        setNotice({ kind: 'err', text: `${plugin.displayName}：${gate.reason}` });
+        return;
+      }
+
       const plan = planUpdate(plugin);
       if (plan && !plan.needsConfirmation) {
         void performInstall(plugin, plan);
@@ -774,6 +958,26 @@ const PluginMarket: React.FC = () => {
     },
     [performInstall]
   );
+
+  /**
+   * 索引里有多少个插件的**最新版本**明确写着未隔离，而设置关着。
+   *
+   * 只在"设置关着"时才有意义 —— 那时它就是"这些现在装不了"的条数，而这句话
+   * 必须出现在列表上方：分散在十几张卡片上的一句"不允许安装"很难让人意识到
+   * **现在一个都装不了**，而那正是最该被立刻看出来的事。
+   *
+   * 只数**明确未隔离**的那些：`runtime` 缺失（索引旧了）的插件是放行到后端判的
+   * （见 `installGate`），把它们也算进来会让横幅说出"这些不允许安装"，
+   * 而实际上它们大多装得上 —— 那就从提示变成了误导。
+   *
+   * 单独成一个计数而不是直接过滤列表：过滤会让这些插件**消失**，而"少了一个
+   * 插件"是最难被发现的一种失败。它们必须在场，只是装不了。
+   */
+  const blockedCount = useMemo(() => {
+    if (allowUnsandboxed) return 0;
+    return (index?.plugins ?? []).filter((plugin) => !installGate(latestVersionOf(plugin)).allowed)
+      .length;
+  }, [index, allowUnsandboxed]);
 
   return (
     <div className="px-6 py-5">
@@ -861,6 +1065,32 @@ const PluginMarket: React.FC = () => {
       {/* 筛选 */}
       {status === 'ready' && index && (
         <>
+          {/*
+            安装策略的横幅。**只在真的有插件装不了时出现** —— 常态下（索引完整、
+            插件都写了 sandboxed）它一个字都不显示，因为那时它只是噪音。
+
+            它存在的原因是那个最容易被误读的状态：整份索引都没有隔离信息
+            （索引比插件仓库旧）。那时每一张卡片上各有一句"隔离状态未知"，
+            用户很难从中读出"一个都装不了"，反而更可能以为市场坏了。
+          */}
+          {blockedCount > 0 && (
+            <div className="mt-5 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+              <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-amber-900">
+                  {blockedCount} 个插件当前不允许安装
+                </p>
+                <p className="mt-1 text-[11px] leading-relaxed text-amber-800">
+                  它们的这个版本<b>没有隔离</b> —— 与宿主跑在同一个上下文里，
+                  权限列表约束不了它，因此宿主默认不放行。
+                  <br />
+                  要安装它们，请到
+                  <span className="mx-0.5 font-medium">设置 → 插件</span>
+                  里打开「允许安装未隔离插件」。已经装上的插件不受这个设置影响。
+                </p>
+              </div>
+            </div>
+          )}
           {/*
             形态：**由清单派生**，因此它是可信的。
             与下面那行的「分类」刻意分成两块 —— 后者是作者自填的浏览分类，
@@ -969,6 +1199,10 @@ const PluginMarket: React.FC = () => {
                 const version = latestVersionOf(plugin);
                 const state = states.get(plugin.id) ?? { kind: 'not-installed' as const };
                 const busy = busyId === plugin.id;
+                // 策略判定在这里算一次，卡片上的徽章、按钮文案与提示同源 ——
+                // 分几处各判一遍，会出现"标着未隔离但按钮写着安装"这种自相矛盾的卡片。
+                const gate = installGate(version);
+                const blocked = !gate.allowed;
 
                 return (
                   <div
@@ -988,6 +1222,7 @@ const PluginMarket: React.FC = () => {
                         </button>
                         <span className="text-[11px] text-gray-400">{version.version}</span>
                         <StateBadge state={state} />
+                        <IsolationBadge version={version} />
                         {plugin.source && (
                           <span
                             className="px-1.5 py-0.5 text-[10px] rounded border border-gray-200 text-gray-500"
@@ -1005,7 +1240,7 @@ const PluginMarket: React.FC = () => {
                       <div className="mt-2 flex items-center gap-3 flex-wrap">
                         <PermissionChips permissions={version.permissions} max={5} />
                         <span className="text-[11px] text-gray-400">
-                          需要宿主 {version.engines.loopcore}
+                          需要宿主 {version.engines.modulith ?? '未声明'}
                         </span>
                       </div>
 
@@ -1053,19 +1288,34 @@ const PluginMarket: React.FC = () => {
                           源码
                         </button>
                       )}
+                      {/*
+                        被策略拦下时按钮**不灰掉**，而是换成一句"不允许安装"。
+                        灰按钮只给出一个"不能点"的事实，用户唯一能做的是猜；而这个
+                        按钮点下去会给出完整原因与下一步（见 requestAction）。
+                        文案也必须换：仍然写着「安装」的按钮点下去弹一句拒绝，
+                        看起来像安装失败了，而实际上它压根没被允许开始。
+                      */}
                       <button
                         type="button"
                         disabled={busy || busyId !== null || state.kind === 'dev-linked'}
                         onClick={() => requestAction(plugin)}
                         title={
-                          state.kind === 'dev-linked'
-                            ? '该插件是开发链接，改完源码点刷新即生效，不需要从市场更新'
-                            : undefined
+                          blocked
+                            ? gate.reason
+                            : state.kind === 'dev-linked'
+                              ? '该插件是开发链接，改完源码点刷新即生效，不需要从市场更新'
+                              : gate.deferred
+                                ? '安装时宿主会读取包内清单核实它的隔离状态；不是沙箱插件的话会被拒绝'
+                                : undefined
                         }
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
+                        className={
+                          blocked
+                            ? 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 disabled:opacity-50'
+                            : 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50'
+                        }
                       >
                         <Download className="w-3.5 h-3.5" />
-                        {busy ? '处理中…' : actionLabel(state)}
+                        {busy ? '处理中…' : blocked ? '不允许安装' : actionLabel(state)}
                       </button>
                     </div>
                   </div>

@@ -29,6 +29,13 @@ import {
   getPluginModuleIds,
 } from './moduleCatalog';
 import type { ModuleDescriptor } from '../types/module';
+import {
+  clearSurfaceModules,
+  fetchDeclaredSurfaces,
+  registerSurfaceModules,
+  unregisterSurfaceModules,
+} from './pluginSurfaces';
+import { clearPluginUiState } from './pluginUiState';
 import type {
   ActivationEvent,
   CommandContribution,
@@ -94,7 +101,7 @@ let resolvedVersion = MODULITH_VERSION;
  *
  * 后端返回的是 `env!("CARGO_PKG_VERSION")`，与插件校验器
  * `validator.rs` 使用的版本源完全相同，因此前端显示、插件读取到的
- * `window.Modulith.version`、以及 `engines.loopcore` 的校验基准
+ * `window.Modulith.version`、以及 `engines.modulith` 的校验基准
  * 三者不可能出现不一致。
  *
  * 失败时静默保留兜底值 —— 版本号显示不该让应用启动失败。
@@ -137,7 +144,7 @@ export interface PluginRepository {
 }
 
 export interface PluginEngines {
-  loopcore: string;
+  modulith: string;
 }
 
 export interface PluginManifest {
@@ -157,6 +164,13 @@ export interface PluginManifest {
   icon?: string;
   iconSvg?: string;
   permissions?: string[];
+  /**
+   * 代码跑在哪里。**必须跟着后端走**（`types.rs` 的 `PluginRuntime`）：
+   * 缺省 `in-process`，写了 `sandboxed` 的插件跑在自己的 webview 里。
+   *
+   * 未知取值后端会让整份清单不合法，因此这里只可能是这两个字符串之一。
+   */
+  runtime?: 'in-process' | 'sandboxed';
   activationEvents?: string[];
   contributes?: unknown;
   preview?: boolean;
@@ -208,7 +222,7 @@ export interface InstalledPlugin {
   /**
    * 引擎范围不匹配时的提示。
    *
-   * 注意它**不表示插件不可用**：`engines.loopcore` 在 0.x 阶段很脆弱
+   * 注意它**不表示插件不可用**：`engines.modulith` 在 0.x 阶段很脆弱
    * （`^0.2.0` 等价于 `>=0.2.0 <0.3.0`，宿主升一个小版本就会不匹配）；
    * 1.0 之后 caret 语义恢复正常，但提示机制保留 ——
    * 因此后端只把它当提示，不阻止安装与加载。界面应当照此表述，
@@ -497,6 +511,13 @@ function buildDeclaredModuleDescriptor(
     children: undefined,
     pluginId,
     iconSvg: resolveInlineIconSvg(pluginId, plugin.manifest),
+    // 清单说它跑在自己的 iframe 里。渲染端据此换成 `SandboxSurface`，
+    // 由它向宿主换令牌并挂出 `<iframe>`。
+    sandboxed: plugin.manifest.runtime === 'sandboxed',
+    // 这个模块打开的是哪一个界面。缺省是主界面 —— 单界面插件因此不必写它，
+    // 而多界面插件写错一个名字时宿主会在 `open_surface` 里拒绝并说清
+    // "清单里没有这个界面"，而不是签出一块服务 404 的令牌。
+    surface: contribution.surface,
   };
 }
 
@@ -525,6 +546,10 @@ function buildRuntimeModuleDescriptor(
     // 内联 SVG 随描述符一起传给渲染层。渲染图标是同步路径，
     // 若等到渲染时再 invoke 读取就会先出现一帧空框，因此在这里取好。
     iconSvg: resolveInlineIconSvg(pluginId, manifest),
+    // 走到这个函数意味着**插件的代码已经在宿主这个 realm 里跑起来了**，
+    // 并且同步调用了 `registerModule`。因此它在定义上就是 in-process ——
+    // 不看清单：一个声明了 sandboxed 的插件根本不会走到这里。
+    sandboxed: false,
   };
 }
 
@@ -681,6 +706,79 @@ export async function runPluginContextMenuEntry(entry: PluginContextMenuEntry): 
 
   await activatePlugin(entry.pluginId, activationEventForContextMenu(menu.id));
   await runPluginCommand(entry.pluginId, menu.command);
+}
+
+/**
+ * 宿主把一条命令交给 **in-process** 插件执行时走这里。
+ *
+ * ============================================================
+ * 为什么这件事需要一个 Tauri 事件，而不是宿主直接调
+ * ============================================================
+ *
+ * 触发点可能在 Rust 那边：`ctx.ui.contextMenu` 里选中了一条**清单声明**的条目时，
+ * 浮层是由宿主显示并等待回答的（`desktop/overlay.rs`），所以"有人选了哪一条"
+ * 只有 Rust 知道。而 in-process 插件的命令处理器是宿主这个 realm 里的一个函数 ——
+ * Rust 碰不到它。
+ *
+ * 因此 Rust 广播一个事件，这里把它落成一次 `runPluginCommand`。
+ * 沙箱插件**不走这条路**：它的命令由宿主直接推进它的界面
+ * （见 `sandbox.rs::deliver_command`）—— 那条路径更短，而且不需要前端参与。
+ */
+export const PLUGIN_COMMAND = 'modulith://plugin-command';
+
+interface PluginCommandRequest {
+  pluginId: string;
+  command: string;
+}
+
+/**
+ * 装上"宿主请求执行某条插件命令"的监听。返回退订函数。
+ *
+ * 失败只记一条警告：这条通道只服务 in-process 插件的右键菜单项，
+ * 它不可用不该让启动路径抛异常。
+ */
+export function installPluginCommandDispatch(): () => void {
+  let disposed = false;
+  let stop: (() => void) | null = null;
+
+  void (async () => {
+    try {
+      const { listen } = await import('@tauri-apps/api/event');
+      const off = await listen<PluginCommandRequest>(PLUGIN_COMMAND, (event) => {
+        const payload = event.payload;
+        if (!payload?.pluginId || !payload.command) return;
+
+        // 不 await：事件回调不该被一次慢的插件初始化钉住，而且失败了也没有
+        // 人能等它。失败必须自己变成可见的东西 —— 否则用户看到的是"点了没反应"。
+        void runPluginCommand(payload.pluginId, payload.command).catch(async (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(
+            `[pluginRuntime] 插件 "${payload.pluginId}" 的命令 "${payload.command}" 执行失败:`,
+            error
+          );
+          await pushNotification({
+            title: `插件命令执行失败：${payload.command}`,
+            body: message,
+            level: 'error',
+            source: payload.pluginId,
+          }).catch(() => {});
+        });
+      });
+
+      if (disposed) {
+        off();
+        return;
+      }
+      stop = off;
+    } catch (error) {
+      console.warn('[pluginRuntime] 无法订阅插件命令广播（右键菜单项将不可用）:', error);
+    }
+  })();
+
+  return () => {
+    disposed = true;
+    stop?.();
+  };
 }
 
 function notify(): void {
@@ -877,6 +975,128 @@ function pluginHttp(pluginId: string) {
     put: (url: string, data?: unknown, init?: RequestInit) =>
       request('PUT', url, { ...normalize(init), body: data === undefined ? undefined : JSON.stringify(data) }),
     delete: (url: string, init?: RequestInit) => request('DELETE', url, normalize(init)),
+
+    /**
+     * 把一个文件**直接下到数据目录**，不经过 JS 内存。
+     *
+     * 与沙箱桥接层**同名同形**（这是"同一个插件能切换运行位置"的全部依据）。
+     * 与 `dataDir` 的分工：`dataDir.write` 拿的是**一整块字节**，用它接几百 MB 的
+     * 下载等于要求调用方先把整份内容放进内存 —— 而那正是这个接口存在的理由。
+     *
+     * 目标路径的上级目录必须已经存在（与 `dataDir.write` 同一条规则）。
+     * 失败时目标文件不会出现，也不会留下一个被截断的版本。
+     */
+    download: (
+      url: string,
+      rel: string,
+      onProgress?: (progress: DownloadProgress) => void,
+      options?: { headers?: Record<string, string> }
+    ) => pluginHttpDownload(pluginId, url, rel, onProgress, options),
+  };
+}
+
+// ============================================================
+// `ctx.http.download` 的进度通道
+// ============================================================
+//
+// 沙箱插件那一条走"宿主推一段脚本进它的 webview"（回调在另一个 realm 里）。
+// in-process 插件的回调就在**宿主这个 realm** —— 因此前端接住一条 Tauri 事件，
+// 按 `(插件, 相对路径)` 找到处理函数，直接调它。
+//
+// 宿主两条都推（它并不知道这次下载是哪个形态发起的），因此这里**找不到处理函数
+// 就什么都不做**：沙箱插件的进度已经在它自己的文档里处理过了。
+
+/** 一条下载进度 */
+export interface DownloadProgress {
+  rel: string;
+  received: number;
+  /** `null` = 服务器没给 `Content-Length`（分块传输） */
+  total: number | null;
+}
+
+/** 宿主广播下载进度时的事件名（与 `rpc.rs::DOWNLOAD_PROGRESS` 逐字一致） */
+export const DOWNLOAD_PROGRESS = 'modulith://plugin-download-progress';
+
+/** `插件 id + 相对路径` → 进度处理函数 */
+const downloadHandlers = new Map<string, (progress: DownloadProgress) => void>();
+
+function downloadKey(pluginId: string, rel: string): string {
+  // 用 NUL 分隔：插件 id 里不可能有它（清单规则限制在字母数字与 `._-`），
+  // 而拼接用的分隔符如果可能与 id 或路径撞上，就会出现"两个不同的下载共用
+  // 一个处理器"—— 而那是静默的。
+  return `${pluginId}\u0000${rel}`;
+}
+
+async function pluginHttpDownload(
+  pluginId: string,
+  url: string,
+  rel: string,
+  onProgress: ((progress: DownloadProgress) => void) | undefined,
+  options: { headers?: Record<string, string> } | undefined
+): Promise<{ rel: string; bytes: number; contentType?: string; status: number }> {
+  const key = downloadKey(pluginId, rel);
+  if (typeof onProgress === 'function') downloadHandlers.set(key, onProgress);
+  else downloadHandlers.delete(key);
+
+  try {
+    return await invoke('plugin_http_download', {
+      id: pluginId,
+      url,
+      rel,
+      headers: options?.headers ?? null,
+    });
+  } finally {
+    // in-process 这一侧可以安全地在这里摘掉：进度是从**同一个 realm** 的前端事件
+    // 派发的，而 `invoke` 的 Promise 一定晚于所有已派发的事件回调。
+    //
+    // （沙箱那一侧**不能**这么做 —— 它的进度由另一个任务推过去，可能比 RPC 的
+    // 返回值晚一点到，删早了会吞掉 100% 那一帧。）
+    downloadHandlers.delete(key);
+  }
+}
+
+/**
+ * 装上 in-process 插件的下载进度监听。返回退订函数。
+ *
+ * 失败只记一条警告：这条通道只影响进度回调，不该让启动路径抛异常。
+ */
+export function installPluginDownloadProgress(): () => void {
+  let disposed = false;
+  let stop: (() => void) | null = null;
+
+  void (async () => {
+    try {
+      const { listen } = await import('@tauri-apps/api/event');
+      const off = await listen<{ pluginId: string; rel: string } & DownloadProgress>(
+        DOWNLOAD_PROGRESS,
+        (event) => {
+          const payload = event.payload;
+          if (!payload?.pluginId || !payload.rel) return;
+
+          const handler = downloadHandlers.get(downloadKey(payload.pluginId, payload.rel));
+          if (!handler) return;
+
+          try {
+            handler({ rel: payload.rel, received: payload.received, total: payload.total ?? null });
+          } catch (error) {
+            console.error('[pluginRuntime] 下载进度回调抛错:', error);
+          }
+        }
+      );
+
+      if (disposed) {
+        off();
+        return;
+      }
+      stop = off;
+    } catch (error) {
+      console.warn('[pluginRuntime] 无法订阅下载进度（进度回调将不可用）:', error);
+    }
+  })();
+
+  return () => {
+    disposed = true;
+    stop?.();
   };
 }
 
@@ -1386,6 +1606,224 @@ function createContext() {
   return createContextFor(pluginId, manifest, activationReasons.get(pluginId) ?? 'legacy');
 }
 
+/**
+ * 插件数据目录（`ctx.dataDir`）。
+ *
+ * ============================================================
+ * 它是什么，与 `ctx.storage` 差在哪
+ * ============================================================
+ *
+ * `ctx.storage` 是一键一个 JSON 文件，单值 1 MB、总量 8 MB、最多 2000 个键。
+ * 那个额度是为**配置与小状态**定的，装不下笔记、文档、图片。
+ *
+ * `ctx.dataDir` 是插件**自己的一个目录**：能建子目录、能存二进制、单文件上限
+ * 256 MB、目录总量 1 GiB。边界不是"随便写"，而是"只在这个目录之内" ——
+ * 路径里的 `..`、盘符、以及指向外面的符号链接都会被宿主拒绝。
+ *
+ * ============================================================
+ * 需要 `plugin-data` 权限
+ * ============================================================
+ *
+ * 未声明时**降级为空实现并只提示一次**，与 `notifications` / `clipboard` 一致：
+ * 抛错会让一个可选的持久化路径把整个插件打断，而"没声明权限"是作者该看到的一条
+ * 提示，不是一次故障。
+ *
+ * ============================================================
+ * 二进制走 base64，这是**已知代价**而不是设计
+ * ============================================================
+ *
+ * `invoke` 的参数走 JSON，JSON 里放不下二进制。代价是 33% 的体积与一次字符串
+ * 拷贝 —— 对配置、缩略图、几 MB 的文档可以接受，对几百 MB 的文件不行。
+ * 原始字节通道（Tauri 支持把 `Uint8Array` 直接作为请求体）是下一步。
+ * 把它写在这里而不是藏起来，是因为"这个 API 适合多大的文件"是作者必须知道的。
+ */
+/** 已经为"没声明 plugin-data 却用了 ctx.dataDir"提示过的插件，避免刷屏。 */
+const warnedMissingDataDir = new Set<string>();
+
+/**
+ * `ctx.db`：把调用转给 Rust 的 `PluginDatabases`。
+ *
+ * ============================================================
+ * 这一层**不做任何判断**
+ * ============================================================
+ *
+ * 权限与"数据根可用"由 `PluginManager::database_path` 判（打开连接的那一步），
+ * SQL 的边界由 SQLite 的 authorizer 判。这里只是三次 `invoke` ——
+ * 加一层 JS 侧的检查只会变成第二套会漂的规则。
+ *
+ * 形状与沙箱桥接层**逐字一致**（`query` / `queryRaw` / `exec` / `transaction`），
+ * 因为同一个插件应该能在 `in-process` 与 `sandboxed` 之间切换而不改一行代码。
+ * `check:sandbox` 有断言盯着这份一致性。
+ */
+function pluginDatabase(pluginId: string) {
+  /** 参数一律折成数组；`undefined` → `null`（Rust 侧两者是同一件事）。 */
+  const normalize = (params: unknown): unknown[] => {
+    if (params === undefined || params === null) return [];
+    const list = Array.isArray(params) ? params : [params];
+    return list.map((value) => (value === undefined ? null : value));
+  };
+
+  /** `{columns, rows}` → 对象数组（重名列只保留最后一个）。 */
+  const toObjects = <T>(result: { columns: string[]; rows: unknown[][] }): T[] =>
+    result.rows.map((row) => {
+      const object: Record<string, unknown> = {};
+      result.columns.forEach((column, index) => {
+        object[column] = row[index];
+      });
+      return object as T;
+    });
+
+  return {
+    async query<T = Record<string, unknown>>(sql: string, params?: unknown): Promise<T[]> {
+      const result = await invoke<{ columns: string[]; rows: unknown[][] }>('plugin_db_query', {
+        id: pluginId,
+        sql,
+        params: normalize(params),
+      });
+      return toObjects<T>(result);
+    },
+
+    /** 原始形状 `{ columns, rows }`。重名列、或者你只是想要数组时用它。 */
+    queryRaw(sql: string, params?: unknown): Promise<{ columns: string[]; rows: unknown[][] }> {
+      return invoke('plugin_db_query', { id: pluginId, sql, params: normalize(params) });
+    },
+
+    exec(
+      sql: string,
+      params?: unknown
+    ): Promise<{ changes: number; lastInsertRowId: number }> {
+      return invoke('plugin_db_exec', { id: pluginId, sql, params: normalize(params) });
+    },
+
+    /**
+     * 一批语句，**全成功或全回滚**。
+     *
+     * 没有 `begin()` / `commit()`：跨调用的显式事务是**会泄漏的状态**
+     * （插件崩溃、被卸载、或忘了提交，那条写事务就一直挂着），而插件那一侧
+     * 拿不到一个"无论发生什么都会执行"的 `finally`。完整推导见 `db.rs`。
+     */
+    transaction(
+      statements: Array<{ sql: string; params?: unknown }>
+    ): Promise<Array<{ changes: number; lastInsertRowId: number }>> {
+      return invoke('plugin_db_transaction', {
+        id: pluginId,
+        statements: statements.map((statement) => ({
+          sql: statement.sql,
+          params: normalize(statement.params),
+        })),
+      });
+    },
+  };
+}
+
+function pluginDataDir(pluginId: string, manifest: PluginManifest | undefined) {
+  const allowed = pluginHasPermission(manifest, 'plugin-data');
+
+  if (!allowed) {
+    // 只提示一次：一个高频调用的接口不该把控制台刷满。
+    if (!warnedMissingDataDir.has(pluginId)) {
+      warnedMissingDataDir.add(pluginId);
+      console.warn(
+        `[pluginRuntime] 插件 "${pluginId}" 使用了 ctx.dataDir，但清单里没有声明 ` +
+          `"plugin-data" 权限，调用被忽略（后续同类调用不再重复提示）`
+      );
+    }
+    // 降级成一个**处处失败**的空实现：返回空列表、读不到东西、写入直接拒绝。
+    // 不静默假装成功 —— 那会让插件以为存好了，而东西根本没落盘。
+    const denied = async (): Promise<never> => {
+      throw new Error('插件未声明 "plugin-data" 权限，无法访问数据目录');
+    };
+    return {
+      available: async (): Promise<boolean> => false,
+      list: async (): Promise<DataEntry[]> => [],
+      stat: async (): Promise<DataStat | null> => null,
+      read: denied,
+      readText: denied,
+      write: denied,
+      writeText: denied,
+      mkdir: denied,
+      remove: denied,
+      used: async (): Promise<number> => 0,
+    };
+  }
+
+  const call = <T>(command: string, args: Record<string, unknown>): Promise<T> =>
+    invoke<T>(command, { id: pluginId, ...args });
+
+  /** `Uint8Array` → base64。分块是为了不把整个文件展开成一个巨大的参数列表。 */
+  const toBase64 = (bytes: Uint8Array): string => {
+    const CHUNK = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  };
+
+  const fromBase64 = (text: string): Uint8Array => {
+    const binary = atob(text);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  return {
+    /**
+     * 宿主那边数据目录现在能不能用。
+     *
+     * **它不是装饰。** 数据放在外置盘/网络盘上时，盘没插就是一个真实状态；
+     * 那时读出来是空的，而"空"与"还没有数据"看起来一模一样。插件应当在写之前
+     * 先问一次，并在为假时**明确告诉用户"数据目录不可用"**，
+     * 而不是让用户以为数据丢了。
+     */
+    available: async (): Promise<boolean> => {
+      try {
+        await call<number>('plugin_data_used', {});
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    list: (rel = '') => call<DataEntry[]>('plugin_data_list', { rel }),
+    stat: (rel: string) => call<DataStat | null>('plugin_data_stat', { rel }),
+
+    read: async (rel: string): Promise<Uint8Array> =>
+      fromBase64(await call<string>('plugin_data_read', { rel })),
+    readText: async (rel: string): Promise<string> => {
+      const bytes = fromBase64(await call<string>('plugin_data_read', { rel }));
+      return decoder.decode(bytes);
+    },
+
+    write: (rel: string, bytes: Uint8Array) =>
+      call<void>('plugin_data_write', { rel, content: toBase64(bytes) }),
+    writeText: (rel: string, text: string) =>
+      call<void>('plugin_data_write', { rel, content: toBase64(encoder.encode(text)) }),
+
+    mkdir: (rel: string) => call<void>('plugin_data_mkdir', { rel }),
+    remove: (rel: string) => call<void>('plugin_data_remove', { rel }),
+    used: () => call<number>('plugin_data_used', {}),
+  };
+}
+
+/** 数据目录里的一个条目 */
+export interface DataEntry {
+  name: string;
+  isDir: boolean;
+  size: number;
+  modified: number;
+}
+
+/** 数据目录里一个路径的元信息 */
+export interface DataStat {
+  isDir: boolean;
+  size: number;
+  modified: number;
+}
+
 /** 上下文工厂。插件身份是**显式参数** —— 这是 `api: 2` 能成立的原因 */
 function createContextFor(
   pluginId: string,
@@ -1407,6 +1845,24 @@ function createContextFor(
      */
     activationEvent: event,
     storage: pluginStorage(pluginId),
+    /** 插件私有文件目录。配置与小状态用 `storage`，文件用这个。 */
+    dataDir: pluginDataDir(pluginId, manifest),
+    /**
+     * 结构化数据：每插件一个 SQLite 文件。
+     *
+     * ============================================================
+     * 它为什么**不是**第二套实现
+     * ============================================================
+     *
+     * 这三条只是把调用转给 Rust 的 `PluginDatabases` —— 也就是沙箱那条协议路径
+     * 用的**同一个**对象、同一些方法。边界（`ATTACH` 被 authorizer 拒绝、
+     * 页数上限、一次调用只编译一条语句）全部在那一侧，因此两条路径不可能漂开。
+     *
+     * 与 `ctx.storage` / `ctx.dataDir` 的分工：那两个装不下**查询**。一个笔记
+     * 插件要"按标签筛、按更新时间排、取第 3 页"时，只有 `db` 能让 SQLite 去做
+     * 这件事，而不是把所有数据拉进 JS 自己过滤。
+     */
+    db: pluginDatabase(pluginId),
     http: pluginHttp(pluginId),
     logger: pluginLogger(pluginId),
     notifications: pluginNotifications(pluginId, manifest),
@@ -1604,7 +2060,7 @@ export interface ModulithHost {
   useModuleActive: typeof useModuleActive;
   /**
    * 宿主能力表。插件用它做**特性探测**，而不是拿 `Modulith.version` 做字符串比较：
-   * `engines.loopcore` 只表达「我要求宿主至少多新」，而且它只提示、不阻断；
+   * `engines.modulith` 只表达「我要求宿主至少多新」，而且它只提示、不阻断；
    * 真正决定一段代码能不能跑的，是这里列出的东西。
    */
   capabilities: ModulithCapabilities;
@@ -2027,6 +2483,11 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
   //     而「未激活时侧边栏也应该是完整的」正是这次改动要保住的东西。
   cleanupInjected(pluginId);
   cleanupPluginResources(pluginId);
+  // 次级界面模块**无论声明式与否都要清**：它们是沙箱插件的界面，而不是清单里
+  // 声明的模块 —— `contract.declarative` 说的是"这个插件的模块来自清单"，
+  // 与"它的界面模块要不要撤"是两件事。
+  unregisterSurfaceModules(pluginId);
+  clearPluginUiState(pluginId);
   if (!contract?.declarative) {
     unregisterDynamicModules(pluginId);
   }
@@ -2125,6 +2586,8 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
     console.error(`[pluginRuntime] 插件 "${pluginId}" 加载失败:`, error);
     cleanupInjected(pluginId);
     cleanupPluginResources(pluginId);
+    unregisterSurfaceModules(pluginId);
+    clearPluginUiState(pluginId);
     if (!contract?.declarative) {
       unregisterDynamicModules(pluginId);
     }
@@ -2145,6 +2608,10 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
 export function unloadPlugin(pluginId: string): void {
   cleanupInjected(pluginId);
   cleanupPluginResources(pluginId);
+  unregisterSurfaceModules(pluginId);
+  // 徽标/进度/占位都留着的话，一个被卸载的插件会继续在侧边栏上显示"3 条新消息"，
+  // 而那个数字再也没有人会去更新它。
+  clearPluginUiState(pluginId);
   unregisterDynamicModules(pluginId);
   loadStates.delete(pluginId);
 }
@@ -2182,6 +2649,9 @@ export async function reloadPluginRuntime(
 
   // 清空全部动态模块，避免残留已卸载插件注册的模块
   clearDynamicModules();
+  // 次级界面模块的记账要一起清：那张表决定"`ui.openSurface` 能不能开"，
+  // 留着重载前的条目会让插件去开一个目录里已经不存在的 id。
+  clearSurfaceModules();
 
   // 作废已缓存的模块组件。**必须在这里做，而不是让调用方各自记得**：
   // 下面每个插件的 registerModule() 都会为同一模块 ID 造一个全新的懒加载
@@ -2223,6 +2693,39 @@ export async function reloadPluginRuntime(
     registerDeclaredCommands(plugin.id, contract.contributions.commands);
     registerPluginSettings(plugin.id, contract.contributions.settings);
   }
+
+  // ---- 多界面：把次级界面登记成可按 id 打开的隐藏模块 ----
+  //
+  // **只对沙箱插件做。** in-process 插件的界面是宿主这个 realm 里的 React 组件，
+  // 它没有"界面表"那一说；而界面表本身只有 `sandbox_view` 给得出 ——
+  // 它只服务沙箱插件。
+  //
+  // 界面表**从宿主读**（`fetchDeclaredSurfaces`），这里不解析清单里的那一段：
+  // 合法形状由 Rust 的 `surfaces.rs` 定义（它还要挡路径越界、缺主界面、id 冲突），
+  // 前端再实现一遍只会多出一套会漂的规则。
+  //
+  // 放在这里而不是各插件加载完之后：这一段是**读清单**的路径，跑完之后侧边栏与
+  // 命令面板就已经完整了。次级界面没有可见入口，但它必须在那之前就登记好，
+  // 否则插件在 `onStartup` 里立刻调 `ui.openSurface` 时会撞上"模块不存在"。
+  await Promise.all(
+    enabledPlugins
+      .filter((plugin) => plugin.manifest.runtime === 'sandboxed')
+      .map(async (plugin) => {
+        const surfaces = await fetchDeclaredSurfaces(plugin.id);
+        if (surfaces.length <= 1) return;
+
+        // 已经被 `contributes.modules` 声明过的界面不再造隐藏模块 ——
+        // 造了的话 `ui.openSurface` 会打开隐藏的那个，于是同一个界面在两个标签里
+        // 各开一个 webview，而 webview 标签是唯一的（宿主会判成冲突）。
+        const claimed = new Set(
+          (contracts.get(plugin.id)?.contributions.modules ?? [])
+            .map((module) => module.surface)
+            .filter((surface): surface is string => typeof surface === 'string')
+        );
+
+        registerSurfaceModules(plugin.id, surfaces, claimed);
+      })
+  );
 
   // 设置值要读回来，插件的 `ctx.settings.get()` 才是同步可用的。
   // 与插件代码一样是异步的，但**必须先于激活完成** —— 因此它在这里 await，
@@ -2480,10 +2983,50 @@ export async function setPluginEnabled(pluginId: string, enabled: boolean): Prom
   await reloadPluginRuntime();
 }
 
+/**
+ * 卸载插件。**数据会保留。**
+ *
+ * 卸载的意图是"我不要这个插件了"，不是"我要销毁它存的东西"——这是两件事，
+ * 不该由一次点击一起完成。重装同一个插件会拿回数据，这是"先卸了试试"的常见用法。
+ *
+ * 要连数据一起删，卸载之后再调 `clearPluginData`（它是单独一步、要确认）。
+ * 之前这里是静默一起删的，见 `PluginManager::uninstall` 上的说明。
+ */
 export async function uninstallPlugin(pluginId: string): Promise<void> {
   unloadPlugin(pluginId);
   await invoke('uninstall_plugin', { id: pluginId });
   await reloadPluginRuntime();
+}
+
+/**
+ * 删除一个插件的数据目录。**不可撤销，调用方必须先确认。**
+ *
+ * 与 `clearPluginStorage` 的分工：那一条要求插件仍然安装且声明了 `storage`
+ * （插件清自己的数据）；这一条卸载之后也能用，因为它是用户删自己机器上的东西。
+ */
+export async function clearPluginData(pluginId: string): Promise<void> {
+  await invoke('plugin_data_clear', { id: pluginId });
+}
+
+/** 一个插件数据目录占用的字节数（**不要求它仍然安装**）。 */
+export async function getPluginDataUsage(pluginId: string): Promise<number> {
+  return invoke<number>('plugin_data_usage', { id: pluginId });
+}
+
+/** 一个已卸载插件留下的数据目录 */
+export interface OrphanPluginData {
+  id: string;
+  bytes: number;
+}
+
+/**
+ * 列出已卸载插件的残留数据（按占用从大到小）。
+ *
+ * 卸载保留数据必须在界面上有对应的出口：否则"数据不会丢"的另一面就是
+ * "占用的空间没人知道"。
+ */
+export async function listOrphanPluginData(): Promise<OrphanPluginData[]> {
+  return invoke<OrphanPluginData[]>('plugin_data_orphans');
 }
 
 export async function installPluginFromPackage(path: string): Promise<InstalledPlugin> {

@@ -203,6 +203,128 @@ pub async fn background_host_shutdown(
     Ok(state.inner().0.describe())
 }
 
+// ============================================================
+// 后台（无界面）插件
+// ============================================================
+
+/// 让"该跑的后台插件"跑起来，并回报当前状态。
+///
+/// 前端在插件列表就绪之后调一次。**由前端决定时机而不是宿主在启动时自动扫**：
+/// 插件注册表读完的时刻只有它知道，而宿主猜一个时机的表现是"该起的没起"。
+///
+/// 幂等：已经跑着的不会重启。
+#[tauri::command]
+pub async fn background_plugins_sync(
+    app: AppHandle,
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+) -> Result<Vec<super::background::plugins::BackgroundPluginStatus>, String> {
+    Ok(state.inner().sync_startup(&app).await)
+}
+
+/// 当前有哪些后台插件在跑。**不启动任何东西。**
+#[tauri::command]
+pub async fn background_plugins_status(
+    app: AppHandle,
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+) -> Result<Vec<super::background::plugins::BackgroundPluginStatus>, String> {
+    Ok(state.inner().status(&app))
+}
+
+/// 手动拉起一个后台插件（用户点了"现在运行"）。
+#[tauri::command]
+pub async fn background_plugin_start(
+    app: AppHandle,
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+    id: String,
+) -> Result<(), String> {
+    state.inner().start(&app, &id).await
+}
+
+/// 手动停掉一个后台插件。
+///
+/// 与"拉起"成对：一个能起不能停的后台能力会把用户逼到任务管理器里 ——
+/// 而他在那里看到的是一个叫 node.exe 的东西，不知道自己该不该结束它。
+#[tauri::command]
+pub async fn background_plugin_stop(
+    state: State<'_, super::background::plugins::BackgroundPlugins>,
+    id: String,
+) -> Result<(), String> {
+    state.inner().stop(&id).await
+}
+
+// ============================================================
+// 宿主浮层（对话框与右键菜单）
+// ============================================================
+//
+// 这三条只有浮层窗口用得到（`capabilities/overlay.json` 只授权给它）。
+// 它们是那个窗口**全部**的能力 —— 它不知道是哪个插件在问，也不需要知道。
+//
+// 它们写在这里而不是 `overlay.rs` 里：命令生成器只扫每个模块的 `commands.rs`。
+
+/// 浮层窗口回答一次询问。
+#[tauri::command]
+pub fn overlay_respond(
+    app: AppHandle,
+    state: State<'_, super::overlay::Overlay>,
+    response: super::overlay::OverlayResponse,
+) -> Result<bool, String> {
+    let delivered = state.inner().respond(response);
+
+    if !delivered {
+        // 迟到的回答（用户先按了 Esc，等待已经被撤）。**不是错误** ——
+        // 记 debug 而不是 warn：它真的会发生，而且每次都正常收尾。
+        log::debug!("浮层收到一个没有等待者的回答（多半是超时或失焦之后的迟到响应）");
+    }
+
+    // 回答之后**立即隐藏**。让前端自己再发一条 hide 会多一次往返，
+    // 而中间那一小段时间里浮层还挂在屏幕上。
+    super::overlay::hide(&app);
+    Ok(delivered)
+}
+
+/// 浮层窗口请宿主按内容调整窗口尺寸。
+///
+/// 尺寸**只有浮层自己知道**（一段说明折行之后有多高取决于字号与字体），
+/// 因此由它量、由宿主设 —— 与沙箱界面那条"量的那一侧量、摆的那一侧摆"一致。
+#[tauri::command]
+pub fn overlay_resize(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
+    super::overlay::resize(&app, width, height)
+}
+
+/// 浮层窗口主动收起自己（点别处、Esc）。
+#[tauri::command]
+pub fn overlay_hide(
+    app: AppHandle,
+    state: State<'_, super::overlay::Overlay>,
+) -> Result<(), String> {
+    // 主动收起 = 用户没回答。把等待撤掉，让插件的 await 立刻以"被放弃"结束，
+    // 而不是挂到 5 分钟超时 —— 那多出来的几分钟里插件什么都做不了。
+    let dropped = state.inner().cancel_all();
+    if dropped > 0 {
+        log::debug!("浮层被主动收起，{dropped} 次等待被放弃");
+    }
+
+    super::overlay::hide(&app);
+    Ok(())
+}
+
+/// 一个插件有没有声明后台入口（界面据此决定显示不显示"后台"那一节）。
+///
+/// 做成独立命令而不是让前端去解析清单：`contributes.background` 的合法形状由
+/// Rust 侧的 `background_manifest::parse` 定义（它还要挡路径越界），
+/// 前端再实现一遍判断只会多出一套会漂的规则。
+#[tauri::command]
+pub async fn plugin_background_contribution(
+    state: State<'_, crate::modules::plugins::PluginState>,
+    id: String,
+) -> Result<Option<crate::modules::plugins::background_manifest::BackgroundContribution>, String> {
+    let manager = state.inner().0.read().await;
+    manager
+        .background_launch(&id)
+        .map(|launch| launch.map(|value| value.contribution))
+        .map_err(|error| error.to_string())
+}
+
 /// 读取当前「关闭窗口时最小化到托盘」的设置
 ///
 /// 托盘菜单可以改这一项，因此界面不能只依赖自己那份设置缓存 ——

@@ -181,18 +181,57 @@ const EnableSwitch: React.FC<{
   </button>
 );
 
-const PermissionChips: React.FC<{ permissions: string[]; max?: number }> = ({
-  permissions,
-  max = 3,
-}) => {
+/**
+ * 权限标签 + **执行模式**标签。
+ *
+ * 两个必须一起出现：这份列表的效力完全取决于插件跑在哪里（详见
+ * `PluginDetailDrawer` 里那段说明）。只显示权限，等于让用户把一份**声明**
+ * 读成一份**约束** —— 而这在 in-process 插件上是不成立的。
+ */
+const PermissionChips: React.FC<{
+  permissions: string[];
+  sandboxed: boolean;
+  max?: number;
+}> = ({ permissions, sandboxed, max = 3 }) => {
+  const mode = sandboxed ? (
+    <span
+      /*
+        ★ 这段措辞是**子 WebView 时代**写的，v1.6.0 换成跨源 iframe 之后就不再准确了：
+        插件界面不再是"一个独立的 webview"，而是宿主文档里的一个跨源 iframe。
+        边界没有变弱（子框架拿不到宿主 IPC、身份靠令牌），但"那个 webview 不匹配
+        任何宿主授权"这句话描述的是一个已经不存在的机制 —— 用户按它去理解边界，
+        会得到一个错的模型。见 `docs/06-项目/已知问题与技术债.md` §7.50。
+      */
+      title="跑在自己的来源里（一个跨源 iframe），拿不到宿主的能力 —— 只能通过它申请的权限调用宿主的接口。"
+      className="px-1.5 py-0.5 text-[11px] font-medium rounded border border-emerald-200 bg-emerald-50 text-emerald-700"
+    >
+      已隔离
+    </span>
+  ) : (
+    <span
+      title="与宿主跑在同一个上下文里 —— 权限列表是它的声明，不是对它的约束。"
+      className="px-1.5 py-0.5 text-[11px] font-medium rounded border border-amber-200 bg-amber-50 text-amber-700"
+    >
+      未隔离
+    </span>
+  );
+
   if (permissions.length === 0) {
-    return <span className="text-xs text-gray-400">未申请任何权限</span>;
+    return (
+      <div className="flex items-center flex-wrap gap-1">
+        {mode}
+        <span className="text-xs text-gray-400">
+          {sandboxed ? '未申请任何权限' : '没有申报权限'}
+        </span>
+      </div>
+    );
   }
   const shown = permissions.slice(0, max);
   const rest = permissions.length - shown.length;
 
   return (
     <div className="flex items-center flex-wrap gap-1">
+      {mode}
       {shown.map((perm) => {
         const info = getPermissionDescriptor(perm);
         const tone =
@@ -231,7 +270,7 @@ const LoadErrorBanner: React.FC<{ message: string }> = ({ message }) => (
  * 引擎范围提示。
  *
  * 用琥珀色而**不是红色**，措辞也说「可能」而不是「无法使用」：
- * 后端只把它当提示，不阻止安装与加载。`engines.loopcore` 在 0.x 阶段很脆弱
+ * 后端只把它当提示，不阻止安装与加载。`engines.modulith` 在 0.x 阶段很脆弱
  * （`^0.2.0` 等价于 `>=0.2.0 <0.3.0`，宿主升一个小版本就会不匹配），
  * 把这种声明层面的差异渲染成「不兼容」会让用户误以为插件已损坏。
  * 插件真的跑不起来时，会以加载失败（红色）的形式单独呈现。
@@ -315,7 +354,11 @@ const PluginCard: React.FC<PluginCardProps> = memo(
               <span className="text-xs text-gray-400 truncate max-w-full">
                 {formatAuthor(plugin.manifest.author)}
               </span>
-              <PermissionChips permissions={permissions} max={2} />
+              <PermissionChips
+                permissions={permissions}
+                sandboxed={plugin.manifest.runtime === 'sandboxed'}
+                max={2}
+              />
             </div>
 
             <div className="flex items-center gap-1 shrink-0">
@@ -436,7 +479,10 @@ const PluginCard: React.FC<PluginCardProps> = memo(
         )}
 
         <div className="mt-3">
-          <PermissionChips permissions={permissions} />
+          <PermissionChips
+            permissions={permissions}
+            sandboxed={plugin.manifest.runtime === 'sandboxed'}
+          />
         </div>
 
         <div className="mt-4 pt-3 border-t border-gray-100 flex items-center justify-between">

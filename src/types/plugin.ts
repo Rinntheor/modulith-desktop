@@ -100,8 +100,21 @@ export interface PluginRepository {
  * 插件引擎要求
  */
 export interface PluginEngines {
-  loopcore: string;  // 语义化版本范围
+  modulith: string;  // 语义化版本范围
 }
+
+/**
+ * 插件代码的运行位置。
+ *
+ * **单独一个别名，因为它有三处消费方**：清单（`PluginManifest.runtime`）、
+ * 市场索引（`MarketVersion.runtime`）、以及安装策略（判"这个版本能不能装"）。
+ * 三处各写一遍联合类型，最终一定会漂 —— 而漂开的表现是"市场说它是沙箱插件，
+ * 装完发现不是"，正是这一整套要防的那件事。
+ *
+ * 名字与后端 `PluginRuntime` 的 kebab-case 序列化形式逐字对应
+ * （见 `src-tauri/src/modules/plugins/types.rs`）。
+ */
+export type PluginRuntimeKind = 'in-process' | 'sandboxed';
 
 /**
  * 模块贡献定义（`contributes.modules`）
@@ -144,6 +157,17 @@ export interface ModuleContribution {
   category?: string;
   /** 侧边栏徽标文本 */
   badge?: string;
+  /**
+   * 这个模块打开的是插件的**哪一个界面**（`contributes.surfaces[].id`）。
+   *
+   * 只对 `runtime: "sandboxed"` 的插件有意义。缺省是主界面（`"main"`）——
+   * 单界面插件因此一个字都不用写。
+   *
+   * 一个插件可以有多个模块指向同一个界面（例如"笔记"与"最近笔记"两个侧边栏
+   * 入口打开同一块界面），那时它们共享同一个 webview —— 这正是想要的：
+   * 界面是重的那一半，入口是轻的。
+   */
+  surface?: string;
 }
 
 /**
@@ -314,6 +338,20 @@ export interface PluginManifest {
   // 宿主无法核实的字段，只会让作者与用户以为存在分级管控。
   // 替代它的是 `permissions`（正在逐步变成真强制）与出站网络策略。
   permissions?: PluginPermission[];
+
+  /**
+   * 代码跑在哪里。
+   *
+   * 与上面那个被删掉的 `sandboxLevel` 的区别不是措辞：**等级**是宿主无法核实的量；
+   * **位置**是可以核实的 —— `sandboxed` 的插件跑在自己的 webview 里，那个 webview
+   * 不匹配任何 capability，因此连宿主命令都调不动。
+   *
+   * 缺省 `'in-process'`：与宿主同一个 webview、同一个 JS 上下文。
+   * 未知取值会让整份清单**不合法**（后端是枚举，不做静默兜底）——
+   * 把 `'sandboxed'` 当成 `'in-process'` 跑，是一次声明了隔离而实际没有的降级。
+   */
+  runtime?: PluginRuntimeKind;
+
   
   // 依赖
   dependencies?: Record<string, string>;
@@ -433,6 +471,21 @@ export interface PluginContext {
   
   // 存储
   storage: PluginStorage;
+
+  /**
+   * 插件私有文件目录。
+   *
+   * 与 `storage` 的分工：那个是一键一个 JSON（单值 1 MB、总量 8 MB），
+   * 适合配置与小状态；这个是**目录**，能建子目录、能存二进制，
+   * 适合文档、图片、缓存（单文件 256 MB、目录总量 1 GiB）。
+   *
+   * 路径严格锁在插件自己的目录内：`..`、盘符、以及指向外面的符号链接都会被
+   * 宿主拒绝。语义是 chroot —— `/a` 指的是 `<数据根>/a`。
+   *
+   * 需要清单声明 `plugin-data`。未声明时每个方法都会抛错，而 `available()`
+   * 返回 false。
+   */
+  dataDir: PluginDataDir;
   
   // 事件
   events: PluginEventBus;
@@ -483,6 +536,51 @@ export interface PluginAPI {
   
   // 获取用户数据路径
   getUserDataPath(): string;
+}
+
+/**
+ * 插件数据目录里的一个条目
+ */
+export interface PluginDataEntry {
+  name: string;
+  isDir: boolean;
+  size: number;
+  /** Unix 毫秒 */
+  modified: number;
+}
+
+/**
+ * 插件私有文件目录（`ctx.dataDir`）。
+ *
+ * 所有路径都是**相对插件数据根**的：`''` 表示根，`'notes/2026/a.md'` 表示子路径。
+ * 语义是 chroot —— 前导 `/` 没有特殊含义，`/a` 与 `a` 等价。
+ * 需要 `plugin-data` 权限；未声明时每个方法都会抛错。
+ */
+export interface PluginDataDir {
+  /**
+   * 数据目录现在能不能用。
+   *
+   * **它不是装饰。** 数据放在外置盘或网络盘上时，"盘没插"是一个真实状态；
+   * 那时读出来是空的，而"空"与"还没有数据"看起来一模一样。插件应当在写之前
+   * 先问一次，并在为假时**告诉用户"数据目录不可用"**，而不是让用户以为数据丢了。
+   */
+  available(): Promise<boolean>;
+
+  list(rel?: string): Promise<PluginDataEntry[]>;
+  stat(rel: string): Promise<PluginDataEntry | null>;
+
+  read(rel: string): Promise<Uint8Array>;
+  readText(rel: string): Promise<string>;
+
+  write(rel: string, bytes: Uint8Array): Promise<void>;
+  writeText(rel: string, text: string): Promise<void>;
+
+  /** 建目录（含中间层）。 */
+  mkdir(rel: string): Promise<void>;
+  /** 删除文件或**整棵目录树**。不可撤销。 */
+  remove(rel: string): Promise<void>;
+  /** 当前占用字节数。 */
+  used(): Promise<number>;
 }
 
 /**
@@ -615,7 +713,7 @@ export interface PluginMenuAPI {
  * 宿主能力表（`Modulith.capabilities`）的**实际**签名。
  *
  * 用途：插件在运行时判断宿主有没有某个能力，而不是靠 `Modulith.version` 做字符串
- * 比较。`engines.loopcore` 只表达「我要求宿主至少多新」，而且它**只提示、不阻断**；
+ * 比较。`engines.modulith` 只表达「我要求宿主至少多新」，而且它**只提示、不阻断**；
  * 真正决定一段代码能不能跑的，是这里列出的东西。
  *
  * 典型用法：

@@ -43,6 +43,20 @@ pub fn run() -> Result<(), tauri::Error> {
         // 放进配置文件才能跟着版本走。
         .plugin(tauri_plugin_updater::Builder::new().build());
 
+    // 插件沙箱的注册表与自定义协议。
+    //
+    // 协议承载插件界面与宿主之间的**全部**通信（见 modules/plugins/sandbox.rs）。
+    // 插件 webview 一条 IPC 权限都没有，因此没有 event / command 可用 ——
+    // 身份由协议处理器拿到的 webview 标签、经注册表查出来，插件伪造不了。
+    //
+    // 注册表挂在 builder 上而不是 setup 里：协议处理器要同步读它，而请求可能在
+    // setup 完成之前就到。
+    //
+    // 协议注册在 builder 上而不是某个窗口上：运行时会给**每一个** webview 各注册
+    // 一遍，因此子 webview 用的是同一条协议。
+    builder = builder.manage(modules::plugins::sandbox::SandboxSurfaces::default());
+    builder = modules::plugins::sandbox::register(builder);
+
     // setup 中初始化模块
     builder = builder.setup(move |app| {
         // 窗口居中兜底。
@@ -53,7 +67,7 @@ pub fn run() -> Result<(), tauri::Error> {
         // 这里再显式居中一次作为兜底：失败只记警告，绝不影响启动。
         #[cfg(desktop)]
         {
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = crate::core::window::main(app.handle()) {
                 if let Err(e) = window.center() {
                     eprintln!("[WARN] Failed to center main window: {e}");
                 }
@@ -86,6 +100,52 @@ pub fn run() -> Result<(), tauri::Error> {
         }
 
         app.manage(registry);
+
+        // 沙箱界面**不再有所有者线程**。
+        //
+        // v1.6.0 之前这里 manage 了一个 SurfaceActor：全宿主只有它能在主线程之外
+        // 创建 / 摆放 / 显示 / 销毁插件子 webview，因为从 IPC 线程（主线程）创建
+        // webview 会让整个应用假死 —— 窗口按钮、托盘、其余插件一起失去响应，
+        // 而且**一处错误都不报**。
+        //
+        // 插件界面改成跨源 iframe 之后，宿主这一侧不再碰窗口系统：它只签发一个
+        // 令牌（一次内存写入），窗口与几何全部交给浏览器的 DOM。那条线程连同它
+        // 服务的 surface.rs 一起删掉了。
+        //
+        // ⚠️ 那条约束本身**没有消失**：它适用于任何"从命令里创建 webview"的地方。
+        // 仓库里现在只剩沙箱自检会建窗口，因此 sandbox_self_test 必须保持
+        // async。完整推导留在 git 历史里 surface.rs 的文件头。
+
+        // 插件主题快照。
+        //
+        // 主题的**真源在宿主文档里**（那一堆 CSS 自定义属性），而 Rust 这一侧
+        // 没有 document 可读。因此它由前端推上来（命令 set_plugin_theme），
+        // 宿主负责注入插件入口文档并推给已经打开的界面。见 modules/plugins/theme.rs。
+        app.manage(modules::plugins::theme::PluginTheme::new());
+
+        // 宿主快捷键表。
+        //
+        // 键盘焦点落进插件 webview 之后，keydown 只在**插件自己的文档**里派发 ——
+        // 宿主窗口上的监听器收不到。桥接层据此表判断某个组合该不该转发回来，
+        // 而那个判断不能靠 IPC 往返（那是每敲一个键一次）。见 modules/plugins/shortcuts.rs。
+        app.manage(modules::plugins::shortcuts::PluginShortcuts::new());
+
+        // 沙箱自检**不在启动路径上**。
+        //
+        // 它曾经在这里起一个 4 秒后的异步任务，无条件弹出一块 560×420 的诊断面板。
+        // 每次启动都多一块挡在界面上的面板，去验一件绝大多数时候都成立的事 ——
+        // 用户的原话是"它很打扰"。现在它由「插件」页上的一个按钮显式触发，
+        // 走命令 sandbox_self_test。
+        //
+        // 能力本身**刻意保留**：它验的是边界本身（ACL 拒绝、身份来自引擎、通道可用、
+        // CSP 生效），而自检页是仓库里唯一会去故意违规的地方。见
+        // modules/plugins/sandbox.rs 的 open_selftest。
+
+        // 主线程停滞看门狗。同样只在 debug 构建里 —— 它对用户没有价值，
+        // 却会在每一次正常的长任务上往日志里写 ERROR。见 core/watchdog.rs。
+        #[cfg(debug_assertions)]
+        crate::core::watchdog::spawn_main_thread_watchdog(handle.clone());
+
         Ok(())
     });
 
@@ -118,6 +178,14 @@ pub fn run() -> Result<(), tauri::Error> {
         set_node_runtime_path,
         background_host_probe,
         background_host_shutdown,
+        background_plugins_sync,
+        background_plugins_status,
+        background_plugin_start,
+        background_plugin_stop,
+        overlay_respond,
+        overlay_resize,
+        overlay_hide,
+        plugin_background_contribution,
         get_close_to_tray,
         set_close_to_tray,
         is_tray_available,
@@ -143,6 +211,14 @@ pub fn run() -> Result<(), tauri::Error> {
         dismiss_notification,
         clear_notifications,
         get_notification_summary,
+        sandbox_surface_open,
+        sandbox_surface_close,
+        sandbox_self_test,
+        plugin_surfaces,
+        set_plugin_theme,
+        get_plugin_theme,
+        set_plugin_shortcuts,
+        get_plugin_shortcuts,
         list_plugins,
         get_plugin,
         list_plugin_permissions,
@@ -165,6 +241,20 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_storage_set,
         plugin_storage_delete,
         plugin_storage_keys,
+        plugin_db_query,
+        plugin_db_exec,
+        plugin_http_download,
+        plugin_db_transaction,
+        plugin_data_clear,
+        plugin_data_usage,
+        plugin_data_list,
+        plugin_data_stat,
+        plugin_data_read,
+        plugin_data_write,
+        plugin_data_mkdir,
+        plugin_data_remove,
+        plugin_data_used,
+        plugin_data_orphans,
         plugin_storage_list,
         plugin_storage_usage,
         plugin_storage_clear,

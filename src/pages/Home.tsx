@@ -67,6 +67,8 @@ import SettingsDialog, { type SettingsSectionId } from '../components/Settings/S
 import GlobalContextMenu, { type GlobalMenuEntry } from '../components/GlobalContextMenu';
 import ModuleIcon from '../components/ModuleIcon';
 import { moduleManager } from '../services/moduleManager';
+import { subscribePluginSettingsRequest } from '../services/pluginSettingsFocus';
+import { subscribeGlobalContextMenu } from '../services/contextMenuBridge';
 import {
   getPluginContextMenuEntries,
   reloadPluginRuntime,
@@ -82,6 +84,7 @@ import {
 } from '../services/appSettings';
 import { getReduceMotion, subscribeTheme } from '../services/theme';
 import { getBootResult } from '../services/boot';
+import { requestAppUpdateCheck } from '../services/appUpdater';
 import { useTabs } from '../hooks/useTabs';
 import { useCatalog } from '../hooks/useCatalog';
 import {
@@ -349,6 +352,20 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
   const handleOpenSettings = useCallback(() => openSettings('general'), [openSettings]);
 
   /**
+   * 有人请求「打开某个插件的设置」（插件详情抽屉里的那个按钮）。
+   *
+   * 抽屉在插件模块里，设置对话框在外壳里 —— 两者没有共同祖先，因此走一个
+   * 模块级的一次性意图（见 `services/pluginSettingsFocus.ts`）。
+   *
+   * 这里**只负责把对话框打开到那一页**；"定位到哪个插件"由
+   * `PluginSettingsSection` 自己去取那个意图。分开的理由：意图是**取走即清空**的，
+   * 两边都去取的话，后取的那一个什么也拿不到。
+   */
+  useEffect(() => {
+    return subscribePluginSettingsRequest(() => openSettings('plugin-settings'));
+  }, [openSettings]);
+
+  /**
    * 更新通知的去处。
    *
    * 只把用户送到「关于」的更新卡片，**不替他点下载安装** —— 安装会关闭并重启
@@ -426,6 +443,13 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
         return;
       }
       if (action === 'update') {
+        // **先记下"要检查"，再打开分页。**
+        //
+        // 顺序是有意的：打开分页是异步的（设置面板要挂载、要切到「关于」），
+        // 而 `requestAppUpdateCheck` 会把请求**记下来**，组件挂载时再取走。
+        // 反过来的话有一次真实的竞争 —— 请求发出时卡片还没挂载，事件丢掉，
+        // 用户看到的就是"点了检查更新，弹出一个窗口让我再点一次"。
+        requestAppUpdateCheck();
         openSettings('about');
         return;
       }
@@ -502,6 +526,26 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
     event.preventDefault();
     setMenuPos({ x: event.clientX, y: event.clientY });
   }, []);
+
+  /**
+   * 沙箱插件界面里的一次右键 / 一次取消。
+   *
+   * **这条通道存在的原因是焦点/事件边界，而不是布局**：插件界面是跨源 iframe，
+   * 是一个独立文档 —— 它里面派发的 `contextmenu` / `mousedown` / `keydown`
+   * 永远冒泡不到这里，因此上面那个处理器、以及 `GlobalContextMenu` 自己那两条
+   * 关闭监听，对插件界面**一次都不会触发**（后者正是"菜单收不回去"的原因）。
+   *
+   * 与上面那条的分工是刻意的：宿主文档里的右键走原生事件（拿得到 `defaultPrevented`
+   * 与 `closest`，让位规则全都在），插件界面里的走这条桥。两条最终都只是给
+   * `menuPos` 一个值 —— 菜单本身、以及它的条目，两处完全一致。
+   *
+   * **`null` 表示关闭。** 开与关写的是同一处状态，因此不存在"打开了却没人负责关"
+   * 这种状态：谁给 `menuPos` 赋值，谁就是那条通路的全部。
+   */
+  useEffect(
+    () => subscribeGlobalContextMenu((request) => setMenuPos(request ? { ...request } : null)),
+    []
+  );
 
   // 全屏时两级标题栏都不占位，内容区上沿归零。
   const showTitlebar = !fullscreen;

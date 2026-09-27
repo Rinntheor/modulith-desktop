@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "宿主浮层窗口（对话框与右键菜单）的授权。它是**由宿主渲染**的浮层，跑在独立窗口里 —— 沙箱插件的界面是原生子 webview，层级高于宿主文档的任何元素，因此浮层必须是一个窗口而不是一段 DOM。刻意只给三条：这个窗口的全部职责是「显示内容 → 回答一次 → 收起自己」，而这三条正好是那三件事。它不知道是哪个插件在问，也不需要知道。",
+  "webviews": ["overlay"],
+  "permissions": [
+    "allow-overlay-respond",
+    "allow-overlay-resize",
+    "allow-overlay-hide"
+  ]
+}

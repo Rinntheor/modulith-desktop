@@ -233,6 +233,46 @@ export function getShortcuts(): RegisteredShortcut[] {
 }
 
 /**
+ * 按**规范化组合键**执行一条快捷键，返回是否命中。
+ *
+ * ============================================================
+ * 它与 `handleShortcutEvent` 的分工
+ * ============================================================
+ *
+ * 那一条从键盘事件出发（"用户按了什么"），这一条从组合键出发
+ * （"已经知道用户按了什么，去执行对应的动作"）。
+ *
+ * 需要这一条的场合很具体：**沙箱插件界面里的按键**。焦点落在插件的 webview 里
+ * 时，keydown 只在**插件自己的文档**里派发，宿主窗口上的监听器什么都收不到 ——
+ * 于是插件那边的桥接层接住、规范化、转发回宿主，宿主再按组合键去查这里。
+ *
+ * ============================================================
+ * 为什么取第一个匹配项
+ * ============================================================
+ *
+ * 与 `handleShortcutEvent` 一致。两边取的不是同一条时，表现是"按了之后执行的
+ * 是另一个动作" —— 那比"没反应"更难排查，因为它看起来像是生效了。
+ */
+export function runShortcutByCombo(normalized: string): boolean {
+  const target = normalized.trim().toLowerCase();
+  if (!target) return false;
+
+  // 遍历**副本**：快捷键的处理函数可能会重新注册，而那会就地修改 registry。
+  for (const shortcut of [...registry]) {
+    if (shortcut.normalized !== target) continue;
+
+    try {
+      void shortcut.run();
+    } catch (error) {
+      console.error(`[shortcutRegistry] 执行快捷键 "${shortcut.id}" 失败:`, error);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * 按来源批量注销，返回被移除的数量。
  *
  * 插件禁用 / 卸载时必须调用，否则会留下调用失效代码的快捷键。

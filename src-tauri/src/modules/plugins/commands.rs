@@ -21,6 +21,191 @@ fn to_msg<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+// ============================================================
+// 沙箱界面：宿主签发令牌，前端渲染 iframe
+// ============================================================
+//
+// 这一组命令从前是"前端量矩形、宿主建 / 摆 / 关 webview"四条。现在只剩两条，
+// 因为宿主**不再碰窗口系统**：插件界面是宿主页面上一个 `<iframe>`，位置与尺寸
+// 由 CSS 决定，宿主既不知道也不该知道它被放在哪。
+//
+// 宿主唯一还负责的是**身份**：签发一个不可猜的令牌，并把它绑到"哪个插件的哪个
+// 界面"上。没有令牌，那个 iframe 一条资源都取不到。理由见 `sandbox.rs` 文件头。
+//
+// 为什么不是"插件自己在页面里画一个 iframe"：iframe 里能拿到什么，完全由**来源**
+// 决定，而"哪个来源能读哪份数据"只有宿主知道。插件自己建 iframe 等于自己给自己
+// 发通行证。
+
+/// 给一个已安装插件的某个界面签发令牌，并把该 iframe 的地址一并返回。
+///
+/// 只对清单里写了 `runtime: "sandboxed"` 的**已安装**插件、且清单里**声明过**的
+/// 界面 id 有效；其余一律拒绝（理由见 `sandbox::open_surface`）。
+///
+/// `surface` 缺省是主界面（`"main"`）。缺省值的意义在于：单界面插件的调用方
+/// （包括已发布的那 9 个）**一个字都不用改**。
+///
+/// **幂等。** 前端会重复调用它（React 重复渲染、宿主布局变化后的重挂载），
+/// 同一个界面永远只拿到一个令牌 —— 理由见 `SandboxSurfaces::issue`。
+///
+/// 它仍然是 `async` 的，因为要读 `PluginManager`（一把 tokio 锁）。这**不是**
+/// 那条"不能在主线程上建 webview"的约束 —— 这条路径根本不碰窗口系统。
+#[tauri::command]
+pub async fn sandbox_surface_open(
+    app: AppHandle,
+    plugin_id: String,
+    surface: Option<String>,
+) -> Result<super::sandbox::SurfaceHandle, String> {
+    let surface = surface.unwrap_or_else(super::surfaces::primary_surface);
+    super::sandbox::open_surface(&app, &plugin_id, &surface).await
+}
+
+/// 收回一块界面的令牌。**没开着时静默成功** —— 前端在卸载时无条件调用它，
+/// 把"本来就没开"当成错误只会在日志里堆噪声。
+///
+/// 认令牌而不是认 `(插件 id, 界面 id)`：令牌才是那个 iframe 的身份，而一个
+/// 界面在"关掉又打开"之间会拿到**不同的**令牌。按名字关会让一次迟到的卸载
+/// 把新开的那一块关掉。
+#[tauri::command]
+pub async fn sandbox_surface_close(app: AppHandle, token: String) -> Result<(), String> {
+    super::sandbox::close_surface(&app, &token);
+    Ok(())
+}
+
+/// 运行沙箱自检（诊断用）。**由人显式触发。**
+///
+/// 它打开一个**独立窗口**，在一个真实 webview 里把几条边界各跑一次：文档里有没有
+/// 宿主 IPC、自定义协议是否可用、CSP 是否真的生效。结果同时画在窗口上并写进日志。
+///
+/// 它**不再随应用启动自动运行** —— 每次启动都弹一块面板去验一件大多数时候都成立的
+/// 事，代价是一个每天都会遇到的打扰。为什么保留它、以及不再自动跑的理由，
+/// 见 `sandbox::open_selftest`。
+///
+/// **这条命令必须保持 `async`。** 它要建一个真窗口，而同步命令的函数体在 IPC
+/// 线程（也就是主线程）上就地执行 —— 那正是当年整机假死的那条路径。改成同步
+/// 会让点一下"自检"就卡死整个应用。
+#[tauri::command]
+pub async fn sandbox_self_test(app: AppHandle) -> Result<(), String> {
+    super::sandbox::open_selftest(&app)
+}
+
+/// 一个插件声明了哪些界面（`contributes.surfaces`）。
+///
+/// ============================================================
+/// 为什么做成命令，而不是让前端自己解析清单
+/// ============================================================
+//
+// `contributes.surfaces` 的合法形状由 Rust 侧的 `surfaces::SurfaceSet::parse`
+// 定义：它要挡入口路径越界、缺主界面、id 冲突、数量超限。前端再实现一遍判断
+// 只会多出一套会漂的规则 —— 而漂开的方向是**"宿主认为有两个界面、前端只登记了
+// 一个"**，症状是某个界面点了没反应。这与 `plugin_background_contribution`
+// 是同一条分工。
+///
+/// 单界面插件（包括全部已发布插件）会拿到一个长度为 1、`primary: true` 的数组
+/// —— 这正是"隐式主界面"在界面这一侧的可见形式。
+#[tauri::command]
+pub async fn plugin_surfaces(
+    state: tauri::State<'_, super::PluginState>,
+    id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let manager = state.inner().0.read().await;
+    let view = manager.sandbox_view(&id).map_err(to_msg)?;
+
+    Ok(view
+        .surfaces
+        .all()
+        .iter()
+        .map(|surface| {
+            serde_json::json!({
+                "id": surface.id,
+                "name": surface.name,
+                "primary": surface.is_primary(),
+            })
+        })
+        .collect())
+}
+
+/// 把宿主的主题快照交给插件系统。由前端在主题变化时调用。
+///
+/// ============================================================
+/// 为什么是"前端推上来"而不是宿主自己去读
+/// ============================================================
+///
+/// 主题的**真源在宿主文档里**（那一堆 CSS 自定义属性），而宿主文档跑在主窗口的
+/// webview 里。Rust 这一侧没有 `document` 可读，也不该去读一个它看不见的东西。
+///
+/// 因此前端是唯一知道"现在的令牌是什么"的一方，它把整份快照推上来，宿主只负责
+/// 把它注入插件文档并推给已经打开的界面。
+///
+/// **返回是否真的变了**：前端会因为它自己的理由重推同一份快照（窗口重新获得
+/// 焦点、设置页重渲染），而每一次"真的变了"都会触发一圈 `eval` ——
+/// 不判等会让那些无关的动作触发所有插件界面重绘。
+#[tauri::command]
+pub async fn set_plugin_theme(
+    app: AppHandle,
+    theme: super::theme::ThemeSnapshot,
+) -> Result<bool, String> {
+    let Some(state) = app.try_state::<super::theme::PluginTheme>() else {
+        return Err("主题尚未就绪".to_string());
+    };
+
+    if !state.set(theme) {
+        return Ok(false);
+    }
+
+    // 只推给**已经打开的**界面。没打开的会在它下一次加载时从入口文档里拿到
+    // 最新的那一份，不需要任何额外动作。
+    super::sandbox::apply_theme(&app);
+    Ok(true)
+}
+
+/// 当前的主题快照（诊断与自检用）。
+#[tauri::command]
+pub fn get_plugin_theme(app: AppHandle) -> serde_json::Value {
+    app.try_state::<super::theme::PluginTheme>()
+        .map(|state| state.describe())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// 把宿主的快捷键表交给插件系统。由前端在快捷键注册表变化时调用。
+///
+/// ============================================================
+/// 这张表要解决的事
+/// ============================================================
+///
+/// 键盘焦点落进插件的 webview 之后，keydown 就只在**插件自己的文档**里派发 ——
+/// 宿主窗口上的监听器什么都收不到。因此用户在插件界面里按 Ctrl+K（全局搜索）、
+/// Ctrl+W（关闭标签）会一点反应都没有，而在宿主界面里是好的。
+///
+/// 桥接层据此表判断某个组合该不该转发回来。它必须是**整张表**而不是一个
+/// "是不是宿主快捷键"的布尔 —— 桥接层没法每次按键都问宿主一趟。
+///
+/// **返回是否真的变了**：注册表会因为它自己的理由重推同一张表，而每一次
+/// "真的变了"都会触发一圈 `eval`。
+#[tauri::command]
+pub async fn set_plugin_shortcuts(
+    app: AppHandle,
+    table: super::shortcuts::ShortcutTable,
+) -> Result<bool, String> {
+    let Some(state) = app.try_state::<super::shortcuts::PluginShortcuts>() else {
+        return Err("快捷键表尚未就绪".to_string());
+    };
+
+    if !state.set(table) {
+        return Ok(false);
+    }
+
+    super::sandbox::apply_shortcuts(&app);
+    Ok(true)
+}
+
+/// 当前的快捷键表（诊断与自检用）。
+#[tauri::command]
+pub fn get_plugin_shortcuts(app: AppHandle) -> serde_json::Value {
+    app.try_state::<super::shortcuts::PluginShortcuts>()
+        .map(|state| state.describe())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 #[tauri::command]
 pub async fn list_plugins(
     state: State<'_, PluginState>,
@@ -202,18 +387,63 @@ pub fn verify_plugin_index(
 
 #[tauri::command]
 pub async fn set_plugin_enabled(
+    app: AppHandle,
     state: State<'_, PluginState>,
     id: String,
     enabled: bool,
 ) -> Result<InstalledPlugin, String> {
-    let mut manager = state.inner().0.write().await;
-    manager.set_enabled(&id, enabled).map_err(to_msg)
+    let outcome = {
+        let mut manager = state.inner().0.write().await;
+        manager.set_enabled(&id, enabled).map_err(to_msg)?
+    };
+
+    // 停用一个插件时，它**已经开着的界面必须一起消失**。
+    //
+    // 不关的话，那些 webview 会继续活着并停在屏幕上 —— 它们属于一个"已经不存在
+    // 的插件"，下一次协议请求会被判成"这个插件当前不可用"，于是用户看到几块再也
+    // 刷不出来的空白面板，而唯一的补救方式是重启应用。
+    //
+    // 放在**命令这一层**而不是让前端记得调：停用插件有三条路径（界面上的开关、
+    // 卸载、将来的命令行），让每一条都记得做同一件事，迟早会漏掉一条 ——
+    // 而漏掉的表现是一个还需要重启才能恢复的状态。
+    if !enabled {
+        // 这一条现在**不会失败**（只收回令牌、再推一条"把这块卸掉"给前端），
+        // 因此没有错误分支了。
+        super::sandbox::close_all_surfaces(&app, &id);
+        // 数据库连接也要放掉。**文件不动**（§6：卸载删代码、保留数据），
+        // 放掉的只是那个文件句柄 —— 它在 Windows 上会让备份与"数据目录被占用"
+        // 的排查变麻烦，而一个被停用的插件本来也不该继续占着它。
+        close_database(&app, &id);
+    }
+
+    Ok(outcome)
 }
 
 #[tauri::command]
-pub async fn uninstall_plugin(state: State<'_, PluginState>, id: String) -> Result<(), String> {
-    let mut manager = state.inner().0.write().await;
-    manager.uninstall(&id).map_err(to_msg)
+pub async fn uninstall_plugin(app: AppHandle, state: State<'_, PluginState>, id: String) -> Result<(), String> {
+    {
+        let mut manager = state.inner().0.write().await;
+        manager.uninstall(&id).map_err(to_msg)?;
+    }
+
+    // 与停用同理：被卸载的插件不该留下任何界面。顺序是**先卸再关** ——
+    // 反过来的话，`close_all_surfaces` 之后到 `uninstall` 之间那段窗口里，
+    // 插件还能重新建出一个界面来。
+    super::sandbox::close_all_surfaces(&app, &id);
+    close_database(&app, &id);
+
+    Ok(())
+}
+
+/// 放掉一个插件的数据库连接（停用 / 卸载）。
+///
+/// **不删文件。** §6 的生命周期表写的是"卸载 → 删代码、**保留数据**"，
+/// 而数据库是数据的一部分 —— 删掉它等于把用户的东西一起删了。
+fn close_database(app: &AppHandle, id: &str) {
+    match app.try_state::<super::db::PluginDatabases>() {
+        Some(databases) => databases.close(id),
+        None => log::debug!("插件数据库表尚未就绪，跳过 {id} 的连接清理"),
+    }
 }
 
 #[tauri::command]
@@ -316,6 +546,225 @@ pub async fn plugin_storage_keys(
 ) -> Result<Vec<String>, String> {
     let manager = state.inner().0.read().await;
     manager.storage_keys(&id).map_err(to_msg)
+}
+
+// ============================================================
+// `ctx.db`：in-process 插件那一条路径
+// ============================================================
+//
+// ============================================================
+// 为什么这三条**不是**第二套实现
+// ============================================================
+//
+// 它们只是把调用转给 `PluginDatabases` —— 也就是沙箱那条协议路径用的**同一个**
+// 对象、同一些方法。边界（authorizer、页数上限、一次一条语句）全部在那个对象里，
+// 因此两条路径不可能漂开。
+//
+// 这与 `rpc.rs` 存在的理由是同一个：同一个 `ctx` 有两个调用方，而"能做什么"
+// 必须只有一处定义。区别只在传输 —— 那边是自定义协议，这边是 Tauri 命令。
+//
+// ============================================================
+// `id` 为什么由前端给
+// ============================================================
+//
+// 与 `plugin_storage_*` 完全一样：in-process 插件与宿主在同一个 realm 里，
+// 这条命令**无法**分辨调用者是宿主还是插件。这是 in-process 的固有性质，
+// 已经写进插件开发文档（"权限列表在 in-process 模式下是声明，不是约束"）。
+// 沙箱那条路径不存在这个问题 —— 身份来自 webview 标签。
+
+#[tauri::command]
+pub async fn plugin_db_query(
+    app: AppHandle,
+    id: String,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<super::db::QueryResult, String> {
+    let databases = app
+        .try_state::<super::db::PluginDatabases>()
+        .ok_or_else(|| "插件数据库尚未就绪".to_string())?;
+    databases
+        .query(&app, &id, &sql, &params.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+pub async fn plugin_db_exec(
+    app: AppHandle,
+    id: String,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<super::db::ExecResult, String> {
+    let databases = app
+        .try_state::<super::db::PluginDatabases>()
+        .ok_or_else(|| "插件数据库尚未就绪".to_string())?;
+    databases
+        .exec(&app, &id, &sql, &params.unwrap_or_default())
+        .await
+}
+
+/// `ctx.http.download`：把一个大文件直接下到插件数据目录。
+///
+/// 与 `plugin_db_*` 同一条理由：它只是把调用转给**沙箱协议那条路径用的同一个**
+/// 方法（`PluginManager::http_download`）。权限、出站策略、配额、三段式落盘全部
+/// 在那一侧，因此两条路径不可能漂开。
+///
+/// 进度不从这里回去（RPC 是"发出去、拿到结果"）—— 它走
+/// `rpc::DOWNLOAD_PROGRESS` 这条广播，由前端交给 in-process 插件的回调。
+#[tauri::command]
+pub async fn plugin_http_download(
+    state: tauri::State<'_, super::PluginState>,
+    id: String,
+    url: String,
+    rel: String,
+    headers: Option<std::collections::HashMap<String, String>>,
+) -> Result<super::types::DownloadOutcome, String> {
+    let manager = state.inner().0.clone();
+    let guard = manager.read().await;
+    guard
+        .http_download(&id, &url, &rel, headers, |_, _| {})
+        .await
+        .map_err(to_msg)
+}
+
+#[tauri::command]
+pub async fn plugin_db_transaction(
+    app: AppHandle,
+    id: String,
+    statements: Vec<super::db::Statement>,
+) -> Result<Vec<super::db::ExecResult>, String> {
+    let databases = app
+        .try_state::<super::db::PluginDatabases>()
+        .ok_or_else(|| "插件数据库尚未就绪".to_string())?;
+    databases.transaction(&app, &id, statements).await
+}
+
+/// 删除一个插件的数据目录（**不要求它仍然安装**）。不可撤销。
+///
+/// 与 `plugin_storage_clear` 的分工：那一条要求插件仍然安装且声明了 `storage`
+/// 权限（它是"插件清自己的数据"）；这一条是**用户删自己机器上的东西**，
+/// 因此卸载之后也要能用 —— 否则"卸载保留数据"会把残留变成删不掉的目录。
+///
+/// 前端必须**先确认**再调它。它不是"顺手清一下"的接口。
+#[tauri::command]
+pub async fn plugin_data_clear(state: State<'_, PluginState>, id: String) -> Result<(), String> {
+    let manager = state.inner().0.read().await;
+    manager.clear_data(&id).map_err(to_msg)
+}
+
+/// 一个插件数据目录的占用字节数（**不要求它仍然安装**）。
+///
+/// 与 `plugin_storage_usage` 的分工：那一个报的是键值存储的配额用量、要过权限；
+/// 这一个只是"这个目录占了多少磁盘"—— 卸载确认框要拿它把选择说清楚。
+#[tauri::command]
+pub async fn plugin_data_usage(state: State<'_, PluginState>, id: String) -> Result<u64, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_usage(&id).map_err(to_msg)
+}
+
+/// 列一个目录。`rel` 为空表示插件的**数据根**。
+#[tauri::command]
+pub async fn plugin_data_list(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<Vec<super::data_dir::DataEntry>, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_list(&id, &rel).map_err(to_msg)
+}
+
+/// 取一个路径的元信息。不存在时返回 `null`（不是错误）。
+#[tauri::command]
+pub async fn plugin_data_stat(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<Option<super::data_dir::DataStat>, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_stat(&id, &rel).map_err(to_msg)
+}
+
+/// 读一个文件，返回 **base64**。
+///
+/// 为什么是 base64 而不是原始字节：`invoke` 的参数走 JSON，JSON 里放不下二进制。
+/// 代价是 33% 的体积与一次字符串拷贝 —— 对配置、缩略图、几 MB 的文档可以接受，
+/// 对几百 MB 的文件不行。**原始字节的通道是下一步**（Tauri 的 `invoke` 支持把
+/// `Uint8Array` 直接作为请求体，那样没有转义开销）。
+///
+/// 这一条与 `ctx.storage` 的区别不在这里，而在有没有上限：
+/// 存储的单值是 1 MB，这里是 256 MB。
+#[tauri::command]
+pub async fn plugin_data_read(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    let manager = state.inner().0.read().await;
+    let bytes = manager.data_read(&id, &rel).map_err(to_msg)?;
+    Ok(BASE64.encode(bytes))
+}
+
+/// 写一个文件（覆盖）。内容同样以 base64 传入。
+#[tauri::command]
+pub async fn plugin_data_write(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+    content: String,
+) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    let bytes = BASE64
+        .decode(content)
+        .map_err(|e| format!("内容不是合法的 base64：{e}"))?;
+
+    let manager = state.inner().0.read().await;
+    manager.data_write(&id, &rel, &bytes).map_err(to_msg)
+}
+
+/// 建一个目录（含中间层）。
+#[tauri::command]
+pub async fn plugin_data_mkdir(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<(), String> {
+    let manager = state.inner().0.read().await;
+    manager.data_mkdir(&id, &rel).map_err(to_msg)
+}
+
+/// 删除一个文件或一棵目录树。
+#[tauri::command]
+pub async fn plugin_data_remove(
+    state: State<'_, PluginState>,
+    id: String,
+    rel: String,
+) -> Result<(), String> {
+    let manager = state.inner().0.read().await;
+    manager.data_remove(&id, &rel).map_err(to_msg)
+}
+
+/// 这个插件的数据目录当前占了多少字节。
+#[tauri::command]
+pub async fn plugin_data_used(
+    state: State<'_, PluginState>,
+    id: String,
+) -> Result<u64, String> {
+    let manager = state.inner().0.read().await;
+    manager.data_used(&id).map_err(to_msg)
+}
+
+/// 列出已卸载插件的残留数据（id 与占用字节数，按占用从大到小）。
+///
+/// 卸载保留数据之后必须有这一条：没有它，那些目录既占着空间、又没有任何界面
+/// 能描述它们。
+#[tauri::command]
+pub async fn plugin_data_orphans(
+    state: State<'_, PluginState>,
+) -> Result<Vec<super::manager::OrphanData>, String> {
+    let manager = state.inner().0.read().await;
+    Ok(manager.orphan_data())
 }
 
 /// 分页列出该插件的存储键（设置 → 插件 与插件自己的列表都走它）

@@ -50,7 +50,18 @@ use serde_json::Value;
 /// **改任何一方的字段语义时都必须同时改它**，否则旧脚本会以"少一个字段"
 /// 的形式静默降级。整数而不是语义化版本：这里没有"向后兼容的小改动"这种
 /// 东西 —— 协议是双方的内部约定，任何不匹配都应当直接拒绝。
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// ============================================================
+/// 版本 2：子进程可以**反向**发起请求
+/// ============================================================
+///
+/// 版本 1 是**单向**的：宿主问、子进程答。那够"通道本身"用，但不够跑插件 ——
+/// 插件的 `ctx.storage.get(...)` 是**子进程发起的**调用，它需要宿主回答。
+///
+/// 因此版本 2 加了反方向的消息。线与线的区分只有一条规则：**带 `method` 的是
+/// 请求，不带的是响应**（见 `Incoming`）。没有加 `type` 字段之类的判别式 ——
+/// 两个方向的字段名本来就不同，多一个判别式就多一个可能不一致的地方。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 一次请求的最大长度（字节）。
 ///
@@ -79,6 +90,15 @@ pub enum BackgroundMethod {
     Status,
     /// 优雅停止
     Shutdown,
+    /// 加载一个后台插件：给它入口文件与身份，让它在自己的上下文里跑起来
+    PluginLoad,
+    /// 卸载一个后台插件：跑它的清理函数，然后丢掉那个上下文
+    PluginUnload,
+    /// 向后台插件投递一件事（命令、事件、定时到点）
+    ///
+    /// 它与 `PluginLoad` 分开：加载是"把代码跑起来"，投递是"让它做一件事"。
+    /// 合成一个方法的代价是每次投递都要带着入口路径，而那个路径只在第一次有意义。
+    PluginDispatch,
 }
 
 impl BackgroundMethod {
@@ -90,6 +110,9 @@ impl BackgroundMethod {
             BackgroundMethod::Ping => "ping",
             BackgroundMethod::Status => "status",
             BackgroundMethod::Shutdown => "shutdown",
+            BackgroundMethod::PluginLoad => "plugin.load",
+            BackgroundMethod::PluginUnload => "plugin.unload",
+            BackgroundMethod::PluginDispatch => "plugin.dispatch",
         }
     }
 }
@@ -176,6 +199,61 @@ pub fn encode_request(request: &Request) -> Result<String, ProtocolError> {
     Ok(line)
 }
 
+/// 从子进程读到的一行。
+///
+/// 两个方向共用同一条管道，因此每一行都必须能自己说清它是哪一种。判别式只有
+/// 一个：**带 `method` 的是请求（子进程发起的），不带的是响应**。
+///
+/// 为什么不加一个显式的 `type: "request" | "response"`：那会多出一个必须两边
+/// 都记得维护、而且**错了不会被发现**的字段 —— 一个写成 `"respose"` 的响应
+/// 仍然能被这里的"没有 method 就是响应"正确分类，而如果判别式是显式字段，
+/// 同一处笔误会让整条消息无法分类。用已有的结构特征做判别，少一个自由度。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Incoming {
+    /// 子进程发起的一条请求（插件的 `ctx.*` 调用）
+    Request(Request),
+    /// 对宿主某条请求的响应
+    Response(Response),
+}
+
+/// 解析子进程发来的一行。
+///
+/// 与 `decode_response` 的分工：那一条是"我知道这是响应"的场景（版本 1 的
+/// 语义），这一条是"我不知道这是哪一种"的读循环用的。
+pub fn decode_incoming(line: &str) -> Result<Incoming, ProtocolError> {
+    if line.len() > MAX_LINE_BYTES {
+        return Err(ProtocolError::LineTooLong);
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(ProtocolError::Malformed("空行".to_string()));
+    }
+
+    let value: Value =
+        serde_json::from_str(trimmed).map_err(|error| ProtocolError::Malformed(error.to_string()))?;
+
+    if value.get("method").is_some() {
+        serde_json::from_value(value)
+            .map(Incoming::Request)
+            .map_err(|error| ProtocolError::Malformed(error.to_string()))
+    } else {
+        serde_json::from_value(value)
+            .map(Incoming::Response)
+            .map_err(|error| ProtocolError::Malformed(error.to_string()))
+    }
+}
+
+/// 把一条响应编码成一行（含结尾换行）。
+///
+/// 宿主回答子进程的请求时用它。与 `encode_request` 一样带上防注入的兜底断言。
+pub fn encode_response(response: &Response) -> Result<String, ProtocolError> {
+    let mut line = serde_json::to_string(response)
+        .map_err(|error| ProtocolError::Malformed(error.to_string()))?;
+    debug_assert!(!line.contains('\n'), "编码后的响应里不允许出现裸换行");
+    line.push('\n');
+    Ok(line)
+}
+
 /// 解析子进程返回的一行
 pub fn decode_response(line: &str) -> Result<Response, ProtocolError> {
     if line.len() > MAX_LINE_BYTES {
@@ -211,6 +289,31 @@ mod tests {
         assert_eq!(BackgroundMethod::Ping.as_wire(), "ping");
         assert_eq!(BackgroundMethod::Status.as_wire(), "status");
         assert_eq!(BackgroundMethod::Shutdown.as_wire(), "shutdown");
+        assert_eq!(BackgroundMethod::PluginLoad.as_wire(), "plugin.load");
+        assert_eq!(BackgroundMethod::PluginUnload.as_wire(), "plugin.unload");
+        assert_eq!(BackgroundMethod::PluginDispatch.as_wire(), "plugin.dispatch");
+    }
+
+    /// 线上方法名**两两不同**。
+    ///
+    /// 复制粘贴一个新变体、改名字时漏掉 `as_wire` 那一行，会让两个方法共用同一个
+    /// 线上名字 —— 而调用方永远只会到达先匹配的那一个，另一个静默地变成死代码。
+    #[test]
+    fn wire_method_names_are_unique() {
+        let all = [
+            BackgroundMethod::Hello,
+            BackgroundMethod::Ping,
+            BackgroundMethod::Status,
+            BackgroundMethod::Shutdown,
+            BackgroundMethod::PluginLoad,
+            BackgroundMethod::PluginUnload,
+            BackgroundMethod::PluginDispatch,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|method| method.as_wire()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "有两个方法共用了同一个线上名字");
     }
 
     #[test]
@@ -354,8 +457,89 @@ mod tests {
 
         // 这条断言本身就是"当前版本是 2"的显式记录：升到 3 时它必须一起改，
         // 那时也会顺带看到上面那份 `ALLOWED`。
-        assert_eq!(PROTOCOL_VERSION, 1, "协议版本变了就更新这条测试");
+        assert_eq!(PROTOCOL_VERSION, 2, "协议版本变了就更新这条测试");
         assert!(ALLOWED.contains(&PROTOCOL_VERSION));
+    }
+
+    // ============================================================
+    // 反向消息（子进程 → 宿主）的分类
+    // ============================================================
+
+    /// 分类的判据是"有没有 `method`"。
+    ///
+    /// 这一条防的是一次具体的手滑：把子进程发来的 `ctx.*` 请求当成响应，
+    /// 于是它在待处理表里查不到 id，被记成一句"收到没有等待者的响应"然后丢掉 ——
+    /// 而插件那边只是**永远等不到回答**，没有任何一处会说"这个调用没人处理"。
+    #[test]
+    fn a_child_request_is_told_apart_from_a_response_by_the_method_field() {
+        let request_line = format!(
+            r#"{{"v":{PROTOCOL_VERSION},"id":7,"method":"ctx.storage.get","params":{{"key":"a"}}}}"#
+        );
+        match decode_incoming(&request_line).unwrap() {
+            Incoming::Request(request) => {
+                assert_eq!(request.id, 7);
+                assert_eq!(request.method, "ctx.storage.get");
+                assert_eq!(request.params.unwrap()["key"], "a");
+            }
+            other => panic!("应当被识别为请求，实际是 {other:?}"),
+        }
+
+        let response_line =
+            format!(r#"{{"v":{PROTOCOL_VERSION},"id":7,"result":{{"ok":true}}}}"#);
+        match decode_incoming(&response_line).unwrap() {
+            Incoming::Response(response) => {
+                assert_eq!(response.id, 7);
+                assert_eq!(response.validate(), Ok(()));
+            }
+            other => panic!("应当被识别为响应，实际是 {other:?}"),
+        }
+    }
+
+    /// 子进程的请求**也必须**在解析前就拒绝超长行 —— 与响应同一条理由：
+    /// 这条通道的内容来自插件，长度完全不受我们控制。
+    #[test]
+    fn decode_incoming_rejects_oversized_lines_before_parsing() {
+        let huge = "x".repeat(MAX_LINE_BYTES + 1);
+        assert_eq!(decode_incoming(&huge), Err(ProtocolError::LineTooLong));
+    }
+
+    #[test]
+    fn encode_response_round_trips_and_never_emits_a_raw_newline() {
+        let response = Response {
+            v: PROTOCOL_VERSION,
+            id: 3,
+            result: Some(serde_json::json!({ "text": "line1\nline2" })),
+            error: None,
+        };
+        let line = encode_response(&response).unwrap();
+        assert_eq!(line.matches('\n').count(), 1, "换行必须被转义：{line}");
+        assert_eq!(decode_response(&line).unwrap(), response);
+    }
+
+    /// 一条响应与一条请求在**同一条管道**上来回时不会互相串号。
+    ///
+    /// id 空间是各自的：宿主可能有 id=1 在飞，子进程同时也用 id=1 发一条请求。
+    /// 因为判别式是 `method` 而不是 id，两者不会混淆 —— 这条测试把那个前提钉住。
+    #[test]
+    fn identical_ids_in_opposite_directions_do_not_collide() {
+        let host_request = encode_request(&request(1, BackgroundMethod::Ping)).unwrap();
+        let child_request = format!(
+            r#"{{"v":{PROTOCOL_VERSION},"id":1,"method":"ctx.storage.keys"}}"#
+        );
+
+        // 宿主发出去的那条被解析成请求（它自己知道），子进程发来的那条也是请求
+        assert!(matches!(
+            decode_incoming(&child_request).unwrap(),
+            Incoming::Request(_)
+        ));
+        // 而宿主收到的一条**响应**即使 id 相同也仍然是响应
+        let response_line = format!(r#"{{"v":{PROTOCOL_VERSION},"id":1,"result":{{"pong":true}}}}"#);
+        assert!(matches!(
+            decode_incoming(&response_line).unwrap(),
+            Incoming::Response(_)
+        ));
+
+        assert!(host_request.contains("\"id\":1"));
     }
 
     #[test]

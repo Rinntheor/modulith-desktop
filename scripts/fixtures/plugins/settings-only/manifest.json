@@ -5,7 +5,7 @@
   "description": "稳定性夹具：只有设置项，没有模块也没有命令",
   "author": { "name": "harness" },
   "license": "MIT",
-  "engines": { "loopcore": ">=1.0.0" },
+  "engines": { "modulith": ">=1.6.0" },
   "main": "index.js",
   "icon": "Package",
   "permissions": ["storage"],

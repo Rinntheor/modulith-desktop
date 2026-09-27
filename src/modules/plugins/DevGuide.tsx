@@ -20,7 +20,7 @@ const MANIFEST_EXAMPLE = `{
   "homepage": "https://example.com/notes",
   "categories": ["productivity"],
   "keywords": ["notes", "markdown"],
-  "engines": { "loopcore": ">=1.0.0" },
+  "engines": { "modulith": ">=1.6.0" },
   "main": "dist/index.js",
   "style": "dist/index.css",
   "icon": "FileText",
@@ -185,7 +185,7 @@ const DevGuide: React.FC<DevGuideProps> = memo(({ open, onClose }) => (
                 <code className="font-mono">dist/index.js</code>。
                 <code className="font-mono">name</code> 需匹配{' '}
                 <code className="font-mono">^[a-zA-Z0-9][a-zA-Z0-9._-]{'{0,63}'}$</code>。
-                <code className="font-mono">engines.loopcore</code> 用于声明兼容的 Modulith
+                <code className="font-mono">engines.modulith</code> 用于声明兼容的 Modulith
                 版本范围。建议使用只带下界的写法（如{' '}
                 <code className="font-mono">&gt;=1.0.0</code>）；范围语法非法会被拒绝安装，
                 但语法正确而版本不匹配只会显示一条提示，不影响安装与加载。

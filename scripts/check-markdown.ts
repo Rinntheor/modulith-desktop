@@ -639,6 +639,50 @@ check(
     : `JSX 文本里出现了字面 Markdown 粗体（用户会看到星号）：\n      ${literalStars.join('\n      ')}`
 );
 
+// ============================================================
+// 文档的章节编号必须连续
+// ============================================================
+//
+// 这条是给**我自己**加的。改文档时用"把某个小节标题整段替换成新内容"的写法，
+// 连着三次把下一个 `## N.` 一起顶掉了 —— 而每一次 `check:markdown` 都是全绿：
+// 丢一个标题不会让任何已有断言失败，文档只是**静默地少了一层结构**。
+//
+// 判据：在一份用了 `## N.` 编号的文档里，N 必须从起点开始逐一递增。
+// 它抓不到"内容写错了"，但能抓到"整节被删掉了" —— 而那正是实际发生的事。
+
+{
+  const numberedDocs = [
+    'docs/06-项目/已知问题与技术债.md',
+    'docs/08-规划/插件沙箱与数据-v2.0范围.md',
+  ];
+
+  for (const doc of numberedDocs) {
+    const path = join(PROJECT_ROOT, doc);
+    if (!existsSync(path)) continue;
+
+    const numbers = readFileSync(path, 'utf8')
+      .split('\n')
+      .map((line) => /^## (\d+)\./.exec(line))
+      .filter((m): m is RegExpExecArray => m !== null)
+      .map((m) => Number(m[1]));
+
+    // 规划稿用 `## 0.` 起头，技术债用 `## 1.`，两种起点都接受。
+    const start = numbers[0] === 0 ? 0 : 1;
+    const expected = numbers.map((_, i) => start + i);
+    const contiguous =
+      numbers.length === expected.length && numbers.every((n, i) => n === expected[i]);
+
+    check(
+      numbers.length >= 3 && contiguous,
+      contiguous
+        ? `${doc} 的章节编号连续（${numbers.length} 节）`
+        : `${doc} 的章节编号不连续：实际 [${numbers.join(', ')}]，期望 [${expected.join(
+            ', '
+          )}] —— 多半是某一节被整段替换掉了`
+    );
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} 项失败`);
   process.exit(1);

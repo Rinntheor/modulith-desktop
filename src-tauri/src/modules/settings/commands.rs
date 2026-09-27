@@ -361,7 +361,7 @@ mod tests {
     /// 2. 与 `validator.rs` 使用的 `env!("CARGO_PKG_VERSION")` 完全一致
     ///
     /// 这两点保证前端显示、插件读到的 `window.Modulith.version`、
-    /// 以及 `engines.loopcore` 的校验基准三者不会分叉。
+    /// 以及 `engines.modulith` 的校验基准三者不会分叉。
     #[test]
     fn app_info_version_is_valid_semver() {
         let info = get_app_info();

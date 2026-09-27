@@ -73,6 +73,49 @@ type UpdateDownloadEvent =
   | { event: 'Finished' };
 
 /**
+ * ============================================================
+ * 「请立刻检查一次更新」的请求
+ * ============================================================
+ *
+ * 存在的理由是托盘菜单里那一项。用户点「检查更新」的**意图是看到结果**，
+ * 而这里曾经只做了一半：后端把主窗口显示出来、切到「关于」分页，然后就没了 ——
+ * 面板上是那张更新卡片和一个「检查更新」按钮，**检查并没有开始**。
+ * 用户看到的是"点了检查更新，弹出一个窗口让我再点一次检查更新"。
+ *
+ * 为什么用"待办标记 + 通知"而不是单纯的事件：
+ * 发请求的那一刻，`UpdateChecker` 很可能**还没挂载**（设置面板正在打开）。
+ * 只发事件的话那一条会丢在空气里，症状就是"偶发：点了没反应"——
+ * 而这正是最难被报告、也最难复现的一类缺陷。因此请求先被**记下**，
+ * 组件挂载时再取走；已经挂载的则当场收到通知。
+ */
+let pendingUpdateCheck = false;
+const updateCheckListeners = new Set<() => void>();
+
+/** 请求检查一次更新。重复请求会合并成一次。 */
+export function requestAppUpdateCheck(): void {
+  pendingUpdateCheck = true;
+  for (const listener of updateCheckListeners) listener();
+}
+
+/**
+ * 取走一条待办的检查请求。
+ *
+ * 返回 `true` 表示"有人在等你检查"，调用方应当立刻开始。
+ * **读一次就清掉**：否则组件每次重挂载都会再查一遍。
+ */
+export function consumePendingUpdateCheck(): boolean {
+  const pending = pendingUpdateCheck;
+  pendingUpdateCheck = false;
+  return pending;
+}
+
+/** 订阅"有人请求检查更新"。返回取消订阅的函数。 */
+export function subscribeAppUpdateCheck(listener: () => void): () => void {
+  updateCheckListeners.add(listener);
+  return () => updateCheckListeners.delete(listener);
+}
+
+/**
  * 检查是否有新版本。重复调用是安全的 —— 后端的实现会先释放上一次的结果。
  *
  * 需要联网。网络不可达时抛错，由调用方决定怎么呈现（而不是在这里吞掉：

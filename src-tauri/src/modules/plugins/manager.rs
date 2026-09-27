@@ -11,11 +11,14 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 
+use super::data_dir;
+use super::data_root;
 use super::icon;
 use super::quota;
 use super::types::{
+    DownloadOutcome,
     ExportOutcome, HttpResponse, InstalledPlugin, PickedAudio, PluginError, PluginManifest,
-    PluginPermission, PluginResult, PluginStatus, RegistryEntry, RegistryFile,
+    PluginPermission, PluginResult, PluginRuntime, PluginStatus, RegistryEntry, RegistryFile,
 };
 use super::validator;
 use crate::modules::net::client::{NetClient, NetError, NetOrigin};
@@ -29,6 +32,17 @@ use crate::modules::settings::{network, settings as settings_store};
 pub struct StorageUsage {
     pub total_bytes: u64,
     pub key_count: usize,
+}
+
+/// 一个**已卸载插件**留下的数据目录。
+///
+/// 卸载保留数据（见 `PluginManager::uninstall`）之后，磁盘上会出现这种目录。
+/// 它们必须能被用户看见并清掉 —— 否则"数据不会丢"的另一面就是"空间没人知道"。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanData {
+    pub id: String,
+    pub bytes: u64,
 }
 
 /// 一页存储键。
@@ -53,6 +67,15 @@ const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_README_BYTES: u64 = 64 * 1024;
 /// HTTP 代理允许的最大响应体（2 MB）
 const MAX_HTTP_BODY_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 一次下载**推到界面的进度**之间至少差多少字节。
+///
+/// 一个 200 MB 的文件按块回调会有上万次。每次都推一次 IPC，等于把"下载一个文件"
+/// 变成一次针对宿主的 DDOS —— 而进度的用处只是让界面上的条动起来。
+///
+/// 256 KiB 在 1 MB/s 的链路上约等于每四分之一秒一次：够顺滑，也不会把消息通道
+/// 占满。
+const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 /// 从插件仓库拉取的单个文本文件允许的最大体积（1 MB）
 ///
 /// 索引正常只有几 KB，README 通常几十 KB。上限的意义是**不把一个来路不明的巨大响应
@@ -126,6 +149,58 @@ fn ensure_permission(
         id,
         permission.as_str()
     )))
+}
+
+/// 安装策略：这个清单**允不允许被安装**。
+///
+/// ============================================================
+/// 为什么这是一个纯函数
+/// ============================================================
+///
+/// 与 `ensure_permission` 同一理由：判定规则本身要被单测钉住，而 `PluginManager`
+/// 持有 `AppHandle`、单测里造不出来。设置值由调用方读出来当参数传进来。
+///
+/// ============================================================
+/// 判据是 `runtime`，不是权限列表
+/// ============================================================
+///
+/// 未隔离插件与宿主共享同一个 JS 上下文，因此**权限列表约束不了它** ——
+/// 它可以绕过 `ctx.*` 直接调宿主这个 realm 里的任何东西。也就是说，对一个
+/// 未隔离插件，"它申报了哪些权限"不是一个可用于判断的量。
+///
+/// 真正区分得开的是运行**位置**：`sandboxed` 的插件跑在自己的来源里，那个来源
+/// 拿不到宿主 IPC。因此这里只看这一项，而不是去数权限有多少条、风险有多高 ——
+/// 那会给出一种"权限少的未隔离插件更安全"的假象。
+///
+/// 用 `needs_own_webview()` 而不是自己写 `== Sandboxed`：这个问题的措辞只该有
+/// 一处实现，将来加第三种运行位置时，"它有没有自己的运行环境"必须跟着一起改。
+fn check_install_policy(
+    manifest: &PluginManifest,
+    allow_unsandboxed: bool,
+) -> PluginResult<()> {
+    if manifest.runtime.needs_own_webview() || allow_unsandboxed {
+        return Ok(());
+    }
+
+    Err(PluginError::UnsafePluginRejected(format!(
+        "插件 {} {} 没有隔离（清单里的 runtime 是 \"{}\"）—— 它与宿主跑在同一个上下文里，\
+         权限列表约束不了它。当前设置不允许安装未隔离插件：\
+         到「设置 → 插件」里打开「允许安装未隔离插件」之后可以再装一次。\
+         已经装上的插件不受这个设置影响。",
+        manifest.name,
+        manifest.version,
+        manifest.runtime.as_str()
+    )))
+}
+
+/// 读当前设置并执行上面的策略。
+///
+/// **每次安装都重新读设置**，不缓存：缓存会引入「改了设置要重启才生效」这种
+/// 最难解释的现象，而安装是低频动作（一次点击一次），`settings.json` 只有几 KB。
+/// 与 `proxy_base()` 同一取向。
+fn ensure_install_allowed(app: &AppHandle, manifest: &PluginManifest) -> PluginResult<()> {
+    let settings = settings_store::load(app);
+    check_install_policy(manifest, settings.allow_unsandboxed_plugins)
 }
 
 /// 计算内容的 SHA-256，返回小写十六进制。
@@ -339,6 +414,11 @@ pub struct PluginManager {
     app: AppHandle,
     plugins_dir: PathBuf,
     data_dir: PathBuf,
+    /// 数据根**现在能不能用**。不可用时所有插件数据操作都必须拒绝。
+    ///
+    /// 存在这里而不是每次现算：判定要写一个探针文件（磁盘 IO），而它会被每一次
+    /// 数据读取问到。启动时算一次，之后由"改数据位置"那条路径重算。
+    data_root_status: data_root::DataRootStatus,
     registry: HashMap<String, RegistryEntry>,
     /// 出站门面。**没有裸 `reqwest::Client` 字段** —— 理由见 `net/client.rs`：
     /// 上一版正是靠"每个调用点各自记得判定"，结果市场索引那条路漏掉了。
@@ -361,10 +441,26 @@ impl PluginManager {
             )))?;
 
         let plugins_dir = app_data.join("plugins");
-        let data_dir = app_data.join("plugin_data");
+
+        // 数据根目录**不再是 `app_data` 下的一个固定子目录**。
+        //
+        // 它现在由 `data_root` 解析：默认落在 `%LOCALAPPDATA%`（大数据不该进漫游配置），
+        // 用户配置时用用户给的位置，并且**带上"它现在能不能用"这个状态**。
+        //
+        // `ctx.storage` 与已有插件的数据**原地不动**：默认根换了名字但 `plugin_data`
+        // 这个名字没变，只是换到了 Local。旧数据留在 Roaming 里 —— 那是下一节
+        // （显式迁移）的事，而"不静默搬用户的文件"是这里的默认。
+        let (data_dir, data_root_status) = data_root::resolve(&app);
 
         std::fs::create_dir_all(&plugins_dir)?;
-        std::fs::create_dir_all(&data_dir)?;
+
+        if !data_root_status.available {
+            log::error!(
+                "插件数据目录不可用：{}（路径 {}）。插件的数据操作会被拒绝，而不是读到一份空数据。",
+                data_root_status.reason.as_deref().unwrap_or("未知原因"),
+                data_root_status.path
+            );
+        }
 
         // 30 秒是**下载整包**用的超时，不是诊断用的短超时 —— 门面按调用方给的值构造，
         // 因为"慢"与"坏"在这里是两件不同的事。
@@ -375,6 +471,7 @@ impl PluginManager {
             app,
             plugins_dir,
             data_dir,
+            data_root_status,
             registry: HashMap::new(),
             net,
         };
@@ -503,6 +600,307 @@ impl PluginManager {
 // ============================================================
 // 查询
 // ============================================================
+
+/// 沙箱要用到的**全部事实**。
+///
+/// 这些字段都来自已安装插件这一次读取，沙箱那边不再自己记一份 —— 理由见
+/// `PluginManager::sandbox_view`。
+#[derive(Debug, Clone)]
+pub struct SandboxView {
+    /// 插件 id（身份）
+    pub id: String,
+    /// 界面标题
+    pub name: String,
+    pub version: String,
+    /// 资源根目录（开发链接优先，与其它读取路径一致）
+    pub root: PathBuf,
+    /// 入口脚本（相对 `root`）
+    ///
+    /// **这是主界面的入口。** 次级界面的入口在 `surfaces` 里按界面 id 取。
+    /// 保留这个字段是因为它被三处既有代码读着（自检、日志、断言），而这些地方
+    /// 说的都是"这个插件的主入口"。
+    pub main: String,
+    /// 样式（相对 `root`）
+    pub style: Option<String>,
+    /// **当前**清单里声明的权限
+    pub permissions: Vec<String>,
+    /// 清单声明的运行位置
+    pub runtime: PluginRuntime,
+    /// 这个插件声明的全部界面（至少一个，且一定含主界面）。
+    ///
+    /// 解析在**这里**做而不是让沙箱那边自己读清单：清单只有一个读者，
+    /// 而"这个插件有哪些界面"是清单的事实之一 —— 与根目录、权限同一个来源。
+    pub surfaces: super::surfaces::SurfaceSet,
+    /// **整份清单**（序列化形式），给 `ctx.manifest` 与 `Modulith.run()` 用。
+    ///
+    /// 为什么是 `Value` 而不是 `PluginManifest`：注入到桥接层时要的就是一段
+    /// JSON 字面量，桥接层那边的形状由插件侧的类型定义管，宿主这边再解释一遍
+    /// 只会多出一处会漂的映射。`Value` 同时也把"清单里有而宿主不认识的字段"
+    /// 原样保留下来 —— 插件读自己的 `contributes` 时不该看到被宿主裁过的版本。
+    ///
+    /// in-process 的 `ctx.manifest` 给的是**规范化之后**的对象（有缺省值、
+    /// 有 `undefined`）。这里给的是清单文件本身的忠实投影，因此少数缺省字段
+    /// 在沙箱里可能是缺席而不是 `undefined` —— 这是**有意的差别**，因为
+    /// "一份被宿主填过默认值的清单"与"作者写的那份"是两件不同的事，而插件
+    /// 读 `manifest` 多半是为了自己的 `contributes`。
+    pub manifest: serde_json::Value,
+}
+
+impl SandboxView {
+    /// 取一个界面的声明。`None` = 清单里没有这个界面。
+    pub fn surface(&self, id: &str) -> Option<&super::surfaces::SurfaceDecl> {
+        self.surfaces.get(id)
+    }
+}
+
+/// 一条**清单声明**的右键菜单条目。
+///
+/// 与前端 `ContextMenuContribution` 逐字对应。它不是 `serde` 反序列化的结果，
+/// 而是从自由形状的 `contributes` 里挑出来的 —— 因此缺字段时是"跳过这一条"，
+/// 而不是整份清单失败。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclaredMenuItem {
+    pub id: String,
+    pub label: String,
+    /// 被执行的命令的**本地** id（与 `contributes.commands[].id` 对齐）
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl PluginManager {
+    /// 取一个插件的沙箱视图。
+    ///
+    /// **这是沙箱唯一的真源。** 沙箱那边只记"我建过哪些界面"（标签 → 插件 id），
+    /// 而"这个插件存在吗、它的资源在哪、它声明了什么"全部从这里读。
+    ///
+    /// 为什么不能各记一份：那会变成两个真源，而两套清单一定会漂 —— 漂开的方向是
+    /// "沙箱以为这个插件存在、存储那边不认"。实测撞到过一次，见
+    /// docs/06-项目/已知问题与技术债.md §7.40。
+    ///
+    /// 权限与运行位置都读**当前**清单，不是注册表里的缓存 —— 与 `manifest_of`
+    /// 同一个理由：开发目录里新加/去掉的声明必须立刻影响判定。
+    pub fn sandbox_view(&self, id: &str) -> PluginResult<SandboxView> {        let entry = self
+            .registry
+            .get(id)
+            .ok_or_else(|| PluginError::NotFound(format!("插件不存在: {id}")))?;
+
+        // 停用的插件不该有界面。放在读清单之前：一个被停用的插件连它的清单都不必解析。
+        if !entry.enabled {
+            return Err(PluginError::NotFound(format!("插件已停用: {id}")));
+        }
+
+        let root = self.asset_root(entry);
+        let manifest = read_manifest(&root)?;
+
+        let display_name = if manifest.display_name.trim().is_empty() {
+            manifest.name.clone()
+        } else {
+            manifest.display_name.clone()
+        };
+
+        // 界面声明**解析失败就是不可用**，而不是退回隐式单界面。
+        //
+        // 退回会制造一个非常糟的状态：插件作者写了三个界面，其中一个 id 打错了，
+        // 于是那个界面静默消失 —— 而作者看到的是"点了没反应"。宁可整块界面
+        // 都建不出来，并把清单里的那一句话说清楚。
+        let surfaces = super::surfaces::SurfaceSet::parse(
+            manifest.contributes.as_ref(),
+            &manifest.main,
+            manifest.style.as_deref(),
+            &display_name,
+        )
+        .map_err(|message| PluginError::InvalidManifest(format!("{id}: {message}")))?;
+
+        Ok(SandboxView {
+            id: id.to_string(),
+            name: display_name,
+            version: manifest.version.clone(),
+            root,
+            main: surfaces.primary().entry.clone(),
+            style: surfaces.primary().style.clone(),
+            permissions: manifest
+                .permissions
+                .iter()
+                .map(|permission| permission.as_str().to_string())
+                .collect(),
+            runtime: manifest.runtime,
+            surfaces,
+            // 序列化失败只能是"清单类型与它自己的 Serialize 实现不一致"，那在编译期
+            // 就该挡住。真发生了就给 `null` 而不是整块界面建不出来 —— 清单这一项
+            // 缺了会让 `ctx.manifest` 是 `null`（可见），而界面白屏是不可见的。
+            manifest: serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        })
+    }
+
+    /// 一个插件声明的右键菜单条目（`contributes.contextMenus`）。
+    ///
+    /// ============================================================
+    /// 为什么在这里读，而不是让前端先读好再传进来
+    /// ============================================================
+    ///
+    /// `ctx.ui.contextMenu({ includeDeclared: true })` 要在**宿主渲染的那次浮层**
+    /// 里出现插件声明的条目。而浮层是由 Rust 这一侧显示并等待回答的
+    /// （见 `desktop/overlay.rs`）—— 让前端先读一遍清单再把条目传上来的话，
+    /// 这条路径上就多了一次往返，而且**清单可能在两者之间被改掉**
+    /// （开发链接下这是常态），于是显示出来的条目与实际能执行的对不上。
+    ///
+    /// 形状校验同样只有一处：菜单项的字段缺失/类型不对时**跳过那一条**，而不是
+    /// 整份清单失败 —— 一个写坏的菜单项不该让插件装不上。这与
+    /// `background_manifest::parse` 是同一条取舍。
+    pub fn context_menus(&self, id: &str) -> PluginResult<Vec<DeclaredMenuItem>> {
+        let Some(entry) = self.registry.get(id) else {
+            return Err(PluginError::NotFound(format!("插件不存在: {id}")));
+        };
+        if !entry.enabled {
+            return Ok(Vec::new());
+        }
+
+        let root = self.asset_root(entry);
+        let manifest = read_manifest(&root)?;
+
+        let Some(items) = manifest
+            .contributes
+            .as_ref()
+            .and_then(|value| value.get("contextMenus"))
+            .and_then(|value| value.as_array())
+        else {
+            return Ok(Vec::new());
+        };
+
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let menu_id = item.get("id")?.as_str()?.trim();
+                let label = item.get("label")?.as_str()?.trim();
+                let command = item.get("command")?.as_str()?.trim();
+
+                if menu_id.is_empty() || label.is_empty() || command.is_empty() {
+                    return None;
+                }
+
+                Some(DeclaredMenuItem {
+                    id: menu_id.to_string(),
+                    label: label.to_string(),
+                    command: command.to_string(),
+                    group: item
+                        .get("group")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                })
+            })
+            .collect())
+    }
+
+    /// 该插件的 **SQLite 文件**路径（`ctx.db`）。
+    ///
+    /// 走 `checked_data_dir`，因此它顺带强制了两件事：`plugin-data` 权限，
+    /// 以及"数据根可用"。数据库是插件数据的一部分，没有理由给它另一套门。
+    ///
+    /// 路径**由宿主拼**（目录 + 常量文件名），不是一个相对路径 —— 插件因此
+    /// 没有机会决定库文件叫什么、放在哪。这与 `data_dir::resolve` 的 chroot
+    /// 语义是同一条思路：能影响"打开哪个文件"的输入越少越好。
+    pub fn database_path(&self, id: &str) -> PluginResult<PathBuf> {
+        let root = self.checked_data_dir(id)?;
+        Ok(super::db::database_file(&root))
+    }
+
+    /// 一个后台（无界面）插件启动所需的事实。
+    /// 返回 `Ok(None)` 表示**这个插件没有后台声明**，因此不该被拉起 ——
+    /// 与"声明了但有问题"（`Err`）分开：前者是常态，后者要能被界面说出来。
+    ///
+    /// ============================================================
+    /// 为什么根目录必须规范化
+    /// ============================================================
+    ///
+    /// `root` 会被当作 Node 的 `--allow-fs-read` 放行目标交给子进程。而权限模型
+    /// 是按**真实路径**比对的：一个指向别处的符号链接会让"看起来在插件目录里"
+    /// 的放行实际打开另一个目录。因此这里 `canonicalize`，并在拼出入口之后再
+    /// 验一次它确实仍在根目录之下。
+    ///
+    /// 两道检查不是冗余：`background_manifest` 验的是**那段相对路径**本身安全，
+    /// 这里验的是**拼出来的路径**没跑出去。符号链接恰好只被第二道拦住。
+    pub fn background_launch(&self, id: &str) -> PluginResult<Option<BackgroundLaunch>> {
+        let Some(entry) = self.registry.get(id) else {
+            return Err(PluginError::NotFound(format!("插件不存在: {id}")));
+        };
+
+        // 停用的插件不该被拉起进程。与界面一样：一个被停用的插件连清单都不必解析。
+        if !entry.enabled {
+            return Ok(None);
+        }
+
+        let root = self.asset_root(entry);
+        let manifest = read_manifest(&root)?;
+
+        let Some(contribution) = super::background_manifest::parse(manifest.contributes.as_ref())
+        else {
+            return Ok(None);
+        };
+
+        let root = root.canonicalize().unwrap_or(root);
+        let entry_path = root.join(&contribution.entry);
+
+        if !entry_path.starts_with(&root) {
+            return Err(PluginError::InvalidManifest(format!(
+                "后台入口跳出插件目录：{}",
+                contribution.entry
+            )));
+        }
+        if !entry_path.is_file() {
+            return Err(PluginError::InvalidManifest(format!(
+                "后台入口不存在：{}（清单里写的是 {}）",
+                entry_path.display(),
+                contribution.entry
+            )));
+        }
+
+        let manifest_json = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+
+        Ok(Some(BackgroundLaunch {
+            id: id.to_string(),
+            name: if manifest.display_name.trim().is_empty() {
+                manifest.name.clone()
+            } else {
+                manifest.display_name.clone()
+            },
+            version: manifest.version.clone(),
+            root,
+            entry: entry_path,
+            permissions: manifest
+                .permissions
+                .iter()
+                .map(|permission| permission.as_str().to_string())
+                .collect(),
+            manifest: manifest_json,
+            contribution,
+        }))
+    }
+}
+
+/// 一个后台插件启动所需的事实。
+///
+/// 与 `SandboxView` 并列而不是复用它：两者的字段只重叠一半（后台没有 `main`
+/// 与 `style`，界面没有 `entry` 与 `contribution`），而合并成一个"什么都有、
+/// 一半是 `None`"的结构会让每一个使用点都要判空。
+#[derive(Debug, Clone)]
+pub struct BackgroundLaunch {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// 插件根目录。**已规范化** —— 见 `PluginManager::background_launch`。
+    pub root: PathBuf,
+    /// 后台入口的绝对路径（已校验仍在 `root` 之下且确实存在）
+    pub entry: PathBuf,
+    pub permissions: Vec<String>,
+    /// 交给子进程的清单原文。插件据此知道自己声明了什么。
+    pub manifest: serde_json::Value,
+    /// 这次启动要遵守的声明
+    pub contribution: super::background_manifest::BackgroundContribution,
+}
 
 impl PluginManager {
     /// 列出所有已安装插件，按 displayName 排序
@@ -924,6 +1322,23 @@ impl PluginManager {
         let manifest = read_manifest(root)?;
         validator::validate_manifest(&manifest, root)?;
 
+        // ============================================================
+        // 安装策略：未隔离插件要不要放行
+        // ============================================================
+        //
+        // **这一处是全部安装路径唯一的汇合点** —— `.lcp` 包、本地目录、用户粘贴
+        // 的 URL、以及市场的下载安装，四条都走这里。因此策略只判一次就覆盖了所有
+        // 入口，也包括"某个插件跳过市场直接 invoke 安装命令"那条路（它确实做得到，
+        // 见 `install_from_url` 的说明：后端分辨不出调用者是谁）。
+        //
+        // 判据取自**包内清单**，不是索引、不是调用方传进来的参数。索引那一侧
+        // （前端 `installGate`）只负责别让用户走到这个错误上，它是体验层 ——
+        // 索引是可以被换掉的一份远端文件，而清单在插件包里，与它自己的代码一起。
+        //
+        // 拒绝发生在**落盘之前**：策略拒绝的插件不该在磁盘上留下任何东西。
+        // `install_from_root` 在这之前只读过清单、校验过清单，没有写过插件目录。
+        ensure_install_allowed(&self.app, &manifest)?;
+
         // validate_manifest 已经确保 main 是安全相对路径
         let main_path = root.join(&manifest.main);
         if !validator::is_within(root, &main_path) {
@@ -1013,7 +1428,31 @@ impl PluginManager {
         self.to_installed(&entry)
     }
 
-    /// 卸载插件：删除插件目录、插件数据目录与注册表条目
+    /// 卸载插件：删除插件目录与注册表条目。**数据目录保留。**
+    ///
+    /// ============================================================
+    /// 为什么不再顺手删数据
+    /// ============================================================
+    //
+    // 这里原来是 `remove_dir_all(&plugin_dir)` 紧接着
+    // `remove_dir_all(&plugin_data_dir)` —— **而且"卸载前二次确认"这个设置关掉时
+    // 整条路径连一个对话框都没有**（见前端 `requestUninstall`）。也就是说：
+    // 用户点一下卸载，插件攒了几个月的数据就没了，没有提示、不进回收站。
+    //
+    // 那是这个插件系统里唯一一处**静默且不可逆地销毁用户数据**的地方。它之所以
+    // 一直没被当成缺陷，是因为在"每个插件只有几 KB 配置"的时代，损失小到没人注意。
+    // 一旦插件开始存文档、图片、数据库，同一个行为就从"无所谓"变成"灾难"。
+    //
+    // 现在语义反过来了：**卸载只删代码，数据默认留下。** 理由是三条：
+    //
+    //   1. 卸载的意图是"我不要这个插件了"，不是"我要销毁它存的东西"。
+    //      这是两件事，不该由一次点击一起完成。
+    //   2. 重装同一个插件能拿回数据 —— 这是最常见的"我先卸了试试"的用法。
+    //   3. 真要删，有一个**独立的、要确认的**入口（`clear_data`）。
+    //
+    // 代价必须说清楚：**卸载之后会留下磁盘占用。** 因此残留必须可见、可清 ——
+    // 否则这就只是把一个静默的数据丢失换成了一个静默的空间泄漏。
+    // 见 `orphan_data()`。
     pub fn uninstall(&mut self, id: &str) -> PluginResult<()> {
         validate_plugin_id(id, "插件 ID")?;
 
@@ -1031,15 +1470,22 @@ impl PluginManager {
             std::fs::remove_dir_all(&plugin_dir)?;
         }
 
-        let data_dir = self.plugin_data_dir(id)?;
-        if data_dir.exists() {
-            std::fs::remove_dir_all(&data_dir)?;
-        }
-
         self.registry.remove(id);
         self.save_registry()?;
 
-        log::info!("插件 {} 已卸载", id);
+        // 把"数据还在、在哪"写进日志。删除动作不该静默，**保留动作同样不该静默** ——
+        // 用户过一阵发现磁盘少了几百 MB 时，这条是唯一能解释它的东西。
+        let kept = self.plugin_data_dir(id)?;
+        if kept.is_dir() {
+            log::info!(
+                "插件 {} 已卸载；数据保留在 {}（{} 字节）。要一并删除，用「插件数据」里的残留清理。",
+                id,
+                kept.display(),
+                dir_size(&kept)
+            );
+        } else {
+            log::info!("插件 {} 已卸载", id);
+        }
         Ok(())
     }
 }
@@ -1222,6 +1668,31 @@ impl PluginManager {
 // ============================================================
 
 impl PluginManager {
+    /// 数据根目录的当前状态（能不能用、在哪、是默认还是用户配置的）。
+    pub fn data_root_status(&self) -> &data_root::DataRootStatus {
+        &self.data_root_status
+    }
+
+    /// 数据根不可用时**拒绝**，而不是返回一份空数据。
+    ///
+    /// 这是整个数据层里最危险的一条的落地：移动硬盘没插、网络盘断开时，如果宿主
+    /// "没找到就当成空的"，插件读到的就是一个空数据目录 —— 而它与"这个插件还没有
+    /// 数据"一模一样。用户会以为数据没了，然后开始重建。
+    ///
+    /// 因此这里返回的是**错误**，而错误会被一路传到界面上（"数据目录不可用：…"）。
+    fn require_data_root(&self) -> PluginResult<()> {
+        if self.data_root_status.available {
+            return Ok(());
+        }
+        Err(PluginError::DataRootUnavailable(format!(
+            "插件数据目录不可用：{}",
+            self.data_root_status
+                .reason
+                .as_deref()
+                .unwrap_or("原因未知")
+        )))
+    }
+
     /// 取该插件的存储目录，并强制 `storage` 权限。
     ///
     /// 五个存储方法（`storage_get` / `set` / `delete` / `keys` / `clear`）全都
@@ -1229,11 +1700,101 @@ impl PluginManager {
     /// 因此 `storage` 权限检查只有这一个执行点。
     ///
     /// 与 `plugin_data_dir` 的分工：那个只保证「ID 合法」，这个额外要求
-    /// 「清单已声明 storage」。卸载等内部流程仍直接使用 `plugin_data_dir`，
-    /// 它们不该受插件的权限声明约束。
+    /// 「清单已声明 storage」与「数据根可用」。卸载等内部流程仍直接使用
+    /// `plugin_data_dir`，它们不该受插件的权限声明约束 —— 而且**在数据根不可用时
+    /// 它们仍然该能工作**（"告诉用户数据在哪、占了多少"这件事不该因为盘没插而失效）。
     fn checked_storage_dir(&self, id: &str) -> PluginResult<PathBuf> {
         self.require_permission(id, PluginPermission::Storage)?;
+        self.require_data_root()?;
         self.plugin_data_dir(id)
+    }
+
+    /// 取该插件的数据目录，并强制 `plugin-data` 权限与数据根可用。
+    ///
+    /// 与 `checked_storage_dir` 并列而不是合并：两者是**两条独立的权限**。
+    /// 合并的话，一个只想要键值存储的插件会顺带拿到整个文件目录 ——
+    /// 权限列表就不再是"它能做什么"的如实描述。
+    fn checked_data_dir(&self, id: &str) -> PluginResult<PathBuf> {
+        self.require_permission(id, PluginPermission::PluginData)?;
+        self.require_data_root()?;
+        self.plugin_data_dir(id)
+    }
+
+    // ============================================================
+    // `ctx.dataDir`：插件私有目录的有界文件操作
+    // ============================================================
+    //
+    // 每一个操作都先取**经过权限与可用性检查的**目录，再把相对路径交给
+    // `data_dir` 那一层做路径校验与 IO。安全判据集中在 `data_dir::resolve`
+    // 一处 —— 散开的话，漏掉任意一个调用点就等于没有边界。
+
+    /// 列一个目录。`rel` 为空表示数据根。
+    pub fn data_list(&self, id: &str, rel: &str) -> PluginResult<Vec<data_dir::DataEntry>> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::list(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 取一个路径的元信息。不存在时 `None`。
+    pub fn data_stat(&self, id: &str, rel: &str) -> PluginResult<Option<data_dir::DataStat>> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::stat(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 读一个文件。
+    pub fn data_read(&self, id: &str, rel: &str) -> PluginResult<Vec<u8>> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::read(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 写一个文件（覆盖）。
+    pub fn data_write(&self, id: &str, rel: &str, bytes: &[u8]) -> PluginResult<()> {
+        self.reject_reserved_data_path(rel)?;
+        let root = self.checked_data_dir(id)?;
+        // 配额用的是**整个数据目录**的当前占用，而不是 `ctx.storage` 那份。
+        // 两者是两个不同的门：一个管键值，一个管文件。
+        let used = data_dir::used_bytes(&root);
+        data_dir::write(&root, rel, bytes, used).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 建一个目录（含中间层）。
+    pub fn data_mkdir(&self, id: &str, rel: &str) -> PluginResult<()> {
+        let root = self.checked_data_dir(id)?;
+        data_dir::mkdir(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 删除一个文件或一棵目录树。
+    pub fn data_remove(&self, id: &str, rel: &str) -> PluginResult<()> {
+        self.reject_reserved_data_path(rel)?;
+        let root = self.checked_data_dir(id)?;
+        data_dir::remove(&root, rel).map_err(PluginError::DataDirViolation)
+    }
+
+    /// 拒绝用 `ctx.dataDir` 覆盖或删掉 **`ctx.db` 的数据库文件**。
+    ///
+    /// 判据本身在 `db::is_reserved_data_path`（那一条有单元测试，因为它是一条
+    /// 纯函数）。这里只负责把"是保留名"翻成一句能指路的错误 —— **读不拦**：
+    /// 把 `plugin.db` 复制出去做备份是合理用法。
+    fn reject_reserved_data_path(&self, rel: &str) -> PluginResult<()> {
+        if super::db::is_reserved_data_path(rel) {
+            return Err(PluginError::DataDirViolation(format!(
+                "{} 是 ctx.db 的数据库文件，不能用 ctx.dataDir 覆盖或删除。\
+                 要备份它请用 read / readText，要清空它请用 ctx.db 里的 SQL。",
+                super::db::DB_FILE_NAME
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// 这个插件的数据目录当前占了多少字节。
+    ///
+    /// **不走权限检查**：它是给人看的数字（界面上显示"这个插件占了多少"），
+    /// 而不是插件能动的东西。与 `data_usage` 的区别是那个用 ID 形状的目录名统计
+    /// （卸载之后也算得出来），这个走 `checked_data_dir`，因此能反映"权限都齐了
+    /// 之后它实际能用多少"。
+    pub fn data_used(&self, id: &str) -> PluginResult<u64> {
+        let root = self.checked_data_dir(id)?;
+        Ok(data_dir::used_bytes(&root))
     }
 
     /// 校验存储 key
@@ -1430,19 +1991,45 @@ impl PluginManager {
         })
     }
 
-    /// 清空插件数据目录。
+    /// 清空插件数据目录。**需要插件仍然安装且声明了 `storage`。**
     ///
     /// **这里曾经完全缺少 ID 守卫**（`data_dir.join(id)` 直接用未校验的 `id`），
     /// `id = ".."` 会让目标解析为应用数据目录本身而被整个删除 —— 连
     /// settings.json / auth.json / notifications.json 一起消失。现在 ID 校验
     /// 收在 `plugin_data_dir` 里，本方法只需保证「只删该插件自己的数据目录」。
+    ///
+    /// 与 `clear_data` 的分工：这一条是**插件自己在运行期**能触发的清空
+    /// （它必须仍然装、仍然有权限）；`clear_data` 是**宿主替用户**执行的删除，
+    /// 卸载之后也要能用。
     pub fn storage_clear(&self, id: &str) -> PluginResult<()> {
         let dir = self.checked_storage_dir(id)?;
+        self.remove_data_dir(&dir, id)
+    }
+
+    /// 删除一个插件的数据目录。**不要求插件仍然安装。**
+    ///
+    /// 为什么必须有这一条：卸载改成"保留数据"之后，`storage_clear` 就够不着那些
+    /// 数据了 —— 它经过 `checked_storage_dir` → `require_permission` → 读清单，
+    /// 而未安装的插件读不到清单。**于是"保留数据"会变成一个再也删不掉的目录**，
+    /// 那只是把静默的数据丢失换成了静默的空间泄漏。
+    ///
+    /// 它是宿主侧的动作（由用户从界面上触发），因此**不做权限判定** ——
+    /// 权限是"插件能不能动自己的数据"，而这里是"用户能不能删自己机器上的东西"。
+    /// 保留的仍然只有 ID 守卫与越界检查。
+    pub fn clear_data(&self, id: &str) -> PluginResult<()> {
+        let dir = self.plugin_data_dir(id)?;
+        self.remove_data_dir(&dir, id)
+    }
+
+    /// 删除数据目录的公共部分：越界检查 + 递归删除。
+    ///
+    /// 两条守卫对所有调用方都成立，因此收在一处 —— 散落的话，漏掉任意一处就等于没有防护。
+    fn remove_data_dir(&self, dir: &Path, id: &str) -> PluginResult<()> {
         if !dir.is_dir() {
             return Ok(());
         }
         // 不变量：目标必须是 data_dir 之下的一个条目，且不能是 data_dir 本身
-        if !validator::is_within(&self.data_dir, &dir) {
+        if !validator::is_within(&self.data_dir, dir) {
             return Err(PluginError::SandboxViolation(format!(
                 "拒绝清空越界目录: {}",
                 id
@@ -1451,6 +2038,73 @@ impl PluginManager {
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+
+    /// 一个插件数据目录的占用字节数。
+    ///
+    /// **不要求插件仍然安装，也不要求它声明 `storage`。** 与 `storage_usage` 的分工：
+    /// 那一个回答"插件的键值存储用了多少配额"，要过权限；这一个只回答"这个目录占了
+    /// 多少磁盘"，是给人看的数字 —— 卸载确认框与残留清理都要它。
+    ///
+    /// 递归统计是这个功能里唯一会慢的一步，因此**只在用户真的要看的时候调它**
+    /// （打开卸载确认框、或列出残留），不要在插件列表里对每个插件都算一遍。
+    pub fn data_usage(&self, id: &str) -> PluginResult<u64> {
+        let dir = self.plugin_data_dir(id)?;
+        Ok(if dir.is_dir() { dir_size(&dir) } else { 0 })
+    }
+
+    /// 列出**已卸载插件的残留数据**。
+    ///
+    /// 卸载保留数据之后，磁盘上会出现一批"没有对应插件"的目录。它们必须能被用户
+    /// 看见 —— 否则"数据不会丢"这句话的另一面就是"占用的空间没人知道"。
+    ///
+    /// 只认**合法插件 id 形状**的目录名：数据目录下不该有别的名字，出现了也不该
+    /// 由这里去动它。目录名非法的一律跳过，也就不可能被这个功能删掉。
+    pub fn orphan_data(&self) -> Vec<OrphanData> {
+        let mut orphans: Vec<OrphanData> =
+            scan_orphan_dirs(&self.data_dir, |id| self.registry.contains_key(id))
+                .into_iter()
+                .map(|(id, path)| OrphanData {
+                    id,
+                    bytes: dir_size(&path),
+                })
+                .collect();
+
+        // 按占用从大到小：这个列表的用途是"我该清理哪个"，不是"有哪些"。
+        orphans.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
+        orphans
+    }
+}
+
+/// 找出数据目录里"没有对应插件"的子目录。**纯函数，因此可以被单测。**
+///
+/// 为什么把它摘出来：这个判定决定**哪些目录会被列给用户、进而可能被删掉**，
+/// 因此它比周围那些 IO 更需要能被单独构造用例覆盖。收在 `PluginManager` 里的话，
+/// 就只能靠"装一个插件再卸掉"来间接验证它，而那种测试很难覆盖"目录名不合法"
+/// 这一类边界。
+///
+/// 只认**合法插件 id 形状**的目录名：数据目录下本不该有别的名字，出现了也不该由
+/// 这里去描述它，更不该被这条路径删掉 —— 一个不认识的东西，正确的处理是不碰它。
+fn scan_orphan_dirs(
+    data_dir: &Path,
+    is_installed: impl Fn(&str) -> bool,
+) -> Vec<(String, PathBuf)> {
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_installed(&name) {
+                return None;
+            }
+            validate_plugin_id(&name, "插件 ID").ok()?;
+            Some((name, entry.path()))
+        })
+        .collect()
 }
 
 // ============================================================
@@ -1592,15 +2246,21 @@ impl PluginManager {
 // ============================================================
 
 impl PluginManager {
-    /// 代插件发起 HTTP 请求（受权限约束）
-    pub async fn http_request(
+    /// 建一个**已经通过权限与策略前置检查**的请求。
+    ///
+    /// `http_request` 与 `http_download` 共用它。抽出来的理由与文件里其它几处
+    /// 完全一样：**两条路径各写一遍权限判定，一定会漂** —— 而漂开的方向是
+    /// "某一条忘了 `network-external` 检查"，那正好是唯一不能出错的那一类。
+    ///
+    /// 出站策略与流量日志**不在这里**：它们在 `NetClient::execute` 里（同一条出口，
+    /// 市场索引与诊断也走它）。这里只做"这个插件能不能发这个请求"。
+    fn plugin_request(
         &self,
         id: &str,
         method: &str,
         url: &str,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
-    ) -> PluginResult<HttpResponse> {
+    ) -> PluginResult<reqwest::RequestBuilder> {
         let method = method.trim().to_ascii_uppercase();
         if !matches!(
             method.as_str(),
@@ -1639,14 +2299,6 @@ impl PluginManager {
             )));
         }
 
-        // ---- 出站策略与流量日志 ----
-        //
-        // **不在这里判定，也不在这里记日志。** 两件事都在 `NetClient::execute` 里，
-        // 与市场索引、诊断走同一条出口。
-        //
-        // 上一版把这段逻辑手写在这里，结果是同一个文件里的 `fetch_once` 没写 ——
-        // 用户设了「禁止出站」后市场照样能加载。一个必须靠"记得写"才生效的纪律，
-        // 迟早会在某个新加的调用点上漏掉；收口到门面之后，漏掉是编译不过的。
         let mut request = self
             .net
             .request(
@@ -1667,6 +2319,34 @@ impl PluginManager {
             }
         }
 
+        Ok(request)
+    }
+
+    /// 把出站策略的拒绝翻成一句带插件名的说明
+    ///
+    /// 用户需要知道是**哪一支**插件在撞策略，而不是只看到"离线模式已开启"却不知道
+    /// 谁在试。两条路径共用它，理由与 `plugin_request` 一样。
+    fn map_net_error(id: &str, error: NetError) -> PluginError {
+        match error {
+            NetError::Denied(reason) => PluginError::PermissionDenied(format!(
+                "插件 {} 的请求被出站策略拒绝：{}",
+                id, reason
+            )),
+            other => PluginError::NetworkError(other.message()),
+        }
+    }
+
+    /// 代插件发起 HTTP 请求（受权限约束）
+    pub async fn http_request(
+        &self,
+        id: &str,
+        method: &str,
+        url: &str,
+        headers: Option<HashMap<String, String>>,
+        body: Option<String>,
+    ) -> PluginResult<HttpResponse> {
+        let mut request = self.plugin_request(id, method, url, headers)?;
+
         if let Some(body) = body {
             request = request.body(body);
         }
@@ -1675,15 +2355,7 @@ impl PluginManager {
             .net
             .execute(request, NetOrigin::plugin(id, "插件网络请求"))
             .await
-            .map_err(|error| match error {
-                // 被策略拒绝时给出带插件名的说明：用户需要知道是哪一支插件在撞策略，
-                // 而不是只看到"离线模式已开启"却不知道谁在试
-                NetError::Denied(reason) => PluginError::PermissionDenied(format!(
-                    "插件 {} 的请求被出站策略拒绝：{}",
-                    id, reason
-                )),
-                other => PluginError::NetworkError(other.message()),
-            })?;
+            .map_err(|error| Self::map_net_error(id, error))?;
         let status = response.status().as_u16();
 
         let mut response_headers: HashMap<String, String> = HashMap::new();
@@ -1721,6 +2393,188 @@ impl PluginManager {
             status,
             headers: response_headers,
             body,
+        })
+    }
+
+    /// 把一个大文件**直接下到插件数据目录**，不经过 JS 内存。
+    ///
+    /// ============================================================
+    /// 为什么不能"下载完再写"
+    /// ============================================================
+    ///
+    /// `ctx.http.fetch` 的响应体是**一个字符串**（见 `HttpResponse`）。一个 200 MB
+    /// 的模型文件走那条路意味着：整段字节在 Rust 里驻留一次、编码成 JSON 字符串
+    /// （+UTF-8 开销）、过一遍 IPC、在插件的 JS 堆里再驻留一次、再 base64 一次写回去。
+    /// 峰值内存是文件大小的好几倍，而它换来的只是"文件从网上下到了磁盘"。
+    ///
+    /// 这一条从网络流直接写进磁盘，全程只有一个固定大小的缓冲区。
+    ///
+    /// ============================================================
+    /// 三段式的写入：`.part` → 校验 → 改名
+    /// ============================================================
+    ///
+    /// 直接往目标文件写、中途断了，留下的是一个**被截断的文件** —— 而它看起来
+    /// 完全正常（图片能打开一半、JSON 是坏的）。调用方没有任何办法分辨"下载失败"
+    /// 与"下载到的东西本来就是坏的"。
+    ///
+    /// 因此先写 `<名字>.part`，只在**全部字节都到齐**之后改名过去。改名在同一卷上
+    /// 是原子的，于是目标文件要么不存在、要么是完整的。
+    ///
+    /// ============================================================
+    /// 配额在**写入过程中**判，不是写完再算
+    /// ============================================================
+    ///
+    /// 写完再统计意味着一个插件可以先占满磁盘再收到"你超了"。这里的做法是：
+    /// 先按当前占用算出**这次最多能写多少**，超出立刻中止并删掉 `.part`。
+    ///
+    /// `on_progress` 由调用方给，用来把进度推给插件。它被**节流**后调用
+    /// （见 `PROGRESS_STEP_BYTES`）—— 一个 200 MB 的文件会产生上万次块回调，
+    /// 每次都推一次 IPC 等于把下载变成一次 DDOS。
+    pub async fn http_download<F>(
+        &self,
+        id: &str,
+        url: &str,
+        rel: &str,
+        headers: Option<HashMap<String, String>>,
+        mut on_progress: F,
+    ) -> PluginResult<DownloadOutcome>
+    where
+        F: FnMut(u64, Option<u64>),
+    {
+        if rel.trim().is_empty() {
+            return Err(PluginError::DataDirViolation(
+                "下载需要一个目标路径".to_string(),
+            ));
+        }
+        // 数据库文件是引擎掌握的：往里写一段 HTTP 响应体会让整个库变成
+        // "file is not a database"，而插件自己一点数据都取不回来。
+        if super::db::is_reserved_data_path(rel) {
+            return Err(PluginError::DataDirViolation(format!(
+                "{} 是 ctx.db 的数据库文件，不能作为下载目标",
+                super::db::DB_FILE_NAME
+            )));
+        }
+
+        let request = self.plugin_request(id, "GET", url, headers)?;
+
+        let root = self.checked_data_dir(id)?;
+        // 目标与配额余量在**发请求之前**算好：一个明显写不下的目标不该先把
+        // 网络流量花掉再告诉你。
+        let target = data_dir::begin_stream(&root, rel, data_dir::used_bytes(&root))
+            .map_err(PluginError::DataDirViolation)?;
+
+        let response = self
+            .net
+            .execute(request, NetOrigin::plugin(id, "插件下载"))
+            .await
+            .map_err(|error| Self::map_net_error(id, error))?;
+
+        let status = response.status().as_u16();
+
+        // 非 2xx 一律**不落盘**，并把响应体的一小段带出来。
+        //
+        // 把它当文件写下去是错的：一个写着"404 Not Found"的 HTML 存成 `model.bin`
+        // 之后，问题会推迟到"读它的时候"才出现，而那时离原因已经很远。
+        if !(200..300).contains(&status) {
+            let snippet = response
+                .text()
+                .await
+                .map(|text| text.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            return Err(PluginError::NetworkError(format!(
+                "下载失败：HTTP {status}{}",
+                if snippet.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{snippet}）")
+                }
+            )));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        let total = response.content_length();
+
+        // Content-Length 已知且已经超过余量时**立刻拒绝**：这省下的不只是一次
+        // 白下的流量，还有"下到一半才发现写不下"的那个状态。
+        if let Some(total) = total {
+            if total > target.headroom {
+                data_dir::abort_stream(&target);
+                return Err(PluginError::QuotaExceeded(format!(
+                    "下载目标过大：服务器声明 {total} 字节，而这次最多还能写 {} 字节",
+                    target.headroom
+                )));
+            }
+        }
+
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mut file = tokio::fs::File::create(&target.temp)
+            .await
+            .map_err(|e| PluginError::DataDirViolation(format!("建不了临时文件：{e}")))?;
+
+        let mut stream = response.bytes_stream();
+        let mut written: u64 = 0;
+        let mut last_reported: u64 = 0;
+
+        let outcome = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    PluginError::NetworkError(format!("下载中断：{e}"))
+                })?;
+
+                written += chunk.len() as u64;
+
+                // 边写边判。`Content-Length` 可能缺失（分块传输），也可能撒谎 ——
+                // 后者是这个判断存在的真正理由。
+                if written > target.headroom {
+                    return Err(PluginError::QuotaExceeded(format!(
+                        "下载超出配额：已经写入 {written} 字节，而这次最多还能写 {} 字节",
+                        target.headroom
+                    )));
+                }
+
+                file.write_all(&chunk).await.map_err(|e| {
+                    PluginError::DataDirViolation(format!("写入失败：{e}"))
+                })?;
+
+                if written - last_reported >= PROGRESS_STEP_BYTES {
+                    last_reported = written;
+                    on_progress(written, total);
+                }
+            }
+
+            file.flush()
+                .await
+                .map_err(|e| PluginError::DataDirViolation(format!("写入失败：{e}")))?;
+            Ok(())
+        }
+        .await;
+
+        // 失败时显式关掉句柄再删：Windows 上"还开着的文件"删不掉，于是失败的
+        // 下载会留下一个 `.part`，而它看起来像一份没写完但可能还有用的数据。
+        drop(file);
+
+        if let Err(error) = outcome {
+            data_dir::abort_stream(&target);
+            return Err(error);
+        }
+
+        // 最后一次进度**无条件推**：不推的话界面会永远停在 96% 那一格。
+        on_progress(written, total);
+
+        data_dir::finish_stream(&target).map_err(PluginError::DataDirViolation)?;
+
+        Ok(DownloadOutcome {
+            rel: rel.to_string(),
+            bytes: written,
+            content_type,
+            status,
         })
     }
 }
@@ -2192,7 +3046,7 @@ mod tests {
             // 真实形状的清单：组 B 要真的解析它，`"{}"` 解析不出来，那一组的数字
             // 就会变成一个假的"很快"
             let manifest = format!(
-                r#"{{"name":"com.example.plugin{index}","displayName":"插件 {index}","version":"1.0.0","description":"规模基线","author":{{"name":"harness"}},"license":"MIT","engines":{{"loopcore":">=1.0.0"}},"main":"index.js","icon":"icon.svg"}}"#
+                r#"{{"name":"com.example.plugin{index}","displayName":"插件 {index}","version":"1.0.0","description":"规模基线","author":{{"name":"harness"}},"license":"MIT","engines":{{"modulith":">=1.6.0"}},"main":"index.js","icon":"icon.svg"}}"#
             );
             std::fs::write(dir.join("manifest.json"), manifest).unwrap();
             std::fs::write(dir.join("index.js"), "x".repeat(JS_KB * 1024)).unwrap();
@@ -2722,6 +3576,190 @@ mod tests {
             perms
         ))
         .expect("最小清单应当能解析")
+    }
+
+    // ============================================================
+    // 安装策略：未隔离插件
+    // ============================================================
+    //
+    // 这一组守的是"沙箱不是一个可以绕过的东西"：只要策略说不行，任何一条安装
+    // 路径都必须拒绝。判定被抽成纯函数 `check_install_policy`，因此能用与上面
+    // 权限那组同样的方式测。
+
+    /// 按 `runtime` 造清单。**不写 `runtime` 字段**时缺省就是 `in-process` ——
+    /// 这正是绝大多数老插件的形态，也是这一组里最该被覆盖的那一种。
+    fn manifest_with_runtime(runtime: Option<&str>) -> PluginManifest {
+        let runtime_field = match runtime {
+            Some(value) => format!(r#","runtime":"{value}""#),
+            None => String::new(),
+        };
+        serde_json::from_str(&format!(
+            r#"{{"name":"com.test.plugin","version":"1.0.0"{}}}"#,
+            runtime_field
+        ))
+        .expect("最小清单应当能解析")
+    }
+
+    /// 未隔离插件在默认设置下必须被拒绝。
+    #[test]
+    fn unsandboxed_install_is_denied_by_default() {
+        let err = check_install_policy(&manifest_with_runtime(None), false)
+            .expect_err("默认设置下未隔离插件必须被拒绝");
+
+        assert!(
+            matches!(err, PluginError::UnsafePluginRejected(_)),
+            "期望 UnsafePluginRejected，实际: {:?}",
+            err
+        );
+    }
+
+    /// 显式的 `in-process` 与"没写这一项"是同一种东西。
+    ///
+    /// 分开测是因为它们走的是两条不同的反序列化路径（前者命中枚举值，后者命中
+    /// `#[serde(default)]`），而"漏了 `runtime` 就等于未隔离"这件事必须两边都成立
+    /// —— 否则一个插件只要删掉一行声明就能绕过安装策略。
+    #[test]
+    fn explicit_in_process_is_denied_like_the_default() {
+        let err = check_install_policy(&manifest_with_runtime(Some("in-process")), false)
+            .expect_err("显式 in-process 也必须被拒绝");
+        assert!(matches!(err, PluginError::UnsafePluginRejected(_)));
+    }
+
+    /// `sandboxed` 不受这个设置影响 —— 否则等于把所有插件一起堵死。
+    #[test]
+    fn sandboxed_install_is_allowed_even_when_the_setting_is_off() {
+        check_install_policy(&manifest_with_runtime(Some("sandboxed")), false)
+            .expect("沙箱插件不该被安装策略拦住");
+    }
+
+    /// 用户打开设置之后放行 —— 拒绝必须是"可以解决的"，而不是死路。
+    #[test]
+    fn the_setting_opens_the_door() {
+        check_install_policy(&manifest_with_runtime(None), true)
+            .expect("用户显式允许之后应当放行");
+    }
+
+    /// 错误信息必须同时给出**为什么**与**下一步**。
+    ///
+    /// 这条测试防的是"把策略拒绝写成一句 `拒绝安装`"：那样的界面用户只能重试，
+    /// 而真正的下一步（去设置里打开开关）就在宿主里摆着，只是没人告诉他。
+    #[test]
+    fn rejection_names_the_plugin_and_the_way_out() {
+        let manifest = manifest_with_runtime(None);
+        let err = check_install_policy(&manifest, false).expect_err("应当拒绝");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("com.test.plugin"),
+            "错误信息里应出现插件 id，实际: {message}"
+        );
+        assert!(
+            message.contains("allow") || message.contains("允许"),
+            "错误信息里应出现那道开关（用户要能照着做），实际: {message}"
+        );
+        assert!(
+            message.contains("in-process"),
+            "错误信息里应写出清单里的 runtime 取值，实际: {message}"
+        );
+    }
+
+    /// 设置项与清单字段都必须真的存在，且默认值是**关**。
+    ///
+    /// 两件事放在一条测试里，因为它们必须同时成立：字段名改了而前端没改，
+    /// 表现是"开关能点但没有效果"；默认值改成 `true` 则整套策略静默失效 ——
+    /// 两者都不会有任何报错。
+    #[test]
+    fn install_policy_defaults_are_closed() {
+        let defaults = crate::modules::settings::settings::AppSettings::default();
+        assert!(
+            !defaults.allow_unsandboxed_plugins,
+            "未隔离插件的安装默认必须是关的"
+        );
+
+        let from_json: crate::modules::settings::settings::AppSettings =
+            serde_json::from_str("{}").expect("空对象应当能反序列化");
+        assert!(
+            !from_json.allow_unsandboxed_plugins,
+            "老设置文件（没有这个字段）也必须拿到「关」"
+        );
+    }
+
+    // ============================================================
+    // 残留数据：哪些目录算"已卸载插件的残留"
+    // ============================================================
+    //
+    // 这个判定决定**哪些目录会被列给用户、进而可能被删掉**，因此它比周围那些 IO
+    // 更需要直接的用例。它是纯函数（`scan_orphan_dirs`），所以能这样测。
+
+    /// 还装着的插件不是残留 —— 否则用户会看到自己正在用的插件出现在"清理"列表里。
+    #[test]
+    fn orphan_scan_skips_installed_plugins() {
+        let root = temp_dir("orphan-installed");
+        std::fs::create_dir_all(root.join("com.test.alive")).unwrap();
+        std::fs::create_dir_all(root.join("com.test.gone")).unwrap();
+
+        let found = scan_orphan_dirs(&root, |id| id == "com.test.alive");
+
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["com.test.gone"], "已安装的插件不该被算成残留");
+    }
+
+    /// **名字不合法的目录一律不碰。**
+    ///
+    /// 数据目录下本不该有这些东西，但"出现了怎么办"必须是有意的：不认识的东西，
+    /// 正确的处理是不去描述它、更不去删它。
+    ///
+    /// 这条测试的第一版写砸了，值得记下来：它造了几个"非法名"目录（`trailing.`、
+    /// `a\b`），然后断言结果里只剩合法的那个 —— 结果失败了，因为**文件系统把它们
+    /// 规范化掉了**：`trailing.` 在 Windows 上建出来叫 `trailing`，`a\b` 建出来是
+    /// 目录 `a`，两个都是**合法**的插件 id 形状。也就是说那条测试的"非法名"前提
+    /// 根本不成立。
+    ///
+    /// 现在它断言的是**真正的不变量**（返回的每一个 id 都合法），并且**先自检前提**
+    /// （确实造出了至少一个非法名）—— 否则一条什么都没造出来的测试会安静地通过。
+    #[test]
+    fn orphan_scan_only_ever_returns_valid_plugin_ids() {
+        let root = temp_dir("orphan-badnames");
+
+        let candidates = ["with space", "semi;colon", "at@sign", "star*", "pipe|"];
+        let mut created: Vec<&str> = Vec::new();
+        for name in candidates {
+            if std::fs::create_dir_all(root.join(name)).is_ok() {
+                created.push(name);
+            }
+        }
+        std::fs::create_dir_all(root.join("com.test.ok")).unwrap();
+        // 一个**文件**也不该被算成残留目录。
+        std::fs::write(root.join("not-a-dir.txt"), b"x").unwrap();
+
+        let found = scan_orphan_dirs(&root, |_| false);
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+
+        assert!(ids.contains(&"com.test.ok"), "合法的数据目录应被列出");
+        for id in &ids {
+            assert!(
+                validate_plugin_id(id, "插件 ID").is_ok(),
+                "扫出了一个不合法的 id：{id}"
+            );
+        }
+
+        // 前提自检：没有造出任何非法名字的话，上面那个循环等于没测。
+        assert!(
+            created
+                .iter()
+                .any(|name| validate_plugin_id(name, "插件 ID").is_err()),
+            "一个非法目录名都没造出来，这条测试是空的：{created:?}"
+        );
+    }
+
+    /// 数据目录不存在时返回空表，而不是报错。
+    ///
+    /// 这条路径在真实使用里会出现：用户从没让任何插件写过数据，
+    /// 而"插件"页每次打开都会问一次残留。
+    #[test]
+    fn orphan_scan_tolerates_a_missing_data_dir() {
+        let root = temp_dir("orphan-missing").join("nope");
+        assert!(scan_orphan_dirs(&root, |_| false).is_empty());
     }
 
     /// 未声明 `storage` 时必须拒绝。
