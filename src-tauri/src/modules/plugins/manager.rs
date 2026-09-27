@@ -151,6 +151,58 @@ fn ensure_permission(
     )))
 }
 
+/// 安装策略：这个清单**允不允许被安装**。
+///
+/// ============================================================
+/// 为什么这是一个纯函数
+/// ============================================================
+///
+/// 与 `ensure_permission` 同一理由：判定规则本身要被单测钉住，而 `PluginManager`
+/// 持有 `AppHandle`、单测里造不出来。设置值由调用方读出来当参数传进来。
+///
+/// ============================================================
+/// 判据是 `runtime`，不是权限列表
+/// ============================================================
+///
+/// 未隔离插件与宿主共享同一个 JS 上下文，因此**权限列表约束不了它** ——
+/// 它可以绕过 `ctx.*` 直接调宿主这个 realm 里的任何东西。也就是说，对一个
+/// 未隔离插件，"它申报了哪些权限"不是一个可用于判断的量。
+///
+/// 真正区分得开的是运行**位置**：`sandboxed` 的插件跑在自己的来源里，那个来源
+/// 拿不到宿主 IPC。因此这里只看这一项，而不是去数权限有多少条、风险有多高 ——
+/// 那会给出一种"权限少的未隔离插件更安全"的假象。
+///
+/// 用 `needs_own_webview()` 而不是自己写 `== Sandboxed`：这个问题的措辞只该有
+/// 一处实现，将来加第三种运行位置时，"它有没有自己的运行环境"必须跟着一起改。
+fn check_install_policy(
+    manifest: &PluginManifest,
+    allow_unsandboxed: bool,
+) -> PluginResult<()> {
+    if manifest.runtime.needs_own_webview() || allow_unsandboxed {
+        return Ok(());
+    }
+
+    Err(PluginError::UnsafePluginRejected(format!(
+        "插件 {} {} 没有隔离（清单里的 runtime 是 \"{}\"）—— 它与宿主跑在同一个上下文里，\
+         权限列表约束不了它。当前设置不允许安装未隔离插件：\
+         到「设置 → 插件」里打开「允许安装未隔离插件」之后可以再装一次。\
+         已经装上的插件不受这个设置影响。",
+        manifest.name,
+        manifest.version,
+        manifest.runtime.as_str()
+    )))
+}
+
+/// 读当前设置并执行上面的策略。
+///
+/// **每次安装都重新读设置**，不缓存：缓存会引入「改了设置要重启才生效」这种
+/// 最难解释的现象，而安装是低频动作（一次点击一次），`settings.json` 只有几 KB。
+/// 与 `proxy_base()` 同一取向。
+fn ensure_install_allowed(app: &AppHandle, manifest: &PluginManifest) -> PluginResult<()> {
+    let settings = settings_store::load(app);
+    check_install_policy(manifest, settings.allow_unsandboxed_plugins)
+}
+
 /// 计算内容的 SHA-256，返回小写十六进制。
 fn hex_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -1269,6 +1321,23 @@ impl PluginManager {
     ) -> PluginResult<InstalledPlugin> {
         let manifest = read_manifest(root)?;
         validator::validate_manifest(&manifest, root)?;
+
+        // ============================================================
+        // 安装策略：未隔离插件要不要放行
+        // ============================================================
+        //
+        // **这一处是全部安装路径唯一的汇合点** —— `.lcp` 包、本地目录、用户粘贴
+        // 的 URL、以及市场的下载安装，四条都走这里。因此策略只判一次就覆盖了所有
+        // 入口，也包括"某个插件跳过市场直接 invoke 安装命令"那条路（它确实做得到，
+        // 见 `install_from_url` 的说明：后端分辨不出调用者是谁）。
+        //
+        // 判据取自**包内清单**，不是索引、不是调用方传进来的参数。索引那一侧
+        // （前端 `installGate`）只负责别让用户走到这个错误上，它是体验层 ——
+        // 索引是可以被换掉的一份远端文件，而清单在插件包里，与它自己的代码一起。
+        //
+        // 拒绝发生在**落盘之前**：策略拒绝的插件不该在磁盘上留下任何东西。
+        // `install_from_root` 在这之前只读过清单、校验过清单，没有写过插件目录。
+        ensure_install_allowed(&self.app, &manifest)?;
 
         // validate_manifest 已经确保 main 是安全相对路径
         let main_path = root.join(&manifest.main);
@@ -3507,6 +3576,112 @@ mod tests {
             perms
         ))
         .expect("最小清单应当能解析")
+    }
+
+    // ============================================================
+    // 安装策略：未隔离插件
+    // ============================================================
+    //
+    // 这一组守的是"沙箱不是一个可以绕过的东西"：只要策略说不行，任何一条安装
+    // 路径都必须拒绝。判定被抽成纯函数 `check_install_policy`，因此能用与上面
+    // 权限那组同样的方式测。
+
+    /// 按 `runtime` 造清单。**不写 `runtime` 字段**时缺省就是 `in-process` ——
+    /// 这正是绝大多数老插件的形态，也是这一组里最该被覆盖的那一种。
+    fn manifest_with_runtime(runtime: Option<&str>) -> PluginManifest {
+        let runtime_field = match runtime {
+            Some(value) => format!(r#","runtime":"{value}""#),
+            None => String::new(),
+        };
+        serde_json::from_str(&format!(
+            r#"{{"name":"com.test.plugin","version":"1.0.0"{}}}"#,
+            runtime_field
+        ))
+        .expect("最小清单应当能解析")
+    }
+
+    /// 未隔离插件在默认设置下必须被拒绝。
+    #[test]
+    fn unsandboxed_install_is_denied_by_default() {
+        let err = check_install_policy(&manifest_with_runtime(None), false)
+            .expect_err("默认设置下未隔离插件必须被拒绝");
+
+        assert!(
+            matches!(err, PluginError::UnsafePluginRejected(_)),
+            "期望 UnsafePluginRejected，实际: {:?}",
+            err
+        );
+    }
+
+    /// 显式的 `in-process` 与"没写这一项"是同一种东西。
+    ///
+    /// 分开测是因为它们走的是两条不同的反序列化路径（前者命中枚举值，后者命中
+    /// `#[serde(default)]`），而"漏了 `runtime` 就等于未隔离"这件事必须两边都成立
+    /// —— 否则一个插件只要删掉一行声明就能绕过安装策略。
+    #[test]
+    fn explicit_in_process_is_denied_like_the_default() {
+        let err = check_install_policy(&manifest_with_runtime(Some("in-process")), false)
+            .expect_err("显式 in-process 也必须被拒绝");
+        assert!(matches!(err, PluginError::UnsafePluginRejected(_)));
+    }
+
+    /// `sandboxed` 不受这个设置影响 —— 否则等于把所有插件一起堵死。
+    #[test]
+    fn sandboxed_install_is_allowed_even_when_the_setting_is_off() {
+        check_install_policy(&manifest_with_runtime(Some("sandboxed")), false)
+            .expect("沙箱插件不该被安装策略拦住");
+    }
+
+    /// 用户打开设置之后放行 —— 拒绝必须是"可以解决的"，而不是死路。
+    #[test]
+    fn the_setting_opens_the_door() {
+        check_install_policy(&manifest_with_runtime(None), true)
+            .expect("用户显式允许之后应当放行");
+    }
+
+    /// 错误信息必须同时给出**为什么**与**下一步**。
+    ///
+    /// 这条测试防的是"把策略拒绝写成一句 `拒绝安装`"：那样的界面用户只能重试，
+    /// 而真正的下一步（去设置里打开开关）就在宿主里摆着，只是没人告诉他。
+    #[test]
+    fn rejection_names_the_plugin_and_the_way_out() {
+        let manifest = manifest_with_runtime(None);
+        let err = check_install_policy(&manifest, false).expect_err("应当拒绝");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("com.test.plugin"),
+            "错误信息里应出现插件 id，实际: {message}"
+        );
+        assert!(
+            message.contains("allow") || message.contains("允许"),
+            "错误信息里应出现那道开关（用户要能照着做），实际: {message}"
+        );
+        assert!(
+            message.contains("in-process"),
+            "错误信息里应写出清单里的 runtime 取值，实际: {message}"
+        );
+    }
+
+    /// 设置项与清单字段都必须真的存在，且默认值是**关**。
+    ///
+    /// 两件事放在一条测试里，因为它们必须同时成立：字段名改了而前端没改，
+    /// 表现是"开关能点但没有效果"；默认值改成 `true` 则整套策略静默失效 ——
+    /// 两者都不会有任何报错。
+    #[test]
+    fn install_policy_defaults_are_closed() {
+        let defaults = crate::modules::settings::settings::AppSettings::default();
+        assert!(
+            !defaults.allow_unsandboxed_plugins,
+            "未隔离插件的安装默认必须是关的"
+        );
+
+        let from_json: crate::modules::settings::settings::AppSettings =
+            serde_json::from_str("{}").expect("空对象应当能反序列化");
+        assert!(
+            !from_json.allow_unsandboxed_plugins,
+            "老设置文件（没有这个字段）也必须拿到「关」"
+        );
     }
 
     // ============================================================

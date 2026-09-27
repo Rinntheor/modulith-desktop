@@ -68,6 +68,7 @@ import GlobalContextMenu, { type GlobalMenuEntry } from '../components/GlobalCon
 import ModuleIcon from '../components/ModuleIcon';
 import { moduleManager } from '../services/moduleManager';
 import { subscribePluginSettingsRequest } from '../services/pluginSettingsFocus';
+import { subscribeGlobalContextMenu } from '../services/contextMenuBridge';
 import {
   getPluginContextMenuEntries,
   reloadPluginRuntime,
@@ -525,6 +526,26 @@ const HomeContent: React.FC<HomeContentProps> = ({ warnings }) => {
     event.preventDefault();
     setMenuPos({ x: event.clientX, y: event.clientY });
   }, []);
+
+  /**
+   * 沙箱插件界面里的一次右键 / 一次取消。
+   *
+   * **这条通道存在的原因是焦点/事件边界，而不是布局**：插件界面是跨源 iframe，
+   * 是一个独立文档 —— 它里面派发的 `contextmenu` / `mousedown` / `keydown`
+   * 永远冒泡不到这里，因此上面那个处理器、以及 `GlobalContextMenu` 自己那两条
+   * 关闭监听，对插件界面**一次都不会触发**（后者正是"菜单收不回去"的原因）。
+   *
+   * 与上面那条的分工是刻意的：宿主文档里的右键走原生事件（拿得到 `defaultPrevented`
+   * 与 `closest`，让位规则全都在），插件界面里的走这条桥。两条最终都只是给
+   * `menuPos` 一个值 —— 菜单本身、以及它的条目，两处完全一致。
+   *
+   * **`null` 表示关闭。** 开与关写的是同一处状态，因此不存在"打开了却没人负责关"
+   * 这种状态：谁给 `menuPos` 赋值，谁就是那条通路的全部。
+   */
+  useEffect(
+    () => subscribeGlobalContextMenu((request) => setMenuPos(request ? { ...request } : null)),
+    []
+  );
 
   // 全屏时两级标题栏都不占位，内容区上沿归零。
   const showTitlebar = !fullscreen;

@@ -15,6 +15,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import { shapeFromIndexKinds, type PluginShapeInfo } from './pluginShape';
+import type { PluginRuntimeKind } from '../types/plugin';
 
 import {
   PLUGIN_INDEX_REF,
@@ -57,7 +58,39 @@ export interface MarketPackage {
 export interface MarketVersion {
   version: string;
   tag: string;
-  engines: { modulith: string };
+  /**
+   * 兼容的宿主版本范围。**`null` 表示这一版索引里没有声明它。**
+   *
+   * ============================================================
+   * 它为什么是**可选**的（这一条是被一次真实故障逼出来的）
+   * ============================================================
+   *
+   * 它曾经是必填：`engines.modulith` 缺失时整份索引判为非法，市场对所有人
+   * 打不开。而这个字段**只用于展示**（详情页的"需要宿主"一行），宿主不据此
+   * 做任何决定 —— 已安装那一侧更是明确写着"它只提示、不阻断"
+   * （见 `pluginRuntime.ts` 的 `engineAdvisory`）。
+   *
+   * 于是一个纯展示字段把整个市场弄挂了。触发它的是一次真实的漂移：插件仓库在
+   * **项目改名**时换掉了 `engines` 的键名，而那份索引还没推上去 —— 发布出去的
+   * 应用拿到旧索引，里面当然没有 `modulith`，于是两道来源（CDN 与 GitHub 直连）
+   * 给出同一个错误。旧键名是什么，见
+   * `docs/06-项目/已知问题与技术债.md` §7.51（**代码里不写它**：`check:contributions`
+   * 第 5 节在扫它，而那条断言要防的正是它被重新读回来）。
+   *
+   * ============================================================
+   * 判据：宿主**据此行事**的字段必须严格，只用于展示的字段不许拖垮整份索引
+   * ============================================================
+   *
+   * 这不是"放宽校验"，是把线划在该划的地方。同一份索引里 `id` / `version` /
+   * `tag` / `package.sha256` / `permissions` 仍然一律严格 —— 那几个宿主真的会
+   * 用到（装什么、校验哪个哈希、显示什么风险），一个坏了就该整份拒绝。
+   * 而 `engines` / `kinds` / `background` 是同一个性质：缺了就如实说"未声明"，
+   * 不要为了让一份展示信息合法而让用户装不了任何东西。
+   *
+   * 界面上因此显示「未声明」而不是 `*`：`*` 是"声明了不限制"，与"没声明"
+   * 是两件不同的事，把后者渲染成前者等于替发布者说了一句他没说过的话。
+   */
+  engines: { modulith: string | null };
   permissions: string[];
   package: MarketPackage;
   /**
@@ -74,6 +107,15 @@ export interface MarketVersion {
   kinds?: string[];
   /** 是否声明了 `onStartup`：应用可用之后它就会开始工作 */
   background?: boolean;
+  /**
+   * 这个版本跑在哪里（`sandboxed` / `in-process`）。**由打包时从清单派生。**
+   *
+   * `undefined` 表示**不知道**：索引比清单旧、或它来自一个还没有这个字段的
+   * 构建脚本。与 `kinds` 同一位置、同一性质 —— 但它比 `kinds` 重要得多：
+   * `kinds` 只影响"会不会占侧边栏"，而这一项决定**安装策略放不放行**
+   * （见 `installGate`）。因此读不出来时按未隔离对待，绝不猜成 `sandboxed`。
+   */
+  runtime?: PluginRuntimeKind;
 }
 
 export interface MarketPlugin {
@@ -123,6 +165,17 @@ function asString(value: unknown, where: string): string {
   return value;
 }
 
+/**
+ * 读一个**只用于展示**的字符串字段：缺失或形状不对都返回 `null`。
+ *
+ * 与 `asString` 的分工就是这次划的那条线：宿主据此行事的字段用 `asString`
+ * （坏了整份索引失败），只用于展示的字段用这个（缺了如实说"未声明"）。
+ * 见 `MarketVersion.engines` 上的长说明。
+ */
+function asOptionalString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+}
+
 function parseVersion(raw: unknown, where: string): MarketVersion {
   if (!raw || typeof raw !== 'object') fail(`${where} 不是对象`);
   const item = raw as Record<string, unknown>;
@@ -141,8 +194,22 @@ function parseVersion(raw: unknown, where: string): MarketVersion {
   const permissions = item.permissions;
   if (!Array.isArray(permissions)) fail(`${where}.permissions 必须是数组`);
 
-  const engines = item.engines;
-  if (!engines || typeof engines !== 'object') fail(`${where}.engines 缺失`);
+  // `engines` 整个缺失、不是对象、或对象里没有 `modulith` —— 三种情况**都不失败**。
+  // 它是展示字段，宿主不据此做任何决定（见 `MarketVersion.engines` 的长说明）。
+  //
+  // 这里刻意**不去兼容改名之前的那个旧键名**：它既不会被读取、也不会报错的意思
+  // 正是"看起来声明了兼容范围，实际什么都没声明"，把它当成 `modulith` 等于
+  // 替发布者说一句他没说过的话。缺了就是缺了。
+  //
+  // 收成一个具名的对象（而不是在下面直接 `(engines as ...)`），是为了让
+  // `engines.modulith` 这个读取点在源码里以**属性访问**的形式出现 ——
+  // `check:contributions` 第 2 节正是按属性访问扫的，它要保证"每一处读这个键的
+  // 地方都用同一个键名"。写成一次类型断言会让那条断言看不见这个读取点。
+  const rawEngines = item.engines;
+  const engines: Record<string, unknown> =
+    rawEngines && typeof rawEngines === 'object'
+      ? (rawEngines as Record<string, unknown>)
+      : {};
 
   return {
     version: asString(item.version, `${where}.version`),
@@ -154,9 +221,8 @@ function parseVersion(raw: unknown, where: string): MarketVersion {
       ? item.kinds.filter((entry): entry is string => typeof entry === 'string')
       : undefined,
     background: item.background === true ? true : undefined,
-    engines: {
-      modulith: asString((engines as Record<string, unknown>).modulith, `${where}.engines.modulith`),
-    },
+    engines: { modulith: asOptionalString(engines.modulith) },
+    runtime: parseRuntime(item.runtime),
     permissions: permissions.map((entry, index) =>
       asString(entry, `${where}.permissions[${index}]`)
     ),
@@ -166,6 +232,29 @@ function parseVersion(raw: unknown, where: string): MarketVersion {
       sha256: sha256.toLowerCase(),
     },
   };
+}
+
+/**
+ * 读版本级 `runtime`（"这个版本跑在哪里"）。
+ *
+ * ============================================================
+ * 为什么它必须宽容，而不像清单里的 `runtime` 那样"未知值让整份不合法"
+ * ============================================================
+ *
+ * 清单里那条严格是对的：一个声明了 `sandboxed` 却被旧宿主当成 `in-process`
+ * 跑起来的插件，是一次**静默的安全降级**（见 types.rs 的 `PluginRuntime`）。
+ * 那里有权威的一侧 —— 清单在插件包里，与它自己的代码一起，没有第二份。
+ *
+ * 索引不是。索引是**打包时从清单派生**的一份缓存，它可能比清单旧一个版本、
+ * 也可能来自一个还没带上这个字段的旧构建脚本。因此这里读不出来时的正确动作
+ * 不是"拒绝"，而是**返回 `undefined` 说"不知道"** —— 由安装策略按未隔离对待
+ * （见 `pluginMarket.ts` 的 `installGate`）。猜一个 `'sandboxed'` 才是真的危险：
+ * 那会让界面标着"已隔离"，而装下来的东西不是。
+ *
+ * 取值只认两个字面量，别的（拼写错误、数字、对象）一律归为"不知道"。
+ */
+function parseRuntime(value: unknown): PluginRuntimeKind | undefined {
+  return value === 'sandboxed' || value === 'in-process' ? value : undefined;
 }
 
 function parsePlugin(raw: unknown, index: number): MarketPlugin {
@@ -412,7 +501,167 @@ export function planUpdate(plugin: MarketPlugin): UpdatePlan | null {
     added,
     removed,
     downgrade,
-    needsConfirmation: downgrade || added.some((p) => getPermissionDescriptor(p).risk !== 'low'),
+    // **"这一版跑在哪里"也必须参与确认。** 权限没变不代表风险没变：一个插件
+    // 完全可以保持同样的权限声明，而把 `runtime` 从 `sandboxed` 改成
+    // `in-process`（或者干脆删掉那一行 —— 缺省就是 `in-process`）。
+    // 只看权限的话那次更新会被判成"无需确认"，于是**一次点击把沙箱插件换成
+    // 未隔离插件**，而用户什么都没被告知。
+    needsConfirmation:
+      downgrade ||
+      !isSandboxConfirmed(version) ||
+      added.some((p) => getPermissionDescriptor(p).risk !== 'low'),
+  };
+}
+
+// ============================================================
+// 运行位置：展示 + 安装策略
+// ============================================================
+//
+// ============================================================
+// 隔离状态有三档，而不是两档
+// ============================================================
+//
+// `sandboxed` / `in-process` 之外必须有第三档 `unknown`：索引里的 `runtime`
+// 可能**根本没有**（索引比插件仓库旧，或来自还没带上这个字段的构建脚本）。
+// 把"不知道"折进任何一档都是在编：
+//
+//   · 折成 `sandboxed` → 界面标着"已隔离"，装下来的却可能是未隔离插件 —— 那正是
+//     这个策略要防的事，而且是**用户无法察觉**的那种；
+//   · 折成 `in-process` → 界面对着一份只是有点旧的索引说"这个插件未隔离"，
+//     那是在冤枉一个老老实实写了 `sandboxed` 的插件，用户也无从分辨。
+//
+// 因此 `unknown` 有自己的说法，并且在**放行判断**上按未隔离对待（安全那一边）。
+
+/** 一个版本隔离状态的三档 */
+export type IsolationKind = 'sandboxed' | 'in-process' | 'unknown';
+
+export interface IsolationInfo {
+  kind: IsolationKind;
+  /** 徽章上的两三个字 */
+  label: string;
+  /** 这句话要说清"这意味着什么"，而不只是复述徽章 */
+  detail: string;
+  /** 徽章的配色类（与市场里权限徽章同一套色板） */
+  tone: string;
+}
+
+/**
+ * 判断一个版本"是不是**确认**为沙箱"。只有明确写着 `sandboxed` 才算。
+ *
+ * 抽成一个函数而不是到处写 `version.runtime === 'sandboxed'`：这个判断同时是
+ * **展示**与**放行**的依据，两处各写一遍，将来改了一处就会出现"标着已隔离、
+ * 但不放行"这种自相矛盾的界面。
+ */
+export function isSandboxConfirmed(version: MarketVersion): boolean {
+  return version.runtime === 'sandboxed';
+}
+
+export function marketVersionIsolation(version: MarketVersion): IsolationInfo {
+  switch (version.runtime) {
+    case 'sandboxed':
+      return {
+        kind: 'sandboxed',
+        label: '已隔离',
+        detail:
+          '它跑在自己的来源里（一个跨源 iframe），拿不到宿主的能力 —— 只能通过宿主开放的那几条接口工作。',
+        tone: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+      };
+    case 'in-process':
+      return {
+        kind: 'in-process',
+        label: '未隔离',
+        detail:
+          '它与宿主跑在同一个上下文里：权限列表是它的**声明**，不是对它的约束 —— 它做得到的比它申报的多。',
+        tone: 'border-red-200 bg-red-50 text-red-700',
+      };
+    default:
+      return {
+        kind: 'unknown',
+        label: '隔离状态未知',
+        detail:
+          '这份索引里没有这个版本的运行位置信息（索引可能比插件仓库旧）。安装时宿主会读**包内清单**核实它到底有没有隔离 —— 不是沙箱插件的话，安装会被拒绝。',
+        tone: 'border-amber-200 bg-amber-50 text-amber-700',
+      };
+  }
+}
+
+/** 安装策略的判定结果 */
+export interface InstallGate {
+  /** 是否放行 */
+  allowed: boolean;
+  /** 不放行时的原因（**直接给用户看**，因此要说清下一步怎么做） */
+  reason: string;
+  /**
+   * 放行是**暂定**的：索引没说这个版本的运行位置，扣下这一点的是后端
+   * （它读得到包内清单），而不是这里。
+   *
+   * 界面据此在确认对话框里多说一句"宿主会在安装时核实"，而不是假装已经知道。
+   * 见 `installGate` 里那段"为什么 `unknown` 要放行"。
+   */
+  deferred: boolean;
+}
+
+/**
+ * 这个版本能不能装。
+ *
+ * ============================================================
+ * 为什么这是**宿主**的判断，而且必须在后端再判一次
+ * ============================================================
+ *
+ * 这一处只负责**别让用户走到那个错误上去**：按钮换成"不允许安装"、说清原因。
+ * 它是体验层，不是安全边界 —— 前端能被插件改（in-process 插件就与宿主共享
+ * 上下文）。真正的强制在 `PluginManager::install_from_root`：那一个函数是四条
+ * 安装路径（`.lcp` / 目录 / URL / 市场）唯一的汇合点，因此在那里判一次就覆盖了
+ * 全部入口，包括"绕过市场直接调命令"。
+ *
+ * ============================================================
+ * 索引是**预测**，包内清单才是**真相**
+ * ============================================================
+ *
+ * 这一条决定了 `runtime` 读不出来时该怎么办，而两种做法都说得通，所以要说清
+ * 为什么选这一个：
+ *
+ *   · **就地拒绝**（把"不知道"当成"未隔离"）听起来最安全，代价却落在一个
+ *     无辜的对象上 —— 一份只是旧了点的索引会让**所有**插件都装不了，而其中
+ *     绝大多数本来是写明了 `sandboxed` 的。用户看到的是"市场坏了"。
+ *   · **放行到下一道门**（这里放行，后端据清单判）：结果要么装上（清单确实是
+ *     `sandboxed`，那本来就该装上），要么被后端拒绝并给出一句准确的原因
+ *     （"这个插件没有隔离…到设置里打开开关"）。两种结果都是对的。
+ *
+ * 后者之所以**不比前者弱**，是因为真正的边界不在这份远端索引上：索引可以被换掉，
+ * 而包内清单与插件自己的代码在一起，随便换不掉。把"不知道"当成拒绝是把一道
+ * 体验层的判断当成了安全边界 —— 那恰好是这一整套设计一直在避免的事。
+ *
+ * ============================================================
+ * 默认**不放行**（对能确定的那一档）
+ * ============================================================
+ *
+ * 索引**明确写着** `in-process` 时，这里在默认设置下拒绝。理由不是"未隔离插件
+ * 不能用"，而是**一次点击不该等于一次静默的安全降级**：装了未隔离插件之后，
+ * 那套沙箱对这个插件就完全不存在了 —— 而那件事没有任何界面症状。默认关着，
+ * 用户要装就显式去打开（那一页写着打开意味着什么）。
+ *
+ * 已经装上的未隔离插件**不受影响**：这个设置只管安装。做成"关掉就禁用"
+ * 会让升级应用变成一次静默的插件下线，那比它要防的问题更糟。
+ */
+export function installGate(version: MarketVersion): InstallGate {
+  if (isSandboxConfirmed(version)) return { allowed: true, reason: '', deferred: false };
+
+  if (version.runtime !== 'in-process') {
+    // 索引里没有这一项 —— 放行到后端那一道门，并在界面上说清这一点。
+    return { allowed: true, reason: '', deferred: true };
+  }
+
+  if (getCachedSettings().allowUnsandboxedPlugins) {
+    return { allowed: true, reason: '', deferred: false };
+  }
+
+  return {
+    allowed: false,
+    deferred: false,
+    reason:
+      '这个版本没有隔离（它与宿主跑在同一个上下文里），而当前设置不允许安装未隔离插件。' +
+      '要安装它，请到「设置 → 插件」里打开「允许安装未隔离插件」。',
   };
 }
 

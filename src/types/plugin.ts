@@ -104,6 +104,19 @@ export interface PluginEngines {
 }
 
 /**
+ * 插件代码的运行位置。
+ *
+ * **单独一个别名，因为它有三处消费方**：清单（`PluginManifest.runtime`）、
+ * 市场索引（`MarketVersion.runtime`）、以及安装策略（判"这个版本能不能装"）。
+ * 三处各写一遍联合类型，最终一定会漂 —— 而漂开的表现是"市场说它是沙箱插件，
+ * 装完发现不是"，正是这一整套要防的那件事。
+ *
+ * 名字与后端 `PluginRuntime` 的 kebab-case 序列化形式逐字对应
+ * （见 `src-tauri/src/modules/plugins/types.rs`）。
+ */
+export type PluginRuntimeKind = 'in-process' | 'sandboxed';
+
+/**
  * 模块贡献定义（`contributes.modules`）
  *
  * 这是「插件往侧边栏放一个模块」的**声明**。声明之后，宿主**不需要执行插件代码**
@@ -337,7 +350,8 @@ export interface PluginManifest {
    * 未知取值会让整份清单**不合法**（后端是枚举，不做静默兜底）——
    * 把 `'sandboxed'` 当成 `'in-process'` 跑，是一次声明了隔离而实际没有的降级。
    */
-  runtime?: 'in-process' | 'sandboxed';
+  runtime?: PluginRuntimeKind;
+
   
   // 依赖
   dependencies?: Record<string, string>;

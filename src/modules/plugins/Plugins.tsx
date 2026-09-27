@@ -28,7 +28,8 @@ import {
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { moduleManager } from '../../services/moduleManager';
-import { getCachedSettings } from '../../services/appSettings';
+import { getCachedSettings, saveAppSettings, subscribeSettings } from '../../services/appSettings';
+import Toggle from '../../components/Settings/Toggle';
 import { getPluginModuleIds, isPluginCatalogLoading, subscribeCatalog } from '../../services/moduleCatalog';
 import {
   getInstalledPlugins,
@@ -397,6 +398,61 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     setFeedback({ kind, message });
     setTimeout(() => setFeedback(null), ms);
   }, []);
+
+  /**
+   * 安装策略开关（"允许安装未隔离插件"）的镜像。
+   *
+   * 唯一的真值在后端设置里（`PluginManager::install_from_root` 每次安装都去读它），
+   * 这里的 state 只是它的投影：订阅设置变化，别的入口（设置文件被外部改动后
+   * 前端重新读一次、或将来的其它界面）改了它，这里跟着变。
+   */
+  const [allowUnsandboxed, setAllowUnsandboxed] = useState(
+    () => getCachedSettings().allowUnsandboxedPlugins
+  );
+  useEffect(
+    () => subscribeSettings(() => setAllowUnsandboxed(getCachedSettings().allowUnsandboxedPlugins)),
+    []
+  );
+
+  const handleToggleUnsandboxed = useCallback(
+    (next: boolean) => {
+      // 乐观更新：设置写入要过一次 IPC 再落盘，等它回来再改开关会让点击有延迟感。
+      // 失败时**回滚并说出来** —— 一个点了没反应的开关比一个报错的开关更糟。
+      setAllowUnsandboxed(next);
+      void saveAppSettings({ allowUnsandboxedPlugins: next }).catch((error) => {
+        setAllowUnsandboxed(!next);
+        flash('error', `保存设置失败：${String(error)}`);
+      });
+    },
+    [flash]
+  );
+
+  /**
+   * 当前**已经装在本机**的未隔离插件。
+   *
+   * ============================================================
+   * 为什么必须把这件事显示出来
+   * ============================================================
+   *
+   * 上面那个开关是**安装策略**，它只在"从外面装进来"那一刻起作用。而已装的未隔离
+   * 插件可以来自别处：
+   *
+   *   · 它是**装这个版本的应用之前**就装上的；
+   *   · 或者它是随一次**备份恢复**回来的 —— 备份包含整个 `plugins/` 目录，
+   *     那条路不经过安装策略（它是"用户把自己机器上的状态整份恢复回来"，
+   *     不是"从一个来源装一个插件"，两者不是同一件事）。
+   *
+   * 无论来源是什么，**"未隔离"这件事必须有一个看得见的地方** —— 那正是这个策略
+   * 要解决的问题本身：装了未隔离插件之后不会有任何症状，而用户以为沙箱在保护他。
+   * 因此这里如实数出来、列出来，哪怕开关是关的。
+   *
+   * 判据直接用清单里的 `runtime`，不在前端再推一遍"哪些情况算未隔离"：那是后端
+   * `check_install_policy` 的判据，两处各写一遍必然漂。
+   */
+  const unsandboxed = useMemo(
+    () => plugins.filter((plugin) => plugin.manifest.runtime !== 'sandboxed'),
+    [plugins]
+  );
 
   /**
    * 打开沙箱自检面板。
@@ -986,6 +1042,75 @@ const Plugins: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
         <StatCard label="已禁用" value={counts.disabled} icon={PowerOff} tone="bg-gray-100 text-gray-500" index={2} />
         <StatCard label="加载异常" value={counts.error} icon={AlertTriangle} tone="bg-red-50 text-red-600" index={3} />
       </div>
+
+      {/*
+        ============================================================
+        安装策略：未隔离插件
+        ============================================================
+        这一块存在的理由，是"沙箱"这件事只有在**装之前**能拦得住：装上一个未隔离
+        插件之后，它与宿主共享同一个 JS 上下文，权限列表对它就不再是约束 ——
+        而界面上不会有任何症状。因此它必须是一个**用户显式做的选择**，
+        而不是"点一下安装"顺带发生的事。
+
+        放在这一页而不是「设置 → 安全」：安全页管的是应用的登录与访问密钥，
+        与插件是两个世界；用户遇到这个问题时人就在这里（装插件失败）。
+
+        文案刻意**不夸张**：不写成"危险"，而是说清未隔离到底意味着什么，
+        以及打开之后会失去什么。恐吓式的措辞会让人永远不敢打开它，
+        而那不是更安全，那只是让一个真实存在的取舍变得不可用。
+      */}
+      <section className="mb-6 rounded-2xl border border-gray-200 bg-white px-5 py-2">
+        <div className="flex items-start justify-between gap-6 py-3.5">
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-gray-800 flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-gray-400" />
+              允许安装未隔离插件
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-gray-500">
+              Modulith 的插件有两种运行方式。<span className="text-gray-700">已隔离</span>
+              的插件跑在自己的来源里，拿不到宿主的能力，只能通过它申请的权限工作。
+              <span className="text-gray-700">未隔离</span>
+              的插件与宿主跑在同一个上下文里 —— 它申请的权限只是它的<b>声明</b>，
+              不是对它的约束，它可以做到比清单上写的更多。
+            </p>
+            <p className="mt-1.5 text-xs leading-relaxed text-gray-500">
+              默认关闭：插件市场里未隔离的插件会显示原因、但不允许安装。
+              打开之后它们可以安装，安装前仍会再向你确认一次。
+              <span className="text-gray-700">这个开关只管安装</span>
+              —— 已经装上的插件不受影响，也不会被禁用。
+            </p>
+          </div>
+
+          <div className="shrink-0 pt-0.5">
+            <Toggle checked={allowUnsandboxed} onChange={handleToggleUnsandboxed} />
+          </div>
+        </div>
+
+        {allowUnsandboxed && (
+          <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+            <p className="text-[11px] leading-relaxed text-amber-800">
+              当前<b>允许</b>安装未隔离插件。装上的那些插件与宿主共享同一个上下文 ——
+              沙箱对它们不起作用，卸载是撤销它的唯一办法。
+            </p>
+          </div>
+        )}
+
+        {/*
+          已装未隔离插件的清单。**开关关着时也要显示** —— 那些插件可能来自备份恢复
+          或更早的版本，而"我明明关着这个开关，为什么有一个未隔离插件"必须有一个
+          地方能回答，否则用户只能把它读成开关坏了。
+        */}
+        {unsandboxed.length > 0 && (
+          <div className="mb-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+            <p className="text-[11px] leading-relaxed text-gray-600">
+              当前已安装的 <b>{plugins.length}</b> 个插件里有 <b>{unsandboxed.length}</b>{' '}
+              个未隔离：{unsandboxed.map((plugin) => plugin.manifest.displayName || plugin.id).join('、')}。
+              它们与宿主共享同一个上下文，<b>沙箱对它们不起作用</b> ——
+              装它们时同意过什么、以及它们能做什么，与上面这个开关无关（它只管安装）。
+            </p>
+          </div>
+        )}
+      </section>
 
       {showSpinner ? (
         <div className="flex items-center justify-center py-20">

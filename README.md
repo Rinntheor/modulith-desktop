@@ -185,6 +185,7 @@ modulith-desktop/
 | `pnpm check:markdown` | Markdown 解析的边界（内容不丢、标识符不被当成斜体、危险协议不生成链接），以及两份发布说明的分工 |
 | `pnpm check:contributions` | 贡献模型：清单字段的规范化、激活事件与加载契约，以及 `engines` 的键名与下限（宿主 ↔ 清单 ↔ 类型包不许漂） |
 | `pnpm check:plugin-runtime` | 插件运行时：真实跑一遍 `pluginRuntime`，用合成插件撞边界 |
+| `pnpm check:market` | 插件市场索引的解析判据（哪些字段坏了整份失败、哪些只算"未声明"）与未隔离插件的安装策略 |
 | `pnpm check:net-guard` | WebView 侧出站门面与后端判定的一致性 |
 
 ## 提交前检查
@@ -201,6 +202,7 @@ pnpm check:memory && pnpm check:performance && pnpm check:scripts
 pnpm check:theme                      # 第 7 节需要先 pnpm build，否则会显式跳过
 pnpm check:sounds && pnpm check:backup && pnpm check:markdown
 pnpm check:contributions && pnpm check:plugin-runtime && pnpm check:net-guard
+pnpm check:market                      # 市场索引的解析判据与安装策略
 ```
 
 `cargo test` 里有一条检查**示例包是否与源码一致**：它解压那个 `.lcp` 并逐个文件比对，

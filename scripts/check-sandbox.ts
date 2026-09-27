@@ -821,6 +821,98 @@ section('运行位置字段');
   );
 }
 
+// ============================================================
+// 7b. 安装策略：未隔离的插件不许悄悄装上
+// ============================================================
+//
+// 沙箱插件跑在自己的来源里、拿不到宿主的能力；未隔离插件与宿主跑在同一个
+// JS 上下文里，**权限列表是它的声明，不是对它的约束**。
+//
+// 因此"装一个未隔离插件"不是一次普通的安装 —— 它是**一次把沙箱对这个插件取消
+// 掉的决定**，而那件事在界面上没有任何症状。这一节守的就是它必须由用户显式
+// 同意，而且这道判定必须落在**所有安装路径汇合的那一处**。
+//
+// 三条失效方式，每一条都不会报错：
+//   * 判定写在某一条安装路径里 → 换个入口（粘贴 URL / 从目录装）就绕过去了；
+//   * 设置项的默认值变成 `true` → 整套策略静默失效；
+//   * 错误信息只说"拒绝" → 用户唯一能做的就是重试，而下一步（去设置里打开
+//     那个开关）就在宿主里摆着，只是没人告诉他。
+
+section('安装策略（未隔离插件）');
+
+{
+  const managerRs = read('../src-tauri/src/modules/plugins/manager.rs');
+  const typesRs = read('../src-tauri/src/modules/plugins/types.rs');
+  const settingsRs = read('../src-tauri/src/modules/settings/settings.rs');
+  const appSettingsTs = read('../src/services/appSettings.ts');
+
+  // ---- 判定必须是**纯函数**，且被唯一的汇合点调用 ----
+  check(
+    /fn check_install_policy\(/.test(managerRs),
+    '存在纯函数 check_install_policy（纯函数才测得了，PluginManager 持 AppHandle）'
+  );
+  check(
+    /fn ensure_install_allowed\(/.test(managerRs),
+    '存在读设置的薄包装 ensure_install_allowed'
+  );
+
+  // `install_from_root` 是四条路径（.lcp / 目录 / URL / 市场）**唯一**的汇合点。
+  // 判定必须在它里面，而不是在各个入口里 —— 后者迟早会漏掉一条。
+  const installFromRoot = /fn install_from_root\([\s\S]*?\n    \}/.exec(managerRs)?.[0] ?? '';
+  check(
+    installFromRoot !== '' && /ensure_install_allowed\(/.test(installFromRoot),
+    '★ 安装策略落在 install_from_root（四条安装路径唯一的汇合点）'
+  );
+  // 它必须发生在**写盘之前**：被拒绝的插件不该在磁盘上留下任何东西。
+  // 判据是"策略检查出现在第一次 create_dir_all / rename 之前"。
+  const policyAt = installFromRoot.indexOf('ensure_install_allowed(');
+  const firstWrite = installFromRoot.search(/create_dir_all\(&target|std::fs::rename\(root/);
+  check(
+    policyAt >= 0 && firstWrite >= 0 && policyAt < firstWrite,
+    '策略检查在写盘之前（被拒绝的插件不在磁盘上留痕）'
+  );
+
+  // 这个问题的措辞只该有一处实现。将来加第三种运行位置时，
+  // `needs_own_webview()` 必须跟着一起改，而自己写 `== Sandboxed` 不会。
+  check(
+    /manifest\.runtime\.needs_own_webview\(\)/.test(stripComments(managerRs)),
+    '判据用 needs_own_webview()（而不是散落的 `== Sandboxed`）'
+  );
+
+  // ---- 错误必须可行动 ----
+  check(
+    /UnsafePluginRejected/.test(typesRs),
+    '有一个专门的错误变体（并进"权限不足"会让那句指引永远不出现在界面上）'
+  );
+  const policyFn = /fn check_install_policy\([\s\S]*?\n\}/.exec(managerRs)?.[0] ?? '';
+  check(
+    /设置/.test(policyFn) && /允许安装未隔离插件/.test(policyFn),
+    '★ 拒绝信息里写着下一步（去哪个设置里打开哪个开关）'
+  );
+  check(
+    /manifest\.runtime\.as_str\(\)/.test(policyFn),
+    '拒绝信息里写出清单里的 runtime 取值（否则作者不知道该改哪一行）'
+  );
+
+  // ---- 默认值必须是「关」，且前后端一致 ----
+  check(
+    /fn default_allow_unsandboxed_plugins\(\) -> bool \{\s*\n\s*false/.test(settingsRs),
+    '后端默认是「不允许」（serde 缺省）'
+  );
+  check(
+    /allow_unsandboxed_plugins: default_allow_unsandboxed_plugins\(\)/.test(settingsRs),
+    'impl Default 与 serde 缺省共用同一个函数（两处不一致会让全新安装与老文件相反）'
+  );
+  check(
+    /allowUnsandboxedPlugins: false/.test(appSettingsTs),
+    '前端缺省也是「不允许」（两处不一致时策略会在其中一侧静默失效）'
+  );
+  check(
+    /allowUnsandboxedPlugins === true/.test(appSettingsTs),
+    '前端只在显式 true 时放行（被改坏的文件不该放宽策略）'
+  );
+}
+
 /** `src-tauri/src` 下的全部 `.rs` 文件（绝对路径）。 */
 function rustSources(): string[] {
   const files: string[] = [];
@@ -1276,6 +1368,135 @@ section('前端界面协作');
   check(
     /absolute inset-0 z-20 flex items-center justify-center bg-white p-6/.test(componentTsx),
     '失败说明用 z-20 盖在占位与 iframe 之上（白面板必须说出它为什么白）'
+  );
+
+  // ---- 插件界面里的右键 → 宿主的外壳菜单 ----
+  //
+  // ★ 这是 iframe 模型**独有**的一条失效方式，而且它在子 webview 时代不存在：
+  // 插件界面是一个独立文档，它里面派发的 `contextmenu` 永远冒泡不到宿主文档，
+  // 因此 `Home` 上那个 `onContextMenu` 对插件界面**一次都不会触发**——
+  // 用户在插件里右键，什么都不发生，而控制台里一个错都没有。
+  //
+  // 三处必须同时成立（少任何一处这条链路都是断的，且断得同样安静）：
+  //   1. 桥接层在**插件文档**里接住右键并转发（宿主够不到那个文档）；
+  //   2. `SandboxSurface` 把坐标换算成**宿主**坐标（跨源 iframe 读不到父文档，
+  //      插件那边算不出这个偏移）；
+  //   3. `Home` 订阅并打开菜单（菜单的唯一事实来源是它的 `menuPos`）。
+  const menuBridgeTs = read('../src/services/contextMenuBridge.ts');
+
+  check(
+    /window\.addEventListener\('contextmenu', onContextMenu, false\)/.test(bridgeJs) &&
+      /channel: 'host-context-menu'/.test(bridgeJs),
+    '桥接层在插件文档里接住右键并转发给父文档'
+  );
+  // 挂在**冒泡**阶段：插件自己注册的处理器先跑，它若 `preventDefault` 就不转发。
+  // 挂捕获阶段等于宿主永远赢 —— 而插件调 `ctx.ui.contextMenu` 画的菜单正是
+  // 它自己的右键，被宿主抢走之后那个插件的最主要入口就没了。
+  const contextMenuFn = /function onContextMenu\(event\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? '';
+  check(
+    /if \(event\.defaultPrevented\) return;/.test(contextMenuFn),
+    '插件自己处理过的右键不转发（`ctx.ui.contextMenu` 要能保住自己的菜单）'
+  );
+  check(
+    /if \(isTypingTarget\(event\.target\)\) return;/.test(contextMenuFn),
+    '输入框里不接管右键（原生菜单的复制 / 粘贴在那里是有用的）'
+  );
+  check(
+    /event\.preventDefault\(\);[\s\S]{0,400}?window\.parent\.postMessage\(/.test(contextMenuFn),
+    '先拦掉默认行为再转发（不拦会同时弹出引擎自己的那个菜单）'
+  );
+
+  // 坐标换算必须发生在 SandboxSurface，且必须用那块 iframe 的**实际矩形**。
+  // 自己去猜一个偏移会让菜单出现在离指针很远的地方 —— 而那种错看起来像
+  // "菜单位置算错了"，实际是把两套坐标系当成了一套。
+  check(
+    /requestGlobalContextMenu\(rect\.left \+ x, rect\.top \+ y\)/.test(componentTsx),
+    'SandboxSurface 用 iframe 的矩形把插件坐标换算成宿主坐标'
+  );
+  check(
+    /typeof x !== 'number' \|\| typeof y !== 'number'/.test(componentTsx) &&
+      /!Number\.isFinite\(x\) \|\| !Number\.isFinite\(y\)/.test(componentTsx),
+    '非数与缺字段的坐标一律丢弃（`left: NaN` 的菜单表现为"右键之后什么都没出现"）'
+  );
+  check(
+    /Number\.isFinite\(x\)/.test(menuBridgeTs) && /Number\.isFinite\(y\)/.test(menuBridgeTs),
+    '桥接服务自己也挡一次非有限坐标（两个调用方，一处判据）'
+  );
+
+  // ---- ★ 菜单必须**关得掉**（这一节是被一个真实缺陷逼出来的） ----
+  //
+  // 第一版只做了"打开"，于是用户报的是"菜单能弹出来，但点空白处收不回去"。
+  // 根因：`GlobalContextMenu` 的两条关闭路径（`document` 上的 `mousedown` 捕获
+  // 监听、Escape 的 `keydown` 监听）都挂在**宿主文档**上，而插件界面是独立文档 ——
+  // 在它里面点击/按键，那两条监听一次都不会触发。
+  //
+  // 这一组断言盯的就是"开"与"关"两侧都必须存在，而且关闭必须走**同一条**通道。
+  check(
+    /channel: 'host-context-menu-dismiss'/.test(bridgeJs),
+    '★ 桥接层会把"在插件界面里的那次点击/按键"转给宿主（否则菜单关不掉）'
+  );
+
+  // 关闭信号必须**无条件**转发。
+  //
+  // 第二版这里曾经是一个"只在刚交出去一次右键之后才转发"的优化（省掉没有菜单时
+  // 每一次点击的 postMessage）。**它错在分屏上**：两个面板是两份独立文档，
+  // 在左面板右键、点右面板想取消时，右面板不知道有过那次右键，什么都不转发，
+  // 菜单照样留着 —— 与用户报的现象一模一样，只是路径更窄。
+  //
+  // 而要让"有菜单开着"跨 iframe 可见，就得让宿主把状态推给每个界面：多一条推送
+  // 通道、多一份要同步的状态，而且**有竞态**（菜单打开与"插件知道"之间的那次点击
+  // 会被漏掉，症状相同）。用竞态换流量不划算，因此这条断言直接钉住"不许再引入
+  // 那个标记" —— 它一出现就会红。
+  const dismissFn =
+    /function reportHostMenuDismiss\(reason\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? '';
+  check(
+    dismissFn !== '' && !/if \(!menuAwaitingDismiss\) return/.test(dismissFn),
+    '关闭信号无条件转发（"已交出去"那个标记在分屏下会漏，见这段说明）'
+  );
+  check(
+    !/menuAwaitingDismiss/.test(stripComments(bridgeJs)),
+    '★ 桥接层里没有"菜单是否开着"的本地标记（它跨不了 iframe，只能靠宿主的推送补齐，而那有竞态）'
+  );
+  // mousedown 那一条**不看** `defaultPrevented`：宿主那条判据是"点在菜单之外就关"，
+  // 而这次点击按定义就在 iframe 里、也就是在菜单之外。
+  check(
+    /window\.addEventListener\('mousedown', function \(\) \{[\s\S]{0,160}?reportHostMenuDismiss\('pointer'\)/.test(
+      bridgeJs
+    ),
+    '在插件界面里按下鼠标就把菜单关掉（不看 defaultPrevented —— 那次点击在菜单之外）'
+  );
+  // Escape 走既有的 keydown 监听，且**不 return**：Escape 也可能是插件自己的，
+  // 也可能是宿主的快捷键。插件自己 preventDefault 时这次按键归它（那条早退在更前面）。
+  check(
+    /if \(event\.key === 'Escape'\) reportHostMenuDismiss\('escape'\);/.test(bridgeJs),
+    'Escape 也能关掉宿主那个菜单（焦点在插件文档里时宿主收不到 keydown）'
+  );
+
+  check(
+    /data\.channel === 'host-context-menu-dismiss'/.test(componentTsx) &&
+      /dismissGlobalContextMenu\(\)/.test(componentTsx),
+    'SandboxSurface 把关闭信号交给桥接服务'
+  );
+
+  // ★ **开与关必须是同一条事件、同一个订阅者。**
+  //
+  // 分成两条（"打开事件" + "关闭事件"）正是这个缺陷的温床：两条通道各自可能漏、
+  // 判据还可能不一致，而表现就是一个关不掉的菜单。这条断言直接钉住"只允许一条
+  // 事件名"，因此那种改法在写出来的那一刻就会红。
+  const eventNames = menuBridgeTs.match(/export const [A-Z_]*EVENT = /g) ?? [];
+  check(
+    eventNames.length === 1,
+    `桥接服务只声明一条事件名（开与关走同一条；实际 ${eventNames.length} 条）`
+  );
+  const dismissServiceFn =
+    /export function dismissGlobalContextMenu\(\)[\s\S]*?\n\}/.exec(menuBridgeTs)?.[0] ?? '';
+  check(
+    /GLOBAL_CONTEXT_MENU_EVENT/.test(dismissServiceFn) && /detail: null/.test(dismissServiceFn),
+    '关闭复用同一条事件，用 `null` 表示关闭'
+  );
+  check(
+    /listener\(null\)/.test(menuBridgeTs) && /request \? \{ \.\.\.request \} : null/.test(homeTsx),
+    '★ Home 把 `null` 写回 menuPos 的同一处状态（开与关没有第二条通路可以漏掉）'
   );
 }
 

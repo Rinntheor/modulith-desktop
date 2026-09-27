@@ -390,7 +390,7 @@ const PluginDetailDrawer: React.FC<PluginDetailDrawerProps> = memo(
 
                     理由是这份列表的效力完全取决于它：插件跑在宿主的 webview 里时，
                     列表只是它自己的声明 —— 宿主没有任何手段核实，也拦不住越界的调用；
-                    跑在独立 webview 里时，越出列表的调用会在 IPC 层被拒。
+                    跑在自己的来源里（跨源 iframe）时，越出列表的调用会在宿主那一层被拒。
                     同样一份列表，两种情况下含义完全不同。
 
                     以前这里只有列表，于是它对每一个 in-process 插件都在说一句

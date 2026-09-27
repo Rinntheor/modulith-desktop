@@ -195,7 +195,14 @@ const PermissionChips: React.FC<{
 }> = ({ permissions, sandboxed, max = 3 }) => {
   const mode = sandboxed ? (
     <span
-      title="跑在独立 webview 里，那个 webview 不匹配任何宿主授权 —— 越出权限列表的调用会在宿主那一层被拒绝。"
+      /*
+        ★ 这段措辞是**子 WebView 时代**写的，v1.6.0 换成跨源 iframe 之后就不再准确了：
+        插件界面不再是"一个独立的 webview"，而是宿主文档里的一个跨源 iframe。
+        边界没有变弱（子框架拿不到宿主 IPC、身份靠令牌），但"那个 webview 不匹配
+        任何宿主授权"这句话描述的是一个已经不存在的机制 —— 用户按它去理解边界，
+        会得到一个错的模型。见 `docs/06-项目/已知问题与技术债.md` §7.50。
+      */
+      title="跑在自己的来源里（一个跨源 iframe），拿不到宿主的能力 —— 只能通过它申请的权限调用宿主的接口。"
       className="px-1.5 py-0.5 text-[11px] font-medium rounded border border-emerald-200 bg-emerald-50 text-emerald-700"
     >
       已隔离

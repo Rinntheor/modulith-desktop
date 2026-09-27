@@ -38,6 +38,7 @@ import React, { useEffect, useRef, useState } from 'react';
 
 import { useModuleActive } from '../hooks/useModuleActive';
 import { subscribeFileDrop } from '../services/fileDrop';
+import { requestGlobalContextMenu, dismissGlobalContextMenu } from '../services/contextMenuBridge';
 import {
   closeSandboxSurface,
   openSandboxSurface,
@@ -347,13 +348,60 @@ const SandboxSurface: React.FC<SandboxSurfaceProps> = ({ pluginId, surface }) =>
       if (event.source !== frame.current?.contentWindow) return;
 
       const data = event.data as
-        | { __modulith?: unknown; channel?: unknown; payload?: { message?: unknown } }
+        | {
+            __modulith?: unknown;
+            channel?: unknown;
+            payload?: { message?: unknown; x?: unknown; y?: unknown };
+          }
         | null;
       if (!data || data.__modulith !== true) return;
 
       if (data.channel === 'ready') {
         readyRef.current = true;
         setFailure(null);
+        return;
+      }
+
+      // ============================================================
+      // 插件界面里的一次右键 → 宿主的外壳菜单
+      // ============================================================
+      //
+      // 桥接层递过来的是**它那个文档的视口坐标**（见 sandbox-bridge.js），
+      // 而菜单要的是宿主文档的坐标。两者之间只差这块 iframe 自己的位置，
+      // 而那个位置只有持有 iframe 的这个文档知道 —— 跨源 iframe 读不到
+      // 父文档，插件那边算不出来。
+      //
+      // 矩形为零（这块 iframe 还没被布局，或面板已经是 `display: none`）时
+      // **丢弃**：坐标会因此毫无意义，而对着 (0,0) 弹一个菜单比什么都不做更糟。
+      // 正常情况下这条不会命中 —— 用户只能右键看得见的界面 —— 它挡的是
+      // "这条消息到得比布局更早"这一类竞态。
+      if (data.channel === 'host-context-menu') {
+        const element = frame.current;
+        const rect = element?.getBoundingClientRect();
+        if (!rect || rect.width === 0 || rect.height === 0) return;
+
+        const x = data.payload?.x;
+        const y = data.payload?.y;
+        if (typeof x !== 'number' || typeof y !== 'number') return;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+
+        requestGlobalContextMenu(rect.left + x, rect.top + y);
+        return;
+      }
+
+      // ============================================================
+      // 把那个菜单关掉（在插件界面里点了一下、或按了 Escape）
+      // ============================================================
+      //
+      // `GlobalContextMenu` 的两条关闭路径（点到菜单外、Escape）都挂在**宿主文档**
+      // 上，而插件界面是独立文档 —— 用户在它里面点一下左键，宿主的 `mousedown`
+      // 监听**一次都不会触发**。那正是"菜单弹得出来、收不回去"的原因。
+      //
+      // 这里**不需要坐标**：那次点击按定义就在菜单之外（它在 iframe 里），
+      // 因此动作只有"关掉"一个可能。也不判"菜单是不是真开着" —— 关闭一个
+      // 已经关掉的菜单是无操作，而判错的代价是菜单留在屏幕上。
+      if (data.channel === 'host-context-menu-dismiss') {
+        dismissGlobalContextMenu();
         return;
       }
 
