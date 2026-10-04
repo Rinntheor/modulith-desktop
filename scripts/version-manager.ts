@@ -746,14 +746,49 @@ const childProcessGit: GitAdapter = {
   },
 };
 
-/** 执行 git 命令并返回 stdout；失败时返回空串而不抛异常 */
+/**
+ * 执行 git 命令并返回 stdout。
+ *
+ * ============================================================
+ * 为什么失败时**不能**一律返回空串
+ * ============================================================
+ *
+ * 此前这里把任何异常都吞成 `''`，而调用方（`isRepo` / `latestTag` / `log`）用
+ * 「空串」表达"没有"这个正常结果。两种语义撞在一起，代价是一次真实故障：
+ *
+ * 受限会话里 git 的**子进程被拒绝**（`spawnSync git EPERM` —— 沙箱不允许创建管道），
+ * 于是 `isRepo()` 得到空串、判定"不在 git 仓库里"，`pnpm ver bump` 便**安静地跳过
+ * 了整个 CHANGELOG 生成**。用户看到版本号升上去了，却没有任何变更日志，而输出里
+ * 连一句警告都没有 —— 一次"什么都没发生"的失败。
+ *
+ * 因此这里把两种情况分开：**非零退出**（例如"不在仓库里"）是正常答案，返回空串；
+ * **进程根本起不来**（EPERM / ENOENT / 被策略拒绝）是环境问题，必须说出来 ——
+ * 它会让所有依赖 git 的功能一起失效，而静默失效正是最难归因的那一类。
+ */
+let gitSpawnFailureReported = false;
+
 function gitOut(args: string[]): string {
   try {
     return execFileSync('git', args, {
       cwd: PROJECT_ROOT,
       encoding: 'utf-8',
     }).trim();
-  } catch {
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    const spawnFailed = code === 'EPERM' || code === 'ENOENT' || code === 'EACCES';
+
+    if (spawnFailed && !gitSpawnFailureReported) {
+      gitSpawnFailureReported = true;
+      printWarning(
+        'Cannot run git',
+        `${code} —— 这个环境不允许本进程创建子进程`,
+      );
+      printDim('依赖 git 的步骤（CHANGELOG 生成、tag）会被跳过，其它步骤不受影响。');
+      printDim('要拿到完整结果，请在一个允许创建子进程的终端里重跑。');
+      console.log();
+    }
+
+    // 非零退出（"不在仓库里"之类）是正常答案，不报噪音。
     return '';
   }
 }

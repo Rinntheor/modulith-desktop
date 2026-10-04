@@ -3,6 +3,25 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.6.1] - 2026-10-05
+
+### Added
+
+- 后端就绪信号：`ReadyState` 挂在 builder 链上，setup 末尾置位并广播 `modulith://backend-ready`；新增 `backend_ready` 命令（应用级 ACL 三处清单同步）
+- 前端启动闸门 `backendReady.ts`：命令轮询与事件双路等待，任一到达即放行
+- 新增门禁 `pnpm check:boot-order`：把「前端在第一个 invoke 之前必须等后端就绪」这条链路逐环钉住
+
+### Changed
+
+- 模块启动顺序改为按注册顺序（此前取自 HashMap 的哈希顺序，注释里那句"只取决于注册顺序"是假的）
+- `version-manager`：git 不可用时不再把所有 git 操作静默吞成空串，而是明确说出「这个环境不允许创建子进程」
+
+### Fixed
+
+- 发行版每次冷启动都会在「检查访问授权」失败并停在「初始化中断」，必须点一次「重试初始化」才能进入应用
+- 同一次竞速里被静默吞掉的四个失败：读设置回落成内置默认值、通知订阅没装上、WebView 内存等级被缓存成「不支持」、插件主题快照没推上去
+- `AuthSession` 改为首次取用时建立状态，早期调用不再以 `state not managed` 失败（托盘菜单窗口是同一堵墙的下一个受害者）
+
 ## [1.6.0] - 2026-09-27
 
 ### Added
