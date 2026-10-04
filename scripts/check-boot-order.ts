@@ -77,6 +77,7 @@ function read(rel: string): string {
 }
 
 const registryRs = read('src-tauri/src/core/registry.rs');
+const readyCmdRs = read('src-tauri/src/core/backend_ready.rs');
 const libRs = read('src-tauri/src/lib.rs');
 const bootTs = read('src/services/boot.ts');
 const mainTsx = read('src/main.tsx');
@@ -150,20 +151,40 @@ check(
 console.log(`\n${BOLD}后端侧：backend_ready 命令的三处清单${RESET}`);
 
 // 应用级 ACL 清单一经声明，未授权的命令对所有人不可用 —— 而且只在运行期显形。
+//
+// 命令**实现在 `core/backend_ready.rs`，不在 `lib.rs`**。这不是风格选择：它写在
+// crate 根时编译不过 —— `#[tauri::command]` 在 `pub` 函数上会生成带 `#[macro_export]`
+// 的宏，而 `#[macro_export]` 会把宏放到 crate 根，于是与函数自己在根命名空间里的
+// 定义撞名，报 `__cmd__backend_ready` is defined multiple times。定位过程完整记在
+// `core/backend_ready.rs` 的文件头。
 check(
-  libRs.includes('pub async fn backend_ready('),
-  'lib.rs 定义了 backend_ready',
-  '它是宿主命令，不属于任何模块'
+  readyCmdRs.includes('pub async fn backend_ready('),
+  'core/backend_ready.rs 定义了 backend_ready',
+  '它是宿主命令，不属于任何模块；但不能写在 lib.rs 的 crate 根（宏命名空间会撞名）'
 );
-check(libRs.includes('        backend_ready,'), 'backend_ready 进了 generate_handler!');
+check(
+  !libRs.includes('pub async fn backend_ready('),
+  'backend_ready 没有留在 lib.rs 的 crate 根',
+  '留在那里会报 E0255：`__cmd__backend_ready` defined multiple times'
+);
+check(
+  libRs.includes('core::backend_ready::backend_ready,'),
+  'generate_handler! 用模块路径引用它',
+  '只写函数名会把它拉回 crate 根的宏命名空间，同一个 E0255 会原样重现'
+);
+check(
+  libRs.includes('app.emit(core::registry::BACKEND_READY_EVENT'),
+  'lib.rs 仍持有就绪广播与 ReadyState 的托管',
+  '命令搬走了，但"什么时候算就绪"这件事仍然属于生命周期，属于 lib.rs'
+);
 check(buildRs.includes('"backend_ready",'), 'backend_ready 进了 build.rs 的 AppManifest');
 check(
   capabilityJson.includes('"allow-backend-ready"'),
   'backend_ready 在 app-commands.json 里被授权'
 );
 check(
-  /HOST_ONLY_COMMANDS = \['backend_ready'\]/.test(generatorTs),
-  '生成器把 backend_ready 记在 HOST_ONLY_COMMANDS 里',
+  /HOST_ONLY_COMMANDS = \['core::backend_ready::backend_ready'\]/.test(generatorTs),
+  '生成器把 backend_ready 的模块路径记在 HOST_ONLY_COMMANDS 里',
   '不记的话下一次 pnpm gen:backend 会把它从 generate_handler! 里删掉 —— ' +
     '那时闸门白等到超时，功能"能用"但每次启动慢 3 秒'
 );

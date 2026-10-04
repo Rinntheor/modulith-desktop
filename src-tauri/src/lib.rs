@@ -125,7 +125,7 @@ pub fn run() -> Result<(), tauri::Error> {
         // 收到信号后立刻调用依赖 `ModuleRegistry` 的命令，而它还没被托管 ——
         // 那正是这个信号要消灭的那类竞态，不能自己再制造一次。
         //
-        // 事件与命令两条路都走（命令见文件末尾的 `backend_ready`）：事件可能在前端
+        // 事件与命令两条路都走（命令实现在 core/backend_ready.rs，不在本文件）：事件可能在前端
         // 挂上监听之前就发出去（那时前端还没有任何监听器），命令则要过 ACL 与
         // 一次 IPC 往返。两条都留，任何一条到达都足以放行启动。
         if let Some(state) = app.try_state::<core::registry::ReadyState>() {
@@ -186,7 +186,7 @@ pub fn run() -> Result<(), tauri::Error> {
 
     // 集中注册所有命令
     builder = builder.invoke_handler(tauri::generate_handler![
-        backend_ready,
+        core::backend_ready::backend_ready,
         get_auth_status,
         verify_session,
         get_hardware_fingerprint,
@@ -364,37 +364,4 @@ pub fn run() -> Result<(), tauri::Error> {
     });
 
     std::process::exit(exit_code);
-}
-
-/// 后端是否已经初始化完成（前端启动闸门的第一道判据）。
-///
-/// 为什么是"查一个已经托管好的原子布尔量"而不是 `try_state::<ModuleRegistry>()`
-/// 然后调 `is_ready()`：`setup` 期间 `ModuleRegistry` 还被局部变量 `registry`
-/// 持有，`app.manage(registry)` 要到 setup 末尾才发生 —— 而那段时间恰好就是
-/// 前端最想问"好了没有"的那段。`ReadyState` 挂在 builder 链上，因此它在这段
-/// 窗口里一定拿得到。
-///
-/// 它的两条路径都不做任何有副作用的事：查一次原子量、或者读一次已托管的状态。
-/// 因此前端可以放心地高频轮询它（实际上只会轮询几次，见
-/// `src/services/backendReady.ts`）。
-///
-/// **ACL**：这条命令注册在应用级清单里，因此必须同时出现在三处 ——
-/// `build.rs` 的 `AppManifest::commands`、这里的 `generate_handler!`、
-/// `capabilities/app-commands.json` 的 `allow-backend-ready`。
-/// 少一处的结果是"命令对所有人不可用"，且只会在运行期显形（`pnpm check:acl` 会拦）。
-#[tauri::command]
-pub async fn backend_ready(app: tauri::AppHandle) -> Result<bool, String> {
-    use tauri::Manager;
-
-    if let Some(state) = app.try_state::<core::registry::ReadyState>() {
-        return Ok(state.is_ready());
-    }
-
-    // 理论上到不了这里（`ReadyState` 注册在 builder 链上）。真到了，就退回真源：
-    // 已经托管了注册表时以它的结论为准，否则如实回答"还没好"——
-    // 这个方向是安全的：前端继续等，而不会拿一个未初始化的后端去跑启动流程。
-    match app.try_state::<ModuleRegistry>() {
-        Some(registry) => Ok(registry.is_ready()),
-        None => Ok(false),
-    }
 }

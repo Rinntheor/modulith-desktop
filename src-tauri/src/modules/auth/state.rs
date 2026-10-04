@@ -14,7 +14,7 @@ use super::config::SESSION_TTL_SECS;
 use super::ratelimit::RateLimiter;
 use super::security::AttemptTracker;
 use super::types::SessionInfo;
-use super::{config::AuthConfig, crypto};
+use super::{config, config::AuthConfig, crypto};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};

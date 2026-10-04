@@ -110,6 +110,10 @@ function extractBlock(
   for (const rawLine of body.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (line === '') continue;
+    // 注释行直接跳过：清单里允许写解释（例如"这一条为什么必须带模块路径"）。
+    // 不跳过的话，一句注释就会被当成"无法解析的一行"而让整个门禁失败 ——
+    // 那种失败与真正的授权泄露毫无关系，却更刺眼。
+    if (line.startsWith('//')) continue;
 
     const match = linePattern.exec(line);
     if (!match) {
@@ -128,7 +132,16 @@ const handlerCommands = (() => {
       'src-tauri/src/lib.rs',
       'generate_handler![',
       /^\s*\]\);/m,
-      /^([a-z][a-z0-9_]*),$/,
+      // 两种写法都要认：
+      //   `backend_ready,`                        —— 命令就在 lib.rs 里（不推荐，见下）
+      //   `core::backend_ready::backend_ready,`   —— 命令在模块里（推荐）
+      //
+      // 只认第一种的话，把命令移进模块就会让这个门禁抛出"无法解析的一行"。
+      // 而**必须**支持模块路径的理由是硬的：`#[tauri::command]` 用在 crate 根的
+      // `pub` 函数上会生成带 `#[macro_export]` 的宏，宏被导出到 crate 根之后与函数
+      // 自己在根命名空间里的定义撞名，报 `__cmd__backend_ready` is defined multiple
+      // times。也就是说"命令只能写在模块里"，因此这里必须认全路径。
+      /^(?:[a-z][a-z0-9_]*::)*([a-z][a-z0-9_]*),$/,
       'generate_handler!'
     );
   } catch (error) {

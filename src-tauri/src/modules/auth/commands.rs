@@ -15,7 +15,7 @@
 
 use super::config::{self, AuthConfig};
 use super::crypto;
-use super::state::{state_of, AuthSession};
+use super::state::{state_of, AuthSession, AuthState};
 use super::types::{
     AuthResponse, AuthStatus, DeviceFingerprint, KeySetupResponse, KnownDevice, LoginLogEntry,
     RecoveryVerification, SecurityInfo, SecurityOverview,

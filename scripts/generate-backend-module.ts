@@ -298,17 +298,45 @@ function updateLibRs(): { moduleCount: number; commandCount: number } {
    *
    * `backend_ready` 是启动闸门的第一道判据（见 `core::registry::ReadyState`），
    * 而它按定义**不能**属于任何一个模块：它要回答的问题正是"模块起来了没有"。
-   * 它由 `lib.rs` 自己定义，因此不在 `commandsByModule` 的扫结果里 —— 不写在这里
-   * 的话，下一次 `pnpm gen:backend update` 会把它从 `generate_handler!` 里删掉。
+   * 因此它不在 `commandsByModule` 的扫描结果里 —— 不写在这里的话，下一次
+   * `pnpm gen:backend update` 会把它从 `generate_handler!` 里删掉。
    *
    * 那一步的失败方式很隐蔽：命令被删掉后 `invoke('backend_ready')` 得到
    * "command not found"，而闸门把命令失败当作"还没就绪"继续轮询 —— 于是
    * 应用会白等到 3 秒超时。功能还"能用"，只是每次启动慢三秒。
    *
+   * ============================================================
+   * 为什么是**模块路径**而不是裸名字
+   * ============================================================
+   *
+   * 值必须是 `core::backend_ready::backend_ready`，不能简写成 `backend_ready`。
+   *
+   * 这条命令最初写在 `lib.rs` 的 crate 根，编译不过：
+   *
+   *   error[E0255]: the name `__cmd__backend_ready` is defined multiple times
+   *   error[E0255]: the name `__tauri_command_name_backend_ready` is defined multiple times
+   *     --> src\lib.rs:386:14
+   *      |
+   *   385 | #[tauri::command]
+   *      | ----------------- previous definition of the macro `__cmd__backend_ready` here
+   *   386 | pub async fn backend_ready(...) -> Result<bool, String> {
+   *      |              -^^^^^^^^^^^^
+   *      |              `__cmd__backend_ready` reimported here
+   *
+   * 原因是三件事叠在一起：`#[tauri::command]` 会生成两个 `macro_rules!`
+   * （`__cmd__<名>` 与 `__tauri_command_name_<名>`）；函数是 `pub` 时宏还带
+   * `#[macro_export]`（"能被 `pub use` 出去就得先导出"）；而 `#[macro_export]`
+   * 把宏放到 **crate 根** —— 函数本身就在根上时，两者在根命名空间里撞名。
+   *
+   * 它被最小化验证过：把实现体换成 `Ok(true)`、去掉参数与函数内导入，报错一模一样，
+   * 因此与实现无关，纯粹是位置问题。放进 `core/backend_ready.rs` 就正常了。
+   * 而这里若退回裸名字，等于又把它拉回 crate 根的命名空间，同一个错误会原样回来。
+   *
    * 同时改三处的要求不变（见 `build.rs`）：这里、`build.rs` 的
-   * `AppManifest::commands`、`capabilities/app-commands.json`。
+   * `AppManifest::commands`（那一处仍然写裸命令名，因为清单里就是命令名）、
+   * `capabilities/app-commands.json` 的 `allow-backend-ready`。
    */
-  const HOST_ONLY_COMMANDS = ['backend_ready'];
+  const HOST_ONLY_COMMANDS = ['core::backend_ready::backend_ready'];
 
   const commandList =
     allCommands.length > 0
@@ -442,7 +470,7 @@ pub fn run() -> Result<(), tauri::Error> {
         // 收到信号后立刻调用依赖 \`ModuleRegistry\` 的命令，而它还没被托管 ——
         // 那正是这个信号要消灭的那类竞态，不能自己再制造一次。
         //
-        // 事件与命令两条路都走（命令见文件末尾的 \`backend_ready\`）：事件可能在前端
+        // 事件与命令两条路都走（命令实现在 core/backend_ready.rs，不在本文件）：事件可能在前端
         // 挂上监听之前就发出去（那时前端还没有任何监听器），命令则要过 ACL 与
         // 一次 IPC 往返。两条都留，任何一条到达都足以放行启动。
         if let Some(state) = app.try_state::<core::registry::ReadyState>() {
@@ -531,39 +559,6 @@ ${commandList}
     });
 
     std::process::exit(exit_code);
-}
-
-/// 后端是否已经初始化完成（前端启动闸门的第一道判据）。
-///
-/// 为什么是"查一个已经托管好的原子布尔量"而不是 \`try_state::<ModuleRegistry>()\`
-/// 然后调 \`is_ready()\`：\`setup\` 期间 \`ModuleRegistry\` 还被局部变量 \`registry\`
-/// 持有，\`app.manage(registry)\` 要到 setup 末尾才发生 —— 而那段时间恰好就是
-/// 前端最想问"好了没有"的那段。\`ReadyState\` 挂在 builder 链上，因此它在这段
-/// 窗口里一定拿得到。
-///
-/// 它的两条路径都不做任何有副作用的事：查一次原子量、或者读一次已托管的状态。
-/// 因此前端可以放心地高频轮询它（实际上只会轮询几次，见
-/// \`src/services/backendReady.ts\`）。
-///
-/// **ACL**：这条命令注册在应用级清单里，因此必须同时出现在三处 ——
-/// \`build.rs\` 的 \`AppManifest::commands\`、这里的 \`generate_handler!\`、
-/// \`capabilities/app-commands.json\` 的 \`allow-backend-ready\`。
-/// 少一处的结果是"命令对所有人不可用"，且只会在运行期显形（\`pnpm check:acl\` 会拦）。
-#[tauri::command]
-pub async fn backend_ready(app: tauri::AppHandle) -> Result<bool, String> {
-    use tauri::Manager;
-
-    if let Some(state) = app.try_state::<core::registry::ReadyState>() {
-        return Ok(state.is_ready());
-    }
-
-    // 理论上到不了这里（\`ReadyState\` 注册在 builder 链上）。真到了，就退回真源：
-    // 已经托管了注册表时以它的结论为准，否则如实回答"还没好"——
-    // 这个方向是安全的：前端继续等，而不会拿一个未初始化的后端去跑启动流程。
-    match app.try_state::<ModuleRegistry>() {
-        Some(registry) => Ok(registry.is_ready()),
-        None => Ok(false),
-    }
 }
 `;
 
