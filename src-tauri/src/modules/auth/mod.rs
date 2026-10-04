@@ -57,7 +57,14 @@ impl Module for AuthModule {
             log::warn!("尚未设置访问密钥，应用将引导用户完成初始化");
         }
 
-        app.manage(state::AuthState::new(current));
+        // 这里托管的是**托管单元**，不是状态本身 —— 两者不等价，且差别正是
+        // 本模块最重要的一条约束：`get_auth_status` 会在 setup 跑完之前被前端调用
+        // （发行版冷启动必现），而状态若只在 setup 里建立，那次调用就会以
+        // "state not managed" 失败并把整个启动流程打断。
+        //
+        // 因此托管单元在 setup 里登记（一次内存写入，代价可忽略），状态本身由
+        // 第一次取用时建立。理由与取舍见 `state::AuthSession` 的文档注释。
+        app.manage(state::AuthSession::new());
         Ok(())
     }
 }

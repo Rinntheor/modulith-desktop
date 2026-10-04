@@ -4,6 +4,7 @@
   "description": "宿主自己的命令只授权给主界面这一个 webview。见 src-tauri/build.rs：应用级 ACL 清单一经声明，这些命令的默认语义就是拒绝，必须逐条授权。这份列表由 pnpm check:acl 与 generate_handler! 逐条比对。注意这里必须用 webviews 而不是 windows —— 写 windows: [main] 会把授权发给该窗口下的所有 webview，插件沙箱一旦落地，那就是把整份授权送给插件。",
   "webviews": ["main"],
   "permissions": [
+    "allow-backend-ready",
     "allow-get-auth-status",
     "allow-verify-session",
     "allow-get-hardware-fingerprint",

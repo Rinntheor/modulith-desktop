@@ -27,6 +27,7 @@ fn main() {
     tauri_build::try_build(
         tauri_build::Attributes::new().app_manifest(
             tauri_build::AppManifest::new().commands(&[
+                "backend_ready",
                 "get_auth_status",
                 "verify_session",
                 "get_hardware_fingerprint",

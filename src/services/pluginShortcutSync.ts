@@ -29,6 +29,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getShortcuts, runShortcutByCombo, subscribeShortcuts } from './shortcutRegistry';
+import { whenBackendReady } from './backendReady';
 
 /** 与 Rust 侧 `shortcuts::ShortcutTable` 一一对应 */
 interface PluginShortcutTable {
@@ -88,7 +89,10 @@ export function installPluginShortcutSync(): void {
     });
   };
 
-  push();
+  // 推第一次表**必须等后端就绪**（`set_plugin_shortcuts` 写宿主侧托管的表；
+  // 发行版冷启动时前端跑在后端 setup 前面，见 `backendReady.ts`）。
+  // 订阅**不等**：第一次真正的推送由上面那一句负责。
+  void whenBackendReady().then(push);
   subscribeShortcuts(push);
 
   void listen<{ normalized: string; source: string }>(SHORTCUT_TRIGGERED, (event) => {

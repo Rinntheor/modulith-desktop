@@ -18,6 +18,7 @@
 
 import { getCachedSettings, loadAppSettings } from './appSettings';
 import { getCachedAuth, getAuthStatus, subscribeAuth } from './authStore';
+import { whenBackendReady } from './backendReady';
 import { getCatalogFlatMap, getCatalogModules, getPluginModuleIds } from './moduleCatalog';
 import { moduleManager } from './moduleManager';
 import {
@@ -464,17 +465,36 @@ class BootManager {
   }
 
   private async run(): Promise<BootState> {
-    const startedAt = Date.now();
-
     this.setState({
       phase: 'running',
-      startedAt,
+      startedAt: null,
       finishedAt: null,
       error: null,
       warnings: [],
       steps: initialState().steps,
       currentStepId: null,
     });
+
+    /*
+     * 后端就绪闸门 —— **启动流程的第一件事**。
+     *
+     * 发行版冷启动时，主窗口由 Tauri 在创建阶段就建好并开始加载前端资源，而模块
+     * 状态是在 Rust `setup` 钩子里注入的，两者之间没有任何同步：打包产物的实测
+     * 日志显示 webview 已经在取资源时，状态注入还晚 25–39ms。落在窗口里的 invoke
+     * 会以 "state not managed" 失败 —— 第一步与第二步都落在里面，而第二步是关键
+     * 步骤，于是用户看到「初始化中断」，点重试才能进。
+     *
+     * 闸门在这里等，而不是给 `get_auth_status` 单独加重试：同一窗口里还有几个被
+     * `catch` 吞掉的失败（读设置回落默认值等），理由与取舍见 `backendReady.ts`。
+     *
+     * 它**永不 reject**，因此这里不需要 try/catch；超时也会放行，让第一步如实
+     * 报错。计时从闸门放行之后开始：那段等待是后端初始化时间，把它算进"读取应用
+     * 设置"的耗时只会让启动性能数据失真。
+     */
+    await whenBackendReady();
+
+    const startedAt = Date.now();
+    this.setState({ startedAt });
 
     for (let index = 0; index < STEPS.length; index += 1) {
       const definition = STEPS[index];

@@ -15,11 +15,11 @@
 
 use super::config::{self, AuthConfig};
 use super::crypto;
+use super::state::{state_of, AuthSession};
 use super::types::{
     AuthResponse, AuthStatus, DeviceFingerprint, KeySetupResponse, KnownDevice, LoginLogEntry,
     RecoveryVerification, SecurityInfo, SecurityOverview,
 };
-use super::state::AuthState;
 use tauri::{AppHandle, State};
 use zeroize::Zeroize;
 
@@ -169,10 +169,13 @@ async fn match_recovery_in_background(code: String, hashes: Vec<String>) -> Opti
 /// 一次性读取启动所需的授权状态
 #[tauri::command]
 pub async fn get_auth_status(
-    state: State<'_, AuthState>,
+    app: AppHandle,
+    auth_state: State<'_, AuthSession>,
     device_fingerprint: DeviceFingerprint,
     token: Option<String>,
 ) -> Result<AuthStatus, String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     let snapshot = state.config_snapshot();
     let device_id = device_fingerprint.device_id();
 
@@ -211,7 +214,13 @@ pub async fn get_auth_status(
 
 /// 校验会话令牌（前端每次启动/reload 后用它确认会话仍然有效）
 #[tauri::command]
-pub async fn verify_session(state: State<'_, AuthState>, token: String) -> Result<bool, String> {
+pub async fn verify_session(
+    app: AppHandle,
+    auth_state: State<'_, AuthSession>,
+    token: String,
+) -> Result<bool, String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     Ok(state.validate_session(&token))
 }
 
@@ -232,10 +241,12 @@ pub async fn get_hardware_fingerprint() -> Result<crypto::HardwareFingerprint, S
 #[tauri::command]
 pub async fn setup_access_key(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     key: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<KeySetupResponse, String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     if state.config_snapshot().is_initialized() {
         return Err("访问密钥已设置；如需更换请使用「修改访问密钥」".to_string());
     }
@@ -260,7 +271,7 @@ pub async fn setup_access_key(
     // 整套刚生成，剩余枚数就是整套数量。先取出来，后面 recovery_codes 会被移动。
     let recovery_codes_len = recovery_codes.len();
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         cfg.verification_hash = Some(hash);
         cfg.crypto_salt = Some(salt);
         cfg.require_auth = true;
@@ -289,30 +300,37 @@ pub async fn setup_access_key(
 #[tauri::command]
 pub async fn verify_access_key(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     key: String,
     device_fingerprint: DeviceFingerprint,
     remember_me: bool,
 ) -> Result<AuthResponse, String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
 
     // 1) 频率限制
     if let Err(limited) = state.limiter.check(&device_id) {
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.push_log(log_entry(&device_id, &label, false, "rate-limited"))
         });
-        return Ok(failure_with(device_id, &state, None, Some(limited.to_string())));
+        return Ok(failure_with(
+            device_id,
+            &*state,
+            None,
+            Some(limited.to_string()),
+        ));
     }
 
     // 2) 是否处于封锁期
     if let Some(blocked) = state.attempts.blocked_for(&device_id) {
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.push_log(log_entry(&device_id, &label, false, "blocked"))
         });
         return Ok(failure_with(
             device_id,
-            &state,
+            &*state,
             Some(blocked),
             Some("该设备尝试次数过多，已被临时锁定".to_string()),
         ));
@@ -335,21 +353,18 @@ pub async fn verify_access_key(
         let now = AuthState::now_iso();
         let mut is_new_device = false;
 
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             is_new_device = cfg.upsert_device(&device_id, &label, &now);
             cfg.push_log(log_entry(&device_id, &label, true, "ok"));
 
             // remember_me：生成一把随机密钥，用硬件绑定密钥加密后落盘，
             // 同时保存它的摘要——下次自动登录会真的比对，而不是只看开关。
             if remember_me {
-                let salt = cfg
-                    .crypto_salt
-                    .clone()
-                    .unwrap_or_else(|| {
-                        let salt = crypto::generate_salt();
-                        cfg.crypto_salt = Some(salt.clone());
-                        salt
-                    });
+                let salt = cfg.crypto_salt.clone().unwrap_or_else(|| {
+                    let salt = crypto::generate_salt();
+                    cfg.crypto_salt = Some(salt.clone());
+                    salt
+                });
 
                 let secret = crypto::generate_token();
                 match crypto::encrypt_bound(&secret, crypto::binding_key(), &salt) {
@@ -377,13 +392,17 @@ pub async fn verify_access_key(
     // 5) 失败：计入封锁并写审计日志
     state.attempts.record_failure(&device_id);
     let blocked = state.attempts.blocked_for(&device_id);
-    let outcome = if blocked.is_some() { "blocked" } else { "bad-key" };
+    let outcome = if blocked.is_some() {
+        "blocked"
+    } else {
+        "bad-key"
+    };
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         cfg.push_log(log_entry(&device_id, &label, false, outcome))
     });
 
-    Ok(failure_with(device_id, &state, blocked, None))
+    Ok(failure_with(device_id, &*state, blocked, None))
 }
 
 /// 「记住我」自动登录。
@@ -398,9 +417,11 @@ pub async fn verify_access_key(
 #[tauri::command]
 pub async fn try_auto_login(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<AuthResponse, String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
     let snapshot = state.config_snapshot();
@@ -410,17 +431,17 @@ pub async fn try_auto_login(
     // 这里的返回值**不带 message**：对前端来说这只是一次"没自动登录成功"，
     // 不是错误。带上提示语会在解锁界面上多出一条无意义的告警。
     if state.is_locked() {
-        return Ok(failure_with(device_id, &state, None, None));
+        return Ok(failure_with(device_id, &*state, None, None));
     }
 
     if !snapshot.auto_login || !snapshot.has_remember_token() {
-        return Ok(failure_with(device_id, &state, None, None));
+        return Ok(failure_with(device_id, &*state, None, None));
     }
 
     if let Some(blocked) = state.attempts.blocked_for(&device_id) {
         return Ok(failure_with(
             device_id,
-            &state,
+            &*state,
             Some(blocked),
             Some("该设备尝试次数过多，已被临时锁定".to_string()),
         ));
@@ -431,7 +452,7 @@ pub async fn try_auto_login(
         snapshot.remember_token_hash.as_deref(),
         snapshot.crypto_salt.as_deref(),
     ) else {
-        return Ok(failure_with(device_id, &state, None, None));
+        return Ok(failure_with(device_id, &*state, None, None));
     };
 
     // 解密失败 = 换机器 / 改硬件 / 密文被篡改，凭据已不可用，直接作废
@@ -439,13 +460,16 @@ pub async fn try_auto_login(
         Ok(secret) => secret,
         Err(e) => {
             log::warn!("自动登录凭据无法解密，已作废: {e}");
-            mutate_config(&app, &state, |cfg| {
+            mutate_config(&app, &*state, |cfg| {
                 cfg.clear_remember_token();
                 cfg.push_log(log_entry(&device_id, &label, false, "auto-login-invalid"));
             });
-            return Ok(failure_with(device_id, &state, None, Some(
-                "自动登录凭据已失效（硬件环境已变化），请使用访问密钥解锁".to_string(),
-            )));
+            return Ok(failure_with(
+                device_id,
+                &*state,
+                None,
+                Some("自动登录凭据已失效（硬件环境已变化），请使用访问密钥解锁".to_string()),
+            ));
         }
     };
 
@@ -455,13 +479,16 @@ pub async fn try_auto_login(
         expected.as_bytes(),
     ) {
         log::warn!("自动登录凭据摘要不匹配，已作废");
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.clear_remember_token();
             cfg.push_log(log_entry(&device_id, &label, false, "auto-login-invalid"));
         });
-        return Ok(failure_with(device_id, &state, None, Some(
-            "自动登录凭据校验失败，请使用访问密钥解锁".to_string(),
-        )));
+        return Ok(failure_with(
+            device_id,
+            &*state,
+            None,
+            Some("自动登录凭据校验失败，请使用访问密钥解锁".to_string()),
+        ));
     }
 
     // 通过：建立会话，并轮换「记住我」密钥（用掉一次就换一把）
@@ -475,7 +502,7 @@ pub async fn try_auto_login(
     let encrypt_key = crypto::binding_key();
     let salt_owned = salt.to_string();
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         match crypto::encrypt_bound(&rotated, encrypt_key, &salt_owned) {
             Ok(cipher) => {
                 cfg.remember_token = Some(cipher);
@@ -513,17 +540,19 @@ pub async fn try_auto_login(
 #[tauri::command]
 pub async fn logout(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     // 保留该参数以兼容既有调用方与 Tauri 的命令签名，但**刻意不使用**：
     // 锁定语义是"结束全部会话"，而不是"只结束这一个"，因此不看令牌内容。
     _token: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<(), String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
 
     // 先审计再锁：日志本身与锁定状态无关
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         cfg.push_log(log_entry(&device_id, &label, true, "locked"))
     });
 
@@ -541,13 +570,15 @@ pub async fn logout(
 #[tauri::command]
 pub async fn change_access_key(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     token: String,
     old_key: String,
     new_key: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<String, String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
@@ -569,7 +600,7 @@ pub async fn change_access_key(
 
     if !verify_in_background(old_key, stored_hash.clone()).await {
         let remaining = state.attempts.record_failure(&device_id);
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.push_log(log_entry(&device_id, &label, false, "bad-old-key"))
         });
         return Err(format!("原访问密钥不正确（剩余 {remaining} 次尝试机会）"));
@@ -585,7 +616,7 @@ pub async fn change_access_key(
     let now = AuthState::now_iso();
     let binding_key = crypto::binding_key();
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         // 换密钥会轮换盐值，已加密的「记住我」凭据必须重新加密，
         // 否则会变成永远解不开的垃圾数据。
         if let (Some(cipher), Some(old_salt)) =
@@ -624,12 +655,14 @@ pub async fn change_access_key(
 #[tauri::command]
 pub async fn set_require_auth(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     token: String,
     enabled: bool,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<bool, String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     // 没有密钥就不允许「要求授权」，否则会把自己永久锁在门外
     if enabled && !state.config_snapshot().is_initialized() {
@@ -639,7 +672,7 @@ pub async fn set_require_auth(
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         cfg.require_auth = enabled;
         cfg.push_log(log_entry(
             &device_id,
@@ -660,18 +693,20 @@ pub async fn set_require_auth(
 #[tauri::command]
 pub async fn set_auto_login(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     token: String,
     enabled: bool,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<bool, String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
 
     if !enabled {
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.clear_remember_token();
             cfg.push_log(log_entry(&device_id, &label, true, "auto-login-off"));
         });
@@ -683,7 +718,7 @@ pub async fn set_auto_login(
     let secret_hash = crypto::sha256_hex(secret.as_bytes());
     let mut succeeded = false;
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         let salt = cfg.crypto_salt.clone().unwrap_or_else(|| {
             let salt = crypto::generate_salt();
             cfg.crypto_salt = Some(salt.clone());
@@ -724,11 +759,13 @@ pub async fn set_auto_login(
 #[tauri::command]
 pub async fn generate_recovery_code(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     token: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<Vec<String>, String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     if !state.config_snapshot().is_initialized() {
         return Err("请先设置访问密钥，再生成恢复码".to_string());
@@ -741,7 +778,7 @@ pub async fn generate_recovery_code(
     let hashes = hash_recovery_codes_in_background(codes.clone()).await?;
     let now = AuthState::now_iso();
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         cfg.recovery_hash = hashes;
         cfg.recovery_created_at = Some(now.clone());
         cfg.push_log(log_entry(&device_id, &label, true, "recovery-generated"));
@@ -761,22 +798,29 @@ pub async fn generate_recovery_code(
 #[tauri::command]
 pub async fn verify_recovery_code(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     recovery_code: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<RecoveryVerification, String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
 
     if let Err(limited) = state.limiter.check(&device_id) {
-        mutate_config(&app, &state, |cfg| {
-            cfg.push_log(log_entry(&device_id, &label, false, "recovery-rate-limited"))
+        mutate_config(&app, &*state, |cfg| {
+            cfg.push_log(log_entry(
+                &device_id,
+                &label,
+                false,
+                "recovery-rate-limited",
+            ))
         });
         return Err(limited.to_string());
     }
 
     if let Some(blocked) = state.attempts.blocked_for(&device_id) {
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.push_log(log_entry(&device_id, &label, false, "blocked"))
         });
         return Ok(RecoveryVerification::failure(
@@ -788,7 +832,7 @@ pub async fn verify_recovery_code(
     let snapshot = state.config_snapshot();
     let stored_hashes = snapshot.recovery_hash.clone();
     if stored_hashes.is_empty() {
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.push_log(log_entry(&device_id, &label, false, "recovery-unavailable"))
         });
         return Err(
@@ -804,7 +848,7 @@ pub async fn verify_recovery_code(
     else {
         state.attempts.record_failure(&device_id);
         let remaining = state.attempts.remaining(&device_id);
-        mutate_config(&app, &state, |cfg| {
+        mutate_config(&app, &*state, |cfg| {
             cfg.push_log(log_entry(&device_id, &label, false, "bad-recovery-code"))
         });
         return Ok(RecoveryVerification::failure(
@@ -818,7 +862,7 @@ pub async fn verify_recovery_code(
     state.attempts.clear(&device_id);
 
     let token = state.issue_recovery_grant(matched_index);
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         cfg.push_log(log_entry(&device_id, &label, true, "recovery-verified"))
     });
 
@@ -838,18 +882,25 @@ pub async fn verify_recovery_code(
 #[tauri::command]
 pub async fn reset_access_key_with_recovery_code(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     recovery_token: String,
     new_key: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<KeySetupResponse, String> {
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
     let device_id = device_fingerprint.device_id();
     let label = device_fingerprint.label();
 
     // 令牌必须是第一步核验通过后签发的那一个；它携带"命中过哪一枚恢复码"
     let Some(matched_index) = state.consume_recovery_grant(&recovery_token) else {
-        mutate_config(&app, &state, |cfg| {
-            cfg.push_log(log_entry(&device_id, &label, false, "recovery-token-invalid"))
+        mutate_config(&app, &*state, |cfg| {
+            cfg.push_log(log_entry(
+                &device_id,
+                &label,
+                false,
+                "recovery-token-invalid",
+            ))
         });
         return Err("恢复凭据已失效，请重新输入恢复码".to_string());
     };
@@ -870,7 +921,7 @@ pub async fn reset_access_key_with_recovery_code(
     // 消费掉被用掉的那一枚之后，还剩几枚可用（供返回值与界面提示）
     let mut remaining_recovery_codes = 0usize;
 
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         // 换密钥 → 轮换盐值 → 已加密的「记住我」凭据必须重新加密，
         // 否则会变成永远解不开的垃圾数据（与 change_access_key 同处理）。
         if let (Some(cipher), Some(old_salt)) =
@@ -944,11 +995,14 @@ pub async fn reset_access_key_with_recovery_code(
 
 #[tauri::command]
 pub async fn get_security_overview(
-    state: State<'_, AuthState>,
+    app: AppHandle,
+    auth_state: State<'_, AuthSession>,
     token: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<SecurityOverview, String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     let snapshot = state.config_snapshot();
     let device_id = device_fingerprint.device_id();
@@ -981,11 +1035,14 @@ pub async fn get_security_overview(
 /// 已知设备列表（`isCurrent` 标记当前设备）
 #[tauri::command]
 pub async fn get_known_devices(
-    state: State<'_, AuthState>,
+    app: AppHandle,
+    auth_state: State<'_, AuthSession>,
     token: String,
     device_fingerprint: DeviceFingerprint,
 ) -> Result<Vec<KnownDevice>, String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     let current = device_fingerprint.device_id();
     let mut devices = state.config_snapshot().known_devices;
@@ -1002,14 +1059,16 @@ pub async fn get_known_devices(
 #[tauri::command]
 pub async fn remove_known_device(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     token: String,
     device_id: String,
 ) -> Result<(), String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     let target = device_id.clone();
-    mutate_config(&app, &state, |cfg| {
+    mutate_config(&app, &*state, |cfg| {
         cfg.known_devices.retain(|d| d.device_id != target);
     });
 
@@ -1022,10 +1081,13 @@ pub async fn remove_known_device(
 /// 登录日志（最新的在前）
 #[tauri::command]
 pub async fn get_login_logs(
-    state: State<'_, AuthState>,
+    app: AppHandle,
+    auth_state: State<'_, AuthSession>,
     token: String,
 ) -> Result<Vec<LoginLogEntry>, String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
     let snapshot = state.config_snapshot();
     Ok(snapshot.login_logs.iter().rev().cloned().collect())
@@ -1035,11 +1097,13 @@ pub async fn get_login_logs(
 #[tauri::command]
 pub async fn clear_login_logs(
     app: AppHandle,
-    state: State<'_, AuthState>,
+    auth_state: State<'_, AuthSession>,
     token: String,
 ) -> Result<(), String> {
-    ensure_unlocked(&state, &token)?;
+    // 状态在这里取用：托管单元保证它一定可用（见 state.rs 的 AuthSession）
+    let state = state_of(&app, &auth_state);
+    ensure_unlocked(&*state, &token)?;
 
-    mutate_config(&app, &state, |cfg| cfg.login_logs.clear());
+    mutate_config(&app, &*state, |cfg| cfg.login_logs.clear());
     Ok(())
 }

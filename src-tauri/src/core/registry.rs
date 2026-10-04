@@ -1,8 +1,8 @@
+use super::lifecycle::{self, LifecyclePlan};
+use super::module::{Module, ModuleEvent};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::AppHandle;
-use super::lifecycle::{self, LifecyclePlan};
-use super::module::{Module, ModuleEvent};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -27,10 +27,26 @@ pub type RegistryResult<T> = Result<T, RegistryError>;
 /// 运行时模块注册表
 pub struct ModuleRegistry {
     modules: HashMap<String, Box<dyn Module>>,
+    /// **注册顺序**的 id 列表。
+    ///
+    /// 存在的理由：执行计划的输入顺序必须是确定的，而 `modules` 是 `HashMap`
+    /// —— 它的迭代顺序由哈希决定，同一份二进制在不同运行里都可能不同。
+    ///
+    /// 此前这里直接把 `self.modules.keys()` 交给 `lifecycle::plan_lifecycle`，
+    /// 于是"顺序只取决于注册顺序"这句注释是假的：没有任何依赖关系的两个模块
+    /// 谁先谁后，取决于哈希。它恰好不会造成崩溃（`plan_lifecycle` 保证被依赖者
+    /// 在前），但会让启动顺序在不同运行之间漂移 —— 那种现象最难查：日志里
+    /// 顺序不一样，却没有一处报错。
+    ///
+    /// `Module::setup` 读到别的模块写入的资源时，这个顺序就是它的可见性边界，
+    /// 因此它必须是确定的、且等于 `modules/mod.rs` 的书写顺序。
+    order: Vec<String>,
     /// 已经成功 `setup` 的模块，按拓扑序
     init_order: Vec<String>,
     /// 已经成功 `start` 的模块，按拓扑序
     start_order: Vec<String>,
+    /// 全部模块是否已经启动完成（见 [`ModuleRegistry::is_ready`]）
+    ready: AtomicBool,
     /// 是否已经执行过整体停止。
     ///
     /// 用原子布尔而不是"记下停过哪些模块"：`stop_all` 只能通过
@@ -52,8 +68,10 @@ impl ModuleRegistry {
     pub fn new() -> Self {
         Self {
             modules: HashMap::new(),
+            order: Vec::new(),
             init_order: Vec::new(),
             start_order: Vec::new(),
+            ready: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         }
     }
@@ -63,6 +81,7 @@ impl ModuleRegistry {
         if self.modules.contains_key(&id) {
             return Err(RegistryError::ModuleAlreadyRegistered(id));
         }
+        self.order.push(id.clone());
         self.modules.insert(id, module);
         Ok(())
     }
@@ -131,11 +150,12 @@ impl ModuleRegistry {
 
     /// 推出生命周期执行计划。
     ///
-    /// 顺序**不再**取自 `HashMap` 的迭代顺序 —— 那正是此前"启动顺序不确定"的根源。
-    /// 顺序只取决于 `modules/mod.rs` 里的注册顺序（生成文件，因此是稳定的）
-    /// 与各模块声明的依赖。见 `core::lifecycle` 的说明。
+    /// 顺序取自**注册顺序**（`self.order`），不是 `HashMap` 的迭代顺序 ——
+    /// 那正是此前"启动顺序不确定"的根源。注册顺序来自生成文件
+    /// `modules/mod.rs`，因此它是稳定的，且与书写顺序一致。
+    /// 见 `core::lifecycle` 的说明。
     fn plan(&self) -> LifecyclePlan {
-        let ids: Vec<String> = self.modules.keys().cloned().collect();
+        let ids: Vec<String> = self.order.clone();
         lifecycle::plan_lifecycle(&ids, |id| {
             self.modules
                 .get(id)
@@ -196,7 +216,57 @@ impl ModuleRegistry {
             }
         }
 
+        // 启动阶段到此结束 —— 这是"后端就绪"的**唯一**判据，见 `is_ready`。
+        //
+        // 放在这里而不是 setup 之后：`start` 才是模块真正开始工作的地方
+        // （启动定时器、拉起后台任务、装载插件列表），setup 只是把状态登记好。
+        // 前端闸门等的正是这件事，因此判据必须与"能安全调用命令"对齐。
+        //
+        // 有模块启动失败时**依然置位**：单个模块起不来不该把用户永久挡在启动
+        // 界面之外（`lib.rs` 里对 `start_all` 的失败策略也是"继续启动其余模块"）。
+        // 失败已经被记进日志并上报给调用方。
+        self.ready.store(true, Ordering::SeqCst);
+        log::debug!(
+            "后端就绪：{} 个模块已启动{}",
+            self.start_order.len(),
+            match &first_failure {
+                Some((id, _)) => format!("（{} 启动失败）", id),
+                None => String::new(),
+            }
+        );
+
         first_failure
+    }
+
+    /// 模块是否已经全部启动完成。
+    ///
+    /// ============================================================
+    /// 它为什么存在：这是一次真实故障的修复
+    /// ============================================================
+    ///
+    /// 发行版冷启动时，主窗口由 Tauri 在创建阶段就建好并开始加载前端资源，
+    /// 而模块状态是在 `setup` 钩子里（`setup_all` → 各模块的 `app.manage(...)`）
+    /// 注入的。两者之间**没有任何同步**：打包产物的实测日志显示，webview 已经在
+    /// 取嵌入资源时，`SettingsState` / `AuthState` 的注入还分别晚 25ms / 39ms。
+    ///
+    /// 于是启动流程第二步（`get_auth_status`，关键步骤）必然失败：
+    ///
+    ///   state not managed for field `state` on command `get_auth_status`.
+    ///   You must call `.manage()` before using this command
+    ///
+    /// 用户只能点「重试初始化」—— 那时 setup 早已跑完，所以一点就过；而下次
+    /// 冷启动照旧。开发模式永远看不到，因为 `devUrl` 那一跳（连 Vite、按需
+    /// transform 上百个 ESM 模块）比 `setup_all` 的磁盘 IO 慢一个数量级。
+    ///
+    /// 同一次竞速里还有几个**被 catch 吞掉**的失败：读设置回落成默认值、通知订阅
+    /// 悄悄没装上、WebView 内存等级没生效、插件主题快照没推上去。它们不报错，
+    /// 只是让启动结果静默地变差 —— 这正是"只修一条命令"不够、必须给出一个
+    /// **显式就绪信号**的理由。
+    ///
+    /// 因此前端在第一个 `invoke` 之前先等这个信号（`backend_ready` 命令 +
+    /// `modulith://backend-ready` 事件，见 `src/services/backendReady.ts`）。
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
     }
 
     /// 按**启动的逆序**停止全部模块。
@@ -449,9 +519,17 @@ mod tests {
     #[test]
     fn duplicate_registration_is_rejected() {
         let mut registry = ModuleRegistry::new();
-        registry.register(Box::new(FakeModule { id: "a", deps: vec![] })).unwrap();
+        registry
+            .register(Box::new(FakeModule {
+                id: "a",
+                deps: vec![],
+            }))
+            .unwrap();
         assert!(matches!(
-            registry.register(Box::new(FakeModule { id: "a", deps: vec![] })),
+            registry.register(Box::new(FakeModule {
+                id: "a",
+                deps: vec![]
+            })),
             Err(RegistryError::ModuleAlreadyRegistered(_))
         ));
     }
@@ -473,4 +551,93 @@ mod tests {
             Err(RegistryError::CircularDependency)
         ));
     }
+
+    /// 没有依赖关系的模块之间，顺序必须**等于注册顺序**。
+    ///
+    /// 这条测试钉住的正是那个只在运行期显形的缺陷：此前计划取自
+    /// `HashMap::keys()`，于是这一组断言会随哈希漂移。它不会崩，只是让启动顺序
+    /// 在不同运行里不一样 —— 而"顺序不一样却没人报错"是最难归因的一类现象。
+    #[test]
+    fn registration_order_decides_between_unrelated_modules() {
+        let registry = registry(&[("zeta", &[]), ("alpha", &[]), ("mid", &[])]);
+
+        assert_eq!(
+            registry.plan().start_order,
+            vec!["zeta".to_string(), "alpha".to_string(), "mid".to_string()],
+            "没有依赖关系时保持注册顺序（不是字母序，也不是哈希序）"
+        );
+    }
+
+    /// 注册表新建时未就绪；`start_all` 跑完才算就绪。
+    ///
+    /// 就绪是前端启动闸门的判据，因此它必须**只在启动真的做完之后**置位：
+    /// 早置位等于闸门形同虚设（前端照样会撞上未托管的状态）。
+    #[test]
+    fn a_fresh_registry_is_not_ready() {
+        assert!(!ModuleRegistry::new().is_ready());
+    }
+
+    #[test]
+    fn ready_state_flips_only_when_marked() {
+        let state = ReadyState::new();
+        assert!(!state.is_ready(), "新建的就绪信号必须是未就绪");
+        state.mark_ready();
+        assert!(state.is_ready());
+    }
 }
+
+// ============================================================
+// 后端就绪信号（供 `backend_ready` 命令使用）
+// ============================================================
+
+/// 后端就绪信号。**仅供 `backend_ready` 命令使用。**
+///
+/// 它必须能在 `setup` 完成之前就被托管，因此挂在 builder 链上（与
+/// `SandboxSurfaces` 同一个理由与同一个位置），而不是在某个模块的 `setup` 里 ——
+/// 那恰好就是它要修的那类缺陷。
+///
+/// 真源是 [`ModuleRegistry::is_ready`]：那一个原子布尔量是"全部模块已启动"的
+/// **唯一**判据。这里这一份存在的理由只是：`ModuleRegistry` 在 `setup` 期间还被
+/// `registry` 局部变量持有，`app.manage(registry)` 之前前端拿不到它，而前端
+/// 恰恰要在这段时间里问"好了没有"。两份状态不一致的代价是前端白等到超时，
+/// 因此 `mark_ready` 只在 `start_all` 返回之后被调用一次，且携带的就是 registry
+/// 自己的结论。
+pub struct ReadyState {
+    ready: AtomicBool,
+}
+
+impl Default for ReadyState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReadyState {
+    pub fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    /// 标记为就绪（由 `setup` 钩子在模块全部启动之后调用一次）
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+}
+
+/// 后端就绪后广播的事件名。
+///
+/// 与命令 `backend_ready` 是**两条独立的路**，这是刻意的：命令要过 ACL 检查，
+/// 也可能因为前端 `invoke` 的时序而失败；事件则是一条主动推送。任何一条到达
+/// 都足以放行启动 —— 见 `src/services/backendReady.ts`。
+///
+/// 命名沿用仓库里既有的 `modulith://` 前缀（`modulith://tray-action`、
+/// `modulith://notifications-changed` 等）。
+pub const BACKEND_READY_EVENT: &str = "modulith://backend-ready";
+
+/// 后端就绪命令的名字。前端与 ACL 三处清单引用的是同一个字符串。
+pub const BACKEND_READY_COMMAND: &str = "backend_ready";

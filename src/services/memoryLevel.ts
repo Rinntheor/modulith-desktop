@@ -46,6 +46,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
+import { whenBackendReady } from './backendReady';
 import { levelForVisibility, type MemoryLevel } from '../utils/memoryLevelPolicy';
 
 export type { MemoryLevel };
@@ -69,10 +70,20 @@ let supportedCache: boolean | null = null;
  */
 export async function isMemoryLevelSupported(): Promise<boolean> {
   if (supportedCache !== null) return supportedCache;
+
+  // 与 `installMemoryLevelPolicy` 里那次同步同一个理由：结果会被**缓存**，
+  // 而缓存在竞速窗口里失败一次就会把整个进程钉在"不支持"上。因此这里也过闸门
+  // —— 就绪之后它是一个已兑现的 Promise，代价只是一个微任务。
+  await whenBackendReady();
+
   try {
     supportedCache = await invoke<boolean>('webview_memory_level_supported');
-  } catch {
-    // 命令本身不可用（旧版应用 / 平台不支持）也归入"不支持"。
+  } catch (error) {
+    // 命令本身不可用（平台不支持）也归入"不支持"。
+    //
+    // 但这里**要说出来**：从前的 `catch {}` 把"失败"与"不支持"揉成同一个结果，
+    // 于是"内存策略从未生效"在日志里一点痕迹都没有。归属不同，排查方式也不同。
+    console.warn('[memoryLevel] 探测内存目标等级支持情况失败，按不支持处理:', error);
     supportedCache = false;
   }
   return supportedCache;
@@ -173,7 +184,13 @@ export function installMemoryLevelPolicy(): void {
 
   // 启动时先套一次：应用可能是在隐藏状态下启动的（自启动 + 静默启动），
   // 那时不会有 visibilitychange 事件。
-  void syncToVisibility();
+  //
+  // **必须等后端就绪之后再套**：`apply_memory_level_for_visibility` 要读托管的
+  // 状态，而发行版冷启动时前端会跑在后端 `setup` 前面（见 `backendReady.ts`）。
+  // 落在那个窗口里的调用会失败，而这里的 catch 会把它当成"运行时太旧"并把
+  // `supportedCache` 记成 false —— 于是**整个进程再也不会降内存**，
+  // 而且一次报错都没有。这正是"被吞掉的失败让启动结果静默变差"的典型一例。
+  void whenBackendReady().then(() => syncToVisibility());
 }
 
 /**

@@ -42,6 +42,7 @@ import {
   subscribeTheme,
 } from './theme';
 import { subscribeAccent } from './accent';
+import { whenBackendReady } from './backendReady';
 
 /** 与 Rust 侧 `theme::ThemeSnapshot` 一一对应 */
 export interface PluginThemeSnapshot {
@@ -184,7 +185,14 @@ export function installPluginThemeSync(): void {
     });
   };
 
-  push();
+  // 立刻推那一次**必须等后端就绪**：`set_plugin_theme` 要写宿主侧托管的
+  // `PluginTheme`，而发行版冷启动时前端会跑在后端 `setup` 前面（见
+  // `backendReady.ts`）。失败在这里只记一条警告，于是表现为"插件主题永远是
+  // 兜底配色"—— 又是一个不报错、只是静默变差的结果。
+  //
+  // 订阅那两行**不等**：它们只是在内存里登记回调，第一次真正的推送由上面这一句
+  // 负责；之后再变时后端必然早已就绪。
+  void whenBackendReady().then(push);
   subscribeTheme(push);
   // ★ 主色有**自己**的一套通知，主题那一路收不到它。
   subscribeAccent(push);

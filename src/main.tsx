@@ -7,6 +7,7 @@ import NetPromptLayer from './components/NetPromptLayer';
 import ThemeProvider from './components/ThemeProvider';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { installGlobalErrorHandlers } from './services/globalErrorHandlers';
+import { installBackendReadyGate } from './services/backendReady';
 import { installMemoryLevelPolicy } from './services/memoryLevel';
 import { subscribeBackendNotificationEvents } from './services/notifications';
 import { subscribePluginEvents } from './services/backgroundPlugins';
@@ -33,6 +34,34 @@ import "@styles/global/index.css";
  * （事件处理器、定时器、未处理的 Promise 拒绝）。见该模块的说明。
  */
 installGlobalErrorHandlers();
+
+/*
+ * 后端就绪闸门。**它必须排在上面所有会 invoke 的安装之前。**
+ *
+ * ============================================================
+ * 它为什么是这里的第一句
+ * ============================================================
+ *
+ * 发行版冷启动时，主窗口由 Tauri 在创建阶段就建好并开始加载前端资源，而模块状态
+ * 是在 Rust 的 `setup` 钩子里注入的 —— 两者没有任何同步。打包产物的实测日志显示，
+ * webview 已经在取嵌入资源时，`SettingsState` / `AuthState` 的注入还分别晚
+ * 25ms / 39ms。落在那个窗口里的 `invoke` 会收到
+ * "state not managed for field `state` on command …"。
+ *
+ * 启动流程第二步没有吞错，所以它是爆点（用户看到「初始化中断」，点重试就能进，
+ * 下次冷启动照旧）。但**同一次竞速里还有四个被吞掉的失败**：读设置回落默认值、
+ * 通知订阅没装上、WebView 内存等级缓存成"不支持"、插件主题快照没推上去 ——
+ * 它们不报错，只是让启动结果静默变差。
+ *
+ * 下面这几行 `install*` 全都会立刻发起 invoke，因此逐个加保护等于把同一件事写
+ * 五遍。正确的做法是**一个闸门**：这些服务内部 await `whenBackendReady()`，
+ * 而闸门在 Rust 那边由 `core::registry::ReadyState` 兑现（命令 `backend_ready`
+ * 与事件 `modulith://backend-ready` 两条路，任一到达即放行）。
+ *
+ * 闸门**永不 reject**：超时也会放行，让后续命令如实报错 —— 一个永远转圈的启动
+ * 界面比现在更难诊断。理由与取舍见 `src/services/backendReady.ts` 的文件头。
+ */
+void installBackendReadyGate();
 
 /*
  * 提示音的解锁监听也要尽早装。

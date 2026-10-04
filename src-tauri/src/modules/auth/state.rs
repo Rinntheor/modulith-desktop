@@ -16,8 +16,9 @@ use super::security::AttemptTracker;
 use super::types::SessionInfo;
 use super::{config::AuthConfig, crypto};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::AppHandle;
 
 /// 已核验恢复码后签发的一次性凭据
 ///
@@ -277,6 +278,100 @@ impl AuthState {
     }
 }
 
+// ============================================================
+// Tauri 托管的状态单元
+// ============================================================
+
+/// 授权状态的**托管单元**：进程内唯一，第一次被取用时才真正建立。
+///
+/// ============================================================
+/// 为什么不直接 `app.manage(AuthState)`
+/// ============================================================
+///
+/// 发行版冷启动时，界面会在后端 **setup 钩子跑完之前**就开始执行 JS ——
+/// 主窗口由 Tauri 在创建阶段就建好并开始加载前端资源，而模块的 `app.manage(...)`
+/// 在 setup 里。于是 `get_auth_status`（启动流程里**唯一一个没有把错误吞掉**的
+/// 早期命令）撞上了一个尚未托管的状态：
+///
+///   state not managed for field `state` on command `get_auth_status`.
+///   You must call `.manage()` before using this command
+///
+/// 它在**启动第二步**抛错，而那一项是关键步骤 —— 于是整个初始化失败，用户只
+/// 剩下「重试初始化」一条路；重试时 setup 早已完成，所以一点就过。开发模式看不到，
+/// 因为 `devUrl` 那一跳（连 Vite、编译、加载模块图）比 setup 慢了一个数量级，
+/// 恰好把竞态盖住 —— 这是一个只在发行版出现、且每次冷启动必现的缺陷。
+///
+/// 因此这里把「初始化」从**生命周期的一个时刻**改成**取用时的一个保证**：
+/// `OnceLock` 保证进程内只有一份；第一次取用（无论是谁、什么时候）就地建立它。
+/// 用户拿到的不再是"你调用得太早"，而是正确的授权状态。
+///
+/// 代价与取舍：
+///
+/// * 不改变任何安全语义 —— 配置来源、解析与降级仍走 `config::load`，解析失败
+///   依旧回落到"需要授权 + 未初始化"（见 `load_from_with_reason`）；
+/// * 只在**第一次取用**时读盘一次。setup 与首次取用共享同一份单元：
+///   谁先到谁建立，后到的那个直接用现成的；
+/// * 它是这一类缺陷的**局部**修法：每一个"状态只在 setup 里注入"的模块都有同一堵墙
+///   （托盘菜单那个窗口在 mount 时就会调 `tray_menu_state`）。
+///   全局修法是前端的启动闸门 —— `src/services/backendReady.ts`，
+///   判据来自 `core::registry::ReadyState`。这里这一层保留，理由见该文件的说明：
+///   闸门负责"不该早调"，这里负责"早调了也不出错"。
+pub struct AuthSession(OnceLock<AuthState>);
+
+impl AuthSession {
+    /// 建立一个尚未初始化的托管单元。
+    ///
+    /// 只是分配一个空 `OnceLock`（一次内存写入），真正的读盘推迟到第一次取用 ——
+    /// 这正是"启动路径上不做多余工作"与"调用时一定拿得到"两者的交点。
+    pub fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// 取用授权状态；尚未初始化时就地建立。
+    ///
+    /// 初始化用 `std::sync::OnceLock::get_or_init`：并发调用时只会有一份存活，
+    /// 落败的那个初始化结果会被丢弃。因此这里故意**不做**任何有副作用的动作
+    /// （迁移回写由 `config::load` 自己保证幂等），重复初始化是安全的。
+    pub fn ready(&self, app: &AppHandle) -> &AuthState {
+        self.0.get_or_init(|| {
+            log::info!("授权状态首次取用：现场读取 auth.json（早期调用不再失败）");
+            AuthState::new(config::load(app))
+        })
+    }
+
+    /// 与 [`AuthSession::ready`] 同一件事，但借出的生命周期**只到本次调用**。
+    ///
+    /// 参数里的 `&AppHandle` 而不是 `&'a AppHandle` 是有意的：命令层从
+    /// `State<'_, AuthSession>` 里拿不到调用者 `AppHandle` 的生命周期保证
+    /// （Tauri 的 `State` 借用的生命周期与 `&self` 无关），因此返回一个绑在
+    /// `app` 上的引用，让调用处按需重借，而不是逼调用方去满足一个它无法证明的约束。
+    ///
+    /// 用它是为了**绕开** `Deref`：需要 trait 分派（例如 `serde::Serialize`）
+    /// 时，传 `&AuthState` 会拿到 `&AuthSession` 或 `&&AuthState` ——
+    /// 两者的报错都长得不像原因。多写四个字符换一个看得懂的编译错误。
+    pub fn ready_service(&self, app: &AppHandle) -> &AuthState {
+        self.ready(app)
+    }
+}
+
+impl Default for AuthSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 把托管单元里的状态借出来。
+///
+/// 单独一个函数（而不是在每个命令里写 `auth_state.ready(&app)`）的理由是统一：
+/// 命令体里满是 `&app`、`&state`，一处漏掉就又是一次"只在发行版出现"的启动失败，
+/// 因此让所有命令走同一个入口。
+///
+/// 注意它**不是**为了绕开借用检查：返回值的生命周期来自 `AuthSession`，
+/// 因此托管单元的借用会一直活到本次命令结束。
+pub fn state_of<'a>(app: &AppHandle, session: &'a AuthSession) -> &'a AuthState {
+    session.ready(app)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,7 +494,10 @@ mod tests {
     fn timestamps_are_usable() {
         assert!(AuthState::now_secs() > 1_700_000_000);
         let iso = AuthState::now_iso();
-        assert!(iso.contains('T') && iso.len() >= 20, "unexpected iso: {iso}");
+        assert!(
+            iso.contains('T') && iso.len() >= 20,
+            "unexpected iso: {iso}"
+        );
     }
 
     // ---------- 恢复码核验凭据 ----------

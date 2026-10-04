@@ -289,13 +289,35 @@ function updateLibRs(): { moduleCount: number; commandCount: number } {
     commandsByModule.push([id, commands.length]);
   }
 
+  /**
+   * 宿主自己的、不属于任何模块的命令。
+   *
+   * ============================================================
+   * 为什么这里必须**写死**一条命令
+   * ============================================================
+   *
+   * `backend_ready` 是启动闸门的第一道判据（见 `core::registry::ReadyState`），
+   * 而它按定义**不能**属于任何一个模块：它要回答的问题正是"模块起来了没有"。
+   * 它由 `lib.rs` 自己定义，因此不在 `commandsByModule` 的扫结果里 —— 不写在这里
+   * 的话，下一次 `pnpm gen:backend update` 会把它从 `generate_handler!` 里删掉。
+   *
+   * 那一步的失败方式很隐蔽：命令被删掉后 `invoke('backend_ready')` 得到
+   * "command not found"，而闸门把命令失败当作"还没就绪"继续轮询 —— 于是
+   * 应用会白等到 3 秒超时。功能还"能用"，只是每次启动慢三秒。
+   *
+   * 同时改三处的要求不变（见 `build.rs`）：这里、`build.rs` 的
+   * `AppManifest::commands`、`capabilities/app-commands.json`。
+   */
+  const HOST_ONLY_COMMANDS = ['backend_ready'];
+
   const commandList =
     allCommands.length > 0
-      ? allCommands.map((cmd) => `        ${cmd},`).join('\n')
-      : '        greet,';
+      ? [...HOST_ONLY_COMMANDS, ...allCommands].map((cmd) => `        ${cmd},`).join('\n')
+      : `        ${HOST_ONLY_COMMANDS.join(',\n        ')},`;
 
   const useStatement =
     modules.length > 0 ? useStatements : '// 默认命令（如果没有模块）';
+
 
   const content = `// src-tauri/src/lib.rs
 // 此文件由 ${GENERATED_BY} 自动生成
@@ -308,7 +330,7 @@ pub mod core;
 pub mod modules;
 
 use core::registry::ModuleRegistry;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 ${useStatement}
 
@@ -351,6 +373,24 @@ pub fn run() -> Result<(), tauri::Error> {
     // 一遍，因此子 webview 用的是同一条协议。
     builder = builder.manage(modules::plugins::sandbox::SandboxSurfaces::default());
     builder = modules::plugins::sandbox::register(builder);
+
+    // 后端就绪信号。
+    //
+    // **它必须在 setup 之前就托管**，理由与 SandboxSurfaces 完全相同：它不是给
+    // 已经跑起来的模块用的，而是给"模块还没跑起来"的那段时间用的。
+    //
+    // 它修的是一个只在发行版出现、且每次冷启动必现的缺陷：主窗口由 Tauri 在创建
+    // 阶段就建好并开始加载前端资源，而各模块的状态是在下面的 setup 钩子里注入的
+    // —— 两者之间没有任何同步。打包产物的实测日志显示，webview 已经在取嵌入资源
+    // 时，\`SettingsState\` / \`AuthState\` 的注入还分别晚 25ms / 39ms。于是启动流程
+    // 第二步（\`get_auth_status\`）必然以 "state not managed" 失败并把用户挡在
+    // 「重试初始化」界面上；重试时 setup 早已跑完，所以一点就过，下次冷启动照旧。
+    //
+    // 同一次竞速里还有几个被 \`catch\` 吞掉的失败（读设置回落默认值、通知订阅没装上、
+    // WebView 内存等级没生效、插件主题快照没推上去）。它们不报错，只是让启动结果
+    // 静默变差 —— 因此正确的修法不是给某几条命令加保护，而是给出一个**显式就绪
+    // 信号**，让前端在第一个 invoke 之前先等它。判据见 \`core::registry::ReadyState\`。
+    builder = builder.manage(core::registry::ReadyState::new());
 
     // setup 中初始化模块
     builder = builder.setup(move |app| {
@@ -395,6 +435,23 @@ pub fn run() -> Result<(), tauri::Error> {
         }
 
         app.manage(registry);
+
+        // 就绪信号置位并广播 —— 这是**唯一**一处。
+        //
+        // 顺序是刻意的：先 \`app.manage(registry)\`，再置位。反过来的话，前端可能
+        // 收到信号后立刻调用依赖 \`ModuleRegistry\` 的命令，而它还没被托管 ——
+        // 那正是这个信号要消灭的那类竞态，不能自己再制造一次。
+        //
+        // 事件与命令两条路都走（命令见文件末尾的 \`backend_ready\`）：事件可能在前端
+        // 挂上监听之前就发出去（那时前端还没有任何监听器），命令则要过 ACL 与
+        // 一次 IPC 往返。两条都留，任何一条到达都足以放行启动。
+        if let Some(state) = app.try_state::<core::registry::ReadyState>() {
+            state.mark_ready();
+        }
+        if let Err(error) = app.emit(core::registry::BACKEND_READY_EVENT, ()) {
+            log::warn!("广播后端就绪事件失败：{error}");
+        }
+        log::info!("后端初始化完成，已广播就绪信号");
 
         // 沙箱界面**不再有所有者线程**。
         //
@@ -474,6 +531,39 @@ ${commandList}
     });
 
     std::process::exit(exit_code);
+}
+
+/// 后端是否已经初始化完成（前端启动闸门的第一道判据）。
+///
+/// 为什么是"查一个已经托管好的原子布尔量"而不是 \`try_state::<ModuleRegistry>()\`
+/// 然后调 \`is_ready()\`：\`setup\` 期间 \`ModuleRegistry\` 还被局部变量 \`registry\`
+/// 持有，\`app.manage(registry)\` 要到 setup 末尾才发生 —— 而那段时间恰好就是
+/// 前端最想问"好了没有"的那段。\`ReadyState\` 挂在 builder 链上，因此它在这段
+/// 窗口里一定拿得到。
+///
+/// 它的两条路径都不做任何有副作用的事：查一次原子量、或者读一次已托管的状态。
+/// 因此前端可以放心地高频轮询它（实际上只会轮询几次，见
+/// \`src/services/backendReady.ts\`）。
+///
+/// **ACL**：这条命令注册在应用级清单里，因此必须同时出现在三处 ——
+/// \`build.rs\` 的 \`AppManifest::commands\`、这里的 \`generate_handler!\`、
+/// \`capabilities/app-commands.json\` 的 \`allow-backend-ready\`。
+/// 少一处的结果是"命令对所有人不可用"，且只会在运行期显形（\`pnpm check:acl\` 会拦）。
+#[tauri::command]
+pub async fn backend_ready(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Manager;
+
+    if let Some(state) = app.try_state::<core::registry::ReadyState>() {
+        return Ok(state.is_ready());
+    }
+
+    // 理论上到不了这里（\`ReadyState\` 注册在 builder 链上）。真到了，就退回真源：
+    // 已经托管了注册表时以它的结论为准，否则如实回答"还没好"——
+    // 这个方向是安全的：前端继续等，而不会拿一个未初始化的后端去跑启动流程。
+    match app.try_state::<ModuleRegistry>() {
+        Some(registry) => Ok(registry.is_ready()),
+        None => Ok(false),
+    }
 }
 `;
 
