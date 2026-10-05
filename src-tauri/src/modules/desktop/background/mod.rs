@@ -478,6 +478,9 @@ impl BackgroundHost {
         let spec = self.spec.lock().unwrap().clone();
 
         let mut command = tokio::process::Command::new(node);
+        // 不分配控制台。少了这一行，发行版每次拉后台宿主都会闪一个黑窗 ——
+        // 而 `.output()` / `Stdio::piped()` 都挡不住它（见 core/process.rs）。
+        crate::core::process::no_console_window_tokio(&mut command);
         command
             // 附加参数放在脚本路径**之前**：它们是 Node 自己的开关
             // （`--permission`、`--allow-fs-read=…`），放在脚本之后就变成
@@ -488,6 +491,9 @@ impl BackgroundHost {
             .stdout(Stdio::piped())
             // stderr 继承：子进程的崩溃与 `console.error` 会直接进应用日志，
             // 而不是被吞掉。这条通道只有 stdout 是协议专用的。
+            //
+            // 它与上面的 `CREATE_NO_WINDOW` 不冲突：那个标志不分配控制台，
+            // 但继承来的标准句柄照旧有效。
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
 

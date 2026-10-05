@@ -33,6 +33,7 @@ import {
 } from '../../services/appSettings';
 import { showToast } from '../../services/toast';
 import { formatBytes } from '../../utils/format';
+import Markdown from '../Markdown';
 import Toggle from './Toggle';
 
 type Status = 'idle' | 'checking' | 'latest' | 'available' | 'installing' | 'error';
@@ -212,10 +213,25 @@ const UpdateChecker: React.FC<Props> = ({ onOpenNetwork, onOpenLogs }) => {
       )}
 
       {/* 发布说明 */}
+      {/*
+        发布说明按 **Markdown** 渲染，而不是直接铺纯文本。
+
+        那个 `<pre>` + `whitespace-pre-wrap` 的写法有一个只对发布者可见的代价：
+        说明里不能出现任何 Markdown 语法 —— `## 标题` 会原样显示成井号，
+        `**粗体**` 会显示成星号，列表与表格更没法看。于是每次发版都要额外维护一份
+        「纯文本版说明」，而两份说明迟早会漂。这个约束曾经被写进
+        `scripts/check-markdown.ts` 强制住，理由是"更新卡片不解析 Markdown"。
+
+        现在它解析了：用与插件 README 同一个 `Markdown` 组件。那个组件**不注入
+        HTML**（源码里的 HTML 在结构上只能作为文本渲染），链接会拦下来交给系统
+        浏览器 —— 这两条对「远程内容」是必须的，而更新说明同样是远程内容。
+
+        高度仍然限制（说明可能有几百行），滚动条与卡片其余部分一致。
+      */}
       {status === 'available' && available?.notes && (
-        <pre className="mt-3 text-[11px] leading-relaxed text-gray-700 bg-gray-50 border border-gray-100 rounded-xl p-3 whitespace-pre-wrap break-words max-h-40 overflow-y-auto custom-scrollbar">
-          {available.notes}
-        </pre>
+        <div className="mt-3 rounded-xl border border-gray-100 bg-gray-50 p-3 max-h-40 overflow-y-auto custom-scrollbar">
+          <Markdown source={available.notes} />
+        </div>
       )}
 
       {/* 安装前必须说清会发生什么 */}

@@ -515,9 +515,9 @@ check(
   '组件本身也是 memo 的（抽屉会因悬停等状态频繁重渲染）'
 );
 
-// 两处 README 都走同一个渲染器。
+// 三处远程 Markdown 都走同一个渲染器。
 //
-// 判据是"旧的 README <pre> 不在了"，而不是"文件里没有 <pre>" —— 这两个文件里
+// 判据是"旧的纯文本 <pre> 不在了"，而不是"文件里没有 <pre>" —— 这几个文件里
 // 还有别的 <pre>（例如插件描述、配置片段），那与本次改动无关。
 for (const file of [
   'src/modules/pluginMarket/PluginMarket.tsx',
@@ -531,6 +531,31 @@ for (const file of [
   );
 }
 
+/*
+ * 更新卡片里的发布说明 —— 这是第三处远程 Markdown，也是最后补上的一处。
+ *
+ * 它此前是一个 `<pre>` + `whitespace-pre-wrap`：说明里的 `##` 与 `**` 会原样
+ * 显示成井号与星号。代价不只是难看，而是**发布者被迫维护一份纯文本版说明**
+ * （`release/notes.md` 不许出现块级 Markdown 语法，那条约束原先就写在这个文件里）。
+ * 两份说明必然漂，而漂了没人会发现。
+ *
+ * 现在它用与插件 README 同一个组件 —— 因此那份纯文本约束可以整体删掉，
+ * `release/notes.md` 与 `release/notes-github.md` 都是正常的 Markdown。
+ */
+const updateChecker = read('src/components/Settings/UpdateChecker.tsx');
+check(
+  updateChecker.includes('<Markdown source={available.notes}'),
+  'UpdateChecker.tsx 使用 Markdown 渲染发布说明'
+);
+check(
+  !updateChecker.includes('whitespace-pre-wrap break-words max-h-40'),
+  'UpdateChecker.tsx 不再用 <pre> 铺发布说明纯文本'
+);
+check(
+  updateChecker.includes("from '../Markdown'"),
+  '更新卡片引的是仓库既有的 Markdown 组件（不新增取回通路）'
+);
+
 const libRs = read('src-tauri/src/lib.rs');
 check(libRs.includes('read_plugin_asset'), 'README 仍由后端资源接口提供（未新增取回通路）');
 
@@ -538,28 +563,29 @@ check(libRs.includes('read_plugin_asset'), 'README 仍由后端资源接口提�
 // 6. 发布说明的两份形态
 // ============================================================
 //
-// 两份文件服务两个完全不同的渲染器，弄混的后果都是"看得见但不体面"：
+// 两份文件服务两个渲染器，而**现在两者都解析 Markdown**：
 //
 //   * `release/notes.md` → `pnpm release --notes-file` → 写进 `latest.json` 的
-//     `notes`，由应用内的更新卡片展示。那个卡片用的是 `<pre>` + `whitespace-pre-wrap`，
-//     **不解析 Markdown**，所以 `#` 与 `**` 会原样露出来。
-//   * `release/notes-github.md` → 直接贴到 GitHub Release，那里解析 Markdown。
+//     `notes`，由应用内的更新卡片展示。那个卡片在 1.6.2 起改用 `Markdown` 组件。
+//   * `release/notes-github.md` → 直接贴到 GitHub Release，那里本来就解析 Markdown。
 //
-// 这条断言把两者的分工固定下来：纯文本那份不许出现块级 Markdown 语法；
-// 两份说明必须指的是同一个版本。
+// 因此两份文件的**形态差别已经消失** —— 上一版这里还在断言"纯文本那份不许出现
+// 块级 Markdown 语法（`#`、`**`、表格、围栏）"，那条约束现在整段删掉。
 //
 // ---------------------------------------------------------------------------
-// 这里原先还有一条「`notes-github.md` 里指明了纯文本版的位置」。它**在正确使用
-// 的情况下必然失败**，因此删掉：
+// 为什么删掉它，而不是"放宽"它
+// ---------------------------------------------------------------------------
 //
-// 要它成立，就得在 `notes-github.md` 开头写一段指向 `release/notes.md` 的内部
-// 注记；而那段话是给自己看的（"这份不进 latest.json，直接贴到 GitHub 即可"），
-// 贴在公开的 Release 页面上并不合适。于是每个照做的人都要在发布前删掉它，删掉
-// 之后检查就红 —— **它逼着人在「检查通过」与「发布得体」之间二选一**。
+// 那条约束的存在理由是"更新卡片用的是 `<pre>`，不解析 Markdown" ——
+// 它是一个**实现细节的投影**，而不是关于发布说明本身的规则。实现变了，
+// 投影就该跟着消失；留着它会让下一个发版的人继续维护一份纯文本版说明，
+// 而两份说明必然会漂。
 //
-// 分工其实已经由上面两条固定住了（一边有 Markdown 标题、一边没有）。真正值得
-// 守的是另一件事：两份说明指的是不是**同一个版本** —— 那才是"拿错"的实际后果，
-// 而不是"没写指针"。
+// 真正值得守的仍然只有一件事：**两份说明指的是同一个版本**。那才是"拿错"的
+// 实际后果（把上一版的说明贴到这一版），而"格式对不对"已经由渲染器解决了。
+//
+// 上面那一段（渲染层接线）已经把"卡片确实走 Markdown"钉住了 ——
+// 也就是"这里可以写 Markdown"这个前提，由它保证，而不是由本段的一个否定断言保证。
 // ---------------------------------------------------------------------------
 
 console.log('\n发布说明的两份形态：');
@@ -578,15 +604,10 @@ if (!existsSync(join(PROJECT_ROOT, NOTES_PLAIN))) {
 } else {
   const plain = read(NOTES_PLAIN);
   check(
-    !/^#{1,6}\s/m.test(plain),
-    `${NOTES_PLAIN} 不含 Markdown 标题（更新卡片不解析 Markdown，会原样显示）`
+    plain.trim().length > 0,
+    `${NOTES_PLAIN} 不是空的`,
+    '空说明会让更新卡片显示一片空白，而"没有说明"与"说明是空的"在界面上长得一样'
   );
-  check(
-    !/\*\*[^*\n]+\*\*/.test(plain),
-    `${NOTES_PLAIN} 不含 Markdown 粗体（同上）`
-  );
-  check(!/^```/m.test(plain), `${NOTES_PLAIN} 不含围栏代码块`);
-  check(!/^\s*\|.*\|/m.test(plain), `${NOTES_PLAIN} 不含 Markdown 表格`);
 
   if (existsSync(join(PROJECT_ROOT, NOTES_GITHUB))) {
     const github = read(NOTES_GITHUB);

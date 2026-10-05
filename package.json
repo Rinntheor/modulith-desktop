@@ -1,7 +1,7 @@
 {
   "name": "modulith-desktop",
   "private": true,
-  "version": "1.6.1",
+  "version": "1.6.2",
   "type": "module",
   "scripts": {
     "dev": "pnpm ver check && pnpm gen:backend update && pnpm gen:modules && vite",
@@ -31,6 +31,7 @@
     "check:backup": "node scripts/check-backup.ts",
     "check:markdown": "node scripts/check-markdown.ts",
     "check:boot-order": "node scripts/check-boot-order.ts",
+    "check:console-window": "node scripts/check-console-window.ts",
     "release": "node scripts/release.ts",
     "release:manifest": "node scripts/generate-latest-json.ts",
     "ver": "node scripts/version-manager.ts",

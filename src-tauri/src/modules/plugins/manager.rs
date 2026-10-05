@@ -2128,6 +2128,11 @@ impl PluginManager {
         validate_launch_args(args)?;
 
         let mut command = std::process::Command::new(&target);
+        // 不分配控制台。这里是「快速启动」那条路径：少了这一行，**每启动一个程序
+        // 都会闪一个黑窗**。被启动的程序若是 GUI 程序，这个标志对它没有影响
+        // （它本来就不会创建控制台）；若是控制台程序，则不会弹窗 —— 它继承的
+        // 标准句柄仍然有效，输出不会丢。
+        crate::core::process::no_console_window(&mut command);
         command.args(args);
 
         let child = command.spawn().map_err(|e| {
