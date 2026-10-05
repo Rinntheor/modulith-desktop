@@ -533,11 +533,11 @@ impl BackgroundPlugins {
             return cached;
         }
 
-        let supported = match tokio::process::Command::new(node)
-            .arg("--version")
-            .output()
-            .await
-        {
+        let mut command = tokio::process::Command::new(node);
+        // 不分配控制台。`.output()` 只重定向了管道，**挡不住窗口的创建** ——
+        // 这正是 Ctrl+R 刷新时那两个一闪而过的黑窗（见 core/process.rs）。
+        crate::core::process::no_console_window_tokio(&mut command);
+        let supported = match command.arg("--version").output().await {
             Ok(output) => {
                 let text = String::from_utf8_lossy(&output.stdout);
                 parse_major_version(&text).is_some_and(|major| major >= PERMISSION_MODEL_MIN_MAJOR)
@@ -576,11 +576,10 @@ impl BackgroundPlugins {
             return cached;
         }
 
-        let supported = match tokio::process::Command::new(node)
-            .arg("--help")
-            .output()
-            .await
-        {
+        let mut command = tokio::process::Command::new(node);
+        // 同上：这是第二个一闪而过的窗口。
+        crate::core::process::no_console_window_tokio(&mut command);
+        let supported = match command.arg("--help").output().await {
             Ok(output) => {
                 // help 有的写 stdout、有的写 stderr，两边都看。
                 let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
