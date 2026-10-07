@@ -3,6 +3,24 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.6.3] - 2026-10-07
+
+### Added
+
+- 插件第一次能读写用户选定的文件：`ctx.files`（会话级授权）
+  - 授权只能由用户在原生对话框里**当场**产生 —— 插件只提供标题与扩展名过滤器，给不出路径，也没有 `open(path)`
+  - 授权绑定「插件 + 界面」：界面关闭、插件停用或应用退出即失效（因此不需要持久化、撤销界面与跨版本迁移）
+  - 一条授权就是一个根：相对路径按 chroot 语义锁在根内，插件拿不到绝对路径，也删不掉授权根
+  - 原始字节走 `/<令牌>/file/<授权 id>/<相对路径>` 的 GET/PUT，与既有的 `/<令牌>/data/…` 同形，不经 base64
+  - 单文件上限 256 MB、每块界面 4096 条授权、一次对话框最多 2048 个文件；写入是「临时文件 + 改名」的全有或全无
+- 沙箱桥接新增 `files` 命名空间：`pick` / `pickDirectory` / `grants` / `release` / `list` / `stat` / `mkdir` / `remove` / `read` / `readText` / `write` / `writeText` / `url`
+
+### Changed
+
+- `filesystem-scoped`（限定目录访问）从「声明了但没有强制点」变为**由后端强制**：`ctx.files` 的可写目录授权、`mkdir`、`remove` 都过 `require_permission`。权限列表里它终于描述的是真实行为
+- 重写 `filesystem-read` / `filesystem-write` / `filesystem-scoped` 三条权限的说明文字。前两条与新能力对齐；`filesystem-write` 明确写出「宿主不提供这项能力」—— **任意路径写入仍然没有任何通道**，这是刻意的
+- `check:sandbox` 的成员表补上 15 项 `files.*`；`check:plugin-boundary` 的「不强制项」计数从 4 改为 3
+
 ## [1.6.2] - 2026-10-05
 
 ### Added

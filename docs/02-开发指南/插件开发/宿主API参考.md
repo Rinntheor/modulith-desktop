@@ -679,7 +679,122 @@ try {
 在按钮点击里有效，在定时器或后台回调里无效。失败时会抛出说明原因的错误，
 而不是无声失败 —— 无声失败会让作者以为是自己传的值不对。
 
-## 12. 完整示例
+## 12. files —— **沙箱独有**
+
+访问**用户在原生对话框里当场选中**的文件与目录。这是插件第一次能读写用户机器上的真实文件，
+因此先把它的边界说清楚：**没有 `files.open(path)` 这样的接口，也不会有。**
+
+| 动作 | 需要什么 | 谁决定 |
+| --- | --- | --- |
+| 读一批文件 | 用户在多选对话框里选中它们 | 用户 |
+| 读一个目录 | 用户在目录对话框里选中它 | 用户 |
+| 写一个目录 | 同上，且清单声明 `filesystem-scoped` | 用户 |
+| 路径 | 相对路径，锁在授权根之内 | 宿主 |
+
+插件能提供的只有对话框的标题与扩展名过滤器 —— 两者都只影响用户看到什么，不影响用户能选什么。
+
+### 12.1 为什么它只有沙箱侧有
+
+授权的载体是一条带令牌的 URL（`/<令牌>/file/<授权 id>/…`），而令牌只发给沙箱界面。
+in-process 插件跑在宿主文档里、没有令牌，因此没有承载"这条授权属于谁"的凭据。
+给它一个永远抛错的桩只会让作者以为它本该能用，所以 `Modulith.capabilities` 的差异清单里
+**显式列着它**（`scripts/check-sandbox.ts` 第 20 节），而不是悄悄缺失。
+
+### 12.2 授权是会话级的
+
+一条授权绑在 `(插件, 界面)` 上，并且**只活在内存里**：
+
+| 事件 | 结果 |
+| --- | --- |
+| iframe 被卸载（切标签、重挂载、插件重载） | 该界面的授权全部收回 |
+| 插件被停用 / 卸载 | 该插件的授权全部收回 |
+| 应用退出 | 全部消失 |
+
+推论：**不要把授权 id 存进 `ctx.storage`。** 下一次打开的界面拿到的是新的 id，
+而旧 id 上的每一次调用都会拿到 `403`。想知道"我这次选过哪些"，用 `files.grants()`。
+
+### 12.3 方法
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `isAvailable` | `() => boolean` | 清单里声明了 `filesystem-read` |
+| `canWrite` | `() => boolean` | 清单里声明了 `filesystem-scoped` |
+| `pick` | `(options?) => Promise<Grant[]>` | 多选文件框。`options` 为 `{ extensions?: string[], filterName?: string }` |
+| `pickDirectory` | `(options?) => Promise<Grant \| null>` | 目录框。`options` 为 `{ writable?: boolean, title?: string }` |
+| `grants` | `() => Promise<Grant[]>` | 这块界面当前持有的全部授权 |
+| `release` | `(grant) => Promise<boolean>` | 主动放开一条 |
+| `list` | `(grant, rel?) => Promise<Entry[]>` | 列**目录授权**里的条目 |
+| `stat` | `(grant, rel?) => Promise<Entry \| null>` | 元信息；不存在返回 `null` |
+| `mkdir` | `(grant, rel) => Promise<void>` | 建目录（含中间层），需要可写 |
+| `remove` | `(grant, rel) => Promise<void>` | 删一个文件或一棵树，需要可写，**删不掉授权根** |
+| `read` | `(grant, rel?) => Promise<ArrayBuffer>` | 读字节 |
+| `readText` | `(grant, rel?) => Promise<string>` | 读文本（UTF-8） |
+| `write` | `(grant, rel, data) => Promise<void>` | 写字节；`data` 收 `ArrayBuffer` / 类型化数组 / `Blob` / 字符串 |
+| `writeText` | `(grant, rel, text) => Promise<void>` | 写文本（UTF-8） |
+| `url` | `(grant, rel?) => string` | 一条**同源**地址，可直接放进 `<img src>` |
+
+`Grant` 形如 `{ grant, kind, label, readable, writable, bytes }`：`kind` 是 `'file'` 或
+`'directory'`，`label` 是给人看的文件名/目录名，**`grant` 是唯一可用的句柄** ——
+绝对路径不会交给插件。
+
+`Entry` 与 `ctx.dataDir.list()` 的形状完全相同：`{ name, isDir, size, modified }`。
+
+```js
+// 让用户挑一批图片，读出元数据，再把结果写进用户指定的目录
+const files = await ctx.files.pick({ extensions: ['png', 'jpg', 'jpeg', 'webp'] });
+
+const out = await ctx.files.pickDirectory({ writable: true, title: '选择导出目录' });
+if (out) {
+  for (const item of files) {
+    const bytes = new Uint8Array(await ctx.files.read(item.grant));
+    // ...处理 bytes...
+    await ctx.files.write(out.grant, `cleaned-${item.label}`, processed);
+  }
+}
+```
+
+### 12.4 预览用户文件要用 `url()`，不要先 `read()`
+
+```js
+// 好：引擎自己去取，它知道怎么省内存
+img.src = ctx.files.url(grant);
+
+// 差：整份字节先进 JS 堆，再交给引擎 —— 缩略图列表里几十张就是几百 MB
+img.src = URL.createObjectURL(new Blob([await ctx.files.read(grant)]));
+```
+
+`url()` 返回的是**同源**地址（`modulith-plugin.localhost`），因此不触犯 CSP 的 `img-src 'self'`。
+
+### 12.5 会被拒绝的写法
+
+- **单文件授权上的相对路径。** `files.read(grant, 'other.png')` 会被拒 —— 单文件授权
+  没有"旁边"这个概念。多文件请对每一项各读一次。
+- **`..`、盘符、UNC、Windows 保留设备名。** 与 `ctx.dataDir` 共用同一份路径校验
+  （`data_dir::resolve_labeled`），越界的错误信息会指明是"用户授权的目录"。
+- **在只读授权上写。** `writable` 为假的授权，`write` / `mkdir` / `remove` 全部拒绝。
+- **删掉授权根。** `files.remove(grant, '')` 被显式拒绝：最坏情况只能是删掉插件自己写进去的东西。
+- **往不存在的父目录里写。** 与 `ctx.dataDir.write` 同一条规矩，不会悄悄建目录 ——
+  一个拼错的路径变成"它明明成功了、东西在别处"是没法自查的。先 `mkdir`。
+
+### 12.6 落盘是"全有或全无"
+
+`write` 先在同目录写一个临时文件、再改名。中途失败（盘满、被占用、进程被杀）不会在用户
+目录里留下一个**半截的成品** —— 而半截的 PNG 在文件管理器里与一张正常的图片长得一模一样。
+
+### 12.7 它与 `ctx.dataDir` 的分工
+
+| | `ctx.dataDir` | `ctx.files` |
+| --- | --- | --- |
+| 根 | 插件自己的私有目录 | **用户当场选定的**文件或目录 |
+| 权限 | `plugin-data` | `filesystem-read` / `filesystem-scoped` |
+| 生命周期 | 跟着插件，卸载后仍保留 | 跟着**界面**，关掉即失效 |
+| 总量上限 | 单文件 256 MB、总量 1 GiB | 单文件 256 MB，**目录总量不限**（那是用户自己的目录） |
+| 路径 | 相对数据根 | 相对授权根 |
+
+最后一行是刻意的：`dataDir` 的边界是"插件在花用户的磁盘"，而 `files` 是用户自己选的目标、
+并且能看到文件一个个出现 —— 再套一个宿主发明的配额只会在"用户就是想导 200 张图"时拦住他。
+
+## 13. 完整示例
 
 一个最小可用的插件代码包：
 
@@ -735,7 +850,7 @@ try {
 }
 ```
 
-## 13. 约束速查
+## 14. 约束速查
 
 | 约束 | 说明 |
 | --- | --- |
@@ -751,8 +866,9 @@ try {
 | 跨模块通信需声明权限 | `plugin-communicate` |
 | 后台工作要看 `useModuleActive()` | 标签页保活，切走不会卸载，定时器需自行暂停 |
 | 插件数据用 `storage` | 不要用 `localStorage` |
+| 用户文件只能经 `ctx.files` | 路径不由插件给出，授权随界面关闭失效；**沙箱独有** |
 
-## 14. 相关文档
+## 15. 相关文档
 
 - 加载流程与隔离边界：[插件系统架构](插件系统架构.md)
 - 清单字段：[清单文件参考](清单文件参考.md)

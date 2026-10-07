@@ -2247,6 +2247,72 @@ impl PluginManager {
 }
 
 // ============================================================
+// `ctx.files`：用户授权的文件访问 —— 对话框那一半
+// ============================================================
+//
+// 这两条**只负责弹框**，不签发任何东西、也不判任何权限。分成两半是有理由的：
+//
+//   * 授权必须绑在 `(插件, 界面)` 上，而**界面名只有 RPC 那一层有**（它来自令牌）。
+//     管理器拿不到它，因此让它来签发就只能靠猜或者靠调用方补一个参数 ——
+//     而"归属"这件事多一个入口就多一处可能漏判的地方；
+//   * 权限判定同理：`filesystem-read` 与 `filesystem-scoped` 的差别在
+//     "这次要干什么"，而那是 `rpc.rs` 里分支本身就知道的事。
+//
+// 这里因此只剩下"弹一个原生框、把用户选的东西原样交出去"。
+
+impl PluginManager {
+    /// 弹原生**多选**文件框。用户取消时返回空列表。
+    ///
+    /// 过滤器由插件给（它知道自己要什么类型的文件），而**过滤器的内容不构成边界**：
+    /// 用户在对话框里总可以切到「所有文件」。真正的判据是"用户在这一刻选了什么"，
+    /// 因此这里对过滤器只做**形状**校验（见 `rpc.rs`），不做语义白名单 ——
+    /// 一个通用文件接口不该由宿主替插件规定它能处理哪些扩展名。
+    pub async fn pick_files_dialog(&self, filter_name: &str, extensions: &[String]) -> PluginResult<Vec<PathBuf>> {
+        let app = self.app.clone();
+        let filter_name = filter_name.to_string();
+        let extensions = extensions.to_vec();
+
+        let picked = tauri::async_runtime::spawn_blocking(move || {
+            let mut dialog = app.dialog().file().set_title("选择要让插件访问的文件");
+            if !extensions.is_empty() {
+                let refs: Vec<&str> = extensions.iter().map(|item| item.as_str()).collect();
+                dialog = dialog.add_filter(filter_name, &refs);
+            }
+            dialog.blocking_pick_files()
+        })
+        .await
+        .map_err(|e| PluginError::DialogUnavailable(e.to_string()))?;
+
+        let Some(choices) = picked else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::with_capacity(choices.len());
+        for choice in choices {
+            out.push(file_path_to_path(choice)?);
+        }
+        Ok(out)
+    }
+
+    /// 弹原生目录框。用户取消时返回 `None`。
+    pub async fn pick_grant_folder_dialog(&self, title: &str) -> PluginResult<Option<PathBuf>> {
+        let app = self.app.clone();
+        let title = title.to_string();
+
+        let picked = tauri::async_runtime::spawn_blocking(move || {
+            app.dialog().file().set_title(title).blocking_pick_folder()
+        })
+        .await
+        .map_err(|e| PluginError::DialogUnavailable(e.to_string()))?;
+
+        match picked {
+            Some(choice) => Ok(Some(file_path_to_path(choice)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+// ============================================================
 // HTTP 代理
 // ============================================================
 

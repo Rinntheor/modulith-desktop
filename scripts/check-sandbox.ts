@@ -1704,6 +1704,28 @@ section('完整 API 表面');
       ['icons.extract', isFunction],
       ['shell.revealInFolder', isFunction],
       ['audio.pick', isFunction],
+
+      // 3.7 数据 · 用户授权的文件（`ctx.files`，沙箱独有）
+      //
+      // 这一族**没有 in-process 对应物**，因此它在下面那份 `EXPECTED_SANDBOX_ONLY`
+      // 里也占一行。逐条列出来的理由与 `dataDir` 那一段相同：方法名漂开的表现是
+      // 插件拿到 `undefined is not a function`，而这种错误看起来像插件自己写错了。
+      ['files.isAvailable', isFunction],
+      ['files.canWrite', isFunction],
+      ['files.pick', isFunction],
+      ['files.pickDirectory', isFunction],
+      ['files.grants', isFunction],
+      ['files.release', isFunction],
+      ['files.list', isFunction],
+      ['files.stat', isFunction],
+      ['files.mkdir', isFunction],
+      ['files.remove', isFunction],
+      ['files.read', isFunction],
+      ['files.readText', isFunction],
+      ['files.write', isFunction],
+      ['files.writeText', isFunction],
+      ['files.url', isFunction],
+
       ['settings.get', isFunction],
       ['settings.all', isFunction],
       ['settings.set', isFunction],
@@ -3625,6 +3647,11 @@ section('两侧的成员表');
     'jsxDEV',
     // 沙箱自己的形状
     'commands',
+    // 用户授权的文件访问。**它是刻意只做沙箱的**：授权的载体是一条带令牌的 URL，
+    // 而令牌只发给沙箱界面（`SandboxSurfaces::issue`）。in-process 插件跑在宿主
+    // 文档里，没有令牌，也就没有承载"这条授权属于谁"的凭据 —— 给它一个永远抛错的
+    // 桩只会让作者以为它本该能用。理由见 `file_grants.rs` 的文件头。
+    'files',
     'has',
     'log',
     'plugin',

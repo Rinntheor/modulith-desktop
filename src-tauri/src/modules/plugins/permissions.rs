@@ -81,11 +81,10 @@ pub enum PermissionEnforcement {
     Frontend,
     /// 当前不改变任何行为。
     ///
-    /// ⚠️ **这一项的"为什么"不是一个值能表达的。** 标为 `None` 的权限有四种互不相同的
+    /// ⚠️ **这一项的"为什么"不是一个值能表达的。** 标为 `None` 的权限有几种互不相同的
     /// 原因，而插件作者与用户对它们的判断完全不同：
     ///
     ///   * `filesystem-write` —— 有语义、**缺检查点**（"以后可能会强制"）
-    ///   * `filesystem-scoped` —— **缺授权模型**（同上，但要先设计授权）
     ///   * `native-module` —— **这一能力不存在**（永远不会有东西可强制）
     ///   * `dev-tools` —— **这一项是冗余的**（插件本来就具备，不需要授权）
     ///
@@ -261,7 +260,7 @@ impl PluginPermission {
             },
             Self::FilesystemRead => Spec {
                 label: "读取文件",
-                description: "读取本机文件信息（图标、所在位置）、导入音频文件，并可接收拖入的文件路径",
+                description: "读取本机文件信息（图标、所在位置）、导入音频文件、接收拖入的文件路径，并读取用户在原生对话框里选中交给插件的那些文件",
                 effect: E::Read,
                 scope: S::Device,
                 reversible: true,
@@ -270,7 +269,7 @@ impl PluginPermission {
             },
             Self::FilesystemWrite => Spec {
                 label: "写入文件",
-                description: "修改或删除本机文件",
+                description: "修改或删除**任意**本机文件。**宿主不提供这项能力**：`ctx.files` 只写用户在原生对话框里亲手选定的那个目录，插件决定不了路径（因此它是「限定目录访问」而不是这一项）。声明它不改变任何行为",
                 effect: E::Write,
                 scope: S::Device,
                 // 删除与覆盖不可撤销，这是它比"读取文件"高一级的唯一依据
@@ -280,12 +279,16 @@ impl PluginPermission {
             },
             Self::FilesystemScoped => Spec {
                 label: "限定目录访问",
-                description: "仅在用户授权的目录内读写文件",
+                description: "在**用户当场授权的**目录内读写文件：目录由用户在原生对话框里选定，授权随界面关闭而失效，插件只能决定目录内的相对路径，且删不掉目录本身",
                 effect: E::Write,
                 scope: S::Device,
                 // 限定在授权目录内，用户可撤销授权，因此可逆
                 reversible: true,
-                enforcement: F::None,
+                // 后端强制（`ctx.files` 的 `pickDirectory({writable:true})` / `mkdir` /
+                // `remove` 都过 `require_permission`）。它此前是 `None` —— 因为那时
+                // **没有任何通道**能写用户目录，而"标着不强制"与"根本没有通道"是
+                // 两件不同的事，权限列表必须说后者。
+                enforcement: F::Host,
                 risk_override: None,
             },
             Self::PluginCommunicate => Spec {
@@ -410,7 +413,7 @@ mod tests {
             S::Device,
             true,
             R::Medium,
-            F::None,
+            F::Host,
         ),
         (
             "plugin-communicate",
@@ -567,8 +570,13 @@ mod tests {
 
         // 5 → 6：新增 `plugin-data`（`ctx.dataDir`），它是 Host 强制的
         // —— 每一次文件操作都经过 `PluginManager::checked_data_dir`。
-        assert_eq!(count(F::Host), 6, "后端强制的权限数量变化");
+        //
+        // 6 → 7：`filesystem-scoped` 从 `None` 移到这里（`ctx.files` 给了它第一个
+        // 检查点）。它此前是 `None` 的理由是"缺授权模型"，而不是"这条通道不存在"
+        // —— `ctx.files` 之后，后者也不成立了：需要写用户目录的插件现在有通道，
+        // 而那条通道受 Rust 侧 `require_permission` 约束。
+        assert_eq!(count(F::Host), 7, "后端强制的权限数量变化");
         assert_eq!(count(F::Frontend), 3, "前端强制的权限数量变化");
-        assert_eq!(count(F::None), 4, "未强制的权限数量变化");
+        assert_eq!(count(F::None), 3, "未强制的权限数量变化");
     }
 }
