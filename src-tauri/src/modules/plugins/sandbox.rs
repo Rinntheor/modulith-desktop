@@ -381,7 +381,11 @@ impl SandboxSurfaces {
 }
 
 /// 一个新令牌。
-fn new_token() -> String {
+///
+/// `pub(super)` 而不是私有：`file_grants` 用它给每条文件授权发一个同样形状的
+/// 不透明 id。两边共用一个生成器，是为了让"什么算一个不可猜的 id"只有一个答案
+/// （`is_token` 那一条长度与字符集校验也是按它写的）。
+pub(super) fn new_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
@@ -538,6 +542,37 @@ async fn handle<R: Runtime>(
         ("PUT", Some("data")) | ("POST", Some("data")) => {
             let rel = segments[2..].join("/");
             store_data(app, &view, &rel, request.body()).await
+        }
+
+        // ---- 用户授权的文件（`ctx.files`）---------------------------------
+        //
+        // 形状与 `data` 那条**刻意一样**：同一套原始字节语义、同一个协议、
+        // 同一个 `fetch(...).then(r => r.arrayBuffer())`。不同的是根从哪来 ——
+        // `data` 的根是插件自己的目录，这里的根是**用户在原生对话框里选中的**
+        // 那个文件或目录，而且只属于签发它的那一块界面。
+        //
+        // 身份仍然只取自令牌（`key`），授权 id 只是"用户选的是哪一个"。
+        // 归属判定在 `file_grants::get` 里，只有那一处。
+        ("GET", Some("file")) => {
+            let Some(grant) = segments.get(2).copied() else {
+                return text(400, "缺少授权 id");
+            };
+            let rel = match decode_segments(&segments[3..]) {
+                Ok(rel) => rel,
+                Err(e) => return text(400, &e),
+            };
+            serve_grant(app, &key, grant, &rel)
+        }
+
+        ("PUT", Some("file")) | ("POST", Some("file")) => {
+            let Some(grant) = segments.get(2).copied() else {
+                return text(400, "缺少授权 id");
+            };
+            let rel = match decode_segments(&segments[3..]) {
+                Ok(rel) => rel,
+                Err(e) => return text(400, &e),
+            };
+            store_grant(app, &key, grant, &rel, request.body())
         }
 
         ("POST", Some("rpc")) => {
@@ -1146,8 +1181,7 @@ fn serve_asset(plugin: &SandboxView, rel: &str) -> http::Response<Cow<'static, [
 }
 
 /// 把一个相对路径解析到 `root` 之下；越界、非文件、读不到元数据一律返回 `None`。
-fn resolve_within(root: &Path, rel: &str) -> Option<PathBuf> {
-    if rel.is_empty() {
+fn resolve_within(root: &Path, rel: &str) -> Option<PathBuf> {    if rel.is_empty() {
         return None;
     }
 
@@ -1254,6 +1288,99 @@ async fn store_data<R: Runtime>(
         Err(e) => {
             log::warn!("[sandbox] 写数据文件 {rel} 失败：{e}");
             text(400, &e.to_string())
+        }
+    }
+}
+
+// ============================================================
+// 原始字节通道（用户授权的文件，`ctx.files`）
+// ============================================================
+//
+// 与上面那两条**共用同一套语义**（原始字节、不走 base64、`data_dir::resolve_labeled`
+// 做路径校验），差的是根从哪来、以及归属怎么判。
+//
+// 为什么不是"把授权目录整个映射成第二条 data 根"：那样插件就只需要一个路径，
+// 而"这个目录是用户给它的"这件事会隐掉。多一段 `/<授权 id>/` 让每一份授权在
+// URL 里是一个独立的根 —— 于是"两个授权之间走得通"这种错误在形状上就不可能。
+
+/// 把 URL 的若干段解码后用 `/` 拼起来。
+///
+/// **逐段解码，而不是把整段 join 之后再解一次。** 桥接层按段 `encodeURIComponent`，
+/// 因此 `%2F` 只可能来自插件手写的一段 —— 整体解码会让它变成一个真的分隔符，
+/// 于是"一个名字里带斜杠"就变成了"往下一层走"。逐段解码之后它仍然只是一个字符。
+fn decode_segments(segments: &[&str]) -> Result<String, String> {
+    let mut parts: Vec<String> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let decoded = urlencoding::decode(segment).map_err(|_| "路径无法解码".to_string())?;
+        parts.push(decoded.into_owned());
+    }
+    Ok(parts.join("/"))
+}
+
+/// 读一条用户授权之内的文件。
+fn serve_grant<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &SurfaceKey,
+    grant_id: &str,
+    rel: &str,
+) -> http::Response<Cow<'static, [u8]>> {
+    let Some(grants) = app.try_state::<super::file_grants::FileGrants>() else {
+        return text(503, "插件系统尚未就绪");
+    };
+
+    // **归属判定只有这一处。** 身份来自令牌（查 `SandboxSurfaces` 那一步已经做过），
+    // 这里比的是"这条授权是不是签给这个插件这块界面的"。
+    let Some(grant) = grants.get(&key.plugin_id, &key.surface, grant_id) else {
+        log::warn!(
+            "[sandbox] {} 的界面 {} 请求了一条不属于它的文件授权",
+            key.plugin_id,
+            key.surface
+        );
+        return text(403, "这条文件授权不存在，或者不属于这个界面");
+    };
+
+    // 先判存在，再读：两者的失败含义完全不同（"去建它" vs "你越界了"），
+    // 而 `read` 把它们揉在一句话里。
+    if !super::file_grants::exists(&grant, rel) {
+        return text(404, "找不到这个文件");
+    }
+
+    match super::file_grants::read(&grant, rel) {
+        Ok(bytes) => {
+            let named = if rel.is_empty() { grant.label.as_str() } else { rel };
+            binary(content_type_of(Path::new(named)), bytes)
+        }
+        Err(e) => {
+            log::debug!("[sandbox] 读授权的文件失败：{e}");
+            text(400, &e)
+        }
+    }
+}
+
+/// 写一条用户授权之内的文件。请求体就是文件内容。
+fn store_grant<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &SurfaceKey,
+    grant_id: &str,
+    rel: &str,
+    body: &[u8],
+) -> http::Response<Cow<'static, [u8]>> {
+    if rel.is_empty() {
+        return text(400, "缺少文件路径");
+    }
+
+    let Some(grants) = app.try_state::<super::file_grants::FileGrants>() else {
+        return text(503, "插件系统尚未就绪");
+    };
+    let Some(grant) = grants.get(&key.plugin_id, &key.surface, grant_id) else {
+        return text(403, "这条文件授权不存在，或者不属于这个界面");
+    };
+
+    match super::file_grants::write(&grant, rel, body) {
+        Ok(()) => json(&format!(r#"{{"ok":true,"bytes":{}}}"#, body.len())),
+        Err(e) => {
+            log::warn!("[sandbox] 写授权的文件 {rel} 失败：{e}");
+            text(400, &e)
         }
     }
 }
@@ -1591,8 +1718,32 @@ pub async fn open_surface<R: Runtime>(
 /// 宿主这一侧没有 DOM 可以拆。前端不拆而只调用这一条的话，绑定就断了 ——
 /// 令牌被收回，那个 iframe 之后的每一条请求都会是 403。
 pub fn close_surface<R: Runtime>(app: &AppHandle<R>, token: &str) {
-    if let Some(surfaces) = app.try_state::<SandboxSurfaces>() {
-        surfaces.forget(token);
+    let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
+        return;
+    };
+
+    // **先按令牌问出它是谁，再收回令牌。** 顺序反过来的话，`forget` 之后我们就
+    // 再也查不到这块界面对应的 (插件, 界面) 了 —— 而那份 (插件, 界面) 正是文件
+    // 授权归属的判据。留下的后果很具体：一块已经关掉的界面持有的授权会一直活着，
+    // 直到同一个插件的**下一块同名界面**开起来并继承它。
+    if let Some(key) = surfaces.key_of(token) {
+        revoke_grants_of_surface(app, &key.plugin_id, &key.surface);
+    }
+
+    surfaces.forget(token);
+}
+
+/// 收回一块界面的全部文件授权。
+///
+/// 只记一条 debug 日志：界面关闭是**每次切换标签/重挂载**都会发生的事，把它写成
+/// warn 会让真正需要被看见的那几条淹掉。
+fn revoke_grants_of_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str, surface: &str) {
+    let Some(grants) = app.try_state::<super::file_grants::FileGrants>() else {
+        return;
+    };
+    let count = grants.revoke_surface(plugin_id, surface);
+    if count > 0 {
+        log::debug!("[sandbox] 界面 {plugin_id}:{surface} 关闭，收回 {count} 条文件授权");
     }
 }
 
@@ -1602,6 +1753,15 @@ pub fn close_surface<R: Runtime>(app: &AppHandle<R>, token: &str) {
 /// 继续活着 —— 而它们属于一个"已经不存在"的插件，下一次协议请求会被 404 拒掉，
 /// 用户看到的是一块再也刷不出来的空白。
 pub fn close_all_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) {
+    // 文件授权跟着一起收。插件被停用/卸载时，用户给它的那些目录许可必须立刻失效 ——
+    // 它们不是插件的数据，是用户当下给的临时许可。
+    if let Some(grants) = app.try_state::<super::file_grants::FileGrants>() {
+        let count = grants.revoke_plugin(plugin_id);
+        if count > 0 {
+            log::debug!("[sandbox] 插件 {plugin_id} 的界面全部关闭，收回 {count} 条文件授权");
+        }
+    }
+
     let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
         return;
     };

@@ -6,6 +6,7 @@ pub mod background_manifest;
 pub mod data_dir;
 pub mod data_root;
 pub mod db;
+pub mod file_grants;
 pub mod icon;
 pub mod manager;
 pub mod permissions;
@@ -59,6 +60,10 @@ impl Module for PluginsModule {
         // 插件数据库的连接表由**插件模块**托管（而不是 desktop 那一边）：
         // 它服务的是 `ctx.db`，而 `ctx` 的语义全部在 `plugins/` 里。
         app.manage(db::PluginDatabases::new());
+        // 用户授权的文件访问（`ctx.files`）。**会话级**：它只在内存里，
+        // 进程一退就没了。这不是省事，而是这个能力能被接受的前提 ——
+        // 见 `file_grants.rs` 的文件头。
+        app.manage(file_grants::FileGrants::new());
         Ok(())
     }
 }

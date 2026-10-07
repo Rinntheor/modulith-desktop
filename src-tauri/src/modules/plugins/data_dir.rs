@@ -88,6 +88,18 @@ fn modified_millis(meta: &std::fs::Metadata) -> u64 {
 /// 语义是 **chroot**：路径一概相对数据根，前导分隔符没有特殊含义 ——
 /// `/etc/passwd` 指的是 `<数据根>/etc/passwd`。这既安全，也是最好理解的一种解释。
 pub fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    resolve_labeled(root, rel, "插件的数据目录")
+}
+
+/// 与 `resolve` 逐字相同，只多一个"这是哪种根"的说法。
+///
+/// 抽出来的理由只有一条，但它是必须的：**越界时的错误消息会被插件显示给用户**。
+/// `ctx.dataDir` 与 `ctx.files` 的根是两种不同的东西（插件自己的目录 / 用户选定的
+/// 目录），而"路径越出插件的数据目录"用在后者身上是一句会让用户找错方向的话。
+///
+/// 校验逻辑**只有这一份**：多一个说法不等于多一套规则，把标签订成参数而不是
+/// 复制一遍函数，正是为了让"改了一处、另一处漂开"这件事不可能发生。
+pub fn resolve_labeled(root: &Path, rel: &str, what: &str) -> Result<PathBuf, String> {
     // Windows 与 POSIX 的分隔符都认：插件在任一侧写出来的路径都该被一致地理解，
     // 而"只认 `/`"会让 `a\..\..\b` 这种在 Windows 上被文件系统当成合法路径的东西
     // 绕过逐段校验。
@@ -108,7 +120,7 @@ pub fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
         out.push(segment);
     }
 
-    assert_within(root, &out)?;
+    assert_within(root, &out, what)?;
     Ok(out)
 }
 
@@ -153,10 +165,10 @@ fn validate_component(segment: &str) -> Result<(), String> {
 ///
 /// 对目标本身 `canonicalize` 是不行的：写入的目标必然还不存在，而
 /// `canonicalize` 一个不存在的路径会直接失败。
-fn assert_within(root: &Path, candidate: &Path) -> Result<(), String> {
+fn assert_within(root: &Path, candidate: &Path, what: &str) -> Result<(), String> {
     let canonical_root = root
         .canonicalize()
-        .map_err(|e| format!("数据目录不可访问：{e}"))?;
+        .map_err(|e| format!("{what}不可访问：{e}"))?;
 
     let mut probe = candidate;
     loop {
@@ -165,13 +177,13 @@ fn assert_within(root: &Path, candidate: &Path) -> Result<(), String> {
                 .canonicalize()
                 .map_err(|e| format!("路径无法解析：{e}"))?;
             if !real.starts_with(&canonical_root) {
-                return Err("路径越出插件的数据目录".to_string());
+                return Err(format!("路径越出{what}"));
             }
             return Ok(());
         }
         match probe.parent() {
             Some(parent) => probe = parent,
-            None => return Err("路径越出插件的数据目录".to_string()),
+            None => return Err(format!("路径越出{what}")),
         }
     }
 }

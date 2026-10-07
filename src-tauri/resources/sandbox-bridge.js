@@ -1100,6 +1100,261 @@
   // 独立窗口（`desktop/overlay.rs`），插件**造不出**它，因此"像"的那一个
   // 一定会露馅，而"露馅"的代价由用户承担。
 
+  // ============================================================
+  // 用户授权的文件访问（`ctx.files`）
+  // ============================================================
+  //
+  // ============================================================
+  // 它与 `ctx.dataDir` 的分工，是"谁的目录"这一个问题
+  // ============================================================
+  //
+  // `dataDir` 是**插件自己的**目录：宿主给了一个根，插件在里面想怎么放就怎么放。
+  // 这里反过来 —— 根是**用户在一次原生对话框里选的**文件或目录，插件连它的绝对
+  // 路径都拿不到，只有一个不透明的授权 id。
+  //
+  // 于是"打开一张用户机器上的图片"这件事第一次成为可能，而它的形状刻意与
+  // `dataDir` 一模一样（同一套原始字节通道、同一个 `arrayBuffer()`），使得
+  // "先在自己目录里试通、再换成用户的文件"不需要改一行调用代码。
+  //
+  // ============================================================
+  // 为什么没有"给我一个路径"这个方法
+  // ============================================================
+  //
+  // 因为路径从来不由插件给出。**唯一**能产生一条授权的动作是用户点了宿主弹出来的
+  // 一个原生对话框；插件能提供的只有标题与扩展名过滤器。这不是限制得不够方便，
+  // 而是这个能力能被接受的前提：一旦有 `files.open(path)`，它就立刻变成任意读。
+  //
+  // ============================================================
+  // 授权是会话级的
+  // ============================================================
+  //
+  // 界面一关（切走标签被卸载、插件被停用、应用退出），宿主那一侧对应的授权就没了，
+  // 而这里持有的 id 随即变成一条 `403`。插件**不该**把授权 id 存进 `ctx.storage`
+  // —— 下一次打开的界面拿到的是新的 id。要"我上次选过哪些文件"，用 `grants()`。
+  var FILE_ROOT = '/' + TOKEN + '/file/';
+
+  /**
+   * 一条授权之内的地址。
+   *
+   * 逐段 `encodeURIComponent`、**不编码斜杠** —— 与 `dataUrl` 同一条规则与同一个
+   * 理由：整条路径编码成一段会让宿主的路径解析收到一个 `%2F` 而认不出目录层级。
+   *
+   * `grant` 本身也编码：它是 32 位十六进制，编码是恒等变换，但把它写成恒等变换
+   * 是"这个值不来自插件"的一个隐含假设 —— 而它确实来自插件（是它上一步拿到的）。
+   */
+  function fileUrl(grant, rel) {
+    var segments = String(rel === undefined || rel === null ? '' : rel)
+      .split('/')
+      .filter(function (segment) {
+        return segment.length > 0;
+      })
+      .map(encodeURIComponent);
+    var head = FILE_ROOT + encodeURIComponent(String(grant));
+    return segments.length === 0 ? head : head + '/' + segments.join('/');
+  }
+
+  function fileRequest(grant, rel, init) {
+    return fetch(fileUrl(grant, rel), init).then(
+      function (response) {
+        if (!response.ok) {
+          // 与 `dataRequest` 同一条分工：404 是"这个文件不在"（插件该去建它），
+          // 其余是宿主拒绝（越界、超上限、只读授权），消息就是拒绝的原因。
+          if (response.status === 404) {
+            throw new Error('文件不存在：' + (rel || grant));
+          }
+          return response.text().then(function (message) {
+            throw new Error(message || '文件通道失败：HTTP ' + response.status);
+          });
+        }
+        return response;
+      },
+      function (error) {
+        throw new Error(
+          '文件通道不可用：' + (error && error.message ? error.message : error)
+        );
+      }
+    );
+  }
+
+  var files = (function () {
+    var allowedRead = has('filesystem-read');
+    var allowedWrite = has('filesystem-scoped');
+
+    var warnedRead = false;
+    var warnedWrite = false;
+
+    function warnReadOnce() {
+      if (warnedRead) return;
+      warnedRead = true;
+      console.warn(
+        '[Modulith] 插件使用了 ctx.files 的读取，但清单里没有声明 "filesystem-read" 权限，' +
+          '调用会被宿主拒绝（后续同类提示不再重复）'
+      );
+    }
+
+    function warnWriteOnce() {
+      if (warnedWrite) return;
+      warnedWrite = true;
+      console.warn(
+        '[Modulith] 插件请求了可写的目录授权，但清单里没有声明 "filesystem-scoped" 权限，' +
+          '调用会被宿主拒绝（后续同类提示不再重复）'
+      );
+    }
+
+    /** 把 `(grant, rel)` 变成合法的 RPC 参数。 */
+    function pair(grant, rel) {
+      return { grant: String(grant), rel: rel === undefined || rel === null ? '' : String(rel) };
+    }
+
+    return {
+      /**
+       * 能不能用文件访问（清单里声明了 `filesystem-read`）。
+       *
+       * 与其它能力的 `isAvailable()` 同一个用途：**插件据此自己降级**，而不是
+       * 去读控制台里那句权限警告。
+       */
+      isAvailable: function () {
+        return allowedRead;
+      },
+
+      /** 能不能拿到**可写**的目录授权（清单里声明了 `filesystem-scoped`）。 */
+      canWrite: function () {
+        return allowedWrite;
+      },
+
+      /**
+       * 让用户挑一批文件。返回一个数组，每一项形如
+       * `{ grant, kind, label, readable, writable, bytes }`。
+       *
+       * 取消选择时返回**空数组**（不是 `null`）：多选对话框取消与"一个都没选"
+       * 是同一件事，而让调用方去分辨两者只会多一条永远不会走到的分支。
+       *
+       * `options.extensions` 只影响对话框里的过滤器 —— 用户仍然可以切到
+       * 「所有文件」，因此**不要把它当成校验**。真正的判据是返回的 `label`
+       * 与内容本身：读进来第一件事应当是认格式。
+       */
+      pick: function (options) {
+        var options0 = options || {};
+        if (!allowedRead) warnReadOnce();
+        return rpc('files.pick', {
+          extensions: options0.extensions === undefined ? [] : options0.extensions,
+          filterName: options0.filterName === undefined ? null : options0.filterName,
+        }).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /**
+       * 让用户挑一个目录。返回一项授权，或 `null`（用户取消）。
+       *
+       * `options.writable` 为真时**需要 `filesystem-scoped` 权限**，返回的授权
+       * 才能被 `write` 写入。只读目录授权不需要它 —— 一个"批量看元数据"的插件
+       * 不该为了这件事去申请写权限。
+       */
+      pickDirectory: function (options) {
+        var options0 = options || {};
+        var writable = options0.writable === true;
+        if (writable && !allowedWrite) warnWriteOnce();
+        return rpc('files.pickDirectory', {
+          writable: writable,
+          title: options0.title === undefined ? null : options0.title,
+        });
+      },
+
+      /** 这块界面当前持有的全部授权。**这是唯一真源**，不要自己记账。 */
+      grants: function () {
+        if (!allowedRead) warnReadOnce();
+        return rpc('files.grants', {}).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /** 主动放开一条授权。用户下次要再用就得重新选一次。 */
+      release: function (grant) {
+        return rpc('files.release', { grant: String(grant) });
+      },
+
+      /** 列一个**目录授权**里的条目。 */
+      list: function (grant, rel) {
+        if (!allowedRead) warnReadOnce();
+        return rpc('files.list', pair(grant, rel)).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /** 取元信息。不存在时返回 `null`（不是错误）。 */
+      stat: function (grant, rel) {
+        if (!allowedRead) warnReadOnce();
+        return rpc('files.stat', pair(grant, rel));
+      },
+
+      /** 建目录（含中间层）。需要可写的目录授权。 */
+      mkdir: function (grant, rel) {
+        if (!allowedWrite) warnWriteOnce();
+        return rpc('files.mkdir', pair(grant, rel));
+      },
+
+      /** 删掉授权目录里的一个文件或一棵树。**删不掉授权目录本身。** */
+      remove: function (grant, rel) {
+        if (!allowedWrite) warnWriteOnce();
+        return rpc('files.remove', pair(grant, rel));
+      },
+
+      /**
+       * 读成 `ArrayBuffer`。**大文件用这个**，不要用 `readBase64`。
+       */
+      read: function (grant, rel) {
+        if (!allowedRead) warnReadOnce();
+        return fileRequest(grant, rel, { method: 'GET' }).then(function (response) {
+          return response.arrayBuffer();
+        });
+      },
+
+      /** 读成文本（按 UTF-8）。 */
+      readText: function (grant, rel) {
+        if (!allowedRead) warnReadOnce();
+        return fileRequest(grant, rel, { method: 'GET' }).then(function (response) {
+          return response.text();
+        });
+      },
+
+      /**
+       * 写一个文件（覆盖）。内容原样进请求体，**不经过 base64**。
+       *
+       * 接受 `ArrayBuffer` / 类型化数组 / `Blob` / 字符串，与 `dataDir.write` 相同。
+       * 落盘是"全有或全无"：宿主先写同目录的临时文件再改名，因此中途失败不会在
+       * 用户目录里留下一个**半截的成品** —— 半截的 PNG 看起来完全正常。
+       */
+      write: function (grant, rel, data) {
+        if (!allowedWrite) warnWriteOnce();
+        return fileRequest(grant, rel, {
+          method: 'PUT',
+          body: toBody(data),
+          headers: { 'Content-Type': 'application/octet-stream' },
+        }).then(function () {});
+      },
+
+      /** 写一段文本（UTF-8）。 */
+      writeText: function (grant, rel, text) {
+        return files.write(grant, rel, String(text));
+      },
+
+      /**
+       * 一条授权之内的地址，**可以直接放进 `<img src>` / `<video src>`**。
+       *
+       * 这是预览用户文件唯一可行的做法：`blob:` 也行，但它要求先把整份字节读进
+       * JS 堆再交给引擎 —— 而一张 4000×4000 的 PNG 在缩略图列表里那样做几十次，
+       * 峰值内存就是几百 MB。让引擎自己去取，它知道怎么省。
+       *
+       * 单文件授权传空 `rel`。返回的地址是**同源**的（`modulith-plugin.localhost`），
+       * 因此不触犯 CSP 的 `img-src 'self'`。
+       */
+      url: function (grant, rel) {
+        return fileUrl(grant, rel);
+      },
+    };
+  })();
+
   var ui = {
     /**
      * 一个**由宿主渲染**的对话框。
@@ -2250,7 +2505,19 @@
         return rpc('storage.all', {});
       },
 
-      /** 清空这个插件的键值存储（不动数据目录）。 */
+      /**
+       * 清空这个插件的键值存储。
+       *
+       * ⚠️ **它现在会连带删掉整个插件数据目录**（包括 `ctx.dataDir` 下的全部文件与
+       * `ctx.db` 的 SQLite 库）。这不是设计，是一个缺陷：宿主侧 `checked_storage_dir`
+       * 与 `checked_data_dir` 返回的是同一个目录，而 `clear` 的实现是递归删除。
+       * 根因是存储键与数据目录文件共享同一个命名空间（键落盘为 `<数据目录>/<键>.json`）。
+       *
+       * 因此**同时使用 `storage` 与 `dataDir` / `db` 的插件不要调用它**。
+       * 这条注释此前写的是"不动数据目录"，与实现相反 —— 那比没有注释更坏，
+       * 因为它会让作者放心地调用它。缺陷本身记在
+       * `docs/06-项目/已知问题与技术债.md`，修法是给键值存储一个独立子目录。
+       */
       clear: function () {
         return rpc('storage.clear', {});
       },
@@ -2495,6 +2762,16 @@
 
     /** 文件拖放。形态与 in-process 一致，语义差别见上面的 `fileDrop`。 */
     fileDrop: fileDrop,
+
+    /**
+     * 用户授权的文件访问。**沙箱独有** —— in-process 的 ctx 上没有这个成员。
+     *
+     * 为什么不做一份 in-process 的对应实现：授权的载体是一条带令牌的 URL，而令牌
+     * 只发给沙箱界面（`SandboxSurfaces::issue`）。in-process 插件跑在宿主文档里，
+     * 没有令牌，也就没有一条能承载"这条授权属于谁"的凭据。给一个永远抛错的桩只会
+     * 让作者以为它本该能用 —— 而 `check:sandbox` 那条差异清单正是为这种情况准备的。
+     */
+    files: files,
 
     events: events,
 

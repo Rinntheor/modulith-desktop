@@ -89,6 +89,89 @@ macro_rules! locked {
     };
 }
 
+/// 取用户授权表（`ctx.files`）。拿不到就直接返回"尚未就绪"。
+macro_rules! grants {
+    ($app:expr) => {
+        match $app.try_state::<super::file_grants::FileGrants>() {
+            None => return rpc_error("文件授权表尚未就绪"),
+            Some(state) => state,
+        }
+    };
+}
+
+/// `ctx.files` 的每一条都要一块界面 —— 理由见 `files.pick` 那一段的说明。
+const FILES_NEEDS_A_SURFACE: &str =
+    "ctx.files 只在插件界面里可用：它的每一份权限都来自用户在原生对话框里的一次选择，\
+     而后台插件没有界面可以承载那次选择";
+
+/// 取一条**属于这个 (插件, 界面)** 的授权。
+///
+/// 归属判定收在这里，而不是让每个分支各写一遍：漏掉任意一处的后果是"猜到 id 就能
+/// 用别人的授权"，而那种缺陷在代码里看不出来 —— 每一处单独读起来都像是在做该做的事。
+fn granted<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: &str,
+    grant_id: &str,
+) -> Result<super::file_grants::Grant, String> {
+    let Some(state) = app.try_state::<super::file_grants::FileGrants>() else {
+        return Err("文件授权表尚未就绪".to_string());
+    };
+    state.get(plugin_id, surface, grant_id).ok_or_else(|| {
+        "这条文件授权不存在，或者不属于这个界面（用户可能已经关掉那次选择，\
+         或者它属于上一个界面）"
+            .to_string()
+    })
+}
+
+/// 校验插件给的扩展名过滤器。
+///
+/// **它校验的是形状，不是白名单。** 过滤器只影响用户在对话框里看到什么 ——
+/// 用户在任何情况下都能切到「所有文件」，因此把它当成一道边界是假的。这里挡的是
+/// 另一类东西：一个会被原生对话框 API 当成别的东西解释的字符串（路径分隔符、
+/// 通配符、空串），以及一个长到没有意义的列表。
+fn sanitize_extensions(args: &Value) -> Result<Vec<String>, String> {
+    /// 一项过滤器最多带多少个扩展名。
+    const MAX_EXTENSIONS: usize = 32;
+
+    let Some(raw) = arg(args, "extensions") else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err("extensions 必须是字符串数组".to_string());
+    };
+    if items.len() > MAX_EXTENSIONS {
+        return Err(format!(
+            "extensions 最多 {MAX_EXTENSIONS} 项（给了 {} 项）",
+            items.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err("extensions 里每一项都必须是字符串".to_string());
+        };
+        // 前导点容错：`.png` 与 `png` 是同一件事，而作者两种都会写。
+        let cleaned = text.trim().trim_start_matches('.').to_ascii_lowercase();
+        if cleaned.is_empty() {
+            continue;
+        }
+        if cleaned.len() > 12 || !cleaned.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(format!(
+                "扩展名 `{text}` 不合法：只允许字母与数字，最长 12 个字符"
+            ));
+        }
+        out.push(cleaned);
+    }
+
+    // 排序去重：原生对话框按给的顺序显示过滤器，而同一份列表用不同顺序传两次
+    // 会让"设置没生效"看起来像随机现象。
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// 一次调用失败。
 ///
 /// 消息**原样透出**给插件：配额拒绝那句里带着"哪一档、上限多少、已用多少、
@@ -581,6 +664,252 @@ pub async fn dispatch<R: Runtime>(
             match picked {
                 Ok(picked) => json_value(serde_json::json!(picked)),
                 Err(e) => rpc_error(&e.to_string()),
+            }
+        }
+
+        // ---- 用户授权的文件访问（`ctx.files`）-------------------------------
+        //
+        // ============================================================
+        // 为什么这块**只存在于沙箱界面**这条路径上
+        // ============================================================
+        //
+        // 授权的载体是一条 URL（`/<令牌>/file/<授权 id>/…`），而令牌只发给沙箱界面。
+        // Node 后台插件没有界面、也没有令牌，因此它拿不到任何授权 —— 这不是"还没做"，
+        // 是这条能力的形状本身决定的：`ctx.files` 的每一份权限都来自"用户当着这个
+        // 界面的面点了一次原生对话框"。
+        //
+        // 因此 `surface` 为 `None` 时这里的每一条都**明确报错**，而不是返回空列表：
+        // 空列表会被读成"用户什么都没选"，而真相是"这条路根本不存在"。
+        //
+        // ============================================================
+        // 权限怎么分
+        // ============================================================
+        //
+        //   * 读侧（`pick` / `list` / `stat`）与"只读地拿一个目录" → `filesystem-read`
+        //   * 写侧（可写目录授权、`mkdir` / `remove`）        → `filesystem-scoped`
+        //
+        // `filesystem-write`（任意写）**仍然没有任何强制点**，因为这里没有任意写：
+        // 目标目录是用户在原生对话框里选的，插件能决定的只有它里面的相对路径。
+        "files.pick" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+
+            let extensions = match sanitize_extensions(args) {
+                Ok(value) => value,
+                Err(e) => return rpc_error(&e),
+            };
+            let filter_name = arg_str(args, "filterName").unwrap_or("可处理的文件");
+
+            {
+                let manager = locked!(app);
+                if let Err(e) = manager
+                    .require_permission(plugin_id, super::types::PluginPermission::FilesystemRead)
+                {
+                    return rpc_error(&e.to_string());
+                }
+            }
+
+            let manager = match plugin_manager(app) {
+                None => return rpc_error("插件系统尚未就绪"),
+                Some(handle) => handle,
+            };
+            // 与 `system.pickAudio` 同一条纪律：对话框会阻塞到用户做出选择，
+            // 因此它绝不能发生在"主线程在等"的位置上（`spawn_blocking` 在管理器里）。
+            let picked = {
+                let guard = manager.read().await;
+                guard.pick_files_dialog(filter_name, &extensions).await
+            };
+            let paths = match picked {
+                Ok(paths) => paths,
+                Err(e) => return rpc_error(&e.to_string()),
+            };
+
+            if paths.len() > super::file_grants::MAX_PICKED_FILES {
+                return rpc_error(format!(
+                    "一次最多 {} 个文件（你选中了 {} 个）—— 处理一整个目录请改用 files.pickDirectory",
+                    super::file_grants::MAX_PICKED_FILES,
+                    paths.len()
+                ));
+            }
+
+            let grants = grants!(app);
+            let mut out: Vec<super::file_grants::GrantSummary> = Vec::with_capacity(paths.len());
+            for path in &paths {
+                // 文件授权一律**只读**：`files.pick` 这个名字说的是"我要读这些"。
+                // 想写就用 `files.pickDirectory`，那时才需要 `filesystem-scoped`。
+                match grants.issue_file(plugin_id, surface, path, false) {
+                    Ok(summary) => out.push(summary),
+                    Err(e) => return rpc_error(&e),
+                }
+            }
+            json_value(serde_json::json!(out))
+        }
+
+        "files.pickDirectory" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+
+            let writable = arg(args, "writable")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let title = arg_str(args, "title").unwrap_or(if writable {
+                "选择一个用于输出的目录"
+            } else {
+                "选择要读取的目录"
+            });
+
+            {
+                let manager = locked!(app);
+                let needed = if writable {
+                    super::types::PluginPermission::FilesystemScoped
+                } else {
+                    super::types::PluginPermission::FilesystemRead
+                };
+                if let Err(e) = manager.require_permission(plugin_id, needed) {
+                    return rpc_error(&e.to_string());
+                }
+            }
+
+            let manager = match plugin_manager(app) {
+                None => return rpc_error("插件系统尚未就绪"),
+                Some(handle) => handle,
+            };
+            let picked = {
+                let guard = manager.read().await;
+                guard.pick_grant_folder_dialog(title).await
+            };
+            let path = match picked {
+                // 取消是正常操作，不是错误 —— 与 `system.pickAudio` 返回 `null` 同一条规矩。
+                Ok(None) => return json_value(Value::Null),
+                Ok(Some(path)) => path,
+                Err(e) => return rpc_error(&e.to_string()),
+            };
+
+            let grants = grants!(app);
+            match grants.issue_directory(plugin_id, surface, &path, writable) {
+                Ok(summary) => json_value(serde_json::json!(summary)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        // 这块界面当前持有哪些授权。插件的"我选过哪些文件"就靠它，而不是自己记 ——
+        // 自己记的那份与宿主那份一定会漂，而漂的方向是"插件以为还能写，其实早被收了"。
+        "files.grants" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+            let grants = grants!(app);
+            json_value(serde_json::json!(grants.list(plugin_id, surface)))
+        }
+
+        "files.release" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+            let Some(grant) = arg_str(args, "grant") else {
+                return rpc_error("缺少 grant");
+            };
+            let grants = grants!(app);
+            json_value(serde_json::json!(grants.release(plugin_id, surface, grant)))
+        }
+
+        "files.list" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+            let Some(grant_id) = arg_str(args, "grant") else {
+                return rpc_error("缺少 grant");
+            };
+            let rel = arg_str(args, "rel").unwrap_or("");
+
+            let grant = match granted(app, plugin_id, surface, grant_id) {
+                Ok(grant) => grant,
+                Err(e) => return rpc_error(&e),
+            };
+            match super::file_grants::list(&grant, rel) {
+                Ok(entries) => json_value(serde_json::json!(entries)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "files.stat" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+            let Some(grant_id) = arg_str(args, "grant") else {
+                return rpc_error("缺少 grant");
+            };
+            let rel = arg_str(args, "rel").unwrap_or("");
+
+            let grant = match granted(app, plugin_id, surface, grant_id) {
+                Ok(grant) => grant,
+                Err(e) => return rpc_error(&e),
+            };
+            match super::file_grants::stat(&grant, rel) {
+                Ok(found) => json_value(serde_json::json!(found)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "files.mkdir" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+            let Some(grant_id) = arg_str(args, "grant") else {
+                return rpc_error("缺少 grant");
+            };
+            let Some(rel) = arg_str(args, "rel") else {
+                return rpc_error("缺少 rel");
+            };
+
+            {
+                let manager = locked!(app);
+                if let Err(e) = manager
+                    .require_permission(plugin_id, super::types::PluginPermission::FilesystemScoped)
+                {
+                    return rpc_error(&e.to_string());
+                }
+            }
+
+            let grant = match granted(app, plugin_id, surface, grant_id) {
+                Ok(grant) => grant,
+                Err(e) => return rpc_error(&e),
+            };
+            match super::file_grants::mkdir(&grant, rel) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "files.remove" => {
+            let Some(surface) = surface else {
+                return rpc_error(FILES_NEEDS_A_SURFACE);
+            };
+            let Some(grant_id) = arg_str(args, "grant") else {
+                return rpc_error("缺少 grant");
+            };
+            let Some(rel) = arg_str(args, "rel") else {
+                return rpc_error("缺少 rel");
+            };
+
+            {
+                let manager = locked!(app);
+                if let Err(e) = manager
+                    .require_permission(plugin_id, super::types::PluginPermission::FilesystemScoped)
+                {
+                    return rpc_error(&e.to_string());
+                }
+            }
+
+            let grant = match granted(app, plugin_id, surface, grant_id) {
+                Ok(grant) => grant,
+                Err(e) => return rpc_error(&e),
+            };
+            match super::file_grants::remove(&grant, rel) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
             }
         }
 
