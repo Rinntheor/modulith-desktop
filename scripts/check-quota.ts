@@ -157,10 +157,17 @@ if (setBody) {
 
 // 用量统计不缓存：缓存一份用量意味着它与磁盘之间有一个窗口，
 // 而插件正好可以在那个窗口里写满磁盘。
-const usageBody = (() => {
-  const start = managerRs.indexOf('pub fn storage_usage');
+//
+// 判据是"**经由一次调用到达真正的目录枚举**"，而不是"它的函数体里直接出现
+// `read_dir`"：枚举被抽进了 `storage_entries` —— 键值存储现在有**两个**落点
+// （见 `manager.rs::storage_dirs` 的「为什么旧键留在原地不搬」），两处都要统计，
+// 把 `read_dir` 强行写回 `storage_usage` 只会让那段逻辑重复一遍。
+// 真正要拦的是**缓存**，而那一条不受这次重构影响。
+function fnBody(signature: string): string | null {
+  const start = managerRs.indexOf(signature);
   if (start === -1) return null;
   const open = managerRs.indexOf('{', start);
+  if (open === -1) return null;
   let depth = 0;
   for (let i = open; i < managerRs.length; i += 1) {
     if (managerRs[i] === '{') depth += 1;
@@ -170,9 +177,16 @@ const usageBody = (() => {
     }
   }
   return null;
-})();
+}
+
+const usageBody = fnBody('pub fn storage_usage');
+const entriesBody = fnBody('fn storage_entries');
 check(
-  usageBody !== null && usageBody.includes('read_dir'),
+  usageBody !== null &&
+    (usageBody.includes('read_dir') ||
+      (usageBody.includes('storage_entries') &&
+        entriesBody !== null &&
+        entriesBody.includes('read_dir'))),
   '用量统计每次都从文件系统现算（不缓存 —— 缓存会留下一个能写爆的窗口）'
 );
 

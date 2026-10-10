@@ -67,13 +67,14 @@ export interface SemVer {
  */
 export type PluginPermission =
   | 'storage'                    // 本地存储
+  | 'plugin-data'                // 插件私有数据目录与 ctx.db（1.6.0 起，宿主强制）
   | 'network'                    // 网络请求（本机/回环）
   | 'network-external'           // 外部域名请求
   | 'notification'               // 应用内通知（已强制）
   | 'clipboard'                  // 剪贴板访问
   | 'filesystem-read'            // 文件读取（已强制）
   | 'filesystem-write'           // 文件写入
-  | 'filesystem-scoped'          // 限定目录访问
+  | 'filesystem-scoped'          // 限定目录访问（沙箱的 ctx.files，宿主强制）
   | 'plugin-communicate'         // 插件间通信
   | 'native-module'              // 原生模块调用
   | 'dev-tools'                  // 开发者工具

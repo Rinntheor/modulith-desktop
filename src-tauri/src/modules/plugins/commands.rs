@@ -446,6 +446,90 @@ fn close_database(app: &AppHandle, id: &str) {
     }
 }
 
+// ============================================================
+// 插件命令的**分发**：处理器住在哪个 realm
+// ============================================================
+//
+// 一个**清单声明**的命令（`contributes.commands[]`）被用户点下时，谁来执行它，
+// 完全由插件的 `runtime` 决定，而两条路的形态是对立的：
+//
+//   * **sandboxed** —— 处理器在插件自己的文档里。宿主这个 realm 里**没有**那个
+//     函数，交不过去，因此只能把"有人点了这条命令"推进它的界面
+//     （`sandbox::deliver_command` → 前端 → iframe → `Modulith.commands.on`）。
+//   * **in-process** —— 处理器确实是宿主这个 realm 里的函数，但它的实现注册在
+//     **前端**（`pluginRuntime.ts` 的 `commandHandlers` 那张表）。Rust 碰不到它，
+//     只能回答"该你自己执行"，由前端继续走它原来的 `activatePlugin` 路径。
+//
+// ============================================================
+// 为什么需要这条命令（一次真实缺陷）
+// ============================================================
+//
+// 前端的 `runPluginCommand()` 原本**无条件**调用 `activatePlugin()`，而后者会把
+// `manifest.main` 当内联 `<script>` 注入**宿主文档**（`loadPluginInner`），三处
+// （`activatePlugin` / `loadPluginInner` / eager 过滤）都没有 `runtime` 守卫。
+// 于是从命令面板执行 `kanban` 的 `new-card` 时，一个声明了
+// `runtime: "sandboxed"` 的插件**在宿主 realm 里跑了起来** ——
+// 这正是 `src/types/plugin.ts` 自己批评的那种"声明了隔离而实际没有"的降级。
+//
+// Rust 侧的同款分支**本来就有**（`rpc.rs` 的 `run_declared_menu`，它服务的是
+// 右键菜单那条由 Rust 显示浮层的路径）。缺的只是"前端能调到那条分支"的路，
+// 这条命令就是那条路。
+//
+// ============================================================
+// 返回值是**指令**，不是执行结果
+// ============================================================
+//
+// `"sandboxed"` = 宿主已经把它推进界面，调用方到此为止；
+// `"in-process"` = 调用方应当自己激活并调用。
+//
+// 用字符串而不是 bool：调用方要做的两件事在语义上不对称（一件是"什么都不用做"，
+// 另一件是"继续走你原来那条路"），字符串让前端的分支读起来就是它要做的事，
+// 而 `true/false` 需要调用方再去记"true 是哪一个"。
+//
+// ============================================================
+// 为什么这里**不**复核命令 id 是否在清单里声明过
+// ============================================================
+//
+// "哪些命令被声明了"这条规则的真源在前端（`pluginContributions.ts` 解析
+// `contributes`），而调用方正是拿着那份解析结果来的。在这里再解析一遍会造出
+// 第二份会漂的规则 —— 这个仓库对这件事的立场写得很清楚（见
+// `manager.rs::sandbox_view` 那段"那会变成两个真源"）。
+//
+// 而且复核在这里也**买不到安全**：`command` 只是被包成 JSON
+// （`{"command": ...}`）经 `postMessage` 送进沙箱，没有"拼"这一步；
+// 不存在的命令由桥接层按"没有这个处理器"忽略，与声明的命令写错时的表现一致。
+#[tauri::command]
+pub async fn run_plugin_declared_command(
+    app: AppHandle,
+    state: State<'_, PluginState>,
+    plugin_id: String,
+    command: String,
+) -> Result<String, String> {
+    let sandboxed = {
+        let manager = state.inner().0.read().await;
+        // 与 `rpc.rs::run_declared_menu` 同一条判据，用 `needs_own_webview()` 而不是
+        // 自己写 `== Sandboxed` —— 这个问题的措辞只该有一处（见 `manager.rs:175`）。
+        //
+        // 取不到视图（插件不存在 / 已停用）时按 in-process 处理：让调用方走原来的
+        // 激活路径，由它给出那条路径上更准确的错误（"不在已安装列表中"/"已被禁用"）。
+        manager
+            .sandbox_view(&plugin_id)
+            .map(|view| view.runtime.needs_own_webview())
+            .unwrap_or(false)
+    };
+
+    if sandboxed {
+        // `None` = 推给这个插件**全部活着的界面**。命令是插件级的（清单里
+        // `commands[].id` 不带界面），在哪块界面里响应由插件自己决定 ——
+        // 与 `ui.contextMenu` 传具体界面名的那种用法相对。
+        super::sandbox::deliver_command(&app, &plugin_id, &command, None).await;
+        log::debug!("插件 {plugin_id} 的命令 {command} 已推送给它的沙箱界面");
+        return Ok("sandboxed".to_string());
+    }
+
+    Ok("in-process".to_string())
+}
+
 #[tauri::command]
 pub async fn read_plugin_asset(
     state: State<'_, PluginState>,

@@ -252,6 +252,40 @@ impl BackgroundPlugins {
             receiver,
         ));
 
+        // ============================================================
+        // 空闲回收：接上此前从未被起过的那个定时器
+        // ============================================================
+        //
+        // `reap_if_idle` 与 `IDLE_TIMEOUT` 此前**都只有定义、没有调用方** ——
+        // 文档说"由模块的 start 起一个低频定时器调用"，而那个定时器从来没有被
+        // 写过，于是 300 秒这个数字从未生效过。
+        //
+        // 它必须被接上：这个进程是**按需拉起**的，而"按需拉起"只有配上
+        // "闲置就收回"才成立。少了后一半，"装了一个后台插件"就等于永久多一个
+        // Node 进程 —— 而那正是本模块存在的理由要避免的东西。
+        //
+        // 用 `Weak` 而不是 `Arc`：插件被停用/卸载时它的条目会被移出 map，
+        // `Arc` 计数归零，这个任务下一次 tick 就自己退出。持 `Arc` 的话
+        // 它会把宿主永远吊着，回收就成了空谈。
+        //
+        // 回收之后**不退出**：那个子进程还会被下一次请求重新拉起，而这个任务
+        // 只花一分钟一次的一次判空。
+        {
+            let weak = Arc::downgrade(&host);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(super::REAP_INTERVAL);
+                // `interval` 的第一次 tick 立即返回：刚拉起的进程不该被立刻判空闲。
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let Some(host) = weak.upgrade() else {
+                        return;
+                    };
+                    host.reap_if_idle().await;
+                }
+            });
+        }
+
         let params = serde_json::json!({
             "id": launch.id,
             "entry": launch.entry,

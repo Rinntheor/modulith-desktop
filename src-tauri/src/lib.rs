@@ -18,6 +18,7 @@ use modules::logging::commands::*;
 use modules::net::commands::*;
 use modules::notifications::commands::*;
 use modules::plugins::commands::*;
+use modules::plugins::safe_mode::safe_mode_state;
 use modules::settings::commands::*;
 use modules::sidebar::commands::*;
 use modules::updater::commands::*;
@@ -265,6 +266,8 @@ pub fn run() -> Result<(), tauri::Error> {
         install_plugin_url_verified,
         fetch_registry_text,
         verify_plugin_index,
+        run_plugin_declared_command,
+        safe_mode_state,
         set_plugin_enabled,
         uninstall_plugin,
         read_plugin_asset,
@@ -360,6 +363,20 @@ pub fn run() -> Result<(), tauri::Error> {
 
             log::info!("应用即将退出，模块收尾已完成");
             app.cleanup_before_exit();
+
+            // 标记"这一次启动走干净了"（安全模式的判定依据之一，见
+            // `modules/plugins/safe_mode.rs`）。
+            //
+            // **放在最后一步**，而不是夹在 `stop_all` 与 `cleanup_before_exit`
+            // 之间：那个顺序有一条门禁盯着（`check-modules` 的「stop_all 在
+            // cleanup_before_exit **之前**调用」），而它盯的是一个真实约束 ——
+            // cleanup 会清掉窗口与资源表，模块收尾必须在它之前。
+            //
+            // 这一步不需要 Tauri 的任何 API（只删一个已知路径），因此放在 cleanup
+            // 之后是安全的。语义上反而更准：标记被清掉就严格等于"整个退出流程
+            // 都走完了"，而夹在中间只等于"模块收尾完了"。
+            app.state::<modules::plugins::safe_mode::SafeMode>()
+                .mark_clean_exit();
         }
     });
 

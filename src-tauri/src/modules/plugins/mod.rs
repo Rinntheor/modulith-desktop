@@ -12,6 +12,7 @@ pub mod manager;
 pub mod permissions;
 pub mod quota;
 pub mod rpc;
+pub mod safe_mode;
 pub mod sandbox;
 pub mod signature;
 pub mod shortcuts;
@@ -50,6 +51,14 @@ impl Module for PluginsModule {
     }
 
     fn setup(&self, app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+        // **安全模式必须最先判定。** 它会读/写一个"上一次有没有走干净"的标记，
+        // 而前端的第一次 `invoke`（`safe_mode_state`）要在此之后读到正确的值。
+        //
+        // 放在这里而不是 `lib.rs` 的 setup：这一步发生在事件循环启动之前，
+        // 因此任何插件代码都还没有机会跑 —— 而"插件把渲染进程卡死"正是它要
+        // 处理的情形。见 `safe_mode.rs` 的文件头。
+        app.manage(safe_mode::install(app));
+
         let manager = manager::PluginManager::new(app.clone())?;
         log::info!(
             "插件系统已就绪：插件目录 {}，数据目录 {}",

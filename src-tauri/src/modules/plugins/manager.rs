@@ -62,7 +62,7 @@ const MAX_PLUGIN_BYTES: u64 = 64 * 1024 * 1024;
 /// 单个插件包最多包含的条目数
 const MAX_ZIP_ENTRIES: usize = 5000;
 /// `read_plugin_asset` 允许读取的最大文件（8 MB）
-const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 /// README 最大读取量（64 KB）
 const MAX_README_BYTES: u64 = 64 * 1024;
 /// HTTP 代理允许的最大响应体（2 MB）
@@ -1693,25 +1693,60 @@ impl PluginManager {
         )))
     }
 
-    /// 取该插件的存储目录，并强制 `storage` 权限。
+    /// 键值存储**自己的**子目录名。
     ///
-    /// 五个存储方法（`storage_get` / `set` / `delete` / `keys` / `clear`）全都
-    /// 经由这里取目录 —— 前三个走 `storage_path`，后两个直接调用本方法 ——
-    /// 因此 `storage` 权限检查只有这一个执行点。
+    /// 它曾经不存在：键直接落成 `<数据目录>/<键>.json`，与 `ctx.dataDir` 的文件、
+    /// `ctx.db` 的库文件**共用同一个命名空间**。那个设计的代价在 `storage_clear`
+    /// 上暴露出来 —— 清空键值存储的实现是递归删除整个数据目录，于是一次
+    /// `ctx.storage.clear()` 会连带删掉 `ctx.dataDir` 的全部文件与 `ctx.db` 的
+    /// SQLite 库：**一个只声明了 `storage` 的插件因此能毁掉它无权触碰的数据**。
+    /// 现在键落到这个子目录里。
+    const STORAGE_SUBDIR: &str = "storage";
+
+    /// 键值存储的**两个**落点：`(新址, 旧址)`。
     ///
-    /// 与 `plugin_data_dir` 的分工：那个只保证「ID 合法」，这个额外要求
-    /// 「清单已声明 storage」与「数据根可用」。卸载等内部流程仍直接使用
-    /// `plugin_data_dir`，它们不该受插件的权限声明约束 —— 而且**在数据根不可用时
-    /// 它们仍然该能工作**（"告诉用户数据在哪、占了多少"这件事不该因为盘没插而失效）。
-    fn checked_storage_dir(&self, id: &str) -> PluginResult<PathBuf> {
+    /// ============================================================
+    /// `storage` 权限的唯一执行点就在这里
+    /// ============================================================
+    ///
+    /// 键值存储的每一个方法都经由本方法取目录，因此 `require_permission`
+    /// 只需要写这一处。与 `plugin_data_dir` 的分工：那个只保证「ID 合法」，
+    /// 这个额外要求「清单已声明 storage」与「数据根可用」。卸载等内部流程仍直接
+    /// 使用 `plugin_data_dir` —— 它们不该受插件的权限声明约束，而且**在数据根
+    /// 不可用时它们仍然该能工作**（"告诉用户数据在哪、占了多少"这件事不该因为
+    /// 盘没插而失效）。
+    ///
+    /// ============================================================
+    /// 为什么旧键留在原地不搬
+    /// ============================================================
+    ///
+    /// 现存插件的键就躺在数据目录根部。搬动它们有两个坏处：
+    ///
+    /// 1. **搬动是写操作**，会在"数据根不可用 / 盘满 / 目录只读"时失败 ——
+    ///    而失败恰好发生在插件启动读配置的那一刻，等于把一个可读的插件变成不可用。
+    /// 2. **更本质：无法区分。** `<数据目录>/foo.json` 到底是键 `foo`，还是一个
+    ///    `ctx.dataDir` 文件？两者形状完全一样，没有元信息可依据。搬错一个就等于
+    ///    把插件自己的文件挪到它读不到的地方 —— 那是把"清空存储会误删文件"换成了
+    ///    "迁移会误挪文件"，代价一样，而且更难发现。
+    ///
+    /// 因此策略是「**读两边、写新址、删两边**」：
+    ///   * 读：新址优先，回落旧址 —— 老插件的键照常读得到；
+    ///   * 写：只写新址 —— 旧址只减不增，新装/新写的键天然不再进共享命名空间；
+    ///   * 删：两边都删 —— 否则 `delete` 之后键会因为旧址那一份还在而"复活"。
+    ///
+    /// **残留的已知歧义**：旧址上一个名字恰好是合法键形状的 `dataDir` 文件，
+    /// 仍会被 `clear()` 当成键删掉。这一条无法在不搬动的前提下消除，已记进
+    /// `docs/06-项目/已知问题/现行问题.md`；新址启用后不会再有新的这类文件。
+    fn storage_dirs(&self, id: &str) -> PluginResult<(PathBuf, PathBuf)> {
         self.require_permission(id, PluginPermission::Storage)?;
         self.require_data_root()?;
-        self.plugin_data_dir(id)
+        let data = self.plugin_data_dir(id)?;
+        Ok((data.join(Self::STORAGE_SUBDIR), data))
     }
 
     /// 取该插件的数据目录，并强制 `plugin-data` 权限与数据根可用。
     ///
-    /// 与 `checked_storage_dir` 并列而不是合并：两者是**两条独立的权限**。
+    /// 与 `storage_dirs` 并列而不是合并：两者是**两条独立的权限**。
     /// 合并的话，一个只想要键值存储的插件会顺带拿到整个文件目录 ——
     /// 权限列表就不再是"它能做什么"的如实描述。
     fn checked_data_dir(&self, id: &str) -> PluginResult<PathBuf> {
@@ -1797,23 +1832,36 @@ impl PluginManager {
         Ok(data_dir::used_bytes(&root))
     }
 
-    /// 校验存储 key
+    /// 校验存储 key，并给出它在**新址**的路径。
     fn storage_path(&self, id: &str, key: &str) -> PluginResult<PathBuf> {
+        Ok(self.storage_files(id, key)?.0)
+    }
+
+    /// 一个键对应的**两个**文件路径：`(新址, 旧址)`。
+    ///
+    /// 键的合法性校验收在这里，`get` / `set` / `delete` 三个入口因此不可能漏掉它。
+    /// 旧址的用途见 `storage_dirs`。
+    fn storage_files(&self, id: &str, key: &str) -> PluginResult<(PathBuf, PathBuf)> {
         if !is_valid_storage_key(key) {
             return Err(PluginError::SandboxViolation(format!(
                 "非法的存储键（只允许字母数字 . _ -，最长 128 字符）: {}",
                 key
             )));
         }
-        Ok(self.checked_storage_dir(id)?.join(format!("{}.json", key)))
+        let (current, legacy) = self.storage_dirs(id)?;
+        let file = format!("{}.json", key);
+        Ok((current.join(&file), legacy.join(file)))
     }
 
     pub fn storage_get(&self, id: &str, key: &str) -> PluginResult<Option<String>> {
-        let path = self.storage_path(id, key)?;
-        if !path.is_file() {
-            return Ok(None);
+        let (current, legacy) = self.storage_files(id, key)?;
+        // 新址优先；旧址是**读回落**（见 `storage_dirs`），因此老插件的键照常读得到。
+        for path in [current, legacy] {
+            if path.is_file() {
+                return Ok(Some(std::fs::read_to_string(path)?));
+            }
         }
-        Ok(Some(std::fs::read_to_string(path)?))
+        Ok(None)
     }
 
     pub fn storage_set(&self, id: &str, key: &str, value: &str) -> PluginResult<()> {
@@ -1857,31 +1905,77 @@ impl PluginManager {
     }
 
     pub fn storage_delete(&self, id: &str, key: &str) -> PluginResult<()> {
-        let path = self.storage_path(id, key)?;
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        // **两边都删**：只删新址的话，旧址那一份会让键在下次 `get` 时"复活"
+        // （`get` 会回落到旧址）—— 那是最难排查的一类 bug。
+        let (current, legacy) = self.storage_files(id, key)?;
+        for path in [current, legacy] {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
         }
         Ok(())
     }
 
-    pub fn storage_keys(&self, id: &str) -> PluginResult<Vec<String>> {
-        let dir = self.checked_storage_dir(id)?;
+    /// 列出键值存储**两个落点**里的全部键，去重排序。
+    ///
+    /// 枚举只读文件名（不读内容、不读元数据）。`storage_dirs` 说明为什么两个都要看。
+    fn collect_storage_keys(&self, id: &str) -> PluginResult<Vec<String>> {
+        let (current, legacy) = self.storage_dirs(id)?;
+        let mut keys = Self::keys_in_dir(&current)?;
+        keys.extend(Self::keys_in_dir(&legacy)?);
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    /// 枚举一个目录里的键。**只读文件名**（不读内容、不读元数据）。
+    ///
+    /// 键的形状校验在这里：旧址上混着 `ctx.dataDir` 的文件（见 `storage_dirs` 的
+    /// 「残留的已知歧义」），因此**只认形状合法的名字** —— 这至少让
+    /// `report(1).json` 这类明显不是键的文件不会出现在列表里、也不会被 `clear` 删掉。
+    fn keys_in_dir(dir: &Path) -> PluginResult<Vec<String>> {
         if !dir.is_dir() {
             return Ok(Vec::new());
         }
-
-        let mut keys: Vec<String> = std::fs::read_dir(&dir)?
+        let mut keys: Vec<String> = std::fs::read_dir(dir)?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().is_file())
-            .filter_map(|entry| {
-                entry
-                    .path()
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().to_string())
-            })
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| path.file_stem().map(|stem| stem.to_string_lossy().to_string()))
+            .filter(|key| is_valid_storage_key(key))
             .collect();
         keys.sort();
         Ok(keys)
+    }
+
+    /// 读一个目录的**元数据**（不读内容），供配额统计用。
+    ///
+    /// 与 `keys_in_dir` 并列而不是合并：那一个只回答"有哪些键"，而配额还要
+    /// "每个键有多大"，两者对"算什么"的判据也不同（这里把非 `.json`、
+    /// 子目录、读不到元数据的条目都交给 `quota::sum_storage` 去判定）。
+    fn storage_entries(dir: &Path) -> Vec<quota::StorageEntry> {
+        if !dir.is_dir() {
+            return Vec::new();
+        }
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let meta = entry.metadata().ok()?;
+                let path = entry.path();
+                Some(quota::StorageEntry {
+                    is_file: meta.is_file(),
+                    is_json: path.extension().is_some_and(|ext| ext == "json"),
+                    len: meta.len(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn storage_keys(&self, id: &str) -> PluginResult<Vec<String>> {
+        self.collect_storage_keys(id)
     }
 
     /// 列出该插件的全部键，**按前缀过滤**，返回一页。
@@ -1917,29 +2011,15 @@ impl PluginManager {
         let after = quota::resolve_cursor(cursor, prefix)?;
         let page_size = quota::clamp_page_size(requested_page_size);
 
-        let dir = self.checked_storage_dir(id)?;
         let usage = self.storage_usage(id)?;
 
-        if !dir.is_dir() {
-            return Ok(StoragePage {
-                keys: Vec::new(),
-                next_cursor: None,
-                usage,
-            });
-        }
-
         // 枚举**只读文件名**（不读内容、不读元数据），再按前缀过滤。
-        let mut keys: Vec<String> = std::fs::read_dir(&dir)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .filter_map(|path| {
-                path.file_stem()
-                    .map(|stem| stem.to_string_lossy().to_string())
-            })
+        // 两个落点都要看 —— 见 `storage_dirs`。
+        let keys: Vec<String> = self
+            .collect_storage_keys(id)?
+            .into_iter()
             .filter(|key| key.starts_with(prefix))
             .collect();
-        keys.sort();
 
         // 切页的规则是纯函数（`quota::slice_page`），因此边界情况能被穷举测试。
         // 这里只负责"把目录读成一组排好序的键"。
@@ -1959,29 +2039,17 @@ impl PluginManager {
     /// 窗口里写满磁盘 —— 于是配额就变成了一个"有时候生效"的东西。
     /// 统计的代价是每个键一次 `metadata`（不读内容），在 2000 个键的上限下是毫秒级。
     pub fn storage_usage(&self, id: &str) -> PluginResult<StorageUsage> {
-        let dir = self.checked_storage_dir(id)?;
-        if !dir.is_dir() {
-            return Ok(StorageUsage {
-                total_bytes: 0,
-                key_count: 0,
-            });
-        }
+        let (current, legacy) = self.storage_dirs(id)?;
 
         // 只读元数据（不读内容），并把"算不算"的判定交给纯函数 ——
         // 那样"目录里混进子目录 / 非 .json 文件 / 读不到元数据的条目"这些情况
         // 都能在 `quota` 的单元测试里直接构造，而不必真的造出那些文件。
-        let entries: Vec<quota::StorageEntry> = std::fs::read_dir(&dir)?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let meta = entry.metadata().ok()?;
-                let path = entry.path();
-                Some(quota::StorageEntry {
-                    is_file: meta.is_file(),
-                    is_json: path.extension().is_some_and(|ext| ext == "json"),
-                    len: meta.len(),
-                })
-            })
-            .collect();
+        //
+        // 两个落点**相加**：同一个键在两处都有一份时会重复计入，这是**有意的保守**——
+        // 配额宁可多算一点而提前拒绝，也不该因为漏算而放行。重复项在插件下一次
+        // `set` 之后就会消失（写只进新址）。
+        let mut entries = Self::storage_entries(&current);
+        entries.extend(Self::storage_entries(&legacy));
 
         let (total_bytes, key_count) = quota::sum_storage(&entries);
 
@@ -1991,25 +2059,49 @@ impl PluginManager {
         })
     }
 
-    /// 清空插件数据目录。**需要插件仍然安装且声明了 `storage`。**
+    /// 清空这个插件的**键值存储**。需要插件仍然安装且声明了 `storage`。
     ///
-    /// **这里曾经完全缺少 ID 守卫**（`data_dir.join(id)` 直接用未校验的 `id`），
-    /// `id = ".."` 会让目标解析为应用数据目录本身而被整个删除 —— 连
-    /// settings.json / auth.json / notifications.json 一起消失。现在 ID 校验
-    /// 收在 `plugin_data_dir` 里，本方法只需保证「只删该插件自己的数据目录」。
+    /// ============================================================
+    /// 它曾经会删掉整个数据目录（一次真实的破坏性缺陷）
+    /// ============================================================
+    ///
+    /// 旧实现是 `remove_dir_all(<数据目录>)`，而键值存储与 `ctx.dataDir` 的文件、
+    /// `ctx.db` 的库共用同一个目录。于是**只声明了 `storage` 的插件**调一次
+    /// `clear()` 就能删掉 `ctx.dataDir` 的全部内容与整个 SQLite 库 ——
+    /// 那些是它**没有权限**触碰的数据。现在：
+    ///
+    ///   * 新址（`<数据目录>/storage/`）整个删掉 —— 那里只装键；
+    ///   * 旧址（数据目录根部）**只删形状合法的键文件** —— 那里还混着
+    ///     `ctx.dataDir` 的文件与 `plugin.db`，递归删除是灾难。
+    ///
+    /// **`plugin.db` 与 `dataDir` 的其余内容一律不动。** 要连数据一起清，
+    /// 那是宿主替用户做的事（`clear_data`），不该由插件的一个
+    /// "清空我的键值存储"触发。
     ///
     /// 与 `clear_data` 的分工：这一条是**插件自己在运行期**能触发的清空
     /// （它必须仍然装、仍然有权限）；`clear_data` 是**宿主替用户**执行的删除，
     /// 卸载之后也要能用。
     pub fn storage_clear(&self, id: &str) -> PluginResult<()> {
-        let dir = self.checked_storage_dir(id)?;
-        self.remove_data_dir(&dir, id)
+        let (current, legacy) = self.storage_dirs(id)?;
+
+        if current.is_dir() {
+            std::fs::remove_dir_all(&current)?;
+        }
+
+        for key in Self::keys_in_dir(&legacy)? {
+            let path = legacy.join(format!("{}.json", key));
+            if path.is_file() {
+                std::fs::remove_file(path)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// 删除一个插件的数据目录。**不要求插件仍然安装。**
     ///
     /// 为什么必须有这一条：卸载改成"保留数据"之后，`storage_clear` 就够不着那些
-    /// 数据了 —— 它经过 `checked_storage_dir` → `require_permission` → 读清单，
+    /// 数据了 —— 它经过 `storage_dirs` → `require_permission` → 读清单，
     /// 而未安装的插件读不到清单。**于是"保留数据"会变成一个再也删不掉的目录**，
     /// 那只是把静默的数据丢失换成了静默的空间泄漏。
     ///

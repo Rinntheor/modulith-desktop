@@ -424,13 +424,103 @@ function runDisposables(pluginId: string): number {
   return ran;
 }
 
+// ============================================================
+// 安全模式
+// ============================================================
+
+/**
+ * 宿主侧的安全模式状态。
+ *
+ * 宿主在**上一次启动没有走干净**时（或环境变量 `MODULITH_SAFE_MODE` 被设置时）
+ * 打开它。理由是插件能让渲染进程永远卡住：bundle 顶层的同步死循环**无法被
+ * 中断**，于是启动门禁永远停在进度条、设置页打不开、用户没有任何办法禁用那个
+ * 插件 —— 唯一的出路是手工去应用数据目录里删文件夹，而普通用户做不到。
+ *
+ * 安全模式只做一件事：**不让插件被自动加载**。清单仍然会同步到界面，因此用户
+ * 能在「设置 → 插件」里禁用/卸载可疑的插件。完整推理见宿主侧
+ * `src-tauri/src/modules/plugins/safe_mode.rs`。
+ */
+export interface SafeModeState {
+  active: boolean;
+  reason: string | null;
+}
+
+let cachedSafeMode: SafeModeState | null = null;
+
+/**
+ * 读安全模式状态。
+ *
+ * **只读一次并缓存**：它在一次进程生命周期内不会变 —— 宿主在启动时就定了，
+ * 而且没有"退出安全模式"这条命令（退出动作是**干净地关闭应用**，见宿主侧
+ * `SafeMode::mark_clean_exit`）。
+ */
+export async function getSafeModeState(): Promise<SafeModeState> {
+  if (cachedSafeMode) return cachedSafeMode;
+  try {
+    cachedSafeMode = await invoke<SafeModeState>('safe_mode_state');
+  } catch (error) {
+    // 读不到就按"没开"处理：安全模式是一层保护，而**保护本身失败不该拦下应用**。
+    // 代价是这种情形下插件会照常加载 —— 与没有这个功能时完全一样，不是倒退。
+    console.warn('[pluginRuntime] 无法读取安全模式状态，按未开启处理：', error);
+    cachedSafeMode = { active: false, reason: null };
+  }
+  return cachedSafeMode;
+}
+
+/**
+ * 把"现在处于安全模式"这件事告诉用户。
+ *
+ * 安全模式在界面上的表现是**插件不见了** —— 而那看起来像故障。不说清的话用户
+ * 会去重装插件、反复重启，却不知道只要禁用那个插件就好。因此这条通知是功能的
+ * 一部分，不是装饰。
+ *
+ * `dedupeKey` 固定：安全模式下每次启动都会发一条内容相同的通知，不合并的话
+ * 通知中心会被同一个问题堆满，而"看得到的告警"会因此变成"看不到的噪声"。
+ */
+export async function announceSafeMode(reason: string | null): Promise<void> {
+  await pushNotification({
+    title: '已进入安全模式：插件未被加载',
+    body:
+      `${reason ?? '上一次启动没有正常退出。'}\n` +
+      '请到「设置 → 插件」禁用可疑的插件，然后关闭并重新打开应用。',
+    level: 'warning',
+    source: 'safe-mode',
+    dedupeKey: 'safe-mode',
+  }).catch(() => {});
+}
+
 /**
  * 执行一条插件命令。
  *
  * 「先激活、再执行」是这个函数的全部意义：命令在面板里的**条目**来自清单，
  * 因此用户在插件一行代码都没跑过时就能看到它；点下去的那一刻才付执行的代价。
+ *
+ * ============================================================
+ * 但"先激活"这一步**只能对 in-process 插件做**
+ * ============================================================
+ *
+ * 激活会把 `manifest.main` 当内联 `<script>` 注入**宿主文档**
+ * （见 `loadPluginInner`）。对声明了 `runtime: "sandboxed"` 的插件，那是
+ * 「声明了隔离而实际没有」的降级 —— 而这里原本没有任何 runtime 判断，
+ * 于是一个沙箱插件只要声明了 `contributes.commands`（`kanban` 就是），
+ * 从命令面板点它就会在宿主 realm 里跑起来。
+ *
+ * 因此先让 Rust 回答"这条命令该由谁执行"，前端只消费那个答案：
+ *   * `"sandboxed"` —— 宿主已经把"有人点了这条命令"推进插件的界面
+ *     （`sandbox::deliver_command` → 前端 → iframe → `Modulith.commands.on`），
+ *     这里到此为止；
+ *   * `"in-process"` —— 继续走下面那条路。
+ *
+ * 判据只该有一处，所以它放在 Rust 侧（`commands.rs::run_plugin_declared_command`，
+ * 与 `rpc.rs::run_declared_menu` 同源），这里不再判断 `manifest.runtime`。
  */
 export async function runPluginCommand(pluginId: string, localId: string): Promise<void> {
+  const dispatched = await invoke<string>('run_plugin_declared_command', {
+    pluginId,
+    command: localId,
+  });
+  if (dispatched === 'sandboxed') return;
+
   await activatePlugin(pluginId, activationEventForCommand(localId));
 
   const fullId = commandFullId(pluginId, localId);
@@ -608,6 +698,31 @@ export async function activatePlugin(
   }
   if (plugin.status === 'error') {
     throw new Error(`插件 "${pluginId}" 的清单无法读取，无法激活`);
+  }
+
+  /*
+   * 沙箱插件在宿主这一侧**没有代码要执行**。
+   *
+   * 它的 bundle 跑在自己的文档里（跨源 iframe），由 `SandboxSurface` 挂载；宿主
+   * 能做的只是签发令牌。因此"激活"对它只意味着"可以挂载了"，**不经过**
+   * `loadPluginInner` —— 那里会把 `manifest.main` 当内联 `<script>` 注入宿主文档。
+   *
+   * 这一条是**纵深防御**，不是唯一防线：`runPluginCommand` 已经不会对沙箱插件
+   * 调用本函数（它先问 Rust 该由谁执行）。但 `ensureProvidedModule` 与
+   * `runPluginContextMenuEntry` 也会调本函数，而"任何路径都不得把沙箱 bundle
+   * 注入宿主文档"这件事不该只靠每个调用方记得。
+   */
+  if (plugin.manifest.runtime === 'sandboxed') {
+    const sandboxState: PluginActivationState = {
+      pluginId,
+      status: 'active',
+      reason: event,
+      activatedAt: new Date().toISOString(),
+    };
+    activationStates.set(pluginId, sandboxState);
+    activationReasons.set(pluginId, event);
+    notify();
+    return sandboxState;
   }
 
   activationStates.set(pluginId, { pluginId, status: 'activating', reason: event });
@@ -2474,6 +2589,28 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
   const manifest = plugin.manifest;
   const contract = contracts.get(pluginId);
 
+  /*
+   * **这里是那条通路的唯一出口，所以守卫也放在这里。**
+   *
+   * 本函数是插件 bundle 被执行的地方（`:2513` 读 `manifest.main`、`:2535` 把它
+   * 作为内联 `<script>` 注入宿主文档）。对声明了 `runtime: "sandboxed"` 的插件，
+   * 那是一件**不该发生**的事：它的代码属于另一个文档。
+   *
+   * 放在函数入口而不是让每个调用方自己判断，理由是"注入宿主文档"这个动作只有
+   * 这一处，把守卫贴在动作旁边，将来新增调用方时不会漏。
+   */
+  if (manifest.runtime === 'sandboxed') {
+    const sandboxState: PluginLoadState = {
+      pluginId,
+      status: 'loaded',
+      moduleIds: [],
+      loadedAt: new Date().toISOString(),
+    };
+    loadStates.set(pluginId, sandboxState);
+    notify();
+    return sandboxState;
+  }
+
   // 允许重复加载：先清理旧资源与旧模块。
   //
   // 目录条目要不要一起清掉，取决于它从哪来：
@@ -2786,7 +2923,17 @@ export async function reloadPluginRuntime(
   // （`onStartup`，或没有可用激活事件时的降级）。其余插件的 bundle 一直等到
   // 它被真正用到 —— 这正是「500 个插件」与「500 段代码在启动后全部执行」
   // 不再是同一件事的地方。
-  const eager = enabledPlugins.filter((plugin) => contracts.get(plugin.id)?.eager !== false);
+  //
+  // 沙箱插件**永远不进这个集合**：宿主这一侧没有它的代码可执行。它的
+  // `onStartup`（如果有）由插件自己的文档在挂载时处理，而"挂载"由用户打开
+  // 那个模块触发。此前这里没有 runtime 过滤，于是 `stand-up` 这种
+  // 「`contributes: {settings, background}` + `activationEvents: ["onStartup"]`」
+  // 的插件会在启动时让宿主去读并执行它那个刻意留空的 `index.js` ——
+  // 现状无害（那个文件全是注释），但通路是真的。
+  const eager = enabledPlugins.filter(
+    (plugin) =>
+      plugin.manifest.runtime !== 'sandboxed' && contracts.get(plugin.id)?.eager !== false
+  );
   const lazyCount = enabledPlugins.length - eager.length;
   const total = eager.length;
 

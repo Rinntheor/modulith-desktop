@@ -76,6 +76,8 @@
     "allow-install-plugin-url-verified",
     "allow-fetch-registry-text",
     "allow-verify-plugin-index",
+    "allow-run-plugin-declared-command",
+    "allow-safe-mode-state",
     "allow-set-plugin-enabled",
     "allow-uninstall-plugin",
     "allow-read-plugin-asset",

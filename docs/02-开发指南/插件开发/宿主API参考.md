@@ -22,8 +22,13 @@
 | `createContext` | function | 取得当前插件的服务集合（靠隐式全局定位插件） |
 | `run` | function | **推荐**：显式引导 —— 宿主把身份与数据作为参数交进来，见 [1.5](#15-run推荐) |
 | `registerCommand` | function | 把一个动作注册进全局搜索框 |
+| `onDeactivate` | function | 登记一个「插件被卸载 / 禁用 / 重载时执行」的清理函数。与 `ctx.disposables.add` 是同一件事的两个入口，且同样**只在加载期可用** |
 | `useModuleActive` | function | 判断当前模块是否真的对用户可见（Hook） |
 | `capabilities` | object | 宿主能力表。**特性探测用它**，不要比较版本号 |
+
+**上表是 in-process `window.Modulith` 的完整集合**（真源是 `src/services/pluginRuntime.ts` 的 `ModulithHost` 与 `installHostGlobals()`，成员名单由 `src/services/pluginBoundary.ts` 的 `HOST_MEMBERS` 登记）。
+
+⚠️ **`Modulith.ui` / `Modulith.plugin` / `Modulith.surfaces` 不在这张表里，它们是 `runtime: "sandboxed"` 的桥接层独有的成员。** `Modulith.ui`（`openSurface` / `closeSurface` / `listSurfaces`）、`Modulith.plugin`（`id` / `name` / `version` / `runtime` / `permissions` / `surface`）与 `Modulith.surfaces` 只由 `src-tauri/resources/sandbox-bridge.js` 注入；in-process 插件在 `window.Modulith` 上拿到它们只会是 `undefined`。`Modulith.capabilities` 的 `host` 名单里也没有它们。
 
 `Modulith.capabilities` 的 `api` 字段是**接口表自身的版本**，当前为 `1`。它描述的是"宿主认识哪些成员"，
 不是"你这个插件用第几版接口" —— 插件不需要在清单里声明 api 版本，用哪个入口由插件自己决定。
@@ -115,7 +120,14 @@ Modulith.registerModule({
 
 调用时机：必须在 `registerModule` 可用的窗口内调用，即插件代码执行期间。注册成功后模块进入动态编目，与内建模块一起出现在侧边栏。
 
-如果插件执行完毕却没有注册任何模块，宿主会判定加载失败。
+**判据不是「注册了模块」。** 从 1.2.0 起，加载成功的判据是「**至少贡献了一样东西**」（`src/services/pluginRuntime.ts` 的 `loadPluginInner`）：
+
+```
+moduleIds.length > 0
+  || (声明式 && (contributes.commands / settings / contextMenus 任一非空 || activationEvents 非空))
+```
+
+旧判据把「插件是什么」与「插件往侧边栏放了什么」焊死在一起，于是只加命令的插件、只做后台监听的插件都会被判为失败。只有在这条新判据也不成立时（bundle 不是预期的 IIFE、入口写错），宿主才判定加载失败。
 
 ### 1.4 createContext
 
@@ -131,6 +143,7 @@ var ctx = Modulith.createContext();
 | `pluginVersion` | string | 当前插件版本 |
 | `manifest` | object | 解析后的清单 |
 | `version` | string | 宿主版本号 |
+| `activationEvent` | string \| null | 本次是为什么被激活的（`onModule:x` / `onCommand:x` / `onContextMenu:x` / `onStartup`；旧式插件为 `'legacy'`） |
 | `storage` | object | 插件私有存储（键值） |
 | `dataDir` | object | 插件私有文件目录（需 `plugin-data` 权限） |
 | `db` | object | 每插件一个 SQLite（需 `plugin-data` 权限） |
@@ -143,6 +156,11 @@ var ctx = Modulith.createContext();
 | `shell` | object | 在文件管理器中定位（需 `filesystem-read` 权限） |
 | `fileDrop` | object | 接收拖入的文件路径（需 `filesystem-read` 权限） |
 | `audio` | object | 导入音频文件（需 `filesystem-read` 权限） |
+| `clipboard` | object | 读写系统剪贴板（需 `clipboard` 权限，**纯前端强制**） |
+| `settings` | object | 读取本插件声明的设置项的当前值（需 `storage` 权限） |
+| `disposables` | object | 收尾登记：`add(dispose)` / `size()`，与 `Modulith.onDeactivate()` 同义 |
+
+**这是 in-process `ctx` 的完整集合**（真源是 `src/services/pluginBoundary.ts` 的 `CONTEXT_MEMBERS`，当前 20 项）。`ctx.files` **不在其中** —— 它只在沙箱侧存在，见第 12 节。
 
 **调用时机是严格受限的**：只能在插件 bundle 执行期间调用，例如 IIFE 顶层。在插件代码之外调用会抛出异常，因为服务需要绑定正在加载的插件 ID。
 
@@ -229,7 +247,7 @@ Modulith.run(function (bootstrap) {
 
 ## 2. storage
 
-插件私有存储，按插件 ID 隔离。数据以 JSON 序列化后保存在应用数据目录中，卸载插件时一并清除。
+插件私有存储，按插件 ID 隔离。数据以 JSON 序列化后保存在**插件数据目录**（默认 `<app_local_data_dir>/plugin_data/<id>/`，即 `%LOCALAPPDATA%`）。**卸载插件时数据默认保留**（重装同一个插件能拿回数据），要删得走独立的、需要确认的「插件数据」残留清理入口。
 
 **需要 `storage` 权限。** 清单里必须声明：
 
@@ -246,7 +264,9 @@ Modulith.run(function (bootstrap) {
 | `delete` | `delete(key) => Promise<void>` | 删除单个键 |
 | `clear` | `clear() => Promise<void>` | 清空该插件的全部数据 |
 | `keys` | `keys() => Promise<string[]>` | 列出全部键 |
-| `all` | `all() => Promise<Record<string, unknown>>` | 读取全部键值 |
+| `list` | `list(options?) => Promise<PluginStoragePage>` | 分页枚举键；`options` 为 `{ prefix?, cursor?, pageSize? }`，返回 `{ keys, nextCursor, usage }`。**键多时应当用它而不是 `keys()`** |
+| `usage` | `usage() => Promise<PluginStorageUsage>` | 当前用量 `{ totalBytes, keyCount }`，供插件自己做配额提示 |
+| `all` | `all() => Promise<Record<string, unknown>>` | 读取全部键值（**上限 500 个键**，超过时抛错而不是截断） |
 
 用法：
 
@@ -266,7 +286,7 @@ var keys = await ctx.storage.keys();
 
 注意 `get` 在内部捕获 JSON 解析错误并返回默认值，因此数据损坏不会导致调用方抛出异常。
 
-**不要用 localStorage 保存插件数据**。`storage` 会随插件卸载而清理，且按插件隔离；`localStorage` 既不隔离也不清理。
+**不要用 localStorage 保存插件数据**。`storage` 按插件隔离；`localStorage` 不隔离（沙箱插件的所有界面共享同一个来源，见[清单文件参考](清单文件参考.md) 2.7.3），也不参与备份与搬家。
 
 ## 2.1 db
 
@@ -370,6 +390,7 @@ const raw = await ctx.db.queryRaw('SELECT 1 AS id, 2 AS id');
 | `post` | `post(url, data?, init?) => Promise<Response>` | POST，`data` 会被 JSON 序列化 |
 | `put` | `put(url, data?, init?) => Promise<Response>` | PUT，`data` 会被 JSON 序列化 |
 | `delete` | `delete(url, init?) => Promise<Response>` | DELETE |
+| `download` | `download(url, rel, onProgress?, options?) => Promise<{ rel, bytes, contentType, status }>` | 把一个文件**直接下到插件数据目录**（`rel` 是数据目录内的相对路径），不经过 JS 内存。`onProgress` 收 `{ rel, received, total }`（`total` 为 `null` 表示服务器没给 `Content-Length`）；`options` 为 `{ headers? }`。目标路径的上级目录必须已存在；失败时不会留下被截断的文件 |
 
 用法：
 
@@ -462,6 +483,10 @@ if (!ctx.notifications.isAvailable()) {
 - 未读徽标与「打开模块」入口会自动处理这个差异：`moduleCatalog` 的 `getNotificationSourcesFor()` 把模块展开为「模块 ID + 其所属插件 ID」，`resolveNotificationTarget()` 把插件 ID 解析回该插件注册的第一个模块。因此一个插件注册多个模块时，通知会显示在**所有**这些模块的徽标上，而点击跳转到 priority 最小的那一个 —— 通知本身不携带「属于哪个模块」的信息。
 - **浮层的展示规则**：`dedupeKey` 命中一条**已读**记录时不会合并（那是新的一件事），因此会重新弹一次；命中未读记录时只增加计数、不弹浮层。
 - **只有应用内通知，没有系统级通知。** 应用关闭时无法提醒。这需要在宿主里引入 `tauri-plugin-notification` 依赖，当前版本刻意不新增依赖，因此不提供该能力。
+
+> **权限列表里这一项的文案已与本节对齐。** `src-tauri/src/modules/plugins/permissions.rs` 里 `Self::Notification` 的 `label` / `description` 现在是「应用内通知」与「在应用内的通知中心发一条提醒。**不是系统级通知** —— 应用关闭时无法提醒用户」。这一项此前写的是「系统通知 / 弹出系统级通知」，与实现相反，现已改正。
+>
+> 但它的**强制程度**仍有口径不一致：元数据标 `Frontend`，而沙箱 RPC 路径（`rpc.rs` 的 `notify` 分支）实际会做一次 Rust 侧 `require_permission`；`rpc.rs` 的注释又说元数据标的是 `host`。三处的准确现状见[插件系统架构](插件系统架构.md) 6.1 与[现行问题](../../06-项目/已知问题/现行问题.md) §4.9。
 - 通知总量上限 200 条，超出后优先丢弃已读的旧通知。
 
 ## 6. events
@@ -860,7 +885,7 @@ img.src = URL.createObjectURL(new Blob([await ctx.files.read(grant)]));
 | 不调用 ReactDOM | 通过 `registerModule` 交组件，宿主负责挂载 |
 | `createContext()` 只在加载期调用 | 在 bundle 顶层获取一次并复用 |
 | `registerCommand()` 只在加载期调用 | 命令需要归属到插件，卸载时据此批量摘除 |
-| 必须注册至少一个模块 | 否则判定为加载失败 |
+| 必须至少贡献一样东西 | 注册了模块，或在清单里声明了 `contributes` 的 commands / settings / contextMenus 之一，或声明了 `activationEvents`；否则判定为加载失败（见 1.3） |
 | 网络需声明权限 | 外部地址需 `network` 与 `network-external` |
 | 通知需声明权限 | `notification`，否则接口是空实现 |
 | 跨模块通信需声明权限 | `plugin-communicate` |
