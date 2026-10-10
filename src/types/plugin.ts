@@ -71,14 +71,16 @@ export type PluginPermission =
   | 'network'                    // 网络请求（本机/回环）
   | 'network-external'           // 外部域名请求
   | 'notification'               // 应用内通知（已强制）
-  | 'clipboard'                  // 剪贴板访问
+  | 'clipboard'                  // 剪贴板读写（前端强制；那三个方法调的是浏览器 API）
   | 'filesystem-read'            // 文件读取（已强制）
   | 'filesystem-write'           // 文件写入
   | 'filesystem-scoped'          // 限定目录访问（沙箱的 ctx.files，宿主强制）
   | 'plugin-communicate'         // 插件间通信
   | 'native-module'              // 原生模块调用
   | 'dev-tools'                  // 开发者工具
-  | 'process-spawn';             // 启动外部程序（已强制）
+  | 'process-spawn'              // 启动外部程序（已强制）
+  | 'secrets'                    // 加密的密钥存储（宿主强制；密文在插件数据目录之外，不进备份）
+  | 'clipboard-monitor';         // 观察剪贴板变化（宿主强制，风险 high；应用运行期间能看到这台机器上复制的任何内容）
 
 /**
  * 插件作者信息

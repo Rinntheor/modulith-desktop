@@ -15,6 +15,7 @@ import { installPluginThemeSync } from './services/pluginThemeSync';
 import { installPluginShortcutSync } from './services/pluginShortcutSync';
 import { installPluginSurfaceRequests } from './services/pluginSurfaces';
 import { installPluginUiState } from './services/pluginUiState';
+import { installPluginClipboardMonitor } from './services/pluginClipboardMonitor';
 import { installPluginCommandDispatch, installPluginDownloadProgress } from './services/pluginRuntime';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
@@ -161,6 +162,19 @@ installPluginSurfaceRequests();
  * 而那时丢掉的那一条会让徽标永远停在旧值。
  */
 installPluginUiState();
+
+/*
+ * 接住宿主观察到的**剪贴板变化**，交给 in-process 插件注册的处理函数。
+ *
+ * 观察点在 Rust 那一侧：浏览器 API 只回答"现在是什么"，不回答"变过没有"，而
+ * `GetClipboardSequenceNumber()` 是宿主进程里的一个整数读。沙箱插件不走这条路 ——
+ * 它的回调在另一个 realm，由宿主直接推进它的界面。
+ *
+ * 装在最外层：插件可能在界面挂载之前就订阅（`onStartup` 里建索引），而那时丢掉的
+ * 那一条会让一份剪贴板历史永远缺一段。**没有插件订阅时这条通道上一句话都不会有**
+ * —— 宿主的轮询线程由第一个订阅者拉起，最后一个离开时退出。
+ */
+installPluginClipboardMonitor();
 
 /*
  * 接住宿主请求执行某条**插件命令**的广播。

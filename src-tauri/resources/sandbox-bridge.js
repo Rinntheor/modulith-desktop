@@ -85,6 +85,10 @@
   var ACTIVATION_EVENT = '__PLUGIN_ACTIVATION__';
   var PERMISSIONS = __PLUGIN_PERMISSIONS__;
   var DATA_AVAILABLE = __PLUGIN_DATA_AVAILABLE__;
+  // 这个平台支不支持剪贴板监测。与 `DATA_AVAILABLE` 同一个理由注入成字面量：
+  // `ctx.clipboard.canMonitor()` 是**同步**方法（插件用它做顶层特性探测），
+  // 而 RPC 是异步的 —— 等它回来时插件的顶层早就跑完了。
+  var CLIPBOARD_MONITOR_SUPPORTED = __PLUGIN_CLIPBOARD_MONITOR__;
   var SURFACES = __PLUGIN_SURFACES__;
   // 整份清单与设置项快照。两者都是 **JSON 字面量**（源文件里不带引号，宿主直接
   // 把序列化结果替换进来）—— 与上面那几条字符串占位符的区别就在这里：包成字符串
@@ -520,11 +524,34 @@
   // 剪贴板（`ctx.clipboard`）
   // ============================================================
   //
-  // **方法名必须与 in-process 一致**：宿主是 `{ isAvailable, readText, writeText }`，
+  // **方法名必须与 in-process 一致**：宿主是
+  // `{ isAvailable, readText, writeText, canMonitor, subscribe, readFormats, readImage }`，
   // 这里曾经叫 `{ read, write }`。同一类错误在这次迁移里出现三次（还有
   // `ctx.notifications` 与 `ctx.events`），根因都是早先的核对只比**成员名**。
+  //
+  // ============================================================
+  // 这个对象里有两种强制程度完全不同的东西
+  // ============================================================
+  //
+  // 前三个方法用页面自己的 `navigator.clipboard`（`clipboard` 权限，前端强制）；
+  // 后四个**只能经宿主**（`clipboard-monitor` 权限，Rust 由 `require_permission`
+  // 强制）：浏览器 API 没有"剪贴板变了"这个通知，也给不出格式列表与原始图片。
+  // 也就是说这一半**没有**"绕过 ctx 直接调浏览器 API"那条替代路径 —— 与
+  // `ctx.secrets` 同一形态，与上面三个方法相反。
+
+  /** 剪贴板变化的订阅者。见 `PUSH_HANDLERS['clipboard']`。 */
+  var CLIPBOARD_HANDLERS = new Set();
+
   var clipboard = (function () {
     var allowed = has('clipboard');
+    /**
+     * 监测那一半的权限，与 `allowed` **是两项**。
+     *
+     * 分开的理由不是"方法多"：`clipboard` 管的是"插件调一次、读写一次"，而这一项
+     * 管的是"用户在这台机器上复制的每一样东西都会经过这个插件"。风险等级也不同
+     * （宿主把这一项显式覆盖成 high，见 `permissions.rs`）。
+     */
+    var allowedMonitor = has('clipboard-monitor');
 
     var warned = false;
     function warnOnce() {
@@ -532,6 +559,39 @@
       warned = true;
       console.warn(
         '[Modulith] 插件调用了剪贴板，但清单里没有声明 "clipboard" 权限，调用被拒绝（后续同类调用不再重复提示）'
+      );
+    }
+
+    var warnedMonitor = false;
+    function warnMonitorOnce() {
+      if (warnedMonitor) return;
+      warnedMonitor = true;
+      console.warn(
+        '[Modulith] 插件使用了剪贴板监测，但清单里没有声明 "clipboard-monitor" 权限，' +
+          '订阅与读取都被拒绝（后续同类调用不再重复提示）'
+      );
+    }
+
+    var warnedUnsupported = false;
+    function warnUnsupportedOnce() {
+      if (warnedUnsupported) return;
+      warnedUnsupported = true;
+      console.warn(
+        '[Modulith] 订阅了剪贴板变化，但当前平台不支持剪贴板监测（它依赖 Win32 的剪贴板' +
+          '序列号与注册格式，只在 Windows 上可用）。订阅被忽略 —— 调用 ' +
+          'ctx.clipboard.canMonitor() 可以在代码里先判断'
+      );
+    }
+
+    /** 缺权限时统一抛出的那句话：**不返回空结果**，理由见 `readFormats`。 */
+    function deniedMonitor(what) {
+      warnMonitorOnce();
+      return Promise.reject(
+        new Error(
+          '插件未声明 "clipboard-monitor" 权限，无法' +
+            what +
+            '。这一项必须显式声明：它读的是用户在这台电脑上复制的所有内容'
+        )
       );
     }
 
@@ -594,6 +654,97 @@
         if (!guard()) return Promise.reject(new Error('这个插件没有声明 clipboard 权限'));
         if (!environmentReady()) return unavailable();
         return navigator.clipboard.writeText(String(text));
+      },
+
+      // ============================================================
+      // 监测那一半（`clipboard-monitor`）
+      // ============================================================
+
+      /**
+       * 现在能不能监测剪贴板变化。**同步**，用于特性探测。
+       *
+       * `CLIPBOARD_MONITOR_SUPPORTED` 由宿主在入口文档里注入（与权限、主题同一
+       * 条路子）：它是"这个平台有没有那套 Win32 接口"，只有宿主知道。
+       */
+      canMonitor: function () {
+        return allowedMonitor && CLIPBOARD_MONITOR_SUPPORTED;
+      },
+
+      /**
+       * 订阅剪贴板变化。返回取消订阅函数。
+       *
+       * 三处与"读一次"不同的行为（与 in-process 逐条一致）：
+       *   * 订阅**不会**交付剪贴板上已有的内容 —— 只有之后发生的变化；
+       *   * 宿主每 800 ms 看一次序列号，因此一轮最多一条（800 ms 内复制两次只会
+       *     得到后一次）；
+       *   * `change.text` 最多 64 KiB（UTF-8），超出部分被截断且**没有标志位**。
+       */
+      subscribe: function (handler) {
+        if (typeof handler !== 'function') {
+          throw new TypeError('clipboard.subscribe 需要一个函数');
+        }
+        if (!allowedMonitor) {
+          warnMonitorOnce();
+          return function () {};
+        }
+        if (!CLIPBOARD_MONITOR_SUPPORTED) {
+          // 与宿主侧 `pluginClipboard` 同一条规矩：空订阅 + 一次告警，而不是抛错。
+          warnUnsupportedOnce();
+          return function () {};
+        }
+
+        // 宿主的订阅表按**插件 id** 记（一个插件是沙箱还是 in-process 在安装时
+        // 就固定了），因此只有**第一个**处理函数到来时才需要告诉宿主。每加一个就
+        // 通知一次也不算错，但会让宿主那一侧多出若干次无意义的往返。
+        var isFirst = CLIPBOARD_HANDLERS.size === 0;
+        CLIPBOARD_HANDLERS.add(handler);
+        if (isFirst) {
+          rpc('clipboard.subscribe', {}).catch(function (error) {
+            // 失败**必须说出来**：插件会以为自己订阅成功了（`subscribe()` 没有抛），
+            // 而宿主那边一条变化都不会来。这是这一层唯一能察觉这件事的地方。
+            console.warn('[Modulith] 剪贴板订阅没有登记成功，将收不到变化事件：' + error);
+          });
+        }
+
+        var released = false;
+        return function () {
+          // 幂等：插件把它存进 `disposables` 之后又自己调一次是常见写法。
+          if (released) return;
+          released = true;
+          CLIPBOARD_HANDLERS.delete(handler);
+
+          // **只有最后一个处理函数离开时才通知宿主**：宿主的表按插件记，
+          // 提前撤会让同一界面里还留着的处理函数再也收不到变化。
+          if (CLIPBOARD_HANDLERS.size === 0) {
+            rpc('clipboard.unsubscribe', {}).catch(function () {});
+          }
+        };
+      },
+
+      /**
+       * 一次读出剪贴板上的**友好格式名**。不要求先订阅。
+       *
+       * 认不出的格式**不会出现**在结果里（不是带着原始名字出现）—— 应用私有格式名
+       * 常常带着软件名甚至路径，原样交给插件等于送出一份"这台机器装了什么"的指纹。
+       *
+       * **缺权限时抛错，不返回空数组。** 空数组会被读成"剪贴板是空的"，而真实原因
+       * 是没声明权限 —— 那是一种看起来完全正常的错误答案。
+       */
+      readFormats: function () {
+        if (!allowedMonitor) return deniedMonitor('读取剪贴板格式');
+        return rpc('clipboard.formats', {}).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /**
+       * 读剪贴板上的图片（PNG data URL）。**没有图片时返回 `null`**；
+       * 有图片但超限时**抛错**（错误里带着实际体积与上限，而那时 `formats` 里
+       * 仍然会列出 `image/png`）。
+       */
+      readImage: function () {
+        if (!allowedMonitor) return deniedMonitor('读取剪贴板图片');
+        return rpc('clipboard.readImage', {});
       },
     };
   })();
@@ -2000,6 +2151,31 @@
       if (window.__modulithDeliver && payload) window.__modulithDeliver(payload);
     },
 
+    // 剪贴板变化。与 `file-drop` 同一条形状：**扇出给插件自己注册的处理器**，
+    // 而不是转发给某个全局钩子 —— 因为 `ctx.clipboard.subscribe(handler)` 的形态
+    // 就是这样（收一个回调，而不是让插件去挂一个全局名字）。
+    //
+    // 权限**不在这里判**：宿主只在订阅登记成功之后才推（那一步已经过了
+    // `require_permission`），因此走到这里的每一条都是该收的。在这里再查一遍
+    // `PERMISSIONS` 只会让人以为那是一道边界。
+    //
+    // 负载就是 `change` 对象本身（`{ text, formats, at }`），与 in-process 那一条
+    // **逐字相同** —— 两边形状漂开的表现是"同一个插件换个运行位置就读不到内容"。
+    clipboard: function (payload) {
+      if (!payload) return;
+
+      // 快照后再遍历：处理器里退订是合法用法，边遍历边删会让 Set 的迭代行为
+      // 变得难以推理（某些实现会因此跳过一项）。
+      Array.from(CLIPBOARD_HANDLERS).forEach(function (handler) {
+        try {
+          handler(payload);
+        } catch (error) {
+          // 与宿主侧的前端扇出同一条规矩：一个处理器出错不该让别的收不到。
+          console.error('[Modulith] clipboard 处理器抛出异常，已隔离：' + error);
+        }
+      });
+    },
+
     // 文件拖放。**与别的通道不同，这一条不是"转发给某个全局钩子"，而是扇出给
     // 插件自己注册的那些处理器** —— 因为 `ctx.fileDrop` 的形态就是这样：
     // `subscribe(handler)` 收一个回调，而不是让插件去挂一个全局名字。
@@ -2280,6 +2456,100 @@
     return { headers: headers, body: JSON.stringify(data) };
   }
 
+  // ============================================================
+  // 密钥存储（`ctx.secrets`）
+  // ============================================================
+  //
+  // ============================================================
+  // 未声明 `secrets` 时**降级**，与 `dataDir` 同一条规矩
+  // ============================================================
+  //
+  // `pluginRuntime.ts` 的 `pluginSecrets` 有一份明确的 stub：`isAvailable()` 恒
+  // false、`keys()` 空数组，`get` / `set` / `delete` / `clear` 抛一句**能照做的
+  // 话**。这里照抄它的行为，包括"只提示一次" —— 同一份插件在两个运行位置上表现
+  // 不同，正是这次迁移反复栽的那个坑。
+  //
+  // `get` 在降级时也抛错而不是返回 `null`：`null` 是一个看起来完全正常的答案，
+  // 作者会据此以为用户还没配置密钥，然后引导他重新输入一遍 —— 而真正的原因是他
+  // 没有声明权限。
+  var secrets = (function () {
+    if (!has('secrets')) {
+      var warnedMissingSecrets = false;
+      function warnOnce() {
+        if (warnedMissingSecrets) return;
+        warnedMissingSecrets = true;
+        console.warn(
+          '[Modulith] 插件使用了 ctx.secrets，但清单里没有声明 "secrets" 权限，' +
+            '调用被拒绝（后续同类调用不再重复提示）'
+        );
+      }
+
+      var denied = function () {
+        warnOnce();
+        return Promise.reject(new Error('插件未声明 "secrets" 权限，无法读写密钥'));
+      };
+
+      return {
+        isAvailable: function () {
+          warnOnce();
+          return false;
+        },
+        get: denied,
+        set: denied,
+        delete: denied,
+        /** 空列表在这里是**如实的答案**：它一个键都拿不到 */
+        keys: function () {
+          warnOnce();
+          return Promise.resolve([]);
+        },
+        clear: denied,
+      };
+    }
+
+    // ============================================================
+    // RPC 是沙箱插件够得着密钥的**唯一**通道
+    // ============================================================
+    //
+    // 密钥表落在插件数据目录**之外**（`<app_data_dir>/plugin_secrets/<id>.json`），
+    // 因此这个文档里没有任何一条路径能拼出它：数据通道 `/<id>/data/...` 被 chroot
+    // 在数据目录之内，而 `..`、盘符与符号链接都由宿主的 `data_dir::resolve` 拒绝。
+    // 换句话说下面这五个方法不是"方便封装"，它们就是这项能力的全部入口。
+    //
+    // 加密的强度与代价见宿主侧 `plugins/secrets.rs` 的文件头：密文由**本机硬件
+    // 指纹**派生，换机器之后解不开 —— 那时 `get` 会抛错，而不是返回 `null`。
+    return {
+      /** 权限是否已声明。**同步**布尔，与 `Modulith.has('secrets')` 同义。 */
+      isAvailable: function () {
+        return true;
+      },
+
+      /** 读一个键。未知的键返回 `null`；密文解不开时抛错（值仍在磁盘上）。 */
+      get: function (key) {
+        return rpc('secrets.get', { key: key });
+      },
+
+      set: function (key, value) {
+        return rpc('secrets.set', { key: key, value: value });
+      },
+
+      delete: function (key) {
+        return rpc('secrets.delete', { key: key });
+      },
+
+      /** 列出**键名**。值一个都不返回。 */
+      keys: function () {
+        return rpc('secrets.keys', {}).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /** 清空**本插件**的密钥。别的插件的密钥不受影响。 */
+      clear: function () {
+        return rpc('secrets.clear', {});
+      },
+    };
+  })();
+
   var Modulith = {
     dataDir: dataDir,
      db: db,
@@ -2526,6 +2796,15 @@
         return rpc('storage.clear', {});
       },
     },
+
+    /**
+     * 加密的密钥存储。**凭据用这个，不要用 `storage`。**
+     *
+     * 两者的保证完全不同：存储是明文、插件自己读得到、进备份；密钥是加密的、落在
+     * 插件数据目录之外、不进备份，代价是换机器之后解不开。需要跟着用户走的令牌，
+     * 那就不是密钥 —— 见上面 `secrets` 工厂的说明。
+     */
+    secrets: secrets,
 
 
     http: {

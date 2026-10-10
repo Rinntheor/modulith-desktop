@@ -68,7 +68,7 @@ pub enum PermissionRisk {
 
 /// 宿主对该权限的实际强制程度。
 ///
-/// 这个字段存在的理由是：文档里"哪七项已强制"是一句散文，代码里则是散落的
+/// 这个字段存在的理由是：文档里"哪几项已强制"是一句散文，代码里则是散落的
 /// `require_permission` 调用，两者会漂移。把它变成数据之后，界面才能如实
 /// 标注"声明了但宿主暂不强制" —— 让用户以为某项权限受管控、而它其实不受管控，
 /// 比不告诉他更危险，因为他会基于一个错误的前提做决定。
@@ -152,7 +152,7 @@ pub struct PermissionDescriptor {
 /// "不可逆"就升级为高危。旧写法只判断 `effect == Write && !reversible`，会把
 /// 这类情况一并升到 high。
 ///
-/// 另一处刻意保留的冗余：当前 12 项权限中 `Execute` 规则不会单独命中 ——
+/// 另一处刻意保留的冗余：当前 15 项权限中 `Execute` 规则不会单独命中 ——
 /// native-module / dev-tools / process-spawn 三项都是 execute，但同时是 System
 /// 作用域，已被更高优先级的规则拦下。保留它是因为两者正交：将来的代码执行能力
 /// 若作用于应用内而非系统层面，它必须自动成为 high，而不需要有人记得回来补规则。
@@ -309,7 +309,8 @@ impl PluginPermission {
                 scope: S::App,
                 reversible: true,
                 enforcement: F::Frontend,
-                // 全表唯一的覆盖项：公式缺一个"混淆代理"轴，见下
+                // 覆盖项之一（另一个是 clipboard-monitor，理由不同）：公式缺一个
+                // "混淆代理"轴，见下
                 risk_override: Some(RiskOverride {
                     risk: PermissionRisk::Medium,
                     reason: "可构成混淆代理：没有文件权限的插件能借有文件权限的插件代为操作，从而绕过权限模型",
@@ -341,6 +342,63 @@ impl PluginPermission {
                 reversible: false,
                 enforcement: F::Host,
                 risk_override: None,
+            },
+            Self::Secrets => Spec {
+                label: "密钥存储",
+                // 这段文字会显示在安装确认页上，因此每一句都得是真的。
+                //
+                // "不进备份" 由 `backup/categories.rs` 的路径白名单保证：那是一份
+                // 白名单，`plugin_secrets/` 不在里面，因此导出端不可能把它打进包里
+                // （导入端也只承认白名单里的名字）。
+                //
+                // "换机器解不开" 是密钥由硬件指纹派生的直接后果 —— 见 `secrets.rs`。
+                // 这句话必须写出来：只写"加密存储"，用户会把它理解成系统钥匙串，
+                // 于是既高估了它在共享机器上的强度，也低估了它在换机后的代价
+                // （那时密钥解不开，而不是"重新输入一次"）。
+                //
+                // 风险是 `low`：作用域只有插件自己，且可逆（`clear` 能清掉）。
+                // 它买到的不是"防住这台机器上的人"，这一点由上面那句"不是系统
+                // 钥匙串"承担 —— 权限列表的等级与描述必须说同一件事。
+                description: "把插件的密钥单独加密存在插件目录之外，不进备份。密钥由本机硬件特征派生 —— 换机器或换硬件后这些密钥无法解密。它不是系统钥匙串",
+                effect: E::None,
+                scope: S::Plugin,
+                reversible: true,
+                enforcement: F::Host,
+                risk_override: None,
+            },
+            Self::ClipboardMonitor => Spec {
+                label: "剪贴板监测",
+                // 这段文字会显示在安装确认页上，因此每一句都得是真的。
+                //
+                // 三件事必须都在里面，而且**不能软化**：
+                //
+                //   1. **"这台机器上复制的任何东西"**。这一项与 `clipboard` 的区别
+                //      不是"多一个方法"，而是作用面从"插件调一次"变成"用户在任何
+                //      程序里复制的每一样东西"。写"读取剪贴板"会让用户以为它和上面
+                //      那项差不多 —— 那是这一页最不该出现的一种误导。
+                //   2. **"剪贴板管理器标记为敏感的会被跳过"**。它**是**一个真实的
+                //      保护（密码管理器都会挂那几个格式），但它靠对方合作，因此这句
+                //      话必须写成"标记过的会被跳过"，而不是"敏感内容不会被读到"。
+                //   3. **"只在应用运行时"**。宿主是一个轮询线程，应用关掉它就不存在
+                //      了 —— 用户需要知道这一点才能对"要不要开着这个应用"有判断。
+                //
+                // 风险推导出来是 `medium`（`Read` + `Device`），这里**显式覆盖成
+                // `high`**：推导公式缺一根"作用面有多广"的轴，而这一项与
+                // `filesystem-read`（也是 Read + Device，也是 medium）的差别恰好
+                // 就在那根轴上 —— 后者只读用户当场选中的文件，前者读的是用户
+                // **在所有程序里**复制的一切。理由写在 `risk_override` 里。
+                description: "在本应用运行期间，可以持续看到你在这台电脑上复制的任何内容（含密码、验证码、私钥），用来做剪贴板历史。**复制它的程序主动标记为敏感的内容会被跳过**（Windows 剪贴板约定）—— 但那只在对方配合时有效。应用退出后监测停止",
+                effect: E::Read,
+                scope: S::Device,
+                reversible: true,
+                // 后端强制：整条链路（订阅、一次性读格式、读图片）都在 Rust 侧，
+                // 前端只是转发。与 `clipboard` 不同 —— 那一项的前端强制之所以弱，
+                // 是因为浏览器 API 本来就在同一页面上；这里没有任何等价的绕行路径。
+                enforcement: F::Host,
+                risk_override: Some(RiskOverride {
+                    risk: PermissionRisk::High,
+                    reason: "公式里没有\"作用面有多广\"这根轴：这一项与 filesystem-read 同为 Read + Device，但它读的不是用户当场选中的某一个文件，而是用户在这台机器上**所有程序里**复制的每一样东西，其中包含密码与验证码",
+                }),
             },
         }
     }
@@ -444,6 +502,17 @@ mod tests {
             R::High,
             F::Host,
         ),
+        ("secrets", E::None, S::Plugin, true, R::Low, F::Host),
+        // 推导公式给的是 `Medium`（`Read` + `Device`），这里是**显式覆盖**成
+        // `High` —— 理由见 `ClipboardMonitor` 的 `risk_override`。
+        (
+            "clipboard-monitor",
+            E::Read,
+            S::Device,
+            true,
+            R::High,
+            F::Host,
+        ),
     ];
 
     #[test]
@@ -492,9 +561,9 @@ mod tests {
         assert_eq!(seen.len(), PluginPermission::ALL.len());
     }
 
-    /// 推导公式本身的行为，与 12 项权限的具体取值无关。
+    /// 推导公式本身的行为，与 15 项权限的具体取值无关。
     ///
-    /// 这一层测试不可省：只测快照的话，公式可以在 12 项权限恰好覆盖不到的地方
+    /// 这一层测试不可省：只测快照的话，公式可以在 15 项权限恰好覆盖不到的地方
     /// 出错，而快照依然全绿。
     #[test]
     fn derive_risk_follows_documented_precedence() {
@@ -532,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn only_plugin_communicate_is_overridden() {
+    fn only_the_documented_permissions_are_overridden() {
         let overridden: Vec<&str> = PluginPermission::ALL
             .iter()
             .map(|p| p.descriptor())
@@ -540,10 +609,13 @@ mod tests {
             .map(|d| d.id)
             .collect();
 
+        // 这一条**故意写成逐项列举**而不是断言"数量 <= 2"：覆盖项是公式覆盖不到
+        // 时的逃生口，因此"多了一个"必须让人看见是哪一个，而不是只看见数字变了。
         assert_eq!(
             overridden,
-            vec!["plugin-communicate"],
-            "覆盖项集合发生变化。覆盖是公式覆盖不到时的逃生口，应当少而明确"
+            vec!["plugin-communicate", "clipboard-monitor"],
+            "覆盖项集合发生变化。覆盖是公式覆盖不到时的逃生口，应当少而明确 —— \
+             新增一个就必须在这里具名，并写清它缺的是哪一根轴"
         );
     }
 
@@ -586,7 +658,15 @@ mod tests {
         // 检查点）。它此前是 `None` 的理由是"缺授权模型"，而不是"这条通道不存在"
         // —— `ctx.files` 之后，后者也不成立了：需要写用户目录的插件现在有通道，
         // 而那条通道受 Rust 侧 `require_permission` 约束。
-        assert_eq!(count(F::Host), 7, "后端强制的权限数量变化");
+        //
+        // 7 → 8：新增 `secrets`（`ctx.secrets`）。它由 Rust 侧强制，而且理由比
+        // 上面几项更硬：密钥表**只有** RPC 与命令层够得着（插件 JS 连它的路径都
+        // 拼不出来），因此"没声明就用不了"在这里是字面意义上的事实。
+        //
+        // 8 → 9：新增 `clipboard-monitor`（`ctx.clipboard` 的订阅/读格式/读图片）。
+        // 它同样是"只有 Rust 够得着"：Win32 的剪贴板序列号与注册格式在宿主进程里，
+        // 前端那一条 `navigator.clipboard` 读不到变化，也读不到别的进程放的格式。
+        assert_eq!(count(F::Host), 9, "后端强制的权限数量变化");
         assert_eq!(count(F::Frontend), 3, "前端强制的权限数量变化");
         assert_eq!(count(F::None), 3, "未强制的权限数量变化");
     }

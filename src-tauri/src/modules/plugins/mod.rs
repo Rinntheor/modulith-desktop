@@ -3,6 +3,7 @@
 
 pub mod commands;
 pub mod background_manifest;
+pub mod clipboard;
 pub mod data_dir;
 pub mod data_root;
 pub mod db;
@@ -13,6 +14,7 @@ pub mod permissions;
 pub mod quota;
 pub mod rpc;
 pub mod safe_mode;
+pub mod secrets;
 pub mod sandbox;
 pub mod signature;
 pub mod shortcuts;

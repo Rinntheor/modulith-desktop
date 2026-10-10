@@ -232,7 +232,7 @@ const HOST_MEMBERS: readonly BoundaryMember[] = [
 // 回答过"它跨不跨得过去"。而 `ctx` 恰恰是边界的主体 —— 权限的实际载体
 // （`http` / `launcher` / `icons` / `shell` / `audio`）全在这里。
 //
-// 值得单独指出的是那 12 个 `handle`：它们**不是资源句柄，而是能力对象**。
+// 值得单独指出的是那 16 个 `handle`：它们**不是资源句柄，而是能力对象**。
 // `ctx.storage` 不是一个"存储连接"，它是一个由若干函数组成的对象。因此把它们标成
 // `handle` 说的是"它代表的是一组消息往返" —— **不是**"它今天已经能跨过去了"。
 // 今天它一个都跨不过去，因为它是个对象。v2 要把它换成 JSON-RPC 式的代理：
@@ -330,7 +330,7 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     name: 'clipboard',
     kind: 'handle',
     migration: 'rpc',
-    note: '读写系统剪贴板。需要 clipboard，**前端强制** —— 剪贴板是浏览器 API，插件本来就能直接调 navigator.clipboard，因此后端加门不会让强制变强',
+    note: '读写系统剪贴板，并（另一个权限）观察它的变化。读写需要 clipboard，**前端强制** —— 那三个方法调的是浏览器 API，后端加门不会让强制变强；canMonitor / subscribe / readFormats / readImage 需要 clipboard-monitor，**Rust 强制** —— 浏览器 API 没有变化通知，也没有格式列表与原始图片，因此那一半绕不过去',
   },
   {
     name: 'settings',
@@ -344,13 +344,19 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     migration: 'message',
     note: '收尾登记。add 的入参是函数，与 onDeactivate 同一个问题',
   },
+  {
+    name: 'secrets',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '加密的密钥存储。需要 secrets 权限，Rust 侧强制；密文落在插件数据目录之外，插件代码寻址不到',
+  },
 ];
 
 // ============================================================
 // 能力方法
 // ============================================================
 //
-// 这一层是 v2 的真实工作量。12 个能力对象标为 `handle` 只是说"它代表消息往返"；
+// 这一层是 v2 的真实工作量。16 个能力对象标为 `handle` 只是说"它代表消息往返"；
 // 能不能真的换成往返，取决于**每个方法**的参数与返回值。
 //
 // `io` 记的是返回值与回调参数的形态（参数里的普通值不单独记 —— 字符串、数字、
@@ -459,9 +465,16 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
     { name: 'pick', io: 'value', migration: 'as-is', note: '返回 PickedAudio（name / dataUrl / bytes）或 null，是纯数据' },
   ],
   clipboard: [
+    // `ctx.clipboard` 上有**两种强制程度不同**的东西，登记时必须分开看：
+    // 前三个方法调的是页面自己的 `navigator.clipboard`（前端强制，需要
+    // `clipboard`），后四个全部要经宿主（Rust 强制，需要 `clipboard-monitor`）。
     { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔：权限已声明**且**环境提供 navigator.clipboard' },
     { name: 'readText', io: 'value', migration: 'as-is', note: '返回 Promise<string>。**可能被浏览器拒绝**（页面未聚焦 / 剪贴板被独占），调用方应有回退' },
     { name: 'writeText', io: 'value', migration: 'as-is', note: '返回 Promise<void>。回退路径用 document.execCommand，需要用户手势' },
+    { name: 'canMonitor', io: 'value', migration: 'as-is', note: '同步返回布尔：声明了 clipboard-monitor **且**这个平台支持（只有 Windows 有那套 Win32 接口）' },
+    { name: 'subscribe', io: 'callable', migration: 'message', note: '**入参是变化处理函数、返回值是取消订阅函数**。与 fileDrop.subscribe 同一条路：v2 要改成"宿主推变化、插件按 ID 认领"。宿主每 800 ms 看一次剪贴板序列号，因此一轮最多一条' },
+    { name: 'readFormats', io: 'value', migration: 'as-is', note: '返回 Promise<string[]>，友好格式名；认不出的格式不出现（应用私有格式名会泄露这台机器装了什么）' },
+    { name: 'readImage', io: 'value', migration: 'as-is', note: '返回 Promise<string \\| null>（PNG data URL）。**没有图片是 null，有图但超限是抛错** —— 后者混成 null 会让作者写出一个永远走不到的分支' },
   ],
   settings: [
     { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔' },
@@ -473,6 +486,17 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
   disposables: [
     { name: 'add', io: 'callable', migration: 'message', note: '**入参是清理函数、返回值是提前执行函数**。v2 要把清理改成"宿主记录插件持有什么"，而不是"插件交出一个函数"' },
     { name: 'size', io: 'value', migration: 'as-is', note: '同步返回数字' },
+  ],
+  secrets: [
+    // `ctx.secrets` 是加密的密钥表。跨边界方式与 `storage` 同类（来回都是字符串），
+    // 但有一处必须写清楚：`get` **解不开时抛错而不是返回 null**。返回 null 会被读成
+    // "这个键从来没存过"，而数据其实还在磁盘上 —— 那是最没有出路的一种失败。
+    { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔：清单里声明了 secrets 权限没有' },
+    { name: 'get', io: 'value', migration: 'as-is', note: '返回 string 或 null；**密文解不开时抛错**（换机器/文件被改过），错误里带着密文仍在磁盘上这件事' },
+    { name: 'set', io: 'value', migration: 'as-is', note: '返回 Promise<void>；密钥名 1..=128 字符、值最多 4096 字节、每插件 64 个键' },
+    { name: 'delete', io: 'value', migration: 'as-is', note: '返回 Promise<void>；删除不存在的键也是成功（幂等）' },
+    { name: 'keys', io: 'value', migration: 'as-is', note: '返回 string[]，**只有键名、永远没有值**' },
+    { name: 'clear', io: 'value', migration: 'as-is', note: '返回 Promise<void>；只清本插件的密钥' },
   ],
 };
 

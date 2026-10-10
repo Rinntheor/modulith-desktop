@@ -108,6 +108,19 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 # 分别是进程树枚举、进程内存计数、以及按 pid 打开进程。
 # 同样刻意不用 WMI —— 为了六个数字拖进一整套 COM 不划算。
 #
+# `Win32_System_DataExchange` 供剪贴板监测使用（plugins/clipboard.rs）：
+# 剪贴板那一族 API（`GetClipboardSequenceNumber` / `OpenClipboard` /
+# `GetClipboardData` / `RegisterClipboardFormatW`）都在这个模块里。
+#
+# 不用 `tauri-plugin-clipboard-manager`：它覆盖的是"读一次、写一次"，而这里真正
+# 需要的是**"剪贴板变了没有"** —— 那件事只有 `GetClipboardSequenceNumber` 能回答
+# （一个会自增的整数，取它不需要打开剪贴板，因此轮询几乎不花钱）。为了这一个函数
+# 拖进一整套插件不划算，而少了它就只能靠"反复读全文再比较"，那会持续占用剪贴板
+# 并与其他程序的剪贴板操作打架。
+#
+# `Win32_System_Memory` 与它成对：`GetClipboardData` 给出的是**全局内存句柄**，
+# 要拿到里面的字节必须先 `GlobalLock`。
+#
 # `webview2-com` + `windows-core` 供 WebView2 的内存目标等级使用
 # （settings/memory_level.rs）：`SetMemoryUsageTargetLevel` 定义在
 # `ICoreWebView2_19` 上，需要 `cast` 到那个接口，而 `cast` 来自
@@ -123,6 +136,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_Registry",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

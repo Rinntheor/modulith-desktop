@@ -115,9 +115,9 @@ pnpm tauri build
 
 **插件**是一个 zip 容器，含清单 `manifest.json` 与一个自执行代码包。代码包在运行时由宿主注入执行，通过 `window.Modulith.registerModule()` 注册界面，通过 `Modulith.createContext()` 取得绑定的存储、网络、日志、通知与事件服务。
 
-插件与宿主运行在同一个 WebView 中，因此**安装插件视同运行本机程序**。权限声明里**真正被检查的目前有七项**：`storage`、`network`、`network-external`、`process-spawn`、`filesystem-read`、`notification`、`plugin-communicate`；其余取值不影响任何行为，仅作意图声明。
+插件与宿主运行在同一个 WebView 中，因此**安装插件视同运行本机程序**。权限声明里**真正被检查的目前有十二项** —— 后端强制九项：`storage`、`plugin-data`、`network`、`network-external`、`process-spawn`、`filesystem-read`、`filesystem-scoped`、`secrets`、`clipboard-monitor`；前端强制三项：`notification`、`plugin-communicate`、`clipboard`。其余取值不影响任何行为，仅作意图声明。
 
-而且这七项买到的是**「权限列表诚实」而不是隔离** —— 插件直接 `invoke('plugin_storage_get', { id: '别的插件', key: 'x' })` 仍能读取他人数据，因为后端在「插件与宿主共享同一个 JS 上下文」的模型下无法知道调用者是谁。逐项边界与剩余缺口见[已知问题与技术债](docs/06-项目/已知问题/现行问题.md)第 4.1 节，模型本身的说明见[插件系统架构](docs/02-开发指南/插件开发/插件系统架构.md)第 6 节。
+而且这十二项买到的是**「权限列表诚实」而不是隔离** —— 插件直接 `invoke('plugin_storage_get', { id: '别的插件', key: 'x' })` 仍能读取他人数据，因为后端在「插件与宿主共享同一个 JS 上下文」的模型下无法知道调用者是谁。逐项边界与剩余缺口见[已知问题与技术债](docs/06-项目/已知问题/现行问题.md)第 4.1 节，模型本身的说明见[插件系统架构](docs/02-开发指南/插件开发/插件系统架构.md)第 6 节。
 
 ## 文档
 

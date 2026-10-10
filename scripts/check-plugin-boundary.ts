@@ -344,7 +344,7 @@ section('清单自洽');
 // 4. 能力方法：逐个登记，并对着运行时实现核对
 // ============================================================
 //
-// 这一层是整份检查里**唯一真正对着 v2 的**：`ctx` 上的 12 个能力对象全部标为
+// 这一层是整份检查里**唯一真正对着 v2 的**：`ctx` 上的 16 个能力对象全部标为
 // `handle`，而"换成代理"可行的前提就是"每个方法的参数与返回值都是值"。
 //
 // 两件事分开做，因为它们会失败的原因不同：
@@ -379,6 +379,7 @@ section('能力方法');
     { member: 'settings', factory: 'pluginSettingsAPI', path: ['return'] },
     { member: 'dataDir', factory: 'pluginDataDir', path: ['return'] },
     { member: 'db', factory: 'pluginDatabase', path: ['return'] },
+    { member: 'secrets', factory: 'pluginSecrets', path: ['return'] },
     // 唯一一个没有独立工厂的：它是在上下文工厂的返回对象里直接写出来的字面量
     { member: 'disposables', factory: 'createContextFor', path: ['return', 'disposables'] },
   ];
@@ -511,8 +512,8 @@ section('迁移面');
     `ctx 上没有函数形态的**成员**（当前 ${contextCallables.length} 个）`
   );
   check(
-    contextHandles.length === 15,
-    `ctx 上有 15 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
+    contextHandles.length === 16,
+    `ctx 上有 16 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
   );
   // 这一条是 v1.5 最该被看见的数字：方法层面的真实工作量。
   check(

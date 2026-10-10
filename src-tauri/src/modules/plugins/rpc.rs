@@ -200,6 +200,51 @@ fn parse_stored(raw: &str) -> Option<Value> {
     serde_json::from_str(raw).ok()
 }
 
+/// 校验 `secrets` 权限，返回这个插件的密钥目录。
+///
+/// 五条密钥 RPC 都要做同一件事，而漏掉任意一处的后果是"没声明也能读别人的凭据"
+/// （路径是按插件 id 拼的）—— 那种缺陷在每一条单独读起来都像是对的。因此这一步
+/// 只有这一处实现。
+///
+/// 权限守卫在**内部的作用域里**就被丢掉，`await` 全部发生在它之外：持着读锁去
+/// 做文件 IO，会让一次写密钥把整个插件系统堵住（`notify` 分支外的其它 `await`
+/// 也遵循同一条纪律）。
+async fn checked_secrets_dir<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::secrets::require_permission(&manager, plugin_id)?;
+    }
+
+    super::secrets::dir_for(app)
+}
+
+/// 校验 `clipboard-monitor` 权限（沙箱路径）。
+///
+/// 与 `checked_secrets_dir` 同一条纪律：权限守卫在**内部的作用域里**就被丢掉，
+/// `await` 全部发生在它之外 —— 持着读锁去碰剪贴板会让一次读取把整个插件系统堵住。
+async fn checked_clipboard_monitor<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+) -> Result<(), String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::clipboard::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
 /// 执行一次 ctx 调用。
 ///
 /// 参数与返回都是 `serde_json::Value` —— 这一层不认识 HTTP，也不认识 stdio。
@@ -1446,6 +1491,172 @@ pub async fn dispatch<R: Runtime>(
             json_value(serde_json::json!(list))
         }
 
+        // ---- 密钥（ctx.secrets）---------------------------------------------
+        //
+        // ============================================================
+        // 为什么它必须走 RPC，而不能像 dataDir 那样有一条字节通道
+        // ============================================================
+        //
+        // 密钥表落在插件数据目录**之外**（`secrets.rs` 文件头写了三条理由）。
+        // 插件 JS 因此既拼不出它的路径，也没有任何命令能读到它 —— 也就是说，
+        // 下面这五条是沙箱插件够得着密钥的**唯一**通道。
+        //
+        // 这条通道上 `require_permission` 就是这项能力的全部边界。注意它挡的**不是**
+        // 冒充：这一侧的身份由 webview 标签给定（不是调用方传来的 id），一个插件
+        // 本来就够不到别人的密钥文件。它挡的是"没声明 `secrets` 的插件照样能把凭据
+        // 存下来" —— 那样权限列表在这一项上就是空的。
+
+        "secrets.get" => {
+            let Some(key) = arg_str(args, "key") else {
+                return rpc_error("缺少 key");
+            };
+
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::get(&dir, plugin_id, key) {
+                // 未知的键是 `null`，不是错误 —— 调用方要能区分"没存过"与"读不出来"
+                // （后者是 `Err`，而且消息里带着密文仍在磁盘上这件事）。
+                Ok(value) => json_value(serde_json::json!(value)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.set" => {
+            let Some(key) = arg_str(args, "key") else {
+                return rpc_error("缺少 key");
+            };
+            let Some(value) = arg_str(args, "value") else {
+                return rpc_error("缺少 value");
+            };
+
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::set(&dir, plugin_id, key, value) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.delete" => {
+            let Some(key) = arg_str(args, "key") else {
+                return rpc_error("缺少 key");
+            };
+
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::delete(&dir, plugin_id, key) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.keys" => {
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::keys(&dir, plugin_id) {
+                Ok(keys) => json_value(serde_json::json!(keys)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.clear" => {
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::clear(&dir, plugin_id) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        // ---- 剪贴板监测（`ctx.clipboard` 的订阅 / 读格式 / 读图片）-----------
+        //
+        // ============================================================
+        // 为什么这四条与 `ctx.clipboard.readText` 的关系是"互补"而不是"重复"
+        // ============================================================
+        //
+        // `readText` / `writeText` 用的是**页面自己的** `navigator.clipboard`，
+        // 因此它们与宿主无关（那一项在权限表里是前端强制，理由见 `permissions.rs`）。
+        // 下面这四条做不到那件事：浏览器 API 没有"剪贴板变了"这个通知，
+        // 也不给格式列表与原始图片。**只有宿主进程里的 Win32 能回答这三个问题** ——
+        // 所以它们必须走 RPC，而且只能在 Rust 侧强制。
+        //
+        // 身份这一侧仍然是"webview 标签给定的 plugin_id"，因此下面几条挡的**不是**
+        // 冒充（一个插件本来就够不到别人的界面），而是"没声明 `clipboard-monitor`
+        // 的插件照样能订阅"。至于"这条订阅属于哪一个界面"，由 `surface` 参数带上 ——
+        // 界面关闭时它就是撤销订阅的判据（见 `sandbox::close_surface`）。
+
+        "clipboard.subscribe" => {
+            let Some(surface) = surface else {
+                return rpc_error(
+                    "ctx.clipboard.subscribe 需要界面上下文：后台插件没有界面可以承载\
+                     这条订阅（也就没有界面关闭时的撤销点）",
+                );
+            };
+
+            if let Err(e) = checked_clipboard_monitor(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+            if !super::clipboard::is_supported() {
+                return rpc_error(super::clipboard::UNSUPPORTED_PLATFORM);
+            }
+
+            let Some(state) = app.try_state::<super::clipboard::ClipboardMonitor>() else {
+                return rpc_error("剪贴板监测表尚未就绪");
+            };
+
+            match state.subscribe(app, plugin_id, Some(surface)) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        // 撤销**不做权限检查**：一条撤不掉的订阅就是一个泄漏（它会一直让轮询线程
+        // 活着）。与 `secrets` 那几条不同，这里没有"没权限就不能撤销"这种说法。
+        "clipboard.unsubscribe" => {
+            if let (Some(state), Some(surface)) = (
+                app.try_state::<super::clipboard::ClipboardMonitor>(),
+                surface,
+            ) {
+                state.unsubscribe(plugin_id, Some(surface));
+            }
+            json_ok()
+        }
+
+        "clipboard.formats" => {
+            if let Err(e) = checked_clipboard_monitor(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+            match super::clipboard::read_formats() {
+                Ok(formats) => json_value(serde_json::json!(formats)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "clipboard.readImage" => {
+            if let Err(e) = checked_clipboard_monitor(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+            match super::clipboard::read_image() {
+                Ok(image) => json_value(serde_json::json!(image)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
     }
 }
@@ -1552,6 +1763,21 @@ pub const SHORTCUT_TRIGGERED: &str = "modulith://plugin-shortcut";
 
 /// 插件请求宿主更新它的状态指示（徽标 / 进度 / 启动占位）。
 pub const PLUGIN_UI: &str = "modulith://plugin-ui";
+
+/// 宿主观察到一次剪贴板变化时，广播给 **in-process** 插件的事件名。
+///
+/// ============================================================
+/// 为什么是一条广播，而不是让前端自己去轮询
+/// ============================================================
+///
+/// 变化是**宿主进程里的 Win32** 观察到的（`GetClipboardSequenceNumber`），前端那
+/// 一侧没有任何等价的能力：`navigator.clipboard` 只回答"现在是什么"，不回答
+/// "变过没有"。因此方向只能是宿主 → 前端，而前端接住之后按 `pluginId` 派发给
+/// 插件注册的处理函数（见 `pluginClipboardMonitor.ts`）。
+///
+/// 沙箱插件不走这条：它的回调在另一个 realm，由宿主直接推进它的界面
+/// （`clipboard::PUSH_CHANNEL`）。两条都保留，与 `PLUGIN_UI` / 下载进度同一形态。
+pub const CLIPBOARD_CHANGE: &str = "modulith://plugin-clipboard-change";
 
 /// 下载进度广播给**前端**时的事件名。
 ///
