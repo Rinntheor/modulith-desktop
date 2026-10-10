@@ -120,6 +120,7 @@ export async function createPluginHost(): Promise<PluginHost> {
   const manifestOverrides = new Map<string, Record<string, unknown>>();
 
   const storage = new Map<string, Map<string, string>>();
+  const secrets = new Map<string, Map<string, string>>();
   const backendCalls: string[] = [];
 
   // ------------------------------------------------------------
@@ -173,6 +174,20 @@ export async function createPluginHost(): Promise<PluginHost> {
     return created;
   };
 
+  /**
+   * 密钥与 `ctx.storage` **分开的两张表**，即使夹具里两者都是 Map。
+   *
+   * 合成一张会让"插件把凭据写进 storage、而不是 secrets"这件事在夹具里看不出来 ——
+   * 而那正是这个 API 存在的理由。
+   */
+  const secretBucket = (pluginId: string): Map<string, string> => {
+    const existing = secrets.get(pluginId);
+    if (existing) return existing;
+    const created = new Map<string, string>();
+    secrets.set(pluginId, created);
+    return created;
+  };
+
   const installedPlugins = () =>
     [...fixtures.values()]
       .filter((fixture) => active.has(fixture.id))
@@ -207,6 +222,21 @@ export async function createPluginHost(): Promise<PluginHost> {
     const permissions = (manifestOf(pluginId)?.permissions as string[] | undefined) ?? [];
     if (!permissions.includes('storage')) {
       throw new Error(`插件 "${pluginId}" 的清单里没有声明 "storage" 权限，命令被拒绝`);
+    }
+  };
+
+  /**
+   * 与 Rust 侧 `secrets.rs::require_permission` 对齐。
+   *
+   * 与 `requireStorage` 同一条纪律（桩后端必须如实拒绝），但这里还多一层理由：
+   * 密钥的实现在真实宿主里**只有 RPC 与命令层够得着**，因此"没声明就用不了"是
+   * 这一项的全部边界 —— 一个不检查权限的桩会让夹具测出"没声明也能存密钥"，
+   * 而那正是真实运行时不成立的事。
+   */
+  const requireSecrets = (pluginId: string): void => {
+    const permissions = (manifestOf(pluginId)?.permissions as string[] | undefined) ?? [];
+    if (!permissions.includes('secrets')) {
+      throw new Error(`插件 "${pluginId}" 的清单里没有声明 "secrets" 权限，命令被拒绝`);
     }
   };
 
@@ -287,6 +317,38 @@ export async function createPluginHost(): Promise<PluginHost> {
     plugin_storage_clear: ({ id }) => {
       requireStorage(String(id));
       bucket(String(id)).clear();
+      return null;
+    },
+
+    // 密钥存储（`ctx.secrets`）。夹具里是**明文**的一张表：这里要测的是"权限与调用
+    // 形状对不对"，而不是密码学 —— 加解密由 `secrets.rs` 的单测对着真实 crypto
+    // 覆盖（包括"解不开时抛错而不是返回 null"那条）。在桩里再造一套假的加密只会
+    // 多一处会漂的副本。
+    plugin_secrets_get: ({ id, key }) => {
+      requireSecrets(String(id));
+      return secretBucket(String(id)).get(String(key)) ?? null;
+    },
+
+    plugin_secrets_set: ({ id, key, value }) => {
+      requireSecrets(String(id));
+      secretBucket(String(id)).set(String(key), String(value));
+      return null;
+    },
+
+    plugin_secrets_delete: ({ id, key }) => {
+      requireSecrets(String(id));
+      secretBucket(String(id)).delete(String(key));
+      return null;
+    },
+
+    plugin_secrets_keys: ({ id }) => {
+      requireSecrets(String(id));
+      return [...secretBucket(String(id)).keys()];
+    },
+
+    plugin_secrets_clear: ({ id }) => {
+      requireSecrets(String(id));
+      secretBucket(String(id)).clear();
       return null;
     },
 

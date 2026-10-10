@@ -68,7 +68,7 @@ pub enum PermissionRisk {
 
 /// 宿主对该权限的实际强制程度。
 ///
-/// 这个字段存在的理由是：文档里"哪七项已强制"是一句散文，代码里则是散落的
+/// 这个字段存在的理由是：文档里"哪几项已强制"是一句散文，代码里则是散落的
 /// `require_permission` 调用，两者会漂移。把它变成数据之后，界面才能如实
 /// 标注"声明了但宿主暂不强制" —— 让用户以为某项权限受管控、而它其实不受管控，
 /// 比不告诉他更危险，因为他会基于一个错误的前提做决定。
@@ -152,7 +152,7 @@ pub struct PermissionDescriptor {
 /// "不可逆"就升级为高危。旧写法只判断 `effect == Write && !reversible`，会把
 /// 这类情况一并升到 high。
 ///
-/// 另一处刻意保留的冗余：当前 12 项权限中 `Execute` 规则不会单独命中 ——
+/// 另一处刻意保留的冗余：当前 14 项权限中 `Execute` 规则不会单独命中 ——
 /// native-module / dev-tools / process-spawn 三项都是 execute，但同时是 System
 /// 作用域，已被更高优先级的规则拦下。保留它是因为两者正交：将来的代码执行能力
 /// 若作用于应用内而非系统层面，它必须自动成为 high，而不需要有人记得回来补规则。
@@ -342,6 +342,29 @@ impl PluginPermission {
                 enforcement: F::Host,
                 risk_override: None,
             },
+            Self::Secrets => Spec {
+                label: "密钥存储",
+                // 这段文字会显示在安装确认页上，因此每一句都得是真的。
+                //
+                // "不进备份" 由 `backup/categories.rs` 的路径白名单保证：那是一份
+                // 白名单，`plugin_secrets/` 不在里面，因此导出端不可能把它打进包里
+                // （导入端也只承认白名单里的名字）。
+                //
+                // "换机器解不开" 是密钥由硬件指纹派生的直接后果 —— 见 `secrets.rs`。
+                // 这句话必须写出来：只写"加密存储"，用户会把它理解成系统钥匙串，
+                // 于是既高估了它在共享机器上的强度，也低估了它在换机后的代价
+                // （那时密钥解不开，而不是"重新输入一次"）。
+                //
+                // 风险是 `low`：作用域只有插件自己，且可逆（`clear` 能清掉）。
+                // 它买到的不是"防住这台机器上的人"，这一点由上面那句"不是系统
+                // 钥匙串"承担 —— 权限列表的等级与描述必须说同一件事。
+                description: "把插件的密钥单独加密存在插件目录之外，不进备份。密钥由本机硬件特征派生 —— 换机器或换硬件后这些密钥无法解密。它不是系统钥匙串",
+                effect: E::None,
+                scope: S::Plugin,
+                reversible: true,
+                enforcement: F::Host,
+                risk_override: None,
+            },
         }
     }
 
@@ -444,6 +467,7 @@ mod tests {
             R::High,
             F::Host,
         ),
+        ("secrets", E::None, S::Plugin, true, R::Low, F::Host),
     ];
 
     #[test]
@@ -492,9 +516,9 @@ mod tests {
         assert_eq!(seen.len(), PluginPermission::ALL.len());
     }
 
-    /// 推导公式本身的行为，与 12 项权限的具体取值无关。
+    /// 推导公式本身的行为，与 14 项权限的具体取值无关。
     ///
-    /// 这一层测试不可省：只测快照的话，公式可以在 12 项权限恰好覆盖不到的地方
+    /// 这一层测试不可省：只测快照的话，公式可以在 14 项权限恰好覆盖不到的地方
     /// 出错，而快照依然全绿。
     #[test]
     fn derive_risk_follows_documented_precedence() {
@@ -586,7 +610,11 @@ mod tests {
         // 检查点）。它此前是 `None` 的理由是"缺授权模型"，而不是"这条通道不存在"
         // —— `ctx.files` 之后，后者也不成立了：需要写用户目录的插件现在有通道，
         // 而那条通道受 Rust 侧 `require_permission` 约束。
-        assert_eq!(count(F::Host), 7, "后端强制的权限数量变化");
+        //
+        // 7 → 8：新增 `secrets`（`ctx.secrets`）。它由 Rust 侧强制，而且理由比
+        // 上面几项更硬：密钥表**只有** RPC 与命令层够得着（插件 JS 连它的路径都
+        // 拼不出来），因此"没声明就用不了"在这里是字面意义上的事实。
+        assert_eq!(count(F::Host), 8, "后端强制的权限数量变化");
         assert_eq!(count(F::Frontend), 3, "前端强制的权限数量变化");
         assert_eq!(count(F::None), 3, "未强制的权限数量变化");
     }

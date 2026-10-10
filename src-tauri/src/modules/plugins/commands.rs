@@ -728,11 +728,33 @@ pub async fn plugin_db_transaction(
 /// 权限（它是"插件清自己的数据"）；这一条是**用户删自己机器上的东西**，
 /// 因此卸载之后也要能用 —— 否则"卸载保留数据"会把残留变成删不掉的目录。
 ///
+/// ============================================================
+/// 它**同时**删掉那个插件的密钥文件
+/// ============================================================
+///
+/// 密钥按设计落在插件数据目录**之外**（见 `plugins/secrets.rs` 文件头），因此
+/// `manager.clear_data` 那次递归删除够不着它们。只删一半的后果是：用户点了
+/// 「清除插件数据」、看到数据没了，而凭据文件还留在 `plugin_secrets/` 里 ——
+/// 而且它**不出现在「插件数据」的残留列表里**（那一列扫的是数据根），也就是一个
+/// 用户看不见、也删不掉的残留。凭据是最不该以这种方式留下来的东西。
+///
+/// 两件事的顺序是"先数据、后密钥"，且任一步失败都返回错误（不做"尽力而为"）：
+/// 一次只成功一半的清除最坏 —— 用户以为它清干净了。
+///
 /// 前端必须**先确认**再调它。它不是"顺手清一下"的接口。
 #[tauri::command]
-pub async fn plugin_data_clear(state: State<'_, PluginState>, id: String) -> Result<(), String> {
-    let manager = state.inner().0.read().await;
-    manager.clear_data(&id).map_err(to_msg)
+pub async fn plugin_data_clear(
+    app: AppHandle,
+    state: State<'_, PluginState>,
+    id: String,
+) -> Result<(), String> {
+    {
+        let manager = state.inner().0.read().await;
+        manager.clear_data(&id).map_err(to_msg)?;
+    }
+
+    let dir = super::secrets::dir_for(&app)?;
+    super::secrets::remove_for_plugin(&dir, &id)
 }
 
 /// 一个插件数据目录的占用字节数（**不要求它仍然安装**）。
@@ -898,6 +920,97 @@ pub async fn plugin_storage_clear(
 ) -> Result<(), String> {
     let manager = state.inner().0.read().await;
     manager.storage_clear(&id).map_err(to_msg)
+}
+
+// ============================================================
+// `ctx.secrets`：in-process 插件那一条路径
+// ============================================================
+//
+// ============================================================
+// 为什么这五条只是**另一个传输**
+// ============================================================
+//
+// 真正的实现在 `secrets.rs`：路径规则、密钥名与值的校验、数量上限、加解密、
+// 原子写入，全都在那里。沙箱那条路径（`rpc.rs` 的五个分支）调的是**同一批
+// 函数** —— 与 `ctx.db` 那三条的理由一样：同一个 `ctx` 有两个调用方，而"能做
+// 什么"必须只有一处定义。区别只在传输，那边是自定义协议，这边是 Tauri 命令。
+//
+// ============================================================
+// `id` 为什么由前端给，以及它在这里买到了什么
+// ============================================================
+//
+// 与 `plugin_storage_*` 完全一样：in-process 插件与宿主在同一个 realm 里，这条
+// 命令**无法**分辨调用者是宿主还是插件。这是 in-process 的固有性质，已经写进
+// 插件开发文档（"权限列表在 in-process 模式下是声明，不是约束"）。
+//
+// 但密钥这一项把那条性质推得很远，必须写清楚：一条
+// `invoke('plugin_secrets_get', { id: '别的插件', key: 'apiKey' })` 读得到**别人
+// 的凭据**，而下面的 `require_permission` 挡不住它 —— 它检查的是被冒充的那个
+// 插件有没有声明 `secrets`，而不是"你是谁"。真正的边界要等进程级隔离。
+//
+// 因此 `secrets` 在 in-process 上买到的是**权限列表诚实**（没声明的插件会被
+// 拒绝），不是隔离。沙箱那条路径不存在这个问题 —— 身份来自 webview 标签。
+
+/// 校验 `secrets` 权限并取密钥目录（in-process 路径）。
+///
+/// 与 `rpc.rs::checked_secrets_dir` 是同一条判据的两个传输。权限守卫在内部
+/// 作用域里就被丢掉，`await` 全部发生在它之外 —— 持着读锁做文件 IO 会让一次
+/// 写密钥把整个插件系统堵住。
+async fn checked_secrets_dir(app: &AppHandle, plugin_id: &str) -> Result<PathBuf, String> {
+    let state = app.state::<PluginState>().inner().0.clone();
+
+    {
+        let manager = state.read().await;
+        super::secrets::require_permission(&manager, plugin_id)?;
+    }
+
+    super::secrets::dir_for(app)
+}
+
+/// 读一个密钥。未知的键返回 `null`；密文解不开时**报错**（不是 `null`）。
+#[tauri::command]
+pub async fn plugin_secrets_get(
+    app: AppHandle,
+    id: String,
+    key: String,
+) -> Result<Option<String>, String> {
+    let dir = checked_secrets_dir(&app, &id).await?;
+    super::secrets::get(&dir, &id, &key)
+}
+
+#[tauri::command]
+pub async fn plugin_secrets_set(
+    app: AppHandle,
+    id: String,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    let dir = checked_secrets_dir(&app, &id).await?;
+    super::secrets::set(&dir, &id, &key, &value)
+}
+
+#[tauri::command]
+pub async fn plugin_secrets_delete(
+    app: AppHandle,
+    id: String,
+    key: String,
+) -> Result<(), String> {
+    let dir = checked_secrets_dir(&app, &id).await?;
+    super::secrets::delete(&dir, &id, &key)
+}
+
+/// 列出键名。**永远不返回值** —— 列出值的接口没有任何合理用途，而它会让一次
+/// 普通的界面刷新把所有凭据搬进内存与日志。
+#[tauri::command]
+pub async fn plugin_secrets_keys(app: AppHandle, id: String) -> Result<Vec<String>, String> {
+    let dir = checked_secrets_dir(&app, &id).await?;
+    super::secrets::keys(&dir, &id)
+}
+
+#[tauri::command]
+pub async fn plugin_secrets_clear(app: AppHandle, id: String) -> Result<(), String> {
+    let dir = checked_secrets_dir(&app, &id).await?;
+    super::secrets::clear(&dir, &id)
 }
 
 #[tauri::command]

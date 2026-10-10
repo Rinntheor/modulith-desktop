@@ -4557,7 +4557,7 @@ section('服务对象的方法（白屏两次都出在这里）');
     // 权限**要给全**：缺哪一项，对应那个服务对象就会降级成空壳，
     // 于是"方法名对不对"这件事在那个成员上根本没被测到。
     permissions:
-      '["storage","notification","plugin-communicate","clipboard","filesystem-read"]',
+      '["storage","notification","plugin-communicate","clipboard","filesystem-read","secrets"]',
     surfaces: '[]',
     theme: '{}',
     shortcuts: '{"entries":[]}',
@@ -4619,6 +4619,10 @@ section('服务对象的方法（白屏两次都出在这里）');
     ],
     ['db', ['query', 'queryRaw', 'exec', 'transaction'], 'pluginDatabase'],
     ['settings', ['isAvailable'], 'pluginSettingsAPI'],
+    // 密钥存储。它在沙箱里**只有 RPC 一条通道**（密文落在数据目录之外，插件代码
+    // 拼不出那个路径），因此这里的六个方法名必须与宿主工厂逐字一致 —— 少一个就是
+    // 插件调用时白屏。
+    ['secrets', ['isAvailable', 'get', 'set', 'delete', 'keys', 'clear'], 'pluginSecrets'],
   ];
 
   for (const [member, methods, source] of REQUIRED) {

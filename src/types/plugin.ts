@@ -78,7 +78,8 @@ export type PluginPermission =
   | 'plugin-communicate'         // 插件间通信
   | 'native-module'              // 原生模块调用
   | 'dev-tools'                  // 开发者工具
-  | 'process-spawn';             // 启动外部程序（已强制）
+  | 'process-spawn'              // 启动外部程序（已强制）
+  | 'secrets';                   // 加密的密钥存储（宿主强制；密文在插件数据目录之外，不进备份）
 
 /**
  * 插件作者信息

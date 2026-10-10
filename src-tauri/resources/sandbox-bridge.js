@@ -2280,6 +2280,100 @@
     return { headers: headers, body: JSON.stringify(data) };
   }
 
+  // ============================================================
+  // 密钥存储（`ctx.secrets`）
+  // ============================================================
+  //
+  // ============================================================
+  // 未声明 `secrets` 时**降级**，与 `dataDir` 同一条规矩
+  // ============================================================
+  //
+  // `pluginRuntime.ts` 的 `pluginSecrets` 有一份明确的 stub：`isAvailable()` 恒
+  // false、`keys()` 空数组，`get` / `set` / `delete` / `clear` 抛一句**能照做的
+  // 话**。这里照抄它的行为，包括"只提示一次" —— 同一份插件在两个运行位置上表现
+  // 不同，正是这次迁移反复栽的那个坑。
+  //
+  // `get` 在降级时也抛错而不是返回 `null`：`null` 是一个看起来完全正常的答案，
+  // 作者会据此以为用户还没配置密钥，然后引导他重新输入一遍 —— 而真正的原因是他
+  // 没有声明权限。
+  var secrets = (function () {
+    if (!has('secrets')) {
+      var warnedMissingSecrets = false;
+      function warnOnce() {
+        if (warnedMissingSecrets) return;
+        warnedMissingSecrets = true;
+        console.warn(
+          '[Modulith] 插件使用了 ctx.secrets，但清单里没有声明 "secrets" 权限，' +
+            '调用被拒绝（后续同类调用不再重复提示）'
+        );
+      }
+
+      var denied = function () {
+        warnOnce();
+        return Promise.reject(new Error('插件未声明 "secrets" 权限，无法读写密钥'));
+      };
+
+      return {
+        isAvailable: function () {
+          warnOnce();
+          return false;
+        },
+        get: denied,
+        set: denied,
+        delete: denied,
+        /** 空列表在这里是**如实的答案**：它一个键都拿不到 */
+        keys: function () {
+          warnOnce();
+          return Promise.resolve([]);
+        },
+        clear: denied,
+      };
+    }
+
+    // ============================================================
+    // RPC 是沙箱插件够得着密钥的**唯一**通道
+    // ============================================================
+    //
+    // 密钥表落在插件数据目录**之外**（`<app_data_dir>/plugin_secrets/<id>.json`），
+    // 因此这个文档里没有任何一条路径能拼出它：数据通道 `/<id>/data/...` 被 chroot
+    // 在数据目录之内，而 `..`、盘符与符号链接都由宿主的 `data_dir::resolve` 拒绝。
+    // 换句话说下面这五个方法不是"方便封装"，它们就是这项能力的全部入口。
+    //
+    // 加密的强度与代价见宿主侧 `plugins/secrets.rs` 的文件头：密文由**本机硬件
+    // 指纹**派生，换机器之后解不开 —— 那时 `get` 会抛错，而不是返回 `null`。
+    return {
+      /** 权限是否已声明。**同步**布尔，与 `Modulith.has('secrets')` 同义。 */
+      isAvailable: function () {
+        return true;
+      },
+
+      /** 读一个键。未知的键返回 `null`；密文解不开时抛错（值仍在磁盘上）。 */
+      get: function (key) {
+        return rpc('secrets.get', { key: key });
+      },
+
+      set: function (key, value) {
+        return rpc('secrets.set', { key: key, value: value });
+      },
+
+      delete: function (key) {
+        return rpc('secrets.delete', { key: key });
+      },
+
+      /** 列出**键名**。值一个都不返回。 */
+      keys: function () {
+        return rpc('secrets.keys', {}).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /** 清空**本插件**的密钥。别的插件的密钥不受影响。 */
+      clear: function () {
+        return rpc('secrets.clear', {});
+      },
+    };
+  })();
+
   var Modulith = {
     dataDir: dataDir,
      db: db,
@@ -2526,6 +2620,15 @@
         return rpc('storage.clear', {});
       },
     },
+
+    /**
+     * 加密的密钥存储。**凭据用这个，不要用 `storage`。**
+     *
+     * 两者的保证完全不同：存储是明文、插件自己读得到、进备份；密钥是加密的、落在
+     * 插件数据目录之外、不进备份，代价是换机器之后解不开。需要跟着用户走的令牌，
+     * 那就不是密钥 —— 见上面 `secrets` 工厂的说明。
+     */
+    secrets: secrets,
 
 
     http: {

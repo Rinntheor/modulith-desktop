@@ -1991,6 +1991,93 @@ export interface DataStat {
   modified: number;
 }
 
+/** 已经为"没声明 secrets 却用了 ctx.secrets"提示过的插件，避免刷屏。 */
+const warnedMissingSecrets = new Set<string>();
+
+/**
+ * 密钥存储（`ctx.secrets`）。
+ *
+ * ============================================================
+ * 它为什么与 `ctx.storage` 是两个能力，而不是一个开关
+ * ============================================================
+ *
+ * `ctx.storage` 是明文 JSON，而且**插件读得到自己的文件**：键文件与 `ctx.dataDir`
+ * 的根在同一个目录里，`readText('<键>.json')` 就能把凭据原样拿走。凭据放进存储，
+ * 等于它平平整整地躺在磁盘上，并且会随备份一起被导出。
+ *
+ * `ctx.secrets` 把值加密后存在插件数据目录**之外**，并且不属于任何备份类别。
+ * 代价必须说清楚，因为它决定了这个接口适合放什么：
+ *
+ *   * 密钥由**本机硬件指纹**派生 —— 换机器之后这些值解不开。那时 `get` 会抛出一
+ *     条说明原因的错误（**不是** `null`），因为 `null` 会被读成"从来没存过"；
+ *   * 它**不是系统钥匙串**：能读这台机器上这个账户文件的人一样能解。它挡的是
+ *     "文件被复制到别处"与"凭据明文躺在磁盘/备份里"。
+ *
+ * 边界（密钥名字符集、值 4096 字节、每插件 64 个键、原子写入）全部在 Rust 侧的
+ * `plugins/secrets.rs`，这里只负责转发 —— 在 JS 侧再写一份判据，一定会与它漂开，
+ * 而漂开的方向是"前端说可以、后端拒绝"。
+ *
+ * 未声明 `secrets` 权限时的降级与 `pluginDataDir` 同一条规矩：只提示一次，并且
+ * **处处失败**，绝不静默假装存上了。`get` 在这里也抛错而不是返回 `null` ——
+ * 原因与上面那条一样：`null` 是一个看起来完全正常的答案，作者会据此以为用户
+ * 还没有配置密钥，然后引导他重新输入一遍。
+ */
+function pluginSecrets(pluginId: string, manifest: PluginManifest | undefined) {
+  const allowed = pluginHasPermission(manifest, 'secrets');
+
+  if (!allowed) {
+    if (!warnedMissingSecrets.has(pluginId)) {
+      warnedMissingSecrets.add(pluginId);
+      console.warn(
+        `[pluginRuntime] 插件 "${pluginId}" 使用了 ctx.secrets，但清单里没有声明 ` +
+          `"secrets" 权限，调用被拒绝（后续同类调用不再重复提示）`
+      );
+    }
+
+    const denied = async (): Promise<never> => {
+      throw new Error('插件未声明 "secrets" 权限，无法读写密钥');
+    };
+    return {
+      isAvailable: (): boolean => false,
+      get: denied,
+      set: denied,
+      delete: denied,
+      /** 空列表在这里是**如实的答案**：它一个键都拿不到 */
+      keys: async (): Promise<string[]> => [],
+      clear: denied,
+    };
+  }
+
+  const call = <T>(command: string, args: Record<string, unknown>): Promise<T> =>
+    invoke<T>(command, { id: pluginId, ...args });
+
+  return {
+    /**
+     * 权限在不在。**同步**，与 `ctx.clipboard.isAvailable` 同一形状 ——
+     * 插件用它做特性探测，不必为了问一句话去 await。
+     */
+    isAvailable: (): boolean => true,
+
+    /**
+     * 读一个键。**未知的键返回 `null`**（与"存了但解不开"是两件事，后者抛错）。
+     */
+    get: (key: string) => call<string | null>('plugin_secrets_get', { key }),
+
+    set: (key: string, value: string) => call<void>('plugin_secrets_set', { key, value }),
+
+    delete: (key: string) => call<void>('plugin_secrets_delete', { key }),
+
+    /**
+     * 列出**键名**。值一个都不返回 —— 列出值的接口会让一次普通的界面刷新把所有
+     * 凭据搬进内存与日志，而它没有任何合理用途。
+     */
+    keys: () => call<string[]>('plugin_secrets_keys', {}),
+
+    /** 清空**本插件**的密钥。别的插件的密钥不受影响。 */
+    clear: () => call<void>('plugin_secrets_clear', {}),
+  };
+}
+
 /** 上下文工厂。插件身份是**显式参数** —— 这是 `api: 2` 能成立的原因 */
 function createContextFor(
   pluginId: string,
@@ -2014,6 +2101,14 @@ function createContextFor(
     storage: pluginStorage(pluginId),
     /** 插件私有文件目录。配置与小状态用 `storage`，文件用这个。 */
     dataDir: pluginDataDir(pluginId, manifest),
+    /**
+     * 凭据用这个，**不要用 `storage`**。
+     *
+     * 两者的差别不是"方便不方便"，而是保证完全不同：存储是明文、插件自己读得到、
+     * 进备份；密钥是加密的、落在插件数据目录之外、不进备份，代价是换机器之后解不开。
+     * 需要一个能跟着用户走的令牌，那就不是密钥 —— 见 `pluginSecrets` 的说明。
+     */
+    secrets: pluginSecrets(pluginId, manifest),
     /**
      * 结构化数据：每插件一个 SQLite 文件。
      *

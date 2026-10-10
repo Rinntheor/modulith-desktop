@@ -200,6 +200,31 @@ fn parse_stored(raw: &str) -> Option<Value> {
     serde_json::from_str(raw).ok()
 }
 
+/// 校验 `secrets` 权限，返回这个插件的密钥目录。
+///
+/// 五条密钥 RPC 都要做同一件事，而漏掉任意一处的后果是"没声明也能读别人的凭据"
+/// （路径是按插件 id 拼的）—— 那种缺陷在每一条单独读起来都像是对的。因此这一步
+/// 只有这一处实现。
+///
+/// 权限守卫在**内部的作用域里**就被丢掉，`await` 全部发生在它之外：持着读锁去
+/// 做文件 IO，会让一次写密钥把整个插件系统堵住（`notify` 分支外的其它 `await`
+/// 也遵循同一条纪律）。
+async fn checked_secrets_dir<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::secrets::require_permission(&manager, plugin_id)?;
+    }
+
+    super::secrets::dir_for(app)
+}
+
 /// 执行一次 ctx 调用。
 ///
 /// 参数与返回都是 `serde_json::Value` —— 这一层不认识 HTTP，也不认识 stdio。
@@ -1444,6 +1469,98 @@ pub async fn dispatch<R: Runtime>(
                 .collect();
 
             json_value(serde_json::json!(list))
+        }
+
+        // ---- 密钥（ctx.secrets）---------------------------------------------
+        //
+        // ============================================================
+        // 为什么它必须走 RPC，而不能像 dataDir 那样有一条字节通道
+        // ============================================================
+        //
+        // 密钥表落在插件数据目录**之外**（`secrets.rs` 文件头写了三条理由）。
+        // 插件 JS 因此既拼不出它的路径，也没有任何命令能读到它 —— 也就是说，
+        // 下面这五条是沙箱插件够得着密钥的**唯一**通道。
+        //
+        // 这条通道上 `require_permission` 就是这项能力的全部边界。注意它挡的**不是**
+        // 冒充：这一侧的身份由 webview 标签给定（不是调用方传来的 id），一个插件
+        // 本来就够不到别人的密钥文件。它挡的是"没声明 `secrets` 的插件照样能把凭据
+        // 存下来" —— 那样权限列表在这一项上就是空的。
+
+        "secrets.get" => {
+            let Some(key) = arg_str(args, "key") else {
+                return rpc_error("缺少 key");
+            };
+
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::get(&dir, plugin_id, key) {
+                // 未知的键是 `null`，不是错误 —— 调用方要能区分"没存过"与"读不出来"
+                // （后者是 `Err`，而且消息里带着密文仍在磁盘上这件事）。
+                Ok(value) => json_value(serde_json::json!(value)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.set" => {
+            let Some(key) = arg_str(args, "key") else {
+                return rpc_error("缺少 key");
+            };
+            let Some(value) = arg_str(args, "value") else {
+                return rpc_error("缺少 value");
+            };
+
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::set(&dir, plugin_id, key, value) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.delete" => {
+            let Some(key) = arg_str(args, "key") else {
+                return rpc_error("缺少 key");
+            };
+
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::delete(&dir, plugin_id, key) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.keys" => {
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::keys(&dir, plugin_id) {
+                Ok(keys) => json_value(serde_json::json!(keys)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "secrets.clear" => {
+            let dir = match checked_secrets_dir(app, plugin_id).await {
+                Ok(dir) => dir,
+                Err(e) => return rpc_error(&e),
+            };
+
+            match super::secrets::clear(&dir, plugin_id) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
         }
 
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),

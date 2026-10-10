@@ -232,7 +232,7 @@ const HOST_MEMBERS: readonly BoundaryMember[] = [
 // 回答过"它跨不跨得过去"。而 `ctx` 恰恰是边界的主体 —— 权限的实际载体
 // （`http` / `launcher` / `icons` / `shell` / `audio`）全在这里。
 //
-// 值得单独指出的是那 12 个 `handle`：它们**不是资源句柄，而是能力对象**。
+// 值得单独指出的是那 16 个 `handle`：它们**不是资源句柄，而是能力对象**。
 // `ctx.storage` 不是一个"存储连接"，它是一个由若干函数组成的对象。因此把它们标成
 // `handle` 说的是"它代表的是一组消息往返" —— **不是**"它今天已经能跨过去了"。
 // 今天它一个都跨不过去，因为它是个对象。v2 要把它换成 JSON-RPC 式的代理：
@@ -344,13 +344,19 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     migration: 'message',
     note: '收尾登记。add 的入参是函数，与 onDeactivate 同一个问题',
   },
+  {
+    name: 'secrets',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '加密的密钥存储。需要 secrets 权限，Rust 侧强制；密文落在插件数据目录之外，插件代码寻址不到',
+  },
 ];
 
 // ============================================================
 // 能力方法
 // ============================================================
 //
-// 这一层是 v2 的真实工作量。12 个能力对象标为 `handle` 只是说"它代表消息往返"；
+// 这一层是 v2 的真实工作量。16 个能力对象标为 `handle` 只是说"它代表消息往返"；
 // 能不能真的换成往返，取决于**每个方法**的参数与返回值。
 //
 // `io` 记的是返回值与回调参数的形态（参数里的普通值不单独记 —— 字符串、数字、
@@ -473,6 +479,17 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
   disposables: [
     { name: 'add', io: 'callable', migration: 'message', note: '**入参是清理函数、返回值是提前执行函数**。v2 要把清理改成"宿主记录插件持有什么"，而不是"插件交出一个函数"' },
     { name: 'size', io: 'value', migration: 'as-is', note: '同步返回数字' },
+  ],
+  secrets: [
+    // `ctx.secrets` 是加密的密钥表。跨边界方式与 `storage` 同类（来回都是字符串），
+    // 但有一处必须写清楚：`get` **解不开时抛错而不是返回 null**。返回 null 会被读成
+    // "这个键从来没存过"，而数据其实还在磁盘上 —— 那是最没有出路的一种失败。
+    { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔：清单里声明了 secrets 权限没有' },
+    { name: 'get', io: 'value', migration: 'as-is', note: '返回 string 或 null；**密文解不开时抛错**（换机器/文件被改过），错误里带着密文仍在磁盘上这件事' },
+    { name: 'set', io: 'value', migration: 'as-is', note: '返回 Promise<void>；密钥名 1..=128 字符、值最多 4096 字节、每插件 64 个键' },
+    { name: 'delete', io: 'value', migration: 'as-is', note: '返回 Promise<void>；删除不存在的键也是成功（幂等）' },
+    { name: 'keys', io: 'value', migration: 'as-is', note: '返回 string[]，**只有键名、永远没有值**' },
+    { name: 'clear', io: 'value', migration: 'as-is', note: '返回 Promise<void>；只清本插件的密钥' },
   ],
 };
 

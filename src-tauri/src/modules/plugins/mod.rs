@@ -13,6 +13,7 @@ pub mod permissions;
 pub mod quota;
 pub mod rpc;
 pub mod safe_mode;
+pub mod secrets;
 pub mod sandbox;
 pub mod signature;
 pub mod shortcuts;
