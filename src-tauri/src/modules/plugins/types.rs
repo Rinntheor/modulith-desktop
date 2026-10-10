@@ -271,6 +271,16 @@ pub enum PluginPermission {
     /// 而且换机器之后解不开。把它们并成一项，用户看到的就是一个"带开关的存储"，
     /// 而那个开关描述的强度与实际不符。边界与真实的保护范围见 `secrets.rs` 文件头。
     Secrets,
+    /// 观察剪贴板的**变化**（`ctx.clipboard.subscribe` / `readFormats` / `readImage`）：
+    /// 让插件能建一份剪贴板历史。
+    ///
+    /// 与 `Clipboard` 分开而不是给它加一个"能不能订阅"的开关：两者的**作用面**
+    /// 完全不同 —— `ctx.clipboard` 是"插件调一次、读写一次"，而这一项是"用户在
+    /// **任何地方**复制的每一样东西都会经过插件"。那也正是它风险等级被显式覆盖成
+    /// `High` 的原因（见 `permissions.rs` 的 `risk_override`）。
+    ///
+    /// 边界、隐私守卫与全部上限见 `clipboard.rs` 文件头。
+    ClipboardMonitor,
 }
 
 impl PluginPermission {
@@ -296,6 +306,7 @@ impl PluginPermission {
             Self::DevTools => "dev-tools",
             Self::ProcessSpawn => "process-spawn",
             Self::Secrets => "secrets",
+            Self::ClipboardMonitor => "clipboard-monitor",
         }
     }
 
@@ -303,7 +314,7 @@ impl PluginPermission {
     ///
     /// 新增枚举值时必须一并加入 —— 否则上面那个一致性测试覆盖不到新值，
     /// 而"测试通过"会给人已经覆盖了的错觉。
-    pub const ALL: [PluginPermission; 14] = [
+    pub const ALL: [PluginPermission; 15] = [
         Self::Storage,
         Self::PluginData,
         Self::Network,
@@ -318,6 +329,7 @@ impl PluginPermission {
         Self::DevTools,
         Self::ProcessSpawn,
         Self::Secrets,
+        Self::ClipboardMonitor,
     ];
 }
 

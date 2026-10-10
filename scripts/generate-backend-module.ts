@@ -275,6 +275,25 @@ ${listItems}
 function updateLibRs(): { moduleCount: number; commandCount: number } {
   const modules = scanExistingModules();
 
+  /**
+   * 少数命令**不在** `commands.rs` 里，因此上面那条 `commands::*` 够不到它们。
+   *
+   * 它们必须逐条写在这里。漏掉的表现不是编译错误 —— 库里有这个函数、
+   * `generate_handler!` 里没有，前端 `invoke` 得到 "command not found"，
+   * 而 `pnpm dev` / `pnpm build` **每次都会重跑这个生成器**，所以一次生成就把
+   * 它悄悄删掉了。`safe_mode_state` 正是这样丢过一次：它定义在
+   * `plugins/safe_mode.rs`（安全模式的判定不属于任何模块的 commands.rs），
+   * 而 `lib.rs` 里那一份是手工补的。
+   *
+   * 键是模块 id，值是**完整路径**（与 `HOST_ONLY_COMMANDS` 同一种写法：不写 `use`，
+   * 直接把路径交给 `generate_handler!`）。裸名字也能用，但那要额外补一条 `use`，
+   * 而两种写法并存正是这里最容易出错的地方 —— 路径只有一种，写错了编译器会报
+   * "未解析的路径"，不会静默变成一个没人注册的命令。
+   */
+  const EXTRA_MODULE_COMMANDS: Readonly<Record<string, readonly string[]>> = {
+    plugins: ['modules::plugins::safe_mode::safe_mode_state'],
+  };
+
   const useStatements = modules.map((id) => `use modules::${id}::commands::*;`).join('\n');
 
   const allCommands: string[] = [];
@@ -338,9 +357,13 @@ function updateLibRs(): { moduleCount: number; commandCount: number } {
    */
   const HOST_ONLY_COMMANDS = ['core::backend_ready::backend_ready'];
 
+  const extraModuleCommands = modules.flatMap((id) => [...(EXTRA_MODULE_COMMANDS[id] ?? [])]);
+
   const commandList =
-    allCommands.length > 0
-      ? [...HOST_ONLY_COMMANDS, ...allCommands].map((cmd) => `        ${cmd},`).join('\n')
+    allCommands.length + extraModuleCommands.length > 0
+      ? [...HOST_ONLY_COMMANDS, ...allCommands, ...extraModuleCommands]
+          .map((cmd) => `        ${cmd},`)
+          .join('\n')
       : `        ${HOST_ONLY_COMMANDS.join(',\n        ')},`;
 
   const useStatement =
@@ -510,6 +533,13 @@ pub fn run() -> Result<(), tauri::Error> {
         // 而那个判断不能靠 IPC 往返（那是每敲一个键一次）。见 modules/plugins/shortcuts.rs。
         app.manage(modules::plugins::shortcuts::PluginShortcuts::new());
 
+        // 剪贴板监测的订阅表（\`ctx.clipboard.subscribe\`）。
+        //
+        // **托管的是那张表，不是线程**：轮询线程由第一个订阅者拉起、最后一个订阅者
+        // 离开时自己退出（见 \`plugins/clipboard.rs\` 的"生命周期"一节）。这里托管
+        // 一个空表是安全的 —— 没有订阅者时它什么都不做，连一次系统调用都没有。
+        app.manage(modules::plugins::clipboard::ClipboardMonitor::default());
+
         // 沙箱自检**不在启动路径上**。
         //
         // 它曾经在这里起一个 4 秒后的异步任务，无条件弹出一块 560×420 的诊断面板。
@@ -547,6 +577,22 @@ ${commandList}
     let app = builder.build(tauri::generate_context!())?;
     let exit_code = app.run_return(|app, event| {
         if let tauri::RunEvent::Exit = event {
+            // 停掉剪贴板轮询线程。
+            //
+            // **这里不需要 \`join\`，也不该有 \`join\`。** 停止的方式是把轮询线程的
+            // 发送端丢掉，它会在 \`recv_timeout\` 上立刻收到 \`Disconnected\` 并退出 ——
+            // 也就是说这里的调用是"通知"，不是"等待"。去 join 它就会把退出流程
+            // 卡在一个最长 800 ms 的睡眠上，而那正是"应用要退出时卡一下"的来源。
+            //
+            // 不显式停也能退出（进程结束会带走线程），但那依赖"托管状态的析构时机
+            // 恰好在线程最后一次醒来之前"—— 那是一个没有人保证的巧合。
+            //
+            // 位置选在 \`stop_all\` **之前**：它不碰任何 Tauri API（只丢一个发送端），
+            // 因此不需要排在模块收尾之后；而排在前面能保证模块开始拆除时不会再有
+            // 新的剪贴板事件推出去。
+            app.state::<modules::plugins::clipboard::ClipboardMonitor>()
+                .stop();
+
             // 停止模块：**逆序**（依赖方先停），见 ModuleRegistry::stop_all。
             // 放在 cleanup_before_exit **之前** —— 后者会清掉窗口与资源表，
             // 之后模块再想用 Tauri 的 API 收尾就拿不到东西了。
@@ -555,6 +601,20 @@ ${commandList}
 
             log::info!("应用即将退出，模块收尾已完成");
             app.cleanup_before_exit();
+
+            // 标记"这一次启动走干净了"（安全模式的判定依据之一，见
+            // \`modules/plugins/safe_mode.rs\`）。
+            //
+            // **放在最后一步**，而不是夹在 \`stop_all\` 与 \`cleanup_before_exit\`
+            // 之间：那个顺序有一条门禁盯着（\`check-modules\` 的「stop_all 在
+            // cleanup_before_exit **之前**调用」），而它盯的是一个真实约束 ——
+            // cleanup 会清掉窗口与资源表，模块收尾必须在它之前。
+            //
+            // 这一步不需要 Tauri 的任何 API（只删一个已知路径），因此放在 cleanup
+            // 之后是安全的。语义上反而更准：标记被清掉就严格等于"整个退出流程
+            // 都走完了"，而夹在中间只等于"模块收尾完了"。
+            app.state::<modules::plugins::safe_mode::SafeMode>()
+                .mark_clean_exit();
         }
     });
 

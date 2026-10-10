@@ -36,6 +36,12 @@ import {
   unregisterSurfaceModules,
 } from './pluginSurfaces';
 import { clearPluginUiState } from './pluginUiState';
+import {
+  clearClipboardSubscriptions,
+  clipboardMonitorSupported,
+  refreshClipboardMonitorSupport,
+  subscribeClipboardChanges,
+} from './pluginClipboardMonitor';
 import type {
   ActivationEvent,
   CommandContribution,
@@ -1355,10 +1361,20 @@ function pluginFileDrop(pluginId: string, manifest: PluginManifest | undefined) 
 }
 
 /**
- * 插件读写系统剪贴板（`ctx.clipboard`）。**需要 `clipboard` 权限。**
+ * 插件读写系统剪贴板（`ctx.clipboard`）。**读写需要 `clipboard` 权限。**
+ *
+ * ⚠️ **这个对象里有两种强制程度完全不同的东西**，不要在读完下面这一段之后
+ * 把整项都当成"前端强制"：
+ *
+ *   * `isAvailable` / `readText` / `writeText` —— 调的是页面自己的
+ *     `navigator.clipboard`，前端强制（理由见下）；
+ *   * `canMonitor` / `subscribe` / `readFormats` / `readImage` —— 全部要经宿主
+ *     （浏览器 API 没有变化通知，也没有格式列表与原始图片），因此它们是
+ *     **Rust 侧强制**，而且需要的是另一项权限 `clipboard-monitor`。
+ *     这一半没有"绕过 ctx 直接调浏览器 API"这条替代路径。
  *
  * ============================================================
- * 为什么这一项是**前端**强制，而不是后端
+ * 为什么读写那一半是**前端**强制，而不是后端
  * ============================================================
  *
  * 剪贴板是浏览器 API（`navigator.clipboard`），页面脚本本来就能直接调它。
@@ -1384,6 +1400,14 @@ function pluginFileDrop(pluginId: string, manifest: PluginManifest | undefined) 
  */
 function pluginClipboard(pluginId: string, manifest: PluginManifest | undefined) {
   const allowed = pluginHasPermission(manifest, 'clipboard');
+  /**
+   * 监测那一半的权限，与 `clipboard` **是两项**。
+   *
+   * 分开的理由不是"方法多"：`clipboard` 管的是"插件调一次、读写一次"，而这一项管的是
+   * "用户在这台机器上复制的每一样东西都会经过这个插件"。风险等级也因此不同
+   * （`clipboard` 是 medium，这一项被显式覆盖成 high，见 `permissions.rs`）。
+   */
+  const allowedMonitor = pluginHasPermission(manifest, 'clipboard-monitor');
 
   let warned = false;
   const warnOnce = () => {
@@ -1391,6 +1415,36 @@ function pluginClipboard(pluginId: string, manifest: PluginManifest | undefined)
     warned = true;
     console.warn(
       `[pluginRuntime] 插件 "${pluginId}" 使用了剪贴板，但清单里没有声明 "clipboard" 权限，调用会被忽略（后续同类调用不再重复提示）`
+    );
+  };
+
+  let warnedMonitor = false;
+  const warnMonitorOnce = () => {
+    if (warnedMonitor) return;
+    warnedMonitor = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 使用了剪贴板监测，但清单里没有声明 ` +
+        `"clipboard-monitor" 权限，订阅与读取都被拒绝（后续同类调用不再重复提示）`
+    );
+  };
+
+  let warnedUnsupported = false;
+  const warnUnsupportedOnce = () => {
+    if (warnedUnsupported) return;
+    warnedUnsupported = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 订阅了剪贴板变化，但当前平台不支持剪贴板监测` +
+        `（它依赖 Win32 的剪贴板序列号与注册格式，只在 Windows 上可用）。` +
+        `订阅被忽略 —— 调用 ctx.clipboard.canMonitor() 可以在代码里先判断`
+    );
+  };
+
+  /** 缺权限时统一抛出的一句话：**不返回空结果**，理由见下面 `readFormats`。 */
+  const deniedMonitor = (what: string): never => {
+    warnMonitorOnce();
+    throw new Error(
+      `插件未声明 "clipboard-monitor" 权限，无法${what}。` +
+        `这一项必须显式声明：它读的是用户在这台电脑上复制的所有内容`
     );
   };
 
@@ -1468,6 +1522,99 @@ function pluginClipboard(pluginId: string, manifest: PluginManifest | undefined)
             '请把写入放在点击等交互里，而不是定时器或后台回调里。'
         );
       }
+    },
+
+    // ============================================================
+    // 监测那一半（`clipboard-monitor`）
+    // ============================================================
+    //
+    // 与上面三个方法**不是同一套机制**：它们调的是页面自己的 `navigator.clipboard`，
+    // 而下面这四条全部要经宿主 —— 浏览器 API 没有"剪贴板变了"这个通知，也给不出
+    // 格式列表与原始图片。因此这一半在权限表里是 **Rust 侧强制**，而 `clipboard`
+    // 那一半是前端强制。
+    //
+    // 由此带来一个必须说清的差别：**这一半没有"绕过 ctx 直接调浏览器 API"这条路。**
+    // 插件当然可以直接调 `navigator.clipboard.readText()` 读一次，但那和"观察到变化"
+    // 是两件事 —— 后者需要轮询宿主进程里的 `GetClipboardSequenceNumber()`。
+
+    /**
+     * 现在能不能监测剪贴板变化。**同步**，用于特性探测。
+     *
+     * 两个条件都满足才为真：清单里声明了 `clipboard-monitor`，**且**这个平台支持
+     * （只有 Windows 有那套 Win32 接口）。非 Windows 上它恒为假，`subscribe()`
+     * 会降级成空订阅并提示一次。
+     */
+    canMonitor: (): boolean => allowedMonitor && clipboardMonitorSupported(),
+
+    /**
+     * 订阅剪贴板变化。返回取消订阅函数。
+     *
+     * 处理函数收到的就是 `{ text, formats, at }`（见 `ClipboardChange`）。
+     *
+     * 三处与"读一次"不同的行为，都写在这里而不是留给文档：
+     *
+     *   * **订阅不会交付剪贴板上已有的内容。** 只有"订阅之后发生的变化"会被交付。
+     *     否则每装一个剪贴板历史插件，用户当时剪贴板里的东西（可能正是一个密码）
+     *     就会被立刻送进去。
+     *   * **一轮最多一条。** 宿主每 800 ms 看一次序列号，因此 800 ms 内复制两次
+     *     只会得到**后一次**的内容。历史插件要按这个粒度接受"可能丢一条中间态"。
+     *   * **`text` 最多 64 KiB。** 超出的部分被截断，而且没有标志位 —— 长度接近
+     *     上限时请当成可能不完整（见 `ClipboardChange`）。
+     */
+    subscribe: (
+      handler: (change: { text: string | null; formats: string[]; at: number }) => void
+    ): (() => void) => {
+      if (typeof handler !== 'function') {
+        throw new TypeError('ctx.clipboard.subscribe 需要一个函数');
+      }
+      if (!allowedMonitor) {
+        warnMonitorOnce();
+        return () => {};
+      }
+      if (!clipboardMonitorSupported()) {
+        // 与宿主的降级同一条规矩：**空订阅 + 一次告警**。抛错会让一个只是想在
+        // Windows 上做特性的插件整体加载失败，而它是可以 `canMonitor()` 自查的。
+        warnUnsupportedOnce();
+        return () => {};
+      }
+      return subscribeClipboardChanges(pluginId, handler);
+    },
+
+    /**
+     * 一次读出剪贴板上的**友好格式名**。不要求先订阅。
+     *
+     * 认不出的格式**不会出现**在结果里（不是带着原始名字出现）—— 剪贴板上的
+     * 应用私有格式名常常带着软件名甚至路径，原样交给插件等于顺手送出一份"这台
+     * 机器上装了什么"的指纹。见宿主侧 `clipboard::friendly_format` 的短名单。
+     *
+     * **缺权限时抛错，不返回空数组。** 空数组会被读成"剪贴板是空的"，而真实原因
+     * 是没声明权限 —— 那是一种看起来完全正常的错误答案。
+     */
+    readFormats: (): Promise<string[]> => {
+      if (!allowedMonitor) return deniedMonitor('读取剪贴板格式');
+      // 平台不支持时由宿主给出那句确切的错误（它知道自己的实现情况，
+      // 而这里只知道一个布尔）。**不在这里编一句"当前平台不支持"** ——
+      // 那句话在"探测还没跑完"时是错的。
+      return invoke<string[]>('plugin_clipboard_formats', { id: pluginId });
+    },
+
+    /**
+     * 读剪贴板上的图片，返回 PNG data URL；**没有图片时为 `null`**。
+     *
+     * 三种结果分得很清楚，调用方必须区分：
+     *
+     *   * `null` —— 剪贴板上没有图片；
+     *   * `data:image/png;base64,...` —— 有一张图，而且在上限之内；
+     *   * **抛错** —— 有一张图，但它超限了（每边 >4096 像素，或编码后 >8 MiB）。
+     *     错误里带着实际体积与上限，而那时 `formats` 里**仍然**会列出
+     *     `image/png`，插件据此可以告诉用户"剪贴板里有一张过大的图片"。
+     *
+     * 把后两种混成 `null` 是最糟的处理：作者会写"没有图片就提示用户复制一张"，
+     * 而用户明明复制了一张 4K 截图 —— 那个分支永远走不到，也没有任何线索。
+     */
+    readImage: (): Promise<string | null> => {
+      if (!allowedMonitor) return deniedMonitor('读取剪贴板图片');
+      return invoke<string | null>('plugin_clipboard_read_image', { id: pluginId });
     },
   };
 }
@@ -2618,13 +2765,16 @@ function cleanupInjected(pluginId: string): void {
 /**
  * 清理与插件绑定的非 DOM 资源。
  *
- * 四样东西必须一起摘掉，否则插件被禁用/卸载后会留下指向失效代码的引用：
+ * 五样东西必须一起摘掉，否则插件被禁用/卸载后会留下指向失效代码的引用：
  *   * 图标 SVG 缓存；
  *   * 事件总线上的全部订阅（`unsubscribeBySource`）；
  *   * 它注册到命令注册表的命令（`unregisterCommandsByPrefix`）——
  *     留着的话搜索框里会出现指向已经不存在的能力的条目；
  *   * 插件自己登记的清理函数（`ctx.disposables` / `Modulith.onDeactivate`）——
- *     定时器、监听器、观察者、连接，宿主没有别的途径知道它们存在。
+ *     定时器、监听器、观察者、连接，宿主没有别的途径知道它们存在；
+ *   * **剪贴板变化的订阅**（`clearClipboardSubscriptions`）—— 它不在事件总线上，
+ *     因此上面那一条够不到它。宿主那一侧的轮询线程由订阅驱动，漏掉它等于让一个
+ *     已经被卸载的插件继续让宿主每 800 ms 读一次用户的剪贴板。
  *
  * **声明式插件有一个例外：命令的「声明」要在清理之后贴回去。** 那些条目本来就
  * 应该在插件未激活时也存在（它们是清单的一部分，不是运行期的产物）；如果不贴回去，
@@ -2636,6 +2786,12 @@ function cleanupPluginResources(pluginId: string): void {
   activationReasons.delete(pluginId);
 
   const removedSubscriptions = unsubscribeBySource(pluginId);
+
+  // 剪贴板监测的订阅单独摘：它**不是**事件总线上的订阅，因此
+  // `unsubscribeBySource` 够不到它，而漏掉它的后果具体到两个 —— 处理函数是插件
+  // bundle 里的闭包（指向已经作废的代码），宿主那边的轮询线程也就永远退不出去。
+  // 宿主那一侧的表按插件 id 记，因此这里一次撤干净。
+  const removedClipboardSubscriptions = clearClipboardSubscriptions(pluginId);
 
   // 已提供但未落进目录的组件也要一并丢弃：它们闭包指向的旧 bundle 已经作废
   for (const key of [...providedModules.keys()]) {
@@ -2654,10 +2810,16 @@ function cleanupPluginResources(pluginId: string): void {
 
   const removedDisposables = runDisposables(pluginId);
 
-  if (removedSubscriptions > 0 || removedCommands > 0 || removedDisposables > 0) {
+  if (
+    removedSubscriptions > 0 ||
+    removedCommands > 0 ||
+    removedDisposables > 0 ||
+    removedClipboardSubscriptions > 0
+  ) {
     console.info(
       `[pluginRuntime] 已清理插件 "${pluginId}" 的资源：事件订阅 ${removedSubscriptions} 个，` +
-        `命令 ${removedCommands} 条，清理函数 ${removedDisposables} 个`
+        `命令 ${removedCommands} 条，清理函数 ${removedDisposables} 个，` +
+        `剪贴板订阅 ${removedClipboardSubscriptions} 个`
     );
   }
 }
@@ -2925,6 +3087,14 @@ export async function reloadPluginRuntime(
   //
   // 失败不抛出，也不阻断下面的插件加载 —— 权限标签缺失不该升级成插件全不可用。
   await loadPermissionRegistry();
+
+  // 剪贴板监测的平台能力也在这里取一次，理由与权限元数据完全相同：**它要在插件
+  // bundle 执行之前就绪**。`ctx.clipboard.canMonitor()` 是同步方法（插件用它做顶层
+  // 特性探测），而"这个平台支不支持"只有宿主知道 —— 晚一步的后果是插件在 Windows
+  // 上读到 `false`，于是它整段剪贴板历史逻辑都不会启动。
+  //
+  // 失败同样不抛出：探测失败按"不支持"处理，插件走它自己的降级路径。
+  await refreshClipboardMonitorSupport();
 
   installed = await invoke<InstalledPlugin[]>('list_plugins');
   runtimeLoadedOnce = true;

@@ -83,6 +83,8 @@ export interface PluginHost {
   restoreConsole(): void;
   /** 插件存储的快照，用来断言设置与清理 */
   storageSnapshot(): Record<string, Record<string, string>>;
+  /** 桩后端的剪贴板订阅表快照：谁当前"正在被宿主轮询"。 */
+  clipboardSubscriptions(): string[];
   /** 启用/禁用一个夹具插件（下一次 reload 生效） */
   setEnabled(pluginId: string, enabled: boolean): void;
   /**
@@ -240,6 +242,33 @@ export async function createPluginHost(): Promise<PluginHost> {
     }
   };
 
+  /**
+   * 与 Rust 侧 `clipboard::require_permission` 对齐。
+   *
+   * 与 `requireSecrets` 同一条纪律，而这一项更该被如实拒绝：它读的是用户在这台
+   * 机器上复制的**所有**内容。夹具里还要多记一件事 —— **谁订阅了**（见
+   * `clipboardSubscribers`），因为"没有订阅者时宿主不该轮询"这条唯一能被断言的地方
+   * 就是那张表。
+   */
+  const requireClipboardMonitor = (pluginId: string): void => {
+    const permissions = (manifestOf(pluginId)?.permissions as string[] | undefined) ?? [];
+    if (!permissions.includes('clipboard-monitor')) {
+      throw new Error(
+        `插件 "${pluginId}" 的清单里没有声明 "clipboard-monitor" 权限，命令被拒绝`
+      );
+    }
+  };
+
+  /**
+   * 夹具的"宿主订阅表"。真实宿主用它决定轮询线程起不起（见
+   * `plugins/clipboard.rs` 的"生命周期"一节），而夹具用它回答"这个插件订阅了没有"。
+   *
+   * **它必须与宿主一样按插件 id 记，而不是按调用次数记**：真实的表是
+   * `插件 id → 订阅者集合`，重复订阅是幂等的 —— 一个按次数记的夹具会让
+   * "重复订阅"在夹具里看起来有问题、在真机上没有问题。
+   */
+  const clipboardSubscribers = new Set<string>();
+
   /** 设置的可变状态。夹具自己持有；**默认值交给前端的 normalize 补** */
   const appSettings: Record<string, any> = {};
 
@@ -352,6 +381,51 @@ export async function createPluginHost(): Promise<PluginHost> {
       return null;
     },
 
+    // ------------------------------------------------------------
+    // 剪贴板监测（`ctx.clipboard` 的订阅 / 读格式 / 读图片）
+    // ------------------------------------------------------------
+    //
+    // 夹具**没有真实剪贴板**，因此这里的桩只回答两件可判定的事：权限对不对、
+    // 调用形状对不对。真正的实现（Win32 轮询、隐私标记、64 KiB 截断、8 MiB 上限、
+    // DIB 转换）在 `src-tauri/src/modules/plugins/clipboard.rs`，由那边的单测对着
+    // 纯函数覆盖 —— 在桩里再造一套假的剪贴板只会多一处会漂的副本。
+    //
+    // `plugin_clipboard_can_monitor` 返回 `true`：夹具跑在开发机上，而这个值决定
+    // 前端的 `ctx.clipboard.canMonitor()`。返回 `false` 会让所有剪贴板订阅在夹具里
+    // 走降级分支，于是"订阅确实登记给了宿主"这件事根本没被测到。
+    plugin_clipboard_can_monitor: () => true,
+
+    /**
+     * 与 Rust 侧 `clipboard::require_permission` 对齐。
+     *
+     * 与 `requireSecrets` 同一条纪律（桩后端必须如实拒绝），而这里的理由更直接：
+     * 这一项读的是用户在这台机器上复制的**所有**内容，一个不检查权限的桩会让
+     * 夹具测出"没声明也能订阅"，而那正是真实运行时不成立、也最不该成立的事。
+     */
+    plugin_clipboard_subscribe: ({ id }) => {
+      requireClipboardMonitor(String(id));
+      clipboardSubscribers.add(String(id));
+      return null;
+    },
+
+    // 撤销**不检查权限**（与真实宿主一致）：一条撤不掉的订阅就是一个泄漏。
+    plugin_clipboard_unsubscribe: ({ id }) => {
+      clipboardSubscribers.delete(String(id));
+      return null;
+    },
+
+    plugin_clipboard_formats: ({ id }) => {
+      requireClipboardMonitor(String(id));
+      return [];
+    },
+
+    // 夹具里"没有图片"是**唯一如实的答案**：这里没有剪贴板可读。
+    // 返回一个编造的 data URL 会让夹具断言通过而真实环境不成立。
+    plugin_clipboard_read_image: ({ id }) => {
+      requireClipboardMonitor(String(id));
+      return null;
+    },
+
     set_plugin_enabled: ({ id, enabled: next }) => {
       enabled.set(String(id), Boolean(next));
       return null;
@@ -397,6 +471,9 @@ export async function createPluginHost(): Promise<PluginHost> {
       const snapshot: Record<string, Record<string, string>> = {};
       for (const [pluginId, entries] of storage) snapshot[pluginId] = Object.fromEntries(entries);
       return snapshot;
+    },
+    clipboardSubscriptions() {
+      return [...clipboardSubscribers].sort();
     },
     setEnabled(pluginId, next) {
       enabled.set(pluginId, next);

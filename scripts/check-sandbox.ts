@@ -85,6 +85,7 @@ const BRIDGE_QUOTED = [
 const BRIDGE_JSON = [
   '__PLUGIN_PERMISSIONS__',
   '__PLUGIN_DATA_AVAILABLE__',
+  '__PLUGIN_CLIPBOARD_MONITOR__',
   '__PLUGIN_SURFACES__',
   '__PLUGIN_THEME__',
   '__PLUGIN_SHORTCUTS__',
@@ -115,6 +116,7 @@ function renderBridge(
     surface?: string;
     permissions?: string;
     dataAvailable?: string;
+    clipboardMonitor?: string;
     surfaces?: string;
     theme?: string;
     shortcuts?: string;
@@ -132,6 +134,10 @@ function renderBridge(
     .replaceAll("'__PLUGIN_ACTIVATION__'", '"open"')
     .replaceAll('__PLUGIN_PERMISSIONS__', options.permissions ?? '["storage"]')
     .replaceAll('__PLUGIN_DATA_AVAILABLE__', options.dataAvailable ?? 'true')
+    // 剪贴板监测的平台能力。默认 `true`（Windows 上的真实取值）：这一节要验的是
+    // "桥接层的方法名与形状"，而在 `false` 下 `subscribe()` 会走降级分支，
+    // 那条分支返回的空函数会把"方法在不在"这件事测成一个永远通过的假象。
+    .replaceAll('__PLUGIN_CLIPBOARD_MONITOR__', options.clipboardMonitor ?? 'true')
     .replaceAll(
       '__PLUGIN_SURFACES__',
       options.surfaces ?? '[{"id":"main","name":"主界面","primary":true}]'
@@ -4346,9 +4352,9 @@ section('桥接层的运行时守卫');
     /if \(!handler\) return;/.test(listenerFn),
     '认不出的 channel 一律忽略（宿主加一条新推送时，旧插件不该因此报错）'
   );
-  // 宿主推的那五条通道，桥接层每一条都要有处理器。少一条的表现是那一类推送
-  // **静默丢失**（主题不动、命令没反应、跨插件事件收不到）。
-  for (const channel of ['theme', 'shortcuts', 'command', 'download-progress', 'event']) {
+  // 宿主推的那六条通道，桥接层每一条都要有处理器。少一条的表现是那一类推送
+  // **静默丢失**（主题不动、命令没反应、跨插件事件收不到、剪贴板变化没人接）。
+  for (const channel of ['theme', 'shortcuts', 'command', 'download-progress', 'event', 'clipboard']) {
     check(
       new RegExp(`(?:^|\\s)'?${channel.replace('-', '\\-')}'?: function \\(`).test(bridgeJs),
       `桥接层有 ${channel} 通道的处理器`
@@ -4557,7 +4563,7 @@ section('服务对象的方法（白屏两次都出在这里）');
     // 权限**要给全**：缺哪一项，对应那个服务对象就会降级成空壳，
     // 于是"方法名对不对"这件事在那个成员上根本没被测到。
     permissions:
-      '["storage","notification","plugin-communicate","clipboard","filesystem-read","secrets"]',
+      '["storage","notification","plugin-communicate","clipboard","filesystem-read","secrets","clipboard-monitor"]',
     surfaces: '[]',
     theme: '{}',
     shortcuts: '{"entries":[]}',
@@ -4603,7 +4609,7 @@ section('服务对象的方法（白屏两次都出在这里）');
       'pluginNotifications',
     ],
     ['events', ['publish', 'subscribe', 'isAvailable'], 'pluginEvents'],
-    ['clipboard', ['isAvailable', 'readText', 'writeText'], 'pluginClipboard'],
+    ['clipboard', ['isAvailable', 'readText', 'writeText', 'canMonitor', 'subscribe', 'readFormats', 'readImage'], 'pluginClipboard'],
     ['fileDrop', ['isAvailable', 'subscribe'], 'pluginFileDrop'],
     ['audio', ['pick'], 'pluginAudio'],
     ['icons', ['extract'], 'pluginFileIcons'],

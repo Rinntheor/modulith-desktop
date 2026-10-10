@@ -18,7 +18,6 @@ use modules::logging::commands::*;
 use modules::net::commands::*;
 use modules::notifications::commands::*;
 use modules::plugins::commands::*;
-use modules::plugins::safe_mode::safe_mode_state;
 use modules::settings::commands::*;
 use modules::sidebar::commands::*;
 use modules::updater::commands::*;
@@ -166,6 +165,13 @@ pub fn run() -> Result<(), tauri::Error> {
         // 而那个判断不能靠 IPC 往返（那是每敲一个键一次）。见 modules/plugins/shortcuts.rs。
         app.manage(modules::plugins::shortcuts::PluginShortcuts::new());
 
+        // 剪贴板监测的订阅表（`ctx.clipboard.subscribe`）。
+        //
+        // **托管的是那张表，不是线程**：轮询线程由第一个订阅者拉起、最后一个订阅者
+        // 离开时自己退出（见 `plugins/clipboard.rs` 的"生命周期"一节）。这里托管
+        // 一个空表是安全的 —— 没有订阅者时它什么都不做，连一次系统调用都没有。
+        app.manage(modules::plugins::clipboard::ClipboardMonitor::default());
+
         // 沙箱自检**不在启动路径上**。
         //
         // 它曾经在这里起一个 4 秒后的异步任务，无条件弹出一块 560×420 的诊断面板。
@@ -266,10 +272,9 @@ pub fn run() -> Result<(), tauri::Error> {
         install_plugin_url_verified,
         fetch_registry_text,
         verify_plugin_index,
-        run_plugin_declared_command,
-        safe_mode_state,
         set_plugin_enabled,
         uninstall_plugin,
+        run_plugin_declared_command,
         read_plugin_asset,
         read_plugin_readme,
         export_plugin,
@@ -302,6 +307,11 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_secrets_delete,
         plugin_secrets_keys,
         plugin_secrets_clear,
+        plugin_clipboard_can_monitor,
+        plugin_clipboard_subscribe,
+        plugin_clipboard_unsubscribe,
+        plugin_clipboard_formats,
+        plugin_clipboard_read_image,
         plugin_http_request,
         plugin_launch_program,
         plugin_extract_icon,
@@ -345,6 +355,7 @@ pub fn run() -> Result<(), tauri::Error> {
         get_favorite_modules,
         check_app_update,
         install_app_update,
+        modules::plugins::safe_mode::safe_mode_state,
     ]);
 
     // 用 run_return 而不是 run，唯一的理由是**拿到退出事件**。
@@ -360,6 +371,22 @@ pub fn run() -> Result<(), tauri::Error> {
     let app = builder.build(tauri::generate_context!())?;
     let exit_code = app.run_return(|app, event| {
         if let tauri::RunEvent::Exit = event {
+            // 停掉剪贴板轮询线程。
+            //
+            // **这里不需要 `join`，也不该有 `join`。** 停止的方式是把轮询线程的
+            // 发送端丢掉，它会在 `recv_timeout` 上立刻收到 `Disconnected` 并退出 ——
+            // 也就是说这里的调用是"通知"，不是"等待"。去 join 它就会把退出流程
+            // 卡在一个最长 800 ms 的睡眠上，而那正是"应用要退出时卡一下"的来源。
+            //
+            // 不显式停也能退出（进程结束会带走线程），但那依赖"托管状态的析构时机
+            // 恰好在线程最后一次醒来之前"—— 那是一个没有人保证的巧合。
+            //
+            // 位置选在 `stop_all` **之前**：它不碰任何 Tauri API（只丢一个发送端），
+            // 因此不需要排在模块收尾之后；而排在前面能保证模块开始拆除时不会再有
+            // 新的剪贴板事件推出去。
+            app.state::<modules::plugins::clipboard::ClipboardMonitor>()
+                .stop();
+
             // 停止模块：**逆序**（依赖方先停），见 ModuleRegistry::stop_all。
             // 放在 cleanup_before_exit **之前** —— 后者会清掉窗口与资源表，
             // 之后模块再想用 Tauri 的 API 收尾就拿不到东西了。

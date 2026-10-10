@@ -156,7 +156,7 @@ var ctx = Modulith.createContext();
 | `shell` | object | 在文件管理器中定位（需 `filesystem-read` 权限） |
 | `fileDrop` | object | 接收拖入的文件路径（需 `filesystem-read` 权限） |
 | `audio` | object | 导入音频文件（需 `filesystem-read` 权限） |
-| `clipboard` | object | 读写系统剪贴板（需 `clipboard` 权限，**纯前端强制**） |
+| `clipboard` | object | 读写系统剪贴板（需 `clipboard` 权限，**纯前端强制**）；并可观察它的变化（需 `clipboard-monitor` 权限，**Rust 强制**） |
 | `settings` | object | 读取本插件声明的设置项的当前值（需 `storage` 权限） |
 | `disposables` | object | 收尾登记：`add(dispose)` / `size()`，与 `Modulith.onDeactivate()` 同义 |
 
@@ -657,7 +657,7 @@ if (picked) {
 > 用户点「开始」这类按钮时先建好并 `resume()` 一个 `AudioContext`，
 > 之后到点播放就不会被拦（插件仓库的 `plugins/pomodoro` 就是这么做的）。
 
-## 11.1 clipboard —— 需要 `clipboard`
+## 11.1 clipboard —— 需要 `clipboard`（读写）与 `clipboard-monitor`（观察变化）
 
 ```js
 await ctx.clipboard.writeText('要复制的内容');
@@ -670,17 +670,27 @@ if (!ctx.clipboard.isAvailable()) { /* 未声明权限或环境不支持，走�
 | `isAvailable()` | boolean | 权限已声明**且**环境提供剪贴板接口 |
 | `readText()` | `Promise<string>` | 未声明权限时返回空串并记录一次警告 |
 | `writeText(text)` | `Promise<void>` | 未声明权限时静默返回；真的失败时抛错 |
+| `canMonitor()` | boolean | 声明了 `clipboard-monitor` **且**当前平台支持（只有 Windows） |
+| `subscribe(handler)` | `() => void` | 订阅剪贴板变化，返回取消订阅函数。见 11.2 |
+| `readFormats()` | `Promise<string[]>` | 剪贴板上的**友好格式名**（`text/plain` / `text/html` / `image/png` / `files` / `text/rtf` / `image/bmp`）。不需要先订阅 |
+| `readImage()` | `Promise<string \| null>` | PNG data URL；**没有图片是 `null`，有图但超限是抛错** |
 
-### ⚠️ 这一项的强制程度比其它权限弱
+### ⚠️ 这一项上有两个权限，而它们的强度不一样
 
-**剪贴板是浏览器 API，插件绕过 `ctx.clipboard` 直接调 `navigator.clipboard` 仍然可行。**
-因此这一项管住的是「插件按约定走宿主通道」，而**不是**「插件拿不到剪贴板」。
+**读写那一半（`clipboard`）的强制程度比其它权限弱。** 剪贴板是浏览器 API，插件绕过
+`ctx.clipboard` 直接调 `navigator.clipboard` 仍然可行。因此这一项管住的是「插件按约定走
+宿主通道」，而**不是**「插件拿不到剪贴板」。这与 `updater` 的处理不同：那里是宿主自己的
+命令（`updater:default`），前端不授权就真的不可达；剪贴板没有这样的开关，在 Rust 侧加门
+只会制造一种「更难绕过」的假象。**那为什么还要有它**：调用会被记录、行为统一，而且
+**忘记声明权限的插件会被降级** —— 权限列表里这一项因此不是空的。
 
-这与 `updater` 的处理不同：那里是宿主自己的命令（`updater:default`），前端不授权就真的
-不可达；剪贴板没有这样的开关，在 Rust 侧加门只会制造一种「更难绕过」的假象。
+**观察变化那一半（`clipboard-monitor`）是真正的 Rust 侧强制，而且没有替代路径。**
+下面 11.2 的四个方法全部要经宿主：浏览器 API 没有「剪贴板变了」这个通知，也给不出格式
+列表与原始图片。因此这一半**不能**像 `readText` 那样被绕过 —— 想观察变化只有这一条路。
 
-**那为什么还要有它**：调用会被记录、行为统一，而且**忘记声明权限的插件会被降级** ——
-权限列表里这一项因此不是空的。需要真正的强隔离，只能等插件挪进独立进程。
+它也是权限表里**风险等级最高的少数几项之一**（`high`），理由写在安装确认页上：它读的是
+用户在这台电脑上复制的**任何内容**。`clipboard` 与 `clipboard-monitor` 是两项独立的权限，
+一个只想在按钮上做「复制到剪贴板」的插件完全不需要第二项。
 
 ### 两条会咬人的行为
 
@@ -703,6 +713,99 @@ try {
 写入路径有一个 `document.execCommand('copy')` 的回退，它**必须由用户手势触发**：
 在按钮点击里有效，在定时器或后台回调里无效。失败时会抛出说明原因的错误，
 而不是无声失败 —— 无声失败会让作者以为是自己传的值不对。
+
+## 11.2 clipboard 的变化观察 —— 需要 `clipboard-monitor`
+
+做剪贴板历史、或者「我刚复制了什么」这类功能的地方。
+
+```json
+"permissions": ["clipboard", "clipboard-monitor"]
+```
+
+```js
+if (!ctx.clipboard.canMonitor()) return;   // 同步判断：权限 + 平台
+
+const off = ctx.clipboard.subscribe((change) => {
+  // change = { text: string | null, formats: string[], at: number }
+  if (change.text === null) return;        // 只复制了一张图（或没有文本）
+  history.push({ text: change.text, formats: change.formats, at: change.at });
+});
+// 停用时：off()
+```
+
+### 事件形状
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `text` | `string \| null` | 剪贴板上的文本。**没有文本时是 `null`，不是空串** —— 空串是「用户复制了一段空内容」，两者必须分得开 |
+| `formats` | `string[]` | 友好格式名。剪贴板上**至少有一样**我们能交付的东西时才会有事件 |
+| `at` | `number` | **宿主观察到变化**的毫秒时间戳（不是用户按 Ctrl+C 的时刻，见下） |
+
+### 它只做这几件事，别的都做不到
+
+**一、订阅不会交付剪贴板上已有的内容。** 只有「订阅之后发生的变化」会被交付。
+否则每装一个剪贴板历史插件，用户当时剪贴板里的东西（可能正是一个密码）就会被立刻送进去。
+
+**二、一轮最多一条。** 宿主每 800 ms 看一次剪贴板的序列号，因此 800 ms 内复制两次只会
+得到**后一次**的内容。历史插件必须按这个粒度接受「可能丢一条中间态」，也不要指望
+`at` 精确到毫秒。
+
+**三、`text` 最多 64 KiB（UTF-8 字节）。** 超出的部分被截断，而且**没有标志位** ——
+`change` 的形状是刻意的三字段。判断办法只有一个：按上限自检（长度接近 65536 时就当成
+可能不完整）。为什么不加一个 `truncated` 标志：那会让「文本恰好 64 KiB」与「文本被截断」
+看起来不一样，于是插件会写出依赖那个标志的分支，而它只在这一条通道上被保证。
+
+**四、应用退出后监测停止。** 轮询线程在应用进程里，没有它就没有变化事件 ——
+这也是权限描述里那句「应用运行期间」的含义。
+
+### 隐私：会跳过什么，以及这件事的真实强度
+
+**复制内容的程序主动标记为敏感的内容会被跳过，宿主一个字节都不读。** 具体是 Windows 上
+三个约定格式：`ExcludeClipboardContentFromMonitorProcessing` 出现即跳过；
+`CanIncludeInClipboardHistory` 或 `CanUploadToCloudClipboard` 的值不是 `1` 时跳过。
+主流密码管理器（KeePass、1Password、Bitwarden 等）复制密码与验证码时都会挂上它们。
+
+**但这只在那段程序合作时有效。** 它是**约定**，不是强制：一个不合作、或者干脆直接调
+`SetClipboardData` 的程序放上去的任何东西，宿主没有技术手段分辨。请据此设计 ——
+不要把「标记过的会被跳过」理解为「敏感内容不会被读到」，也不要把用户复制的内容不加提示
+地写进插件自己的明文存储或发到网络上。权限描述里对用户说的也是这一句话。
+
+被标记时 `subscribe` 不会收到事件，而 `readFormats()` / `readImage()` 会**抛错**并说明原因
+（不返回空数组/`null`：那会被读成「剪贴板是空的」，而真实原因是它被保护着）。
+
+### 图片：什么时候 `null`，什么时候抛错
+
+`readImage()` 的三种结果必须分开处理：
+
+| 情况 | 结果 |
+| --- | --- |
+| 剪贴板上没有图片 | `null` |
+| 有图片，在上限之内 | `data:image/png;base64,...` |
+| 有图片，但**每边 > 4096 像素**或**编码后 > 8 MiB** | **抛错**（消息里带着实际体积与上限） |
+
+最后一种**不能**当成 `null` 处理：作者会写「没有图片就提示用户复制一张」，而用户明明
+复制了一张 4K 截图 —— 那个分支永远走不到，也没有任何线索。超限时变化事件的 `formats`
+里**仍然**会列出 `image/png`，可以据此给出一句准确的提示。
+
+体积上限之所以容易撞到：宿主不引第三方 PNG 编码器（本项目一贯刻意不引依赖），用的是
+`icon.rs` 里那个手写的编码器，而它只输出 zlib 的**非压缩存储块** —— 也就是说编码后的
+大小接近「像素数 × 4」，一张 1920×1080 的截图约 8.3 MB，**刚好越过 8 MiB**。剪贴板上
+已经带 `PNG` 格式时宿主直接透传（浏览器与多数截图工具都会给这条），那种情况不受此限；
+只有宿主必须自己编码（DIB-only 的来源）时才会撞到。
+
+### 平台
+
+只有 Windows 有这套接口（剪贴板序列号与注册格式都是 Win32 的）。其它平台上
+`canMonitor()` 恒为 `false`，`subscribe()` 会降级成「空订阅 + 一次控制台告警」，
+而 `readFormats()` / `readImage()` 会抛出一句说明「这个平台不支持」的错误 ——
+**不会**返回空数组或 `null`，那会让插件以为剪贴板是空的。
+
+### 后台插件没有 `ctx.clipboard`
+
+`runtime` 为后台（`contributes.background`）的插件既没有这个成员，也拿不到剪贴板监测。
+理由不是「缺一个 DOM 对象」，而是**方向不对**：变化由宿主观察，宿主把它推给订阅者所在的
+界面，而后台插件没有界面承载那条推送，也没有一条从宿主主动回到它的通道。需要剪贴板历史
+的插件必须是界面插件 —— 那也正是它能展示历史的前提。
 
 ## 12. files —— **沙箱独有**
 

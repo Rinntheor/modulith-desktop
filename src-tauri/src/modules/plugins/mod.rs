@@ -3,6 +3,7 @@
 
 pub mod commands;
 pub mod background_manifest;
+pub mod clipboard;
 pub mod data_dir;
 pub mod data_root;
 pub mod db;

@@ -55,7 +55,7 @@ export interface SandboxSurfaceHandle {
  * 宿主推进来的一条消息。
  *
  * `channel` 是**固定的几个之一**（主题、快捷键、命令、下载进度、跨插件事件、
- * 关闭），`payload` 的形状随 `channel` 而定。桥接层按 `channel` 分派，
+ * 剪贴板变化、关闭），`payload` 的形状随 `channel` 而定。桥接层按 `channel` 分派，
  * 认不出的 channel 一律忽略 —— 宿主加一条新的推送时，旧版插件不该因此报错。
  */
 export interface SandboxPush {

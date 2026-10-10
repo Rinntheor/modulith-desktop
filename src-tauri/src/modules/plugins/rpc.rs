@@ -225,6 +225,26 @@ async fn checked_secrets_dir<R: Runtime>(
     super::secrets::dir_for(app)
 }
 
+/// 校验 `clipboard-monitor` 权限（沙箱路径）。
+///
+/// 与 `checked_secrets_dir` 同一条纪律：权限守卫在**内部的作用域里**就被丢掉，
+/// `await` 全部发生在它之外 —— 持着读锁去碰剪贴板会让一次读取把整个插件系统堵住。
+async fn checked_clipboard_monitor<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+) -> Result<(), String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::clipboard::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
 /// 执行一次 ctx 调用。
 ///
 /// 参数与返回都是 `serde_json::Value` —— 这一层不认识 HTTP，也不认识 stdio。
@@ -1563,6 +1583,80 @@ pub async fn dispatch<R: Runtime>(
             }
         }
 
+        // ---- 剪贴板监测（`ctx.clipboard` 的订阅 / 读格式 / 读图片）-----------
+        //
+        // ============================================================
+        // 为什么这四条与 `ctx.clipboard.readText` 的关系是"互补"而不是"重复"
+        // ============================================================
+        //
+        // `readText` / `writeText` 用的是**页面自己的** `navigator.clipboard`，
+        // 因此它们与宿主无关（那一项在权限表里是前端强制，理由见 `permissions.rs`）。
+        // 下面这四条做不到那件事：浏览器 API 没有"剪贴板变了"这个通知，
+        // 也不给格式列表与原始图片。**只有宿主进程里的 Win32 能回答这三个问题** ——
+        // 所以它们必须走 RPC，而且只能在 Rust 侧强制。
+        //
+        // 身份这一侧仍然是"webview 标签给定的 plugin_id"，因此下面几条挡的**不是**
+        // 冒充（一个插件本来就够不到别人的界面），而是"没声明 `clipboard-monitor`
+        // 的插件照样能订阅"。至于"这条订阅属于哪一个界面"，由 `surface` 参数带上 ——
+        // 界面关闭时它就是撤销订阅的判据（见 `sandbox::close_surface`）。
+
+        "clipboard.subscribe" => {
+            let Some(surface) = surface else {
+                return rpc_error(
+                    "ctx.clipboard.subscribe 需要界面上下文：后台插件没有界面可以承载\
+                     这条订阅（也就没有界面关闭时的撤销点）",
+                );
+            };
+
+            if let Err(e) = checked_clipboard_monitor(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+            if !super::clipboard::is_supported() {
+                return rpc_error(super::clipboard::UNSUPPORTED_PLATFORM);
+            }
+
+            let Some(state) = app.try_state::<super::clipboard::ClipboardMonitor>() else {
+                return rpc_error("剪贴板监测表尚未就绪");
+            };
+
+            match state.subscribe(app, plugin_id, Some(surface)) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        // 撤销**不做权限检查**：一条撤不掉的订阅就是一个泄漏（它会一直让轮询线程
+        // 活着）。与 `secrets` 那几条不同，这里没有"没权限就不能撤销"这种说法。
+        "clipboard.unsubscribe" => {
+            if let (Some(state), Some(surface)) = (
+                app.try_state::<super::clipboard::ClipboardMonitor>(),
+                surface,
+            ) {
+                state.unsubscribe(plugin_id, Some(surface));
+            }
+            json_ok()
+        }
+
+        "clipboard.formats" => {
+            if let Err(e) = checked_clipboard_monitor(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+            match super::clipboard::read_formats() {
+                Ok(formats) => json_value(serde_json::json!(formats)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "clipboard.readImage" => {
+            if let Err(e) = checked_clipboard_monitor(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+            match super::clipboard::read_image() {
+                Ok(image) => json_value(serde_json::json!(image)),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
     }
 }
@@ -1669,6 +1763,21 @@ pub const SHORTCUT_TRIGGERED: &str = "modulith://plugin-shortcut";
 
 /// 插件请求宿主更新它的状态指示（徽标 / 进度 / 启动占位）。
 pub const PLUGIN_UI: &str = "modulith://plugin-ui";
+
+/// 宿主观察到一次剪贴板变化时，广播给 **in-process** 插件的事件名。
+///
+/// ============================================================
+/// 为什么是一条广播，而不是让前端自己去轮询
+/// ============================================================
+///
+/// 变化是**宿主进程里的 Win32** 观察到的（`GetClipboardSequenceNumber`），前端那
+/// 一侧没有任何等价的能力：`navigator.clipboard` 只回答"现在是什么"，不回答
+/// "变过没有"。因此方向只能是宿主 → 前端，而前端接住之后按 `pluginId` 派发给
+/// 插件注册的处理函数（见 `pluginClipboardMonitor.ts`）。
+///
+/// 沙箱插件不走这条：它的回调在另一个 realm，由宿主直接推进它的界面
+/// （`clipboard::PUSH_CHANNEL`）。两条都保留，与 `PLUGIN_UI` / 下载进度同一形态。
+pub const CLIPBOARD_CHANGE: &str = "modulith://plugin-clipboard-change";
 
 /// 下载进度广播给**前端**时的事件名。
 ///

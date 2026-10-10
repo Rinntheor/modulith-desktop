@@ -1013,6 +1013,116 @@ pub async fn plugin_secrets_clear(app: AppHandle, id: String) -> Result<(), Stri
     super::secrets::clear(&dir, &id)
 }
 
+// ============================================================
+// `ctx.clipboard` 的监测部分：in-process 插件那一条路径
+// ============================================================
+//
+// ============================================================
+// 为什么这些必须在宿主里，而 `readText` / `writeText` 不在
+// ============================================================
+//
+// `ctx.clipboard.readText` / `writeText` 是**前端**强制的一项，因为它调的就是
+// 页面自己的 `navigator.clipboard` —— 后端加门不改变任何事（理由写在
+// `permissions.rs` 的 `Clipboard` 规格里）。
+//
+// 下面这四条做不到那件事，因此它们与那一项是**互补**而不是重复：
+//
+//   * "剪贴板变了没有"只有 `GetClipboardSequenceNumber` 能回答，而它是宿主进程
+//     里的一个 Win32 调用。浏览器 API 没有变化通知。
+//   * 格式列表与原始图片同样只有宿主能拿到（`navigator.clipboard.read()` 在
+//     这个项目支持的 WebView 里给不出格式名，也没有 `image/png` 的原始字节）。
+//
+// 也就是说这一项**只能**在 Rust 侧强制，而前端那一条绕不过去 —— 与 `secrets`
+// 同一形态，与 `clipboard` 相反。
+//
+// ============================================================
+// `id` 由前端给，因此 in-process 上买到的是"权限列表诚实"
+// ============================================================
+//
+// 与 `plugin_storage_*` / `plugin_secrets_*` 完全一样：in-process 插件与宿主在
+// 同一个 realm 里，这条命令**无法**分辨调用者是宿主还是插件。一条
+// `invoke('plugin_clipboard_subscribe', { id: '别的插件' })` 会把那个插件登记成
+// 订阅者，而下面的 `require_permission` 挡不住它 —— 它检查的是被冒充的那个插件
+// 有没有声明 `clipboard-monitor`，而不是"你是谁"。
+//
+// 后果比 `secrets` 那一条轻：冒充者只能让**别的插件**收到剪贴板变化，自己看不到
+// （变化事件按被冒充的 id 广播）。真正的边界仍然要等进程级隔离。沙箱那条路径不
+// 存在这个问题 —— 身份来自 webview 标签。
+
+/// 校验 `clipboard-monitor` 权限（in-process 路径）。
+///
+/// 与 `rpc.rs::checked_clipboard_monitor` 是同一条判据的两个传输。权限守卫在内部
+/// 作用域里就被丢掉，`await` 全部发生在它之外 —— 持着读锁去碰剪贴板会让一次读取
+/// 把整个插件系统堵住。
+async fn checked_clipboard_monitor(app: &AppHandle, plugin_id: &str) -> Result<(), String> {
+    let state = app.state::<PluginState>().inner().0.clone();
+
+    {
+        let manager = state.read().await;
+        super::clipboard::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
+/// 这个平台支不支持剪贴板监测。
+///
+/// **不需要权限**：它回答的是"这台机器上有没有这项能力"，与调用者是谁无关，也不
+/// 泄露任何用户数据。前端的 `canMonitor()` 把它与"清单里声明了没有"相与。
+#[tauri::command]
+pub fn plugin_clipboard_can_monitor() -> bool {
+    super::clipboard::is_supported()
+}
+
+/// 登记一条 in-process 订阅，并在第一个订阅者到来时拉起轮询线程。
+///
+/// 未声明 `clipboard-monitor` 时**拒绝**（而不是像 `notification` 那样降级）：
+/// 降级在"可选附加能力"上是对的，而剪贴板监测不是可选附加能力 —— 它是一条持续
+/// 读取用户全部复制内容的通道，插件不该在没声明的情况下意外打开它。
+#[tauri::command]
+pub async fn plugin_clipboard_subscribe(app: AppHandle, id: String) -> Result<(), String> {
+    checked_clipboard_monitor(&app, &id).await?;
+
+    let Some(state) = app.try_state::<super::clipboard::ClipboardMonitor>() else {
+        return Err("剪贴板监测表尚未就绪".to_string());
+    };
+
+    state.subscribe(&app, &id, None)
+}
+
+/// 撤销一条 in-process 订阅。**没有权限检查** —— 一条撤不掉的订阅就是一个泄漏。
+///
+/// 它同时服务插件自己的 `unsubscribe()` 与宿主侧的停用/卸载收尾（见
+/// `cleanupPluginResources`），因此这里不能有任何"因为权限变了就拒绝"的路径。
+#[tauri::command]
+pub async fn plugin_clipboard_unsubscribe(app: AppHandle, id: String) -> Result<(), String> {
+    if let Some(state) = app.try_state::<super::clipboard::ClipboardMonitor>() {
+        state.unsubscribe(&id, None);
+    }
+    Ok(())
+}
+
+/// 一次性读出剪贴板上的友好格式名。**不要求先订阅**。
+#[tauri::command]
+pub async fn plugin_clipboard_formats(app: AppHandle, id: String) -> Result<Vec<String>, String> {
+    checked_clipboard_monitor(&app, &id).await?;
+    super::clipboard::read_formats()
+}
+
+/// 读剪贴板上的图片（PNG data URL）。
+///
+/// 三种结果必须分得开，见 `clipboard::read_image`：没有图片是 `Ok(null)`，
+/// 有图片但超限是 `Err`（消息里带着实际体积、上限，以及"formats 里仍然有
+/// image/png"这条线索）。
+#[tauri::command]
+pub async fn plugin_clipboard_read_image(
+    app: AppHandle,
+    id: String,
+) -> Result<Option<String>, String> {
+    checked_clipboard_monitor(&app, &id).await?;
+    super::clipboard::read_image()
+}
+
 #[tauri::command]
 pub async fn plugin_http_request(
     state: State<'_, PluginState>,

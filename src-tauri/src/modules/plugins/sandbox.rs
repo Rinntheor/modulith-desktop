@@ -953,6 +953,18 @@ fn bridge_script<R: Runtime>(
         .replace("'__PLUGIN_RUNTIME__'", &js_string(runtime_wire(&plugin.runtime)))
         .replace("__PLUGIN_PERMISSIONS__", &permissions)
         .replace("__PLUGIN_DATA_AVAILABLE__", if data_available { "true" } else { "false" })
+        // 剪贴板监测的平台能力。与 `data_available` **同一个理由**注入成字面量：
+        // `ctx.clipboard.canMonitor()` 是同步方法（插件在 bundle 顶层用它决定要不要
+        // 建历史），而"这个平台支不支持"只有宿主知道 —— 让插件先 await 一次 RPC
+        // 就等于要求它把特性探测挪到异步路径里，而那时的界面已经渲染过一帧了。
+        //
+        // 它只是"这个平台有没有那套 Win32 接口"，**不是权限**：权限仍由
+        // `has('clipboard-monitor')` 在桥接层判、并最终由 RPC 侧的
+        // `require_permission` 强制。
+        .replace(
+            "__PLUGIN_CLIPBOARD_MONITOR__",
+            if super::clipboard::is_supported() { "true" } else { "false" },
+        )
         .replace("__PLUGIN_SURFACES__", &serde_json::Value::from(declared).to_string())
         .replace("'__PLUGIN_ACTIVATION__'", &js_string("open"))
         // 主题快照注入成**字面量**而不是让桥接层先 RPC 一次：插件在顶层同步
@@ -1743,11 +1755,35 @@ pub fn close_surface<R: Runtime>(app: &AppHandle<R>, token: &str) {
     // 再也查不到这块界面对应的 (插件, 界面) 了 —— 而那份 (插件, 界面) 正是文件
     // 授权归属的判据。留下的后果很具体：一块已经关掉的界面持有的授权会一直活着，
     // 直到同一个插件的**下一块同名界面**开起来并继承它。
+    //
+    // 剪贴板订阅走同一条路，也必须在 `forget` **之前**撤：订阅表记的就是
+    // `(插件, 界面)`，令牌一旦被忘掉就再也对不回那一条了。它是界面的资源 ——
+    // 一块关掉的界面没人再收变化，而留下的那条订阅会让轮询线程一直活着。
     if let Some(key) = surfaces.key_of(token) {
         revoke_grants_of_surface(app, &key.plugin_id, &key.surface);
+        revoke_clipboard_subscription_of_surface(app, &key.plugin_id, &key.surface);
     }
 
     surfaces.forget(token);
+}
+
+/// 撤掉一块界面持有的剪贴板订阅。
+///
+/// 与文件授权同一个理由、同一条路径：**它是界面的资源，不是插件的**。宿主那一侧
+/// 一张表按插件 id 分（一个插件是沙箱还是 in-process 在安装时就固定了），而值里
+/// 记着发起订阅的界面名 —— 否则一次界面关闭会把同一插件另一块界面的订阅一起撤掉。
+///
+/// 只记一条 debug 日志，与 `revoke_grants_of_surface` 同一取舍：切换标签时的重挂载
+/// 也会走到这里。
+fn revoke_clipboard_subscription_of_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: &str,
+) {
+    let Some(monitor) = app.try_state::<super::clipboard::ClipboardMonitor>() else {
+        return;
+    };
+    monitor.unsubscribe(plugin_id, Some(surface));
 }
 
 /// 收回一块界面的全部文件授权。
@@ -1777,6 +1813,16 @@ pub fn close_all_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) {
         if count > 0 {
             log::debug!("[sandbox] 插件 {plugin_id} 的界面全部关闭，收回 {count} 条文件授权");
         }
+    }
+
+    // 剪贴板订阅同样跟着一起收，而且**按插件收**（不是按界面）：这一段走的是
+    // 停用/卸载，那个插件已经不在了，它剩下的每一块界面都不该再有人交付变化。
+    //
+    // 放在这里而不是只靠 `close_surface`：那条路径要求前端逐个调用它，而插件被
+    // 停用时前端可能正好在重挂载、什么都还没来得及调 —— 留下的就是一个永远不会
+    // 被撤销的订阅，以及一个永远不退出的轮询线程。
+    if let Some(monitor) = app.try_state::<super::clipboard::ClipboardMonitor>() {
+        monitor.forget_plugin(plugin_id);
     }
 
     let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
