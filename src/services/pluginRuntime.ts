@@ -571,6 +571,37 @@ function registerDeclaredCommands(pluginId: string, commands: CommandContributio
   }
 }
 
+/**
+ * 沙箱模块在宿主侧的**占位**组件。
+ *
+ * **它不该被渲染。** 沙箱模块的渲染路径是 `ModuleRenderer` 的 `sandboxed` 分支
+ * （渲染 `SandboxSurface`，由它换令牌并挂 `<iframe>`），因此正常流程永远走不到这里。
+ * 留着它是因为 `ModuleDescriptor.component` 是必需字段，而返回 `undefined` 会让
+ * 类型与渲染端都多出一层判空。
+ *
+ * 万一真的被渲染了（将来新增一条绕开 `sandboxed` 判断的渲染路径），**必须给出
+ * 能指路的报错**而不是一个空白面板 —— "沙箱插件打开后一片空白"正是这个位置最难查
+ * 的失败形态。
+ *
+ * `preload()` 立刻 resolve，这是**关键**：启动预热（`boot.ts`）会 `preload()`
+ * 上次打开的那个模块，而对沙箱模块"没有可预热的东西"的正确结果就是**成功**。
+ * 此前这里挂的是 `ensureProvidedModule` 的加载器，那个 loader 对沙箱插件必然抛错，
+ * 于是每次启动都报一句"预热失败：模块「…」"，把真正的预热失败一起埋掉。
+ */
+function createSandboxModuleComponent(
+  pluginId: string,
+  moduleId: string
+): React.LazyExoticComponent<React.ComponentType<Record<string, never>>> {
+  const Placeholder: React.ComponentType<Record<string, never>> = () => {
+    throw new Error(
+      `模块 "${moduleId}" 属于沙箱插件 "${pluginId}"，它的界面在自己的 iframe 里，` +
+        `宿主侧没有对应组件。渲染路径应当走 SandboxSurface` +
+        `（见 ModuleRenderer 的 sandboxed 分支）。`
+    );
+  };
+  return createLazyComponent(async () => ({ default: Placeholder }));
+}
+
 /** 由清单声明建立的模块描述符：组件在**渲染时**才触发激活 */
 function buildDeclaredModuleDescriptor(
   plugin: InstalledPlugin,
@@ -594,10 +625,31 @@ function buildDeclaredModuleDescriptor(
     disabled: false,
     badge: contribution.badge,
     // 这里是整块设计的落点：条目现在就有，组件要等到有人真的打开它。
-    component: createLazyComponent(async () => {
-      const Component = await ensureProvidedModule(pluginId, moduleId);
-      return { default: Component };
-    }),
+    //
+    // ============================================================
+    // 沙箱模块**没有宿主侧组件**，因此也没有可预热的东西
+    // ============================================================
+    //
+    // 这里此前无条件挂上 `ensureProvidedModule` 的懒加载器。而
+    // `ensureProvidedModule` 做的是"激活插件，然后要它交出 `registerModule`
+    // 注册过的那个组件" —— 沙箱插件的代码在**它自己的文档**里，永远不会有
+    // 这样一个组件，于是那个 loader **必然抛错**。
+    //
+    // 它的后果不是"少预热一次"，而是一条**每次启动都必然出现**的用户可见告警：
+    // `boot.ts` 的预热会 `preload()` 上次打开的那个模块（`resolveInitialModule()`
+    // 取的就是 `settings.lastModule`），因此报出来的永远是"上次用的那个插件"。
+    // 一个每次都响的告警不只是噪声 —— 它把**真正的**预热失败一起埋掉了。
+    //
+    // 正确形态是"没有可预热的东西"，而不是"预热一件不存在的东西然后失败"。
+    // 沙箱模块的渲染路径根本不碰 `component`：`ModuleRenderer` 走
+    // `sandboxed` 分支渲染 `SandboxSurface`，iframe 在打开时才建。
+    component:
+      plugin.manifest.runtime === 'sandboxed'
+        ? createSandboxModuleComponent(pluginId, moduleId)
+        : createLazyComponent(async () => {
+            const Component = await ensureProvidedModule(pluginId, moduleId);
+            return { default: Component };
+          }),
     children: undefined,
     pluginId,
     iconSvg: resolveInlineIconSvg(pluginId, plugin.manifest),
