@@ -355,15 +355,66 @@ function createPluginSandbox(identity, _unused) {
     },
 
     settings: {
+      /**
+       * 全部设置值。
+       *
+       * 名字与 in-process / 沙箱一致（`ctx.settings.getAll`）。此前这里叫 `all`
+       * —— 同一个能力在三个运行位置上出现两个名字，正是"同一个插件换个运行位置
+       * 就得改代码"的来源。
+       */
+      getAll: () => callHost('ctx.settings.all', {}),
+      /** 兼容别名，服务 `stand-up@1.x`。新代码用 `getAll`。 */
       all: () => callHost('ctx.settings.all', {}),
       get: (id, fallback) =>
         callHost('ctx.settings.all', {}).then((values) =>
           Object.prototype.hasOwnProperty.call(values || {}, id) ? values[id] : fallback
         ),
       set: (id, value) => callHost('ctx.settings.set', { id, value }),
+      /**
+       * 设置能力是否可用 —— 与 in-process 同一条判据（要 `storage`）。
+       *
+       * **这里没有 `onChange`，这是刻意不做的。** 宿主没有"设置变了"的推送通道
+       * 给后台进程，而造一个永远不触发的函数比没有它更坏：作者会写
+       * `onChange` 然后等一个永不到来的回调。这是后台位置与另外两个位置之间
+       * **仍然存在**的一处差异，已记进 `现行问题` —— 不假装已经统一。
+       */
+      isAvailable: () => identity.permissions.indexOf('storage') !== -1,
     },
 
     notifications: {
+      /**
+       * 发一条应用内通知。**名字与签名与 in-process / 沙箱一致**
+       * （那边是 `ctx.notifications.show(title, body, dedupeKey)`）。
+       */
+      show: (title, body, dedupeKey) =>
+        callHost('ctx.notify', {
+          title,
+          body: body ?? '',
+          level: 'info',
+          dedupeKey: dedupeKey ?? null,
+        }),
+
+      /** 与 `show` 同一件事、同一个级别，只是名字不同 —— 与 in-process 一致。 */
+      info: (title, body, dedupeKey) =>
+        callHost('ctx.notify', { title, body: body ?? '', level: 'info', dedupeKey: dedupeKey ?? null }),
+      success: (title, body, dedupeKey) =>
+        callHost('ctx.notify', { title, body: body ?? '', level: 'success', dedupeKey: dedupeKey ?? null }),
+      warn: (title, body, dedupeKey) =>
+        callHost('ctx.notify', { title, body: body ?? '', level: 'warn', dedupeKey: dedupeKey ?? null }),
+      error: (title, body, dedupeKey) =>
+        callHost('ctx.notify', { title, body: body ?? '', level: 'error', dedupeKey: dedupeKey ?? null }),
+
+      isAvailable: () => identity.permissions.indexOf('notification') !== -1,
+
+      /**
+       * **兼容别名，服务 `stand-up@1.x`。** 新代码用 `show`。
+       *
+       * 它必须留一段时间，而不是"顺手删掉"：`stand-up@1.0.1` 已经发布，用户机器上
+       * 装着的就是调 `notify({...})` 的那一份。宿主先把新名字加上、插件再迁移、
+       * 等 `engines.modulith` 的下界排除掉旧版本之后才删这一个 —— 这是本项目迁移
+       * 沙箱运行时用过的同一套顺序（宿主先支持、插件后迁移、下限最后抬）。
+       * 删早了的表现是"应用更新之后，某个用户的后台插件静默失灵"。
+       */
       notify: (input) => {
         const input0 = input || {};
         return callHost('ctx.notify', {
@@ -384,6 +435,14 @@ function createPluginSandbox(identity, _unused) {
     },
 
     events: {
+      /** 与 in-process / 沙箱一致：`publish` / `subscribe`。 */
+      publish: (name, payload) => callHost('ctx.events.emit', { name, payload: payload ?? null }),
+      subscribe: (name, handler) => subscribe(`event:${name}`, handler, 'ctx.events.subscribe'),
+
+      /**
+       * **兼容别名，服务 `stand-up@1.x`。** 新代码用 `publish` / `subscribe`。
+       * 理由与 `notifications.notify` 逐字相同 —— 已发布的插件调的是这两个名字。
+       */
       emit: (name, payload) => callHost('ctx.events.emit', { name, payload: payload ?? null }),
       on: (name, handler) => subscribe(`event:${name}`, handler, 'ctx.events.on'),
     },

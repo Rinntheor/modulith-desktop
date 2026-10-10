@@ -22,8 +22,10 @@ import { whenBackendReady } from './backendReady';
 import { getCatalogFlatMap, getCatalogModules, getPluginModuleIds } from './moduleCatalog';
 import { moduleManager } from './moduleManager';
 import {
+  announceSafeMode,
   getInstalledPlugins,
   getLoadStates,
+  getSafeModeState,
   loadPluginsInBackground,
   reloadPluginRuntime,
 } from './pluginRuntime';
@@ -192,6 +194,43 @@ const STEPS: BootStepDefinition[] = [
     critical: false,
     run: async (report, ctx) => {
       const settings = getCachedSettings();
+
+      // ============================================================
+      // 安全模式：插件一律不执行，但**清单照常同步**
+      // ============================================================
+      //
+      // 宿主在上一次启动没有走干净时打开它（见 `pluginRuntime.ts` 的
+      // `getSafeModeState` 与宿主侧 `modules/plugins/safe_mode.rs`）。
+      //
+      // 关键的一步是**仍然走 `listOnly`**：清单不取的话，「设置 → 插件」会是
+      // 空的，于是用户既看不到那个坏插件、也无法禁用它 —— 那样安全模式就只是
+      // 把用户关在一个更安静的房间里，不解决问题。
+      //
+      // `listOnly` 只构建目录与注入宿主 API，**不执行任何插件 bundle**，
+      // 正是这里需要的东西。
+      const safeMode = await getSafeModeState();
+      if (safeMode.active) {
+        try {
+          await reloadPluginRuntime(undefined, {
+            timeoutMs: settings.pluginLoadTimeoutMs,
+            listOnly: true,
+          });
+        } catch (error) {
+          ctx.warn(
+            `安全模式下读取插件清单失败：${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+
+        const count = getInstalledPlugins().filter((p) => p.enabled).length;
+        report(count, count, `安全模式：已跳过 ${count} 个插件的加载`);
+        ctx.warn(`安全模式已启用，插件未被加载：${safeMode.reason ?? '原因未知'}`);
+
+        // 开发模式自动重载**不启动**：它会在文件变化时重新加载插件运行时，
+        // 而安全模式的前提正是"不要自动执行插件代码"。
+        // 后台插件（`contributes.background`）同理不拉起。
+        await announceSafeMode(safeMode.reason);
+        return;
+      }
 
       report(0, 0, '正在读取插件列表');
 

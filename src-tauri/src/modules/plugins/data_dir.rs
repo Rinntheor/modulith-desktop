@@ -234,11 +234,34 @@ pub fn stat(root: &Path, rel: &str) -> Result<Option<DataStat>, String> {
 }
 
 /// 读一个文件。
+///
+/// ============================================================
+/// 读**也**有尺寸上限（此前只有写有）
+/// ============================================================
+///
+/// `MAX_FILE_BYTES` 此前只在 `write` 上判，于是同一个上限对"写"成立、对"读"
+/// 不成立 —— 而读的代价比写更大：一次 `ctx.dataDir.read()` 要把整个文件读进内存、
+/// 再经 RPC 送出去。一个 256 MB 的文件足以让界面卡住。
+///
+/// 上限取与写侧**同一个常量**：一个能被写进来的文件就该能被读出去，两侧用不同的
+/// 数字只会让"我写得进去却读不回来"变成一个没人解释得清的现象。
+///
+/// 先看元数据再读，因此超限的文件**不会**被读进内存。这不是一项安全边界
+/// （文件可能在两次调用之间变大），而是一道资源保护 —— 与写入侧同一性质。
 pub fn read(root: &Path, rel: &str) -> Result<Vec<u8>, String> {
     let path = resolve(root, rel)?;
-    if !path.is_file() {
+
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取失败：{e}"))?;
+    if !meta.is_file() {
         return Err("不是一个文件".to_string());
     }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "文件过大：{} 字节，上限 {MAX_FILE_BYTES} 字节",
+            meta.len()
+        ));
+    }
+
     std::fs::read(&path).map_err(|e| format!("读取失败：{e}"))
 }
 

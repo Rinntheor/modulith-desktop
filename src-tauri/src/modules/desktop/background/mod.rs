@@ -54,6 +54,13 @@ pub use protocol::{BackgroundMethod, ProtocolError, PROTOCOL_VERSION};
 /// 挂一整晚。它只在"已经拉起过"之后才有意义 —— 没拉起来的话这个数字没有作用。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 空闲回收的**检查间隔**。
+///
+/// 它与 `IDLE_TIMEOUT` 是两件事：这个决定"回收最晚晚多久被发现"，
+/// 那个才是"多久没被用算空闲"。取 60 秒是因为判据本身是"距离最后一次请求多久"，
+/// 请求随时可能来 —— 精确定时反而要不停重置计时器，而晚一分钟回收没有代价。
+const REAP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// 单次启动握手（读取问候行）的超时。
 ///
 /// 比普通请求短：这一行是脚本第一件事就会打印的，而启动阶段卡住通常意味着

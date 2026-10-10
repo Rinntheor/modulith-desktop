@@ -229,6 +229,23 @@ export async function createPluginHost(): Promise<PluginHost> {
 
     list_plugins: () => installedPlugins(),
 
+    // 命令归属的判定在**宿主**那一侧（`commands.rs::run_plugin_declared_command`），
+    // 前端只消费它的答案（`"sandboxed"` / `"in-process"`）。
+    //
+    // 桩必须照实现回答，否则"执行一条声明式命令"这条路径在夹具里会走进沙箱分支、
+    // 于是一个插件代码都不会被执行 —— 而"执行命令触发了插件代码"正是这门门禁
+    // 要盯的东西。它返回 `"sandboxed"` 时前端会**早退**，那对沙箱夹具是对的。
+    run_plugin_declared_command: ({ pluginId }) => {
+      const fixture = fixtures.get(String(pluginId));
+      if (!fixture) throw new Error(`夹具里没有插件 "${pluginId}"`);
+      return fixture.manifest.runtime === 'sandboxed' ? 'sandboxed' : 'in-process';
+    },
+
+    // 安全模式：夹具里永远是"没开"（没有"上一次启动没走干净"这件事）。
+    // 提供它而不是让调用方吃一个 reject，是因为 `getSafeModeState` 会捕获失败并按
+    // "没开"处理 —— 那条回落路径本身值得被单独测，不该在这里被意外覆盖。
+    safe_mode_state: () => ({ active: false, reason: null }),
+
     list_plugin_permissions: () => [],
 
     read_plugin_asset: ({ id, rel }) => {

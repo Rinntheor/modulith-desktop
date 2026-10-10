@@ -231,8 +231,19 @@ impl PluginPermission {
                 risk_override: None,
             },
             Self::Notification => Spec {
-                label: "系统通知",
-                description: "弹出系统级通知",
+                // 标签与描述都必须是**实现**的如实描述 —— 这段文字会显示在安装确认页上，
+                // 因此它是对用户做出的承诺。
+                //
+                // 这里曾写「系统通知 / 弹出系统级通知」，而实现是**应用内**通知
+                // （`ctx.notifications.show` → 宿主的通知中心，经 `pushNotification`），
+                // 应用关闭时收不到提醒。也就是说旧文案承诺了一件做不到的事，
+                // 并与 `宿主API参考.md`、`README.md`、`notifications/mod.rs` 三处
+                // 「只有应用内通知，没有系统级通知」直接矛盾 —— 而文档说的才是对的。
+                //
+                // 历史文档里有一处声称这次改名"已从「系统通知」改为「应用内通知」"，
+                // 但代码里一直没改；现在改的是代码那一侧。
+                label: "应用内通知",
+                description: "在应用内的通知中心发一条提醒。**不是系统级通知** —— 应用关闭时无法提醒用户。",
                 effect: E::Write,
                 scope: S::App,
                 reversible: true,

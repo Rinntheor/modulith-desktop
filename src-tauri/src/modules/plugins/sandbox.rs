@@ -1171,6 +1171,23 @@ fn serve_asset(plugin: &SandboxView, rel: &str) -> http::Response<Cow<'static, [
         return text(403, "资源路径越界");
     };
 
+    // 尺寸上限与 `read_plugin_asset` 命令**同一个常量**。
+    //
+    // 此前 `MAX_ASSET_BYTES` 只在那条命令上判，而沙箱取资源走的是本函数 ——
+    // 于是同一个文件经命令读会被拦住、经 `/<token>/asset/...` 读却不会。
+    // 上限放在这里而不是让两条路径各判一次：资源读只有这两个出口，
+    // 而"两处判据"正是它们会漂的原因。
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > super::manager::MAX_ASSET_BYTES {
+            log::warn!(
+                "[sandbox] 拒绝过大的资源请求：{} 请求 {rel}（{} 字节）",
+                plugin.id,
+                meta.len()
+            );
+            return text(413, "资源过大");
+        }
+    }
+
     match std::fs::read(&path) {
         Ok(bytes) => binary(content_type_of(&path), bytes),
         Err(e) => {
