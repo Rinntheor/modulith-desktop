@@ -123,29 +123,30 @@ pub fn configured_root<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
-/// 写入用户配置的数据根。`None` 表示恢复默认。
-pub fn set_configured_root<R: Runtime>(
-    app: &AppHandle<R>,
-    root: Option<&Path>,
-) -> Result<(), String> {
-    let path = config_path(app).ok_or("拿不到配置目录")?;
-
-    // 设置一个根之前先验证它：**指向一个不存在的目录会让所有插件数据立刻不可用**，
-    // 而那应该是"现在就被拒绝"，不是"重启之后才发现"。
-    if let Some(dir) = root {
-        probe_writable(dir).map_err(|reason| format!("这个目录不可用：{reason}"))?;
-    }
-
-    let config = RootConfig {
-        root: root.map(|p| p.display().to_string()),
-    };
-    let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, text).map_err(|e| e.to_string())
-}
+// ============================================================
+// 为什么**没有**"设置数据根"的函数
+// ============================================================
+//
+// 这里曾经有一个 `set_configured_root(app, root)`：写指针文件，写之前先
+// `probe_writable` 验证。它写得很完整，但**从来没有过调用方** —— 没有命令、
+// 没有界面，因此它没有一行被执行过。
+//
+// 处置是**删掉它**，而不是"留着等以后接"：一个有实现、无调用方的函数在代码里
+// 与"已实现的能力"无法区分，读者会以为换根是产品提供的功能。本仓库对这类中间态
+// 的立场是明确的（见 `现行问题` 里 `dependencies` 那四个字段的记录）。
+//
+// 换根因此**只剩手改** —— 而 `plugin_data_root.json` 本来就是给别人改的，
+// 那是 `CONFIG_FILE` 上面那条注释的原意（"搬家时改这个小文件"）。这条路是完整的，
+// 不是残缺的：
+//
+//   * `configured_root()` 照常读它；
+//   * `resolve()` 会**验证**它（`probe_writable`），不可用就进 `DataRootStatus`
+//     的"不可用"状态，而不是被当成"这个插件还没有数据"；
+//   * 界面上显示的是解析出来的真实路径，因此"我改了但没生效"看得见。
+//
+// 加一个设置界面是**独立的工作**：它要先定"目录授权"的交互，而那与 v1.5 里
+// `filesystem-scoped` 被推迟是同一类问题 —— 让用户选一个目录，就要定义
+// "这份授权属于谁、什么时候失效"。在那之前，把死代码留着并不会让它更接近可用。
 
 /// 真的写一个文件再删掉，判定"能不能用"。
 ///
