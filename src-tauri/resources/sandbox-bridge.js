@@ -2742,9 +2742,32 @@
         });
       },
 
+      /**
+       * 全部设置值。
+       *
+       * 名字与 in-process 一致（那边是 `pluginSettingsAPI.getAll`）。这里此前只有
+       * `all` —— 同一个能力在沙箱侧叫一个名字、在 in-process 侧叫另一个，
+       * 正是"同一份插件换个运行位置就得改代码"的来源；后台宿主那边也是同一个错
+       * （见 `background-host.mjs`），三处现在用同一个名字。
+       */
+      getAll: function () {
+        return rpc('settings.all', {});
+      },
+
+      /** 兼容别名。新代码用 `getAll`。 */
       all: function () {
         return rpc('settings.all', {});
       },
+
+      /**
+       * **这里没有 `onChange`，这是刻意不做的。**
+       *
+       * in-process 有它，因为那边宿主与插件同处一个 realm、直接就能回调。
+       * 沙箱侧要它就得有一条"设置变了"的推送通道，而宿主目前没有发这条事件；
+       * 造一个永远不触发的函数比没有它更坏 —— 作者会写 `onChange` 然后等一个
+       * 永不到来的回调，而那种缺陷不会报错。这是沙箱位置与 in-process 之间
+       * **仍然存在**的一处差异，已记进 `现行问题`，不假装已经统一。
+       */
 
       set: function (id, value) {
         // 与 in-process **同一条规矩**：`ctx.settings.set` 是唯一一个在缺 `storage`
