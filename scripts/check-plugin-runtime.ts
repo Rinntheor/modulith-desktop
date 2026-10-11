@@ -360,10 +360,15 @@ console.log('\n规模（全部夹具一起装）：');
   await loadAll(all);
 
   const ran = executed();
-  const lazyFixtures = ['fixture.declarative-module', 'fixture.command-only', 'fixture.duplicate-module'];
+  const lazyFixtures = [
+    'fixture.declarative-module',
+    'fixture.command-only',
+    'fixture.duplicate-module',
+    'fixture.context-menu-icon',
+  ];
   const ranLazy = ran.filter((id) => lazyFixtures.includes(id));
 
-  check(all.length === 10, `夹具数量为 10（当前 ${all.length}）`);
+  check(all.length === 11, `夹具数量为 11（当前 ${all.length}）`);
   check(
     ranLazy.length === 0,
     `★ 按需激活的插件一个都没执行（实际执行了：${ranLazy.join('、') || '无'}）`
@@ -573,6 +578,72 @@ console.log('\n路径型模块图标与启动路径：');
     check(ok, `${label}（实际：${actual}）`);
   }
 
+  // --- (c) 右键菜单项：与侧边栏/仪表盘显示**同一个插件**的那张图 ---
+  //
+  // 用户报的那句「找不到」在右键菜单里还有第二个落点：`contributes.contextMenus[].icon`
+  // 在运行时**不做 svg 路径解析**。写 `icon.svg` 的插件在模块那条路上已经被 9b 的
+  // (a) 修好了，而菜单项此前只把 `icon` 交给 `ModuleIcon`、没有 `iconSvg` ——
+  // 于是同一个插件在侧边栏有图、在右键菜单里却是 `Box`。
+  //
+  // 这里断言的是**结果**（菜单项拿得到 `iconSvg`、且判定不会落到 `fallback`），
+  // 不是"代码里写了一行"。
+  const menuEntry = (menuId: string): { icon?: string; iconSvg?: string } | undefined =>
+    runtime.getPluginContextMenuEntries().find((entry) => entry.id === menuId);
+
+  /** 与 `waitIcon` 同理：图标补全不阻塞调用方，这里必须轮询 */
+  const waitMenuIcon = async (menuId: string): Promise<string | undefined> => {
+    for (let i = 0; i < 400; i += 1) {
+      const svg = menuEntry(menuId)?.iconSvg;
+      if (svg) return svg;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return menuEntry(menuId)?.iconSvg;
+  };
+
+  const brandMenu = await waitMenuIcon('brand-menu');
+  check(
+    typeof brandMenu === 'string' && brandMenu.includes('fixture-plugin-brand'),
+    '★ 插件右键菜单项（没写 icon）也拿到了插件自己的图标（不是 Box）'
+  );
+
+  const ownMenu = await waitMenuIcon('own-icon-menu');
+  check(
+    typeof ownMenu === 'string' && ownMenu.includes('fixture-panel-own'),
+    '★ 菜单项自己声明了包内路径时，用的是那一张（与同名模块一致）'
+  );
+  check(
+    host.backendCallsWithArgs.some(
+      (call) =>
+        call.command === 'read_plugin_asset' &&
+        call.args.id === id &&
+        call.args.rel === 'panels/own.svg'
+    ),
+    '菜单项那张图是按它自己声明的包内路径读回来的'
+  );
+
+  // 判定层：把菜单项真实的 icon / iconSvg 喂给同一个纯函数，它必须走内联 SVG。
+  // 只断言"字段有值"是不够的 —— `ModuleIcon` 认的才是最终结果。
+  const menuSource = resolveModuleIconSource({
+    icon: menuEntry('own-icon-menu')?.icon,
+    iconSvg: menuEntry('own-icon-menu')?.iconSvg,
+    hasBuiltinIcon,
+  });
+  check(
+    menuSource.kind === 'inline-svg',
+    `★ 右键菜单项的判定走内联 SVG，不会落到 Box（实际：${menuSource.kind}）`
+  );
+
+  // 反面判据：**没有** iconSvg 的菜单项仍然按老规矩落 Box，绝不空白。
+  // 少了这一条，"菜单项永远画一张图"这种改法也能让上面几条全绿。
+  const noIconSource = resolveModuleIconSource({
+    icon: 'icon.svg',
+    hasBuiltinIcon,
+  });
+  check(
+    noIconSource.kind === 'fallback',
+    `★ 拿不到图时仍然落 Box 兜底（绝不空白），实际：${noIconSource.kind}`
+  );
+
   // --- (b) 启动的第二趟：真实的后台加载入口 ---
   //
   // 这一趟会把目录整个清空重建（`clearDynamicModules`），因此它同时证明：
@@ -593,6 +664,43 @@ console.log('\n路径型模块图标与启动路径：');
   check(
     !executed().includes(id),
     '它仍然没有被执行（按需激活）—— 因此上面那些图标只可能来自资源读取'
+  );
+
+  // --- (d) 插件级图标**不是** SVG 时，候选过滤必须单独看右键菜单项 ---
+  //
+  // 上面那个夹具的清单顶层就是 `icon.svg`，因此它无论如何都进候选集 ——
+  // 过滤条件里"右键菜单项也声明了 SVG 路径"那一支被删掉也不会有任何一条红。
+  // 这个夹具的顶层图标是 lucide 名（`Package`）、没有任何模块带图，
+  // `panels/menu.svg` **只被右键菜单项引用**：过滤漏了这一支，这个插件整条被滤掉，
+  // 那张图永远不会被读，菜单项于是落 `Box`。
+  const menuOnlyId = 'fixture.context-menu-icon';
+  await loadCatalog([menuOnlyId]);
+
+  const menuOnlySvg = await waitMenuIcon('menu-only');
+  check(
+    typeof menuOnlySvg === 'string' && menuOnlySvg.includes('fixture-context-menu-own'),
+    '★ 只被右键菜单项引用的那张图也被读回来了（候选过滤不只看插件级与模块图标）'
+  );
+  check(
+    host.backendCallsWithArgs.some(
+      (call) =>
+        call.command === 'read_plugin_asset' &&
+        call.args.id === menuOnlyId &&
+        call.args.rel === 'panels/menu.svg'
+    ),
+    '它是按菜单项自己声明的包内路径读的'
+  );
+  check(
+    resolveModuleIconSource({
+      icon: menuEntry('menu-only')?.icon,
+      iconSvg: menuEntry('menu-only')?.iconSvg,
+      hasBuiltinIcon,
+    }).kind === 'inline-svg',
+    '★ 这个插件的右键菜单项同样不会落到 Box'
+  );
+  check(
+    !executed().includes(menuOnlyId),
+    '它没有被执行（按需激活）—— 图标只能来自资源读取'
   );
 
   host.useAll();
