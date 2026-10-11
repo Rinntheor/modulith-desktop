@@ -97,6 +97,7 @@ fn main() {
                 "verify_plugin_index",
                 "run_plugin_declared_command",
                 "safe_mode_state",
+                "mark_boot_ok",
                 "set_plugin_enabled",
                 "uninstall_plugin",
                 "read_plugin_asset",

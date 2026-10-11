@@ -78,6 +78,7 @@
     "allow-verify-plugin-index",
     "allow-run-plugin-declared-command",
     "allow-safe-mode-state",
+    "allow-mark-boot-ok",
     "allow-set-plugin-enabled",
     "allow-uninstall-plugin",
     "allow-read-plugin-asset",

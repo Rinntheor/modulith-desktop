@@ -369,6 +369,12 @@ export async function createPluginHost(): Promise<PluginHost> {
     // "没开"处理 —— 那条回落路径本身值得被单独测，不该在这里被意外覆盖。
     safe_mode_state: () => ({ active: false, reason: null }),
 
+    // 夹具里没有标记文件系统，但"前端确实在插件那一步之前报了启动成功"这件事
+    // 必须能被喂进去 —— 否则 `boot.ts` 里那句 `invoke('mark_boot_ok')` 会走到
+    // 它自己的 catch 分支，测试看到的是"命令不存在"而不是被测的行为。
+    // 它没有可观察的返回值（宿主侧也只是写一个标记文件），因此桩是空操作。
+    mark_boot_ok: () => undefined,
+
     list_plugin_permissions: () => [],
 
     read_plugin_asset: ({ id, rel }) => {
