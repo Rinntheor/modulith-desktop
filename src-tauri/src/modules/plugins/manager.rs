@@ -3014,8 +3014,13 @@ fn resolve_background_entry(
 ///
 /// 只对 Windows 目标编译：在别的平台上 `canonicalize` 不产出这种前缀，写一个
 /// 永远走不到的分支只会让它显得像是"跨平台的"。
+///
+/// **调用方不只有这里。** `icon.rs` 也要用它：那里给 `SHGetFileInfoW` 的路径
+/// 同样不能带 `\\?\`（原因写在那边的 `shell_icon` 上），而它**必须**是这一份
+/// 实现 —— UNC 形态、`Volume{…}` 形态这些边界一旦分叉成两份，两边迟早会给出
+/// 不同的路径。因此它从这里 `pub(crate)` 出去，而不是在 `icon.rs` 里再写一遍。
 #[cfg(windows)]
-fn strip_verbatim_path(path: &Path) -> PathBuf {
+pub(crate) fn strip_verbatim_path(path: &Path) -> PathBuf {
     let text = path.as_os_str().to_string_lossy();
 
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
@@ -3034,7 +3039,7 @@ fn strip_verbatim_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn strip_verbatim_path(path: &Path) -> PathBuf {
+pub(crate) fn strip_verbatim_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 /// 读取并规范化插件根目录下的 manifest.json
