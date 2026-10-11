@@ -3,6 +3,47 @@
 本文件由 `pnpm ver bump` 依据 git 提交自动维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [1.7.0] - 2026-10-11
+
+### Added
+
+- **`ctx.secrets`**：插件凭据的加密存储（新权限 `secrets`，Rust 侧强制，风险 low）
+  - 落在 `<应用数据目录>/plugin_secrets/<插件 id>.json` —— **在插件数据目录之外**：插件代码寻址不到它（`ctx.dataDir` 被 chroot 在自己目录里），`storage.clear` 删不掉它，备份的路径白名单里也没有它
+  - AES-256-GCM，密钥由本机硬件指纹经 HKDF 派生（复用 `auth::crypto`），盐取插件 id 做域分隔；写入是同目录临时文件 + 改名
+  - 键 ≤128 字符、值 ≤4096 UTF-8 字节、每插件 ≤64 个键；文件读取上限 512 KiB，先看元数据再进内存
+  - **解不开 ≠ 没有这个键**：解密失败时 `get` 抛错并说明密文仍在磁盘上、以及下一步能做什么，而不是返回 `null` 让人以为从没存过
+  - 在此之前插件没有任何存放 token 的地方 —— `ctx.storage` 是明文 JSON，而且随备份一起导出
+- **`ctx.clipboard` 变化监听**（新权限 `clipboard-monitor`，风险**显式覆盖为 High**）
+  - `canMonitor` / `subscribe` / `readFormats` / `readImage`；轮询 `GetClipboardSequenceNumber()`（一个自增整数，**不需要打开剪贴板**），800 ms 一次，**无订阅者时线程退出**
+  - 遵守 Windows 那三个"不要监视我"的注册格式，并且**读不到标记值时一律按"不允许"** —— "少交付一次变化"与"读到不该读的东西"代价不对等
+  - 格式表是**刻意的短名单**：原始格式名有几十种，全须全尾交出去等于把"这台机器上装了什么软件"的指纹送给插件
+  - 剪贴板内容**永不进日志**
+- **`ctx.ui.popover`**：宿主渲染的结果卡。插件只给标题 / 正文 / 按钮文案，**宿主负责画**（因此插件仍然不能冒充宿主界面）。三个运行位置都可用 —— 这是对"后台没有 ui"的一次**有意破例**：其余 ui 成员缺是因为后台没有窗口承载宿主推送，而弹窗方向相反，正因为无界面它才必须能请宿主画一张卡
+- **`ctx.hotkey`** 与 **`ctx.selection`**（新权限 `global-hotkey` 覆盖为 Medium、`read-selection` 覆盖为 **High**）
+  - 系统级热键：消息专用窗口（`HWND_MESSAGE`）跑在自己的线程与自己的消息循环里，因此完全不碰 winit 的事件循环；每插件最多 4 个；**没有修饰键的裸键被拒绝**（`RegisterHotKey` 允许 `modifiers == 0`，那意味着插件可以把一个键从机器上每个程序手里抢走）；停用 / 卸载 / 退出**全部解绑**
+  - 读取选中文本：快照剪贴板 → 合成 Ctrl+C → 等序号变化（有界）→ 读走文本 → **把你原来的文本放回去**。**只能还原文本**，图片与富文本还原不了 —— 这是该方案的固有代价，已如实写进文档
+  - 合成的这一次复制**不会被剪贴板监测记进历史**（RAII 抑制 + 双标志位：一次采集可能跨过一个轮询 tick）
+- 后台运行位置补上 `ctx.secrets` 与 `ctx.clipboard.writeText`。此前后台插件要存一个 token 只能退回明文 `ctx.storage`，而剪贴板写入通道在后台**完全不存在**（沙箱的读写走 `navigator.clipboard`，从不经过 RPC 表）
+- 权限表 **13 → 15** 项（Host 强制 9 / 前端 3 / 不强制 3）；命令清单 **153 → 164**
+
+### Fixed
+
+- **后台插件一个都跑不起来**，两个叠加的原因：
+  - `Path::canonicalize()` 在 Windows 上返回**逐字路径** `\\?\D:\…`，而 Node 的 JS 版 `realpathSync`（不是 `.native`）不认这个前缀，剥掉之后只剩驱动相对的 `D:` → `EISDIR: illegal operation on a directory, lstat 'D:'`。Rust 侧算出的路径是对的，**缺陷是一个逐字形式的路径被允许跨进程边界**。现在在跨边界前剥掉前缀（`--allow-fs-read` 的根同样要剥，否则在 `--permission` 之下会 `ERR_ACCESS_DENIED`），并且入口不是文件时**在宿主侧就报错**，绝不把坏路径交给子进程
+  - 空闲回收器把"闲着等下一个 tick / 等一个热键"的后台宿主当"空闲"杀掉（`IDLE_TIMEOUT` 300 秒，而 `stand-up` 的间隔是 600 秒），而且**子进程死后永远不会被重新拉起**（读循环 EOF 时没清 `child`/`writer`，而 `ensure_started` 只看句柄在不在 → 后续请求全写进断掉的管道，报一句看起来像偶发故障的 `Broken pipe`）。现在有显式的存活语义（`Liveness::{OnDemand, Pinned}`）与收尸后重启
+- **宿主渲染浮层这条机制自诞生起就没有工作过**：`capabilities/overlay.json` 只授权了那三条 `overlay_*` 命令，**没有事件授权**，而 `listen` 在 Tauri v2 里是一条走 ACL 的普通 IPC 命令 → 未列出的权限默认拒绝 → 浮层窗口收不到内容，**弹出来是一张空白窗**。对话框、右键菜单、结果卡片三者同病，前两个因为没有任何插件调用过而一直没被发现
+- 结果卡片的三个可用性问题：会自动消失（现在**默认常驻**，`timeoutMs` 变成选填）、无法移动（现在头部可拖动，且拖拽所需的 `core:window:allow-start-dragging` 已精确授权 —— 不授权的失败方式与上面那次 `listen` 一模一样：什么都不发生、什么都不记日志）、**必须先点一下卡片再点外面才能关**（tao 只在 `WM_KILLFOCUS` 上发 `Focused(false)`，而卡片从不拿焦点，所以那个事件从来没到过）。现在卡片会拿焦点，**点外面一次即关**，并有可见的 × 按钮
+- 后台派发被一张常驻卡片**饿死**：插件在 `await` 卡片时，它之后所有 `ctx.*` 调用（含定时器与后续热键）都被堵住；`plugin.dispatch` 还被 10 秒的传输预算框着，而它该等多久由插件处理器决定 —— 于是产生两条互相矛盾又都不实的日志。现在子→父方向每请求一个任务，父→子方向用独立的派发预算
+- `scripts/generate-backend-module.ts` 无法复现 `lib.rs`，而 `pnpm dev` / `pnpm build` 的第一步就是它 —— 于是每跑一次都会静默删掉模板里没覆盖的托管与退出钩子（`safe_mode_state`、`SafeMode::mark_clean_exit()`、`HotkeyRegistry`、`ClipboardMonitor`）。模板已补齐并**逐字节幂等**，另加门禁：`lib.rs` 里每一处 `app.manage(modules::plugins::…)` 与 `app.state::<modules::plugins::…>()` 都必须在模板里存在
+- 结果卡片的超时预算曾**比传输预算还长**（插件可请求到 30 秒，而 IPC 上限是 10 秒），于是答复落在一条没人等的通道上。现在宿主截止钳到 6 秒并在 10 秒预算下留 4 秒余量，两侧的关系由测试与门禁钉住
+- 若干**已经写错**的文档与注释计数：5 个文档写着"153 条命令"而 `check:acl` 早在改动前就报 163；`宿主API参考.md` 的 ctx 成员表写着 20 项、实际 21 项且漏了 `secrets`；`pluginBoundary.ts` 的注释写"51 个方法"、实际 68
+
+### Security
+
+- **如实处置 Windows 上的沙箱边界**：wry 在 Windows 上把 Tauri 的**主框架**初始化脚本也注入到子框架（它自己的文档写明这是 WebView2 未提供相应 API 之前的平台行为），因此 `__TAURI_INTERNALS__`、`isTauri`、乃至**那个随机 invoke key** 都会落进插件的 iframe 里。实测这些属性**全部** `writable:false, configurable:false`，删不掉也改不了，invoke key 是闭包里的常量 —— 因此**最后一跳 `window.chrome.webview.postMessage` 是唯一可用的杠杆**，桥接层在插件脚本之前把它切成静默 no-op（两条 Tauri 传输都在调用时才解析它；`fetch` 那条已被文档 CSP 挡住）。这是**纵深防御**，不是重建引擎级隔离 —— Windows 不提供后者
+  - 边界断言因此改成按**效果**判断（"这个文档还能不能碰到宿主"），而不是"这些名字在不在"；名字在而通道死是 Windows 上的平台事实
+  - 同时更正三处**不实陈述**（`sandbox.rs` 文件头、`插件系统架构.md`、沙箱自检页第 5 项 —— 它现在报的是平台事实，不再声称证明了插件边界）
+
 ## [1.6.3] - 2026-10-07
 
 ### Added
