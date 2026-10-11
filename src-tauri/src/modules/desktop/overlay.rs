@@ -57,6 +57,20 @@
 //
 // 三条合起来是同一句话：插件能让一张卡片出现，但不能把用户的光标抢走、
 // 也不能让它赖在屏幕上。
+//
+// ============================================================
+// 「把内容交给浮层窗口」这一步有一条容易漏掉的前提
+// ============================================================
+//
+// 请求是**广播一条事件**送进那个窗口的（`show` / `show_popover` 里的
+// `app.emit(OVERLAY_SHOW, request)`），而这个窗口收不收得到，取决于它**有没有
+// 被授权 listen**：`plugin:event|listen` 是一条走 ACL 的 IPC，而宿主一旦声明
+// 了应用级 ACL 清单，没写在 `capabilities/overlay.json` 里的权限就是**默认拒绝**。
+//
+// 这条前提漏掉时的表现恰好是"什么都没发生"：窗口收到了显示指令、被摆好、被
+// 显示出来，而里面是空的（前端那条 `listen` 在它自己的 Promise 里失败），插件
+// 那一次 await 只能等超时。日志里只有一句"调用宿主超时"，**看不出根因在这里** ——
+// 因此 `check:sandbox` 里有一条断言把这份授权与这里的 `app.emit` 钉在一起。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -265,6 +279,32 @@ pub struct Overlay {
 /// 数量级的那个上限，而且到了那个上限**不是错误**（见 `popover`）。
 const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// `popover` 收到非卡片请求时的错误。
+///
+/// 写成常量是因为它同时被那句纯判据与那条测试引用 —— 两处各写一遍字符串的话，
+/// 改一处就会让另一处悄悄地不再成立（那种测试会一直绿）。
+const POPOVER_NEEDS_A_CARD: &str = "结果卡片收到了别种浮层请求";
+
+/// 只接受结果卡片。
+///
+/// ============================================================
+/// 为什么这条判据是**纯函数**
+/// ============================================================
+///
+/// 它要挡的是一条接错线的调用（拿对话框或菜单来当卡片显示）。那种情况下前端的
+/// 卡片组件读不到 `body` / `actions`，会渲染一张空卡片，而调用方在等一条永远
+/// 不会来的回答 —— 表现是"窗口弹出来了、里面什么都没有"。
+///
+/// 判据本身与窗口无关，因此它不该藏在 `popover` 那个 async 方法里：那样想测它
+/// 就得造一个真窗口（`AppHandle`），而这条规则最容易被改坏的时刻恰恰是有人
+/// "顺手"把某个变体也放进来的时候。
+fn accept_popover(request: &OverlayRequest) -> Result<(), String> {
+    match request {
+        OverlayRequest::Popover { .. } => Ok(()),
+        _ => Err(POPOVER_NEEDS_A_CARD.to_string()),
+    }
+}
+
 impl Overlay {
     pub fn new() -> Self {
         Self::default()
@@ -342,12 +382,15 @@ impl Overlay {
     ) -> Result<Option<String>, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        match &mut request {
-            OverlayRequest::Popover { id: slot, .. } => *slot = id,
-            // 上层（`rpc::dispatch`）只会用 `Popover` 调这里。真收到别的说明
-            // 有人接错了线 —— 当卡片显示的话，它的字段会全部读不出来。
-            _ => return Err("结果卡片收到了别种浮层请求".to_string()),
-        }
+        // 先判形状、再写 id：一次接错线的调用不该白分掉一个号 ——
+        // 那与"某一次请求没有登记"在诊断上长得一样（号不连续）。
+        accept_popover(&request)?;
+
+        let OverlayRequest::Popover { id: slot, .. } = &mut request else {
+            // 上面那句已经挡掉了别的变体，这里只是让 `match` 穷尽。
+            return Err(POPOVER_NEEDS_A_CARD.to_string());
+        };
+        *slot = id;
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.pending
@@ -406,6 +449,10 @@ impl Overlay {
                 // 关掉（他没点过它，它也没有关闭按钮）。
                 self.dismiss_window_of(app, id);
                 log::debug!("结果卡片 {id} 到点自动收起");
+                // 回到调用方的是 `Ok(None)`（→ 契约里的 `{action: null}`），
+                // **不是 `Err`** —— 即使前端一个字都没渲染过也是这一条：这正是
+                // "宿主侧的截止时间说了算"的意思，"用户没回答"与"卡片没能显示
+                // 出来"（那一条走上面的显示失败分支）是两件事。
                 Ok(None)
             }
         }
@@ -569,6 +616,9 @@ fn show_popover<R: Runtime>(app: &AppHandle<R>, request: &OverlayRequest) -> Res
         format!("浮层窗口不存在（检查 tauri.conf.json 里 label 为 {OVERLAY_LABEL} 的窗口）")
     })?;
 
+    // 这一条广播**只有在该窗口被授了 `core:event:*` 时才真的落到前端** ——
+    // 理由与判据见文件头那一段。这里的顺序（先内容、后显示）同时也是"漏授权时
+    // 用户什么都看不见"的原因：窗口会照常弹出来，只是里面是空的。
     app.emit(OVERLAY_SHOW, request)
         .map_err(|e| format!("无法把内容交给浮层窗口：{e}"))?;
 
@@ -1113,6 +1163,165 @@ mod tests {
         let overlay = Overlay::new();
         assert_eq!(overlay.pending_count(), 0);
         assert_eq!(overlay.cancel_all(), 0);
+    }
+
+    /// 配对 id **只增不减、每次一个**，而且从 0 开始。
+    ///
+    /// 它是 `id → 等待` 那张表的键：两个调用方各自生成就会撞号，而撞号的表现是
+    /// "回答给了另一次请求"。这里钉的是另一半 —— 一次全局热键之后紧接着一次
+    /// 定时事件（真实日志里正是这样）必须拿到**两个不同的 id**，否则后到的那张
+    /// 卡片会把前一次的等待当成自己的。
+    #[test]
+    fn each_request_gets_its_own_pairing_id() {
+        let overlay = Overlay::new();
+
+        let first = overlay.next_id.fetch_add(1, Ordering::SeqCst);
+        let second = overlay.next_id.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(first, 0, "id 从 0 开始（契约里没有说要从 1 开始，但要有定数）");
+        assert_eq!(second, first + 1);
+        assert_eq!(overlay.next_id.load(Ordering::SeqCst), 2, "分配过两个");
+    }
+
+    /// 配对 id 会被**写进请求本身** —— 前端就是靠它把回答带回来的。
+    ///
+    /// 漏写这一句的表现是：浮层里的内容完全正确、用户点了按钮，而回答带着
+    /// `id: 0` 回来，命中的是另一次等待（或谁都不命中）。
+    #[test]
+    fn the_allocated_id_is_written_back_into_the_request() {
+        let id = 41;
+        let mut request = OverlayRequest::Popover {
+            id: 0,
+            tone: "info".to_string(),
+            title: None,
+            body: "正文".to_string(),
+            actions: Vec::new(),
+            timeout_ms: 6_000,
+            at: PopoverAnchor::Cursor,
+        };
+
+        match &mut request {
+            OverlayRequest::Popover { id: slot, .. } => *slot = id,
+            _ => unreachable!(),
+        }
+
+        assert_eq!(request.id(), id);
+    }
+
+    /// 等待表是 `id → 通道`，回答取出通道时**登记就没了**。
+    ///
+    /// 这一条与 `a_response_is_delivered_exactly_once` 是同一条纪律的两种读法：
+    /// 它同时说明"表里不会留下空壳"（留下的话 `pending_count` 会一直涨，而
+    /// 那张表是诊断与 `cancel_all` 的判据）。
+    #[test]
+    fn taking_a_waiter_out_of_the_table_leaves_nothing_behind() {
+        let overlay = Overlay::new();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        overlay.pending.lock().unwrap().insert(3, sender);
+
+        let answer = OverlayResponse {
+            id: 3,
+            confirmed: false,
+            selected: None,
+            action: Some("copy".to_string()),
+            dismissed: false,
+        };
+        assert!(overlay.respond(answer));
+        assert_eq!(overlay.pending_count(), 0, "取走过的那一条不该留下空壳");
+        assert_eq!(
+            receiver.try_recv().expect("应当收到回答").action.as_deref(),
+            Some("copy")
+        );
+    }
+
+    /// **`popover` 只接受 `Popover` 那一种请求**，别的必须当场以一条能照做的
+    /// 错误结束，而不是拿对话框的字段去当卡片显示。
+    ///
+    /// ============================================================
+    /// 为什么这条判据值得一个测试
+    /// ============================================================
+    ///
+    /// 走错线的代价不是"多一次报错"，而是**一次错位的等待被登记进了表**：
+    /// 前端的卡片组件按 `kind` 选组件，读不到 `body` / `actions` 时它会渲染一张
+    /// 空白卡片（或者什么都不渲染），而调用方在等一条永远不会来的回答。
+    /// 真实撞上的那种形态是"卡片窗口弹出来、里面是空的"。
+    ///
+    /// 判据落在 `accept_popover` 这个纯函数上而不是 `popover` 上：后者要一个真
+    /// `AppHandle`，而这一条判定的全部内容与窗口无关 —— 把它留在 async 里，
+    /// 想测它就得造一个真窗口。
+    #[test]
+    fn a_popover_refuses_a_request_that_is_not_a_card() {
+        let dialog = OverlayRequest::Dialog {
+            id: 0,
+            tone: "info".to_string(),
+            title: "标题".to_string(),
+            message: "正文".to_string(),
+            confirm_label: "确定".to_string(),
+            cancel_label: None,
+        };
+        let menu = OverlayRequest::Menu {
+            id: 0,
+            title: None,
+            items: Vec::new(),
+        };
+
+        assert_eq!(
+            accept_popover(&dialog).expect_err("对话框不该被当成卡片收下"),
+            POPOVER_NEEDS_A_CARD
+        );
+        assert_eq!(
+            accept_popover(&menu).expect_err("菜单不该被当成卡片收下"),
+            POPOVER_NEEDS_A_CARD
+        );
+
+        let card = OverlayRequest::Popover {
+            id: 7,
+            tone: "info".to_string(),
+            title: None,
+            body: "正文".to_string(),
+            actions: Vec::new(),
+            timeout_ms: 6_000,
+            at: PopoverAnchor::Cursor,
+        };
+        assert!(accept_popover(&card).is_ok(), "卡片当然会被收下");
+        assert_eq!(card.id(), 7);
+    }
+
+    /// 浮层窗口**必须**被授权 `listen` —— 否则请求根本到不了前端。
+    ///
+    /// ============================================================
+    /// 这条断言是被一次真实的"卡片不出现"抓出来的
+    /// ============================================================
+    ///
+    /// 内容是用 `app.emit(OVERLAY_SHOW, ...)` 送进那个窗口的，而
+    /// `plugin:event|listen` 是一条走 ACL 的 IPC：宿主一旦声明了应用级 ACL 清单，
+    /// 没写在 capability 里的权限就是**默认拒绝**。因此这份清单里少了
+    /// `core:event:*` 时，前端那条 `listen` 在它自己的 Promise 里失败，窗口照常
+    /// 弹出来，而里面永远没有内容 —— 插件那一次 await 只能等超时。
+    ///
+    /// 它在真机上的表现是**完全静默**的（日志里只有一句"调用宿主超时"），
+    /// 所以判据必须在这里，而不是靠"记得跑一次"。
+    #[test]
+    fn the_overlay_capability_lets_the_window_listen_for_its_content() {
+        let capability = include_str!("../../../capabilities/overlay.json");
+
+        assert!(
+            capability.contains("\"overlay\""),
+            "这份清单必须作用于 overlay 这个 webview"
+        );
+        // `core:event:default` 覆盖 listen / unlisten / emit / emit-to 四条；
+        // 逐条写 `core:event:allow-listen` 也接受 —— 两者都说明"这个窗口能听"。
+        assert!(
+            capability.contains("core:event:default") || capability.contains("core:event:allow-listen"),
+            "浮层窗口没有 core:event 的授权（缺少它时请求永远到不了前端，\
+             而表现是『卡片不出现 + 调用方超时』）：{capability}"
+        );
+        // 反向：内容那一条广播必须在 Rust 这一侧真的发出去（两个方向都钉住，
+        // 只钉一头的话，"授予了权限却没人发"与"发了但没人能听"看起来一样）。
+        assert!(
+            include_str!("overlay.rs").contains("app.emit(OVERLAY_SHOW, request)"),
+            "浮层内容没有真的广播给前端"
+        );
     }
 
     #[test]

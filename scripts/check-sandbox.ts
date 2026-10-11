@@ -2282,6 +2282,10 @@ section('宿主浮层');
   const overlayRoot = read('../src/overlay/OverlayRoot.tsx');
   const overlayHtmlExists = exists('../overlay.html');
 
+  // 广播那一条事件在两侧的**常量名**（取值另有一条断言，见下面那段）：
+  // 名字都要是这一个，取值都要是 `modulith://overlay-show`。
+  const OVERLAY_SHOW_EVENT = 'OVERLAY_SHOW';
+
   // 独立入口必须登记进 Vite 的多入口配置。
   //
   // 漏登记时**开发模式一切正常**（Vite 按 URL 提供任意 HTML），而发布版里
@@ -2321,6 +2325,139 @@ section('宿主浮层');
     /RESPONSE_TIMEOUT/.test(overlayRs) && /tokio::time::timeout\(RESPONSE_TIMEOUT/.test(overlayRs),
     '等待回答有超时（否则插件会永远挂着）'
   );
+
+  // ============================================================
+  // 请求**真的到得了**浮层前端吗
+  // ============================================================
+  //
+  // 上面那一条只证明了"等待不会永远挂着"，而"卡片不出现"这件事的根因在它前面：
+  // 内容是 `app.emit(OVERLAY_SHOW, ...)` 广播进那个窗口的，而那个窗口收不收得到
+  // 取决于它**有没有被授权 listen** —— `plugin:event|listen` 是一条走 ACL 的 IPC，
+  // 宿主一旦声明了应用级 ACL 清单，没写在 capability 里的权限就是默认拒绝。
+  //
+  // 真实撞上过的那一次：`overlay.json` 里只有那三条 overlay 命令，于是前端那条
+  // `listen` 在它自己的 Promise 里失败，窗口照常弹出来、里面永远是空的，而插件
+  // 那一次 await 只能等超时 —— 日志里只有一句"调用宿主超时"，看不出根因在这里。
+  //
+  // 因此这三条要把**整条投递链**钉住：宿主把内容广播出去（Rust）→ 前端确实在听
+  // （TSX）→ 那个窗口真的被授权听（capability）。少任何一环，日志都长得一样。
+  check(
+    /app\.emit\(OVERLAY_SHOW, request\)/.test(overlayRs),
+    '宿主把浮层内容广播给那个窗口（少了它，窗口弹出来却是空的）'
+  );
+  check(
+    new RegExp(`listen<OverlayRequest>\\(${OVERLAY_SHOW_EVENT}`).test(overlayRoot),
+    '浮层前端确实在听那条广播（常量名对不上时它会静默地什么都不做）'
+  );
+  {
+    // 事件名是**跨语言的线上契约**：两侧各写一个字面量、谁也不检查谁。
+    // 常量名相同而取值不同时，宿主发出去的没有人听 —— 表现与"没授权"完全一样。
+    //
+    // 单引号与双引号都要认：TypeScript 那一侧写 `'...'`、Rust 那一侧写 `"..."`，
+    // 只认一种的话这条断言会永远为假绿（它取不到值时返回 `null`，而
+    // `null === 'modulith://overlay-show'` 恰好是 false —— 但"取不到"也可能是
+    // 有人把它写成了另一种引号，那就该红）。
+    const eventName = (source: string): string | null => {
+      const match =
+        new RegExp(
+          `const ${OVERLAY_SHOW_EVENT}(?::\\s*&?\\s*\\w+)?\\s*=\\s*(['"])([^'"]+)\\1`
+        ).exec(source);
+      return match ? match[2] : null;
+    };
+    const expectedEventName = 'modulith://overlay-show';
+
+    check(
+      eventName(overlayRoot) === expectedEventName,
+      `浮层前端那个事件名的取值是 ${expectedEventName}（实际：${eventName(overlayRoot)}）`
+    );
+    check(
+      eventName(overlayRs) === expectedEventName,
+      `宿主那一条广播的事件名与前端一致（实际：${eventName(overlayRs)}）`
+    );
+  }
+  {
+    // `listen` 在宿主这一侧是一条命令，而命令要授权。这份清单是**唯一**的授权
+    // 来源：漏了它，前端那一句 `listen` 会被 ACL 挡掉，而它看起来与"什么都没发生"
+    // 一模一样（错误只出现在那个窗口的 console 里）。
+    const overlayCapability = read('../src-tauri/capabilities/overlay.json');
+    const grants = JSON.parse(overlayCapability) as {
+      webviews?: string[];
+      permissions?: string[];
+    };
+    check(
+      (grants.webviews ?? []).includes('overlay'),
+      '浮层的 capability 作用于 overlay 这个 webview（写错标签等于没有授权）'
+    );
+    check(
+      (grants.permissions ?? []).some(
+        (permission) =>
+          permission === 'core:event:default' ||
+          permission === 'core:event:allow-listen'
+      ),
+      '浮层窗口被授权 listen（漏了这一条：请求到不了前端，卡片永远不出现）'
+    );
+  }
+
+  // 卡片自己的截止时间必须**留在后台那一条 IPC 的预算之内**。
+  //
+  // 两次计时是独立的：后台那一侧到点就丢掉这次等待（`收到没有等待者的响应`），
+  // 宿主这一侧到点才回话。子进程里那个上限（10 秒）必须明显长于卡片的上限，
+  // 否则宿主的答复落在一条没有人等的通道上 —— 而两侧的代码读起来都是对的。
+  {
+    const backgroundHost = read('../src-tauri/resources/background-host.mjs');
+    const protocol = read('../src-tauri/src/modules/desktop/background/protocol.rs');
+    // **必须锚在行首的常量定义上**：两个名字在各自的文档注释里也被提到
+    // （`与 Rust 侧的 REQUEST_TIMEOUT_MS 一致`），只找第一个出现的位置会拿到
+    // 注释里的那一次 —— 于是这条断言变成假绿。类型标注（`: u64`）可以省，
+    // `.mjs` 与 `.rs` 两侧的写法因此都能被这一条覆盖。
+    const numberAfter = (source: string, name: string): number | null => {
+      const match = new RegExp(
+        `^\\s*(?:(?:export|pub)\\s+)?const\\s+${name}\\s*(?::\\s*\\w+)?\\s*=\\s*([0-9_]+)`,
+        'm'
+      ).exec(source);
+      return match ? Number(match[1].replace(/_/g, '')) : null;
+    };
+
+    const hostBudget = numberAfter(backgroundHost, 'HOST_CALL_TIMEOUT_MS');
+    const rustBudget = numberAfter(protocol, 'REQUEST_TIMEOUT_MS');
+    const cardDeadline = numberAfter(rpcRs, 'POPOVER_TIMEOUT_MAX_MS');
+
+    check(
+      hostBudget !== null && hostBudget === rustBudget,
+      '后台两侧的单次调用上限同值（两个数字各写一处，漂开时余量算的是另一个数）'
+    );
+    check(
+      cardDeadline !== null && hostBudget !== null && cardDeadline + 2_000 <= hostBudget,
+      `卡片的上限比后台那一条 IPC 的上限短出至少 2 秒（否则答复会落在没有人等的通道上）`
+    );
+  }
+
+  // 卡片只接受**卡片**那一种请求：接错线时它的字段会全部读不出来，前端会渲染
+  // 一张空卡片，而调用方在等一条永远不会来的回答。
+  check(
+    /fn accept_popover\(/.test(overlayRs) &&
+      /accept_popover\(&request\)\?;/.test(overlayRs) &&
+      /OverlayRequest::Popover \{ \.\. \} => Ok\(\(\)\)/.test(overlayRs),
+    '结果卡片只接受 Popover 那种请求（接错线时它会渲染成一张空白卡片）'
+  );
+
+  // `ui.popover` **不许要求界面上下文**。
+  //
+  // 三个运行位置里有两个传 `surface: None`（界面插件那条命令、以及后台宿主），
+  // 而卡片恰恰是后台插件唯一的出口。真要在这里加一条"没有界面就不行"，表现是
+  // 后台插件的卡片每一次都失败、而界面插件那一侧完全正常 —— 只跑界面插件的
+  // 调试看不见它。判据因此落在那一个分支的**分支体**里（到 `ask_popover` 为止）。
+  {
+    const start = rpcRs.indexOf('"ui.popover" => {');
+    const end = start === -1 ? -1 : rpcRs.indexOf('ask_popover(app, request, timeout)', start);
+    const body = start === -1 || end === -1 ? '' : rpcRs.slice(start, end);
+    // 定位失败必须**报红**，而不是让下面那条断言在一个空串上悄悄通过。
+    check(body.length > 0, '能定位到 ui.popover 那一分支（定位失败时下面那条是假绿）');
+    check(
+      !/let Some\(surface\) = surface/.test(body) && !/FILES_NEEDS_A_SURFACE/.test(body),
+      'ui.popover 不要求界面上下文（后台插件传的永远是 surface: None）'
+    );
+  }
 
   // 显示失败必须**把登记撤掉**，否则那条等待只能靠超时结束。
   check(
