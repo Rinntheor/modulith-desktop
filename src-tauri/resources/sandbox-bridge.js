@@ -3481,6 +3481,21 @@
           args: args === undefined ? [] : args,
         });
       },
+
+      /**
+       * 用系统默认方式打开：快捷方式（`.lnk` / `.url`）、网址、文档、目录。
+       *
+       * **别用 `launch` 打开它们。** `launch` 走 `CreateProcess`，只认可执行
+       * 映像 —— 交给它一个 `.lnk` 会得到 `os error 193`（"%1 不是有效的 Win32
+       * 应用程序"），因为快捷方式不是可执行映像，它是给 shell 看的一份数据。
+       * 网址同理：`CreateProcess` 不认识 `https://…`。
+       *
+       * 这一条走 shell 的关联，因此用的是用户自己为这种文件选定的那个程序。
+       * URL 只放行 `http` / `https` / `mailto`，其余按本机路径处理。
+       */
+      open: function (target) {
+        return rpc('system.open', { target: String(target) });
+      },
     },
 
     icons: {

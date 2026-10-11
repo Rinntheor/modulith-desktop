@@ -123,6 +123,7 @@
     "allow-plugin-data-used",
     "allow-plugin-http-request",
     "allow-plugin-launch-program",
+    "allow-plugin-open-target",
     "allow-plugin-extract-icon",
     "allow-plugin-reveal-in-folder",
     "allow-plugin-pick-audio",

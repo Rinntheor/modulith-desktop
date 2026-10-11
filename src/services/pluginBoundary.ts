@@ -468,6 +468,7 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
   ],
   launcher: [
     { name: 'launch', io: 'value', migration: 'as-is', note: '返回 Promise<void>，参数是字符串与字符串数组' },
+    { name: 'open', io: 'value', migration: 'as-is', note: '返回 Promise<void>，参数是一个字符串。走 shell 关联（`ShellExecuteExW`），因此能打开 `.lnk` / 网址 / 文档 / 目录 —— 而 `launch` 只能跑可执行映像' },
   ],
   icons: [
     { name: 'extract', io: 'value', migration: 'as-is', note: '返回 data URL 字符串' },

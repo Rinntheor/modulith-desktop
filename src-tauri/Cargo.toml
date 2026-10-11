@@ -162,6 +162,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    # `Win32_UI_Shell` 供图标提取的**回退路径**使用（`icon.rs` 的 `SHGetFileInfoW`）：
+    # `PrivateExtractIconsW` 只能从可执行文件/图标文件的内嵌资源里取图标，而快捷方式
+    # （.lnk）、.url、普通文档都没有这种资源 —— 它们要问 shell 才拿得到用户实际
+    # 看到的那个图标。
+    "Win32_UI_Shell",
+    # `Win32_System_Com` 供上面那条回退路径的 `CoInitializeEx` / `CoUninitialize`：
+    # shell 的图标查询在**没有初始化过 COM 的线程**上不保证可用，而图标提取会被
+    # 从任意一个 Tauri 工作线程调用。
+    "Win32_System_Com",
     "Wdk_System_Threading",
 ] }
 webview2-com = "0.38"
