@@ -965,6 +965,22 @@ fn bridge_script<R: Runtime>(
             "__PLUGIN_CLIPBOARD_MONITOR__",
             if super::clipboard::is_supported() { "true" } else { "false" },
         )
+        // 全局热键与读取选中文本的平台能力。与上面两条**同一个理由**：两者的
+        // `isAvailable()` 都是同步方法（插件在 bundle 顶层用它决定要不要注册热键、
+        // 要不要在界面上画一个"翻译选中文本"的按钮），而"这个平台支不支持"只有宿主
+        // 知道 —— 让插件先 await 一次 RPC 就等于要求它把特性探测挪到异步路径里。
+        //
+        // 它们同样**只是"这个平台有没有那套 Win32 接口"，不是权限**：权限由
+        // `has('global-hotkey')` / `has('read-selection')` 在桥接层判、并最终由
+        // RPC 侧的 `require_permission` 强制。
+        .replace(
+            "__PLUGIN_HOTKEY__",
+            if super::hotkey::HotkeyRegistry::is_supported() { "true" } else { "false" },
+        )
+        .replace(
+            "__PLUGIN_SELECTION__",
+            if super::selection::is_supported() { "true" } else { "false" },
+        )
         .replace("__PLUGIN_SURFACES__", &serde_json::Value::from(declared).to_string())
         .replace("'__PLUGIN_ACTIVATION__'", &js_string("open"))
         // 主题快照注入成**字面量**而不是让桥接层先 RPC 一次：插件在顶层同步
@@ -1009,6 +1025,8 @@ fn bridge_script<R: Runtime>(
             && !source.contains("__PLUGIN_SURFACE__")
             && !source.contains("__PLUGIN_PERMISSIONS__")
             && !source.contains("__PLUGIN_DATA_AVAILABLE__")
+            && !source.contains("__PLUGIN_HOTKEY__")
+            && !source.contains("__PLUGIN_SELECTION__")
             && !source.contains("__PLUGIN_SURFACES__")
             && !source.contains("__PLUGIN_RUNTIME__")
             && !source.contains("__PLUGIN_ACTIVATION__")
@@ -1762,6 +1780,9 @@ pub fn close_surface<R: Runtime>(app: &AppHandle<R>, token: &str) {
     if let Some(key) = surfaces.key_of(token) {
         revoke_grants_of_surface(app, &key.plugin_id, &key.surface);
         revoke_clipboard_subscription_of_surface(app, &key.plugin_id, &key.surface);
+        // 热键的**订阅**同样是界面的资源（一块关掉的界面没人再收触发），但热键的
+        // **注册**不是 —— 两者必须分开，见 `close_all_surfaces` 里的说明。
+        revoke_hotkey_subscription_of_surface(app, &key.plugin_id, &key.surface);
     }
 
     surfaces.forget(token);
@@ -1786,8 +1807,35 @@ fn revoke_clipboard_subscription_of_surface<R: Runtime>(
     monitor.unsubscribe(plugin_id, Some(surface));
 }
 
-/// 收回一块界面的全部文件授权。
+/// 撤掉一块界面持有的**热键订阅**。
 ///
+/// ============================================================
+/// 这里撤的是订阅，**不是热键注册**
+/// ============================================================
+///
+/// 这两个东西看起来像一件事，实际上作用面完全不同，而把它们合成一步会造成一个
+/// 很难发现的缺陷：
+///
+///   * **订阅**是界面级的：它说"一块界面想收到触发"。界面关掉之后就没人收了，
+///     留着它只会让宿主往一个不存在的令牌上推。
+///   * **注册**是插件级的：`RegisterHotKey` 绑定的是"这个插件占着这个组合键"。
+///     后台插件根本没有界面，它却正是最需要全局热键的那一种 —— 按界面撤注册会让
+///     一个后台插件在用户切换标签（界面重挂载）时**无声地失去热键**，而它的代码
+///     一行都没跑过。
+///
+/// 因此注册只在**插件被停用 / 卸载 / 应用退出**时撤销，见 `close_all_surfaces`。
+fn revoke_hotkey_subscription_of_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: &str,
+) {
+    let Some(registry) = app.try_state::<super::hotkey::HotkeyRegistry>() else {
+        return;
+    };
+    registry.unsubscribe(plugin_id, Some(surface), false);
+}
+
+/// 收回一块界面的全部文件授权。
 /// 只记一条 debug 日志：界面关闭是**每次切换标签/重挂载**都会发生的事，把它写成
 /// warn 会让真正需要被看见的那几条淹掉。
 fn revoke_grants_of_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str, surface: &str) {
@@ -1823,6 +1871,18 @@ pub fn close_all_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) {
     // 被撤销的订阅，以及一个永远不退出的轮询线程。
     if let Some(monitor) = app.try_state::<super::clipboard::ClipboardMonitor>() {
         monitor.forget_plugin(plugin_id);
+    }
+
+    // 全局热键在**这里**一次全解绑 —— 而且它是本模块最要紧的一条收尾。
+    //
+    // `RegisterHotKey` 是系统级独占的：一个被停用/卸载的插件若还占着一个组合键，
+    // 用户按那个键时**这台机器上任何程序**都不会有反应，而他能做的唯一一件事是
+    // 关掉本应用。它必须发生在这里（而不是只靠插件的 `unregister`），因为停用
+    // 插件时它的代码**一行都不会执行**。
+    //
+    // 与剪贴板订阅同一取舍：按**插件**收，不是按界面收。
+    if let Some(registry) = app.try_state::<super::hotkey::HotkeyRegistry>() {
+        registry.forget_plugin(plugin_id);
     }
 
     let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {

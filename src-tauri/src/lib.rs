@@ -171,6 +171,12 @@ pub fn run() -> Result<(), tauri::Error> {
         // 离开时自己退出（见 `plugins/clipboard.rs` 的"生命周期"一节）。这里托管
         // 一个空表是安全的 —— 没有订阅者时它什么都不做，连一次系统调用都没有。
         app.manage(modules::plugins::clipboard::ClipboardMonitor::default());
+        // 全局热键的注册表与消息窗口线程（`ctx.hotkey`）。
+        //
+        // **它必须在 `setup` 里托管，而不是懒加载。** `RunEvent::Exit` 那条路径要
+        // 通过 `app.state::<HotkeyRegistry>()` 拿到它来解绑全部组合键 —— 而
+        // "拿得到"是"用户能拿回那个按键"的前提。
+        app.manage(modules::plugins::hotkey::HotkeyRegistry::default());
 
         // 沙箱自检**不在启动路径上**。
         //
@@ -312,6 +318,14 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_clipboard_unsubscribe,
         plugin_clipboard_formats,
         plugin_clipboard_read_image,
+        plugin_hotkey_can_register,
+        plugin_hotkey_register,
+        plugin_hotkey_unregister,
+        plugin_hotkey_list,
+        plugin_hotkey_subscribe,
+        plugin_hotkey_unsubscribe,
+        plugin_selection_can_read,
+        plugin_selection_read,
         plugin_http_request,
         plugin_launch_program,
         plugin_extract_icon,
@@ -386,6 +400,19 @@ pub fn run() -> Result<(), tauri::Error> {
             // 因此不需要排在模块收尾之后；而排在前面能保证模块开始拆除时不会再有
             // 新的剪贴板事件推出去。
             app.state::<modules::plugins::clipboard::ClipboardMonitor>()
+                .stop();
+
+            // 把**全部**全局热键还给系统。
+            //
+            // 顺序与理由与上面那条不同，而且更硬：热键是**系统级独占**的资源，
+            // 用户在被占用的组合键上按什么都没有反应。进程退出时内核会回收它们，
+            // 但 `stop_all` 与 `cleanup_before_exit` 之间还有一个可观测的窗口 ——
+            // 显式解绑把那个窗口消掉。
+            //
+            // 放在 `stop_all` **之前**：模块收尾会拆除插件系统，而热键的投递路径
+            // （`hotkey::deliver`）要读插件系统的托管状态。排在前面能保证"窗口线程
+            // 已经不会再投递任何东西"发生在插件系统开始拆除之前。
+            app.state::<modules::plugins::hotkey::HotkeyRegistry>()
                 .stop();
 
             // 停止模块：**逆序**（依赖方先停），见 ModuleRegistry::stop_all。

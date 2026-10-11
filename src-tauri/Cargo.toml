@@ -121,6 +121,24 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 # `Win32_System_Memory` 与它成对：`GetClipboardData` 给出的是**全局内存句柄**，
 # 要拿到里面的字节必须先 `GlobalLock`。
 #
+# `Win32_UI_Input_KeyboardAndMouse` 供全局热键与读取选中文本使用
+# （plugins/hotkey.rs 与 plugins/selection.rs）：`RegisterHotKey` /
+# `UnregisterHotKey` / `SendInput` 三个函数与它们的全部常量与结构体
+# （`INPUT` / `KEYBDINPUT` / `INPUT_KEYBOARD` / `MOD_*` / `VK_*` / `KEYEVENTF_*`）
+# **都在这一个模块里**，因此不需要再打开 `Win32_UI_Input` 那一层 ——
+# 后者在 0.61 里只有 `Pointer` / `Ink` 等与这里无关的子模块。
+#
+# 不用 `global-hotkey` / `tauri-plugin-global-shortcut`：前者是社区 crate，
+# 后者要挂在 Tauri 的 builder 上并自己管理一张全局表 —— 而这里真正需要的能力
+# 是**把组合键与插件 id 绑定、并在插件被停用时确保解绑**。那件事的判据（哪条
+# 组合属于哪个插件、什么时候必须释放）宿主自己才说得清，包一层只会把它藏起来。
+# 而"注册失败时是谁占着这条组合"这句对用户最重要的话，第三方库根本不会给出。
+#
+# `Win32_System_LibraryLoader` 只为一个调用：`GetModuleHandleW` ——
+# `RegisterClassW` 与 `CreateWindowExW` 都要一个 `HINSTANCE`。
+# 传 `NULL` 在多数机器上也能建出窗口，但那是**未定义行为**，而这里的失败方式
+# （热键永远注册不上、且没有任何症状）恰好最难被发现，因此宁可为它多开一个特性。
+#
 # `webview2-com` + `windows-core` 供 WebView2 的内存目标等级使用
 # （settings/memory_level.rs）：`SetMemoryUsageTargetLevel` 定义在
 # `ICoreWebView2_19` 上，需要 `cast` 到那个接口，而 `cast` 来自
@@ -141,7 +159,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Wdk_System_Threading",
 ] }
 webview2-com = "0.38"

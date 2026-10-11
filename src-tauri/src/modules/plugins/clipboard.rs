@@ -491,6 +491,16 @@ impl ChangeDetector {
     fn discard(&mut self) {
         self.pending = None;
     }
+
+    /// 把序列号**直接对齐**到给定值，并丢掉挂起的那一个。
+    ///
+    /// 只有一处用到它：抑制窗口结束时（见 `ClipboardMonitor::suppress`）。它与
+    /// `commit` 的区别是这里**不交付**任何东西 —— 它抹掉的正是窗口期内发生的、
+    /// 不该被交付的变化。
+    fn resync(&mut self, sequence: u32) {
+        self.last = sequence;
+        self.pending = None;
+    }
 }
 
 // ============================================================
@@ -532,6 +542,10 @@ struct MonitorState {
     /// 轮询线程的"活着"凭据。**`None` 就代表线程没在跑** —— 因此"没有订阅者时
     /// 停掉线程"这件事只有一个判据，不需要另一个布尔量去跟它同步。
     stop: Option<Sender<()>>,
+    /// **抑制窗口。** 见下方"为什么这里有第二个标志位"。
+    suppressed: bool,
+    /// 抑制结束之后要求轮询线程重新对齐序列号。
+    resync: bool,
 }
 
 /// 剪贴板监测的宿主状态。由 `lib.rs` 在 `setup` 里托管。
@@ -635,6 +649,9 @@ impl ClipboardMonitor {
 
 /// 轮询线程。
 fn pump<R: Runtime>(app: AppHandle<R>, receiver: std::sync::mpsc::Receiver<()>) {
+    // 抑制窗口由这一侧拥有（见 `ClipboardMonitor::suppress`），因此线程要在每一轮
+    // 里问它两件事：要不要交付、要不要重新对齐。
+    let monitor = app.try_state::<ClipboardMonitor>();
     let mut detector = ChangeDetector::new(win::sequence_number());
 
     loop {
@@ -648,6 +665,14 @@ fn pump<R: Runtime>(app: AppHandle<R>, receiver: std::sync::mpsc::Receiver<()>) 
             Err(RecvTimeoutError::Timeout) => {}
         }
 
+        // 抑制窗口刚刚结束 → 把序列号直接对齐到当前值。
+        //
+        // **必须排在 `poll` 之前**：抑制期内发生的变化（我们合成的复制与还原）
+        // 此刻可能还挂在 `pending` 上，先对齐再 poll 才能把它们一次抹掉。
+        if monitor.as_ref().is_some_and(|state| state.take_resync()) {
+            detector.resync(win::sequence_number());
+        }
+
         // 先看序列号：没变就一个字节都不碰。**绝大多数轮次走的是这一条。**
         if detector.poll(win::sequence_number()).is_none() {
             continue;
@@ -658,8 +683,14 @@ fn pump<R: Runtime>(app: AppHandle<R>, receiver: std::sync::mpsc::Receiver<()>) 
             ReadOutcome::Retry => detector.discard(),
             ReadOutcome::Skip => detector.commit(),
             ReadOutcome::Change(change) => {
+                // 序列号**照样推进**：留在原处会让这条幻影变化在抑制结束之后被
+                // 当成新变化补交一次，而那正是抑制要防的事情。
                 detector.commit();
-                deliver(&app, &change);
+
+                let suppressed = monitor.as_ref().is_some_and(|state| state.is_suppressed());
+                if !suppressed {
+                    deliver(&app, &change);
+                }
             }
         }
     }
@@ -749,6 +780,68 @@ pub fn require_permission(
 }
 
 // ============================================================
+// 抑制窗口：为什么这里有第二个标志位
+// ============================================================
+//
+// **这是本模块与 `selection.rs` 之间唯一的耦合，而且必须留在这里被人看见。**
+//
+// `selection.rs` 读取选中文本的办法是**合成一次 Ctrl+C**，也就是说宿主自己会改
+// 用户的剪贴板。如果那条路径上的两次变化（复制 / 还原）被当成普通变化交付出去，
+// 后果是很具体的：**每一次翻译触发都会往用户的剪贴板历史里注入一条幻影记录** ——
+// 而且是一条用户从来没有复制过的内容。历史插件本身没有问题，这是那条路径在污染它。
+//
+// 因此抑制窗口由**剪贴板这一侧**拥有：只有它知道"要不要交付"，也只有它持着轮询
+// 线程。`selection.rs` 只负责在自己那一段的开始与结束处把它打开、关掉。
+//
+// 两个标志位而不是一个，是因为下面的时序：轮询每 800 ms 才看一次序列号，而一次
+// 捕获最长持续 400 ms。于是"抑制结束"的那一刻，轮询线程可能**一次都还没醒来**，
+// 而那条幻影变化仍然排在它下一轮的队里 —— 只把 `suppressed` 放掉会让它在抑制
+// 结束之后被交付。`resync` 就是为这一刻存在的：抑制结束后的第一个轮次里，
+// 轮询线程把序列号**直接对齐到当前值**，把窗口期内发生的一切一次抹掉。
+//
+// 抹掉是安全的，因为窗口期内只有我们自己的两次变化（复制与还原）。
+impl ClipboardMonitor {
+    /// 打开抑制窗口，返回一个 RAII guard。
+    ///
+    /// guard 的 `Drop` 关掉窗口并置上 `resync`，因此**没有一条提前返回的路径能
+    /// 漏掉关闭** —— 那正是这里用 RAII 而不是一对 `begin() / end()` 的理由：
+    /// `selection.rs` 里至少有四条提前返回（没有前台窗口、前台窗口是我们自己的、
+    /// 超时、以及 SendInput 失败），漏掉任意一条都会让剪贴板监测**永久**失聪。
+    pub fn suppress(&self) -> Suppression<'_> {
+        self.lock().suppressed = true;
+        Suppression { monitor: self }
+    }
+
+    /// 现在是不是在抑制窗口里。
+    ///
+    /// 轮询线程用它决定"这一次变化要不要交付"。注意它**不影响序列号的推进**：
+    /// 抑制期内的变化照样 `commit`，否则它们会在窗口结束之后被当成新变化补交一次。
+    fn is_suppressed(&self) -> bool {
+        self.lock().suppressed
+    }
+
+    /// 取出"需要重新对齐序列号"这件事，并把它清掉。
+    fn take_resync(&self) -> bool {
+        let mut state = self.lock();
+        std::mem::take(&mut state.resync)
+    }
+}
+
+/// 抑制窗口的 RAII guard。见 `ClipboardMonitor::suppress` 的说明。
+pub struct Suppression<'a> {
+    monitor: &'a ClipboardMonitor,
+}
+
+impl Drop for Suppression<'_> {
+    fn drop(&mut self) {
+        let mut state = self.monitor.lock();
+        state.suppressed = false;
+        // 见上面"两个标志位"那一节：只放掉 `suppressed` 是不够的。
+        state.resync = true;
+    }
+}
+
+// ============================================================
 // 平台层
 // ============================================================
 
@@ -779,6 +872,44 @@ pub fn read_image() -> Result<Option<String>, String> {
 /// data URL 前缀。抽出来是为了让"返回的是 PNG"只有一处定义。
 const PNG_DATA_URL_PREFIX: &str = "data:image/png;base64,";
 
+// ============================================================
+// 文本的读 / 写 / 序列号（供 `selection.rs` 使用）
+// ============================================================
+//
+// `selection.rs` 读取选中文本的办法是"合成 Ctrl+C → 读剪贴板 → 把原内容写回"，
+// 而这三件事全部是**剪贴板**的操作。因此它们的 Win32 实现留在这个文件里，而不是
+// 在那边再抄一份 `OpenClipboard` / `GetClipboardData` —— 两份实现必然漂，而漂开
+// 的表现是"其中一个能读到剪贴板、另一个读到 nil"。
+//
+// 它们与下面那些 `pub fn` 的区别只有一个：`current_text` / `replace_text` 是
+// **一次完整的打开—读写—关闭**，而 `read_formats` / `read_image` 是给插件的一次
+// 查询。混在一起会让"谁负责关闭剪贴板"变得说不清。
+
+/// 读一次剪贴板上的文本。**没有文本时是 `None`**，不是空串。
+///
+/// 空串是一个合法取值（用户复制了一段空内容），因此两者必须分得开 ——
+/// `selection.rs` 的快照与还原都建立在这一点上。
+pub fn current_text() -> Option<String> {
+    win::current_text()
+}
+
+/// 把剪贴板上的内容整体替换成给定的文本。
+///
+/// **它会 `EmptyClipboard`。** 也就是说原来在那里的图片、富文本、文件列表都会没
+/// —— 这不是实现上的疏漏，而是"写文本"在 Win32 里唯一的形式。它的唯一调用方是
+/// `selection.rs` 的还原路径，而那条路径的代价写在 `selection.rs` 的文件头里。
+pub fn replace_text(text: &str) -> Result<(), String> {
+    win::replace_text(text)
+}
+
+/// 当前的剪贴板序列号。
+///
+/// 它每次剪贴板内容变化就自增，而**取它不需要打开剪贴板** —— 因此
+/// `selection.rs` 可以在 400 ms 里轮询它 20 次而完全不碰用户剪贴板里的内容。
+pub fn sequence_number() -> u32 {
+    win::sequence_number()
+}
+
 fn data_url(bytes: &[u8]) -> String {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     format!("{PNG_DATA_URL_PREFIX}{}", BASE64.encode(bytes))
@@ -808,11 +939,15 @@ mod win {
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
-        GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
+        CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+        GetClipboardFormatNameW, GetClipboardSequenceNumber, OpenClipboard,
+        RegisterClipboardFormatW, SetClipboardData,
     };
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    };
 
     use super::*;
 
@@ -904,6 +1039,76 @@ mod win {
 
     pub fn sequence_number() -> u32 {
         unsafe { GetClipboardSequenceNumber() }
+    }
+
+    /// 一次完整的"打开 → 读文本 → 关闭"。
+    ///
+    /// 打开失败（别的程序占着剪贴板）时返回 `None` 而不是报错：调用方是
+    /// `selection.rs` 的快照路径，而那里"没读到快照"是一个合法的状态（还原时写回
+    /// 一个空串，见 `selection::clipboard_restore`）。
+    pub fn current_text() -> Option<String> {
+        let _opened = Opened::try_open()?;
+        read_text()
+    }
+
+    /// 一次完整的"分配 → 打开 → 清空 → 写入 → 关闭"。
+    ///
+    /// ============================================================
+    /// 每一个失败分支都必须自己收尾
+    /// ============================================================
+    ///
+    /// 这里有三种失败（分配失败、打不开剪贴板、`EmptyClipboard` / `SetClipboardData`
+    /// 失败），而它们的收尾**不一样**，这正是它容易写错的地方：
+    ///
+    ///   * 只要 `SetClipboardData` 还没成功，那块全局内存就**归我们**，必须
+    ///     `GlobalFree` —— 漏掉它就是一次内存泄漏，而它发生在"用户每次读取选中
+    ///     文本时剪贴板恰好被占用"这种偶发路径上，几乎不可能被发现；
+    ///   * 一旦 `SetClipboardData` 成功，那块内存**归系统**，此时再 `GlobalFree`
+    ///     是在释放一块不属于我们的内存 —— 那会让剪贴板里出现一个悬垂句柄，
+    ///     用户下一次粘贴时崩溃的是**别的程序**。
+    pub fn replace_text(text: &str) -> Result<(), String> {
+        // UTF-16 + 结尾 NUL。`CF_UNICODETEXT` 要求写入的内容以 NUL 结尾，少了它
+        // 读到的是内存里接着的那一段未初始化数据。
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = wide.len() * std::mem::size_of::<u16>();
+
+        unsafe {
+            let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if handle.is_null() {
+                return Err("无法为剪贴板文本分配全局内存（GlobalAlloc 失败）".to_string());
+            }
+
+            let pointer = GlobalLock(handle) as *mut u16;
+            if pointer.is_null() {
+                GlobalFree(handle);
+                return Err("无法锁定刚分配的剪贴板内存（GlobalLock 失败）".to_string());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), pointer, wide.len());
+            GlobalUnlock(handle);
+
+            if OpenClipboard(std::ptr::null_mut::<c_void>() as HWND) == 0 {
+                GlobalFree(handle);
+                return Err(
+                    "打不开剪贴板（另一个程序正占用它），无法还原剪贴板里的文本".to_string(),
+                );
+            }
+
+            if EmptyClipboard() == 0 {
+                CloseClipboard();
+                GlobalFree(handle);
+                return Err("无法清空剪贴板（EmptyClipboard 失败）".to_string());
+            }
+
+            if SetClipboardData(CF_UNICODETEXT, handle).is_null() {
+                CloseClipboard();
+                GlobalFree(handle);
+                return Err("无法把文本写进剪贴板（SetClipboardData 失败）".to_string());
+            }
+
+            CloseClipboard();
+        }
+
+        Ok(())
     }
 
     /// 一个格式 id 的原始名字。
@@ -1168,6 +1373,16 @@ mod win {
 
     pub fn sequence_number() -> u32 {
         0
+    }
+
+    /// 非 Windows 上不会有选中文本捕获（`selection.rs` 的 `read` 直接拒绝），
+    /// 因此这里不会有人调用它。留着同一个签名是为了让上层不需要任何 `cfg`。
+    pub fn current_text() -> Option<String> {
+        None
+    }
+
+    pub fn replace_text(_text: &str) -> Result<(), String> {
+        Err(UNSUPPORTED_PLATFORM.to_string())
     }
 
     /// 非 Windows 上不会有变化事件：线程根本不会起来（`subscribe` 直接拒绝）。

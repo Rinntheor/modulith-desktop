@@ -89,6 +89,12 @@
   // `ctx.clipboard.canMonitor()` 是**同步**方法（插件用它做顶层特性探测），
   // 而 RPC 是异步的 —— 等它回来时插件的顶层早就跑完了。
   var CLIPBOARD_MONITOR_SUPPORTED = __PLUGIN_CLIPBOARD_MONITOR__;
+  // 全局热键与读取选中文本的平台能力。与上面那条**同一个理由**：两者的
+  // `isAvailable()` 都是**同步**方法（插件在顶层用它决定要不要注册热键、
+  // 要不要画一个"翻译选中文本"的按钮），而 RPC 是异步的 —— 等它回来时插件的
+  // 顶层早就跑完了。
+  var HOTKEY_SUPPORTED = __PLUGIN_HOTKEY__;
+  var SELECTION_SUPPORTED = __PLUGIN_SELECTION__;
   var SURFACES = __PLUGIN_SURFACES__;
   // 整份清单与设置项快照。两者都是 **JSON 字面量**（源文件里不带引号，宿主直接
   // 把序列化结果替换进来）—— 与上面那几条字符串占位符的区别就在这里：包成字符串
@@ -745,6 +751,235 @@
       readImage: function () {
         if (!allowedMonitor) return deniedMonitor('读取剪贴板图片');
         return rpc('clipboard.readImage', {});
+      },
+    };
+  })();
+
+  // ============================================================
+  // 全局热键（`ctx.hotkey`）
+  // ============================================================
+  //
+  // ============================================================
+  // 它与 `ctx.clipboard` 的监测那一半是同一形态
+  // ============================================================
+  //
+  // 两者都**只能经宿主**：`RegisterHotKey` 在宿主进程里，而浏览器里没有任何 API
+  // 能让一个页面在**别的程序**聚焦时收到按键（`addEventListener('keydown')` 只在
+  // 本文档聚焦时有效）。因此权限是 Rust 侧强制的，而这一层能做的只是"没声明时
+  // 给出可读的降级 + 一次告警"。
+  //
+  // ============================================================
+  // 触发是**宿主 → 插件**方向的，因此需要一条推送通道
+  // ============================================================
+  //
+  // 热键触发天生是"用户按了键"，而按键发生在别的程序里 —— 这一侧没有任何东西
+  // 能观察到它。因此 `subscribe` 除了登记一个处理函数，还要告诉宿主"请往我这里推"，
+  // 而宿主推回来时走 `PUSH_HANDLERS.hotkey`（与 clipboard / file-drop 同一个形状：
+  // 扇出给插件自己注册的那些处理函数，而不是转发给某个全局钩子）。
+
+  /** 热键触发的订阅者。见 `PUSH_HANDLERS['hotkey']`。 */
+  var HOTKEY_HANDLERS = new Set();
+
+  var hotkey = (function () {
+    var allowed = has('global-hotkey');
+
+    var warned = false;
+    function warnOnce() {
+      if (warned) return;
+      warned = true;
+      console.warn(
+        '[Modulith] 插件使用了全局热键，但清单里没有声明 "global-hotkey" 权限，' +
+          '注册与订阅都被拒绝（后续同类调用不再重复提示）'
+      );
+    }
+
+    /**
+     * 缺权限时统一抛出的那句话。
+     *
+     * **不返回一个空结果。** `register()` 静默成功会让插件以为热键装上了，
+     * 而用户按下去没有任何反应 —— 那是最难查的一类缺陷：插件这一侧全绿，
+     * 而没有任何地方说得出"它根本没注册"。
+     */
+    function denied(what) {
+      warnOnce();
+      return Promise.reject(
+        new Error(
+          '插件未声明 "global-hotkey" 权限，无法' +
+            what +
+            '。这一项必须显式声明：占用的组合键会从这台机器上所有其它程序手里被拿走'
+        )
+      );
+    }
+
+    return {
+      /**
+       * 现在能不能注册全局热键。**同步**，用于特性探测。
+       *
+       * 两个条件都满足才为真：清单里声明了 `global-hotkey`，**且**这个平台支持
+       * （只有 Windows 有 `RegisterHotKey`）。非 Windows 上它恒为假，注册会走
+       * 降级分支。
+       */
+      isAvailable: function () {
+        return allowed && HOTKEY_SUPPORTED;
+      },
+
+      /**
+       * 注册一条组合键。返回**宿主实际绑定的**规范化组合键（`Ctrl+Q` 会变成
+       * `mod+q`）—— 插件拿它去 `unregister` 或显示给用户，都该用这一个。
+       *
+       * 冲突时**拒绝**，而且消息里点名是谁占着它（宿主快捷键 / 另一个插件 /
+       * 系统里的别的程序）。那三种情况下用户能做的事完全不同，因此这一层
+       * 绝不能把宿主的错误消息改写成一句笼统的"注册失败"。
+       */
+      register: function (combo) {
+        if (!allowed) return denied('注册全局热键');
+        if (!HOTKEY_SUPPORTED) {
+          return Promise.reject(
+            new Error(
+              '当前平台不支持全局热键（它依赖 Win32 的 RegisterHotKey / ' +
+                'UnregisterHotKey，只在 Windows 上可用）。调用 ctx.hotkey.isAvailable() ' +
+                '可以在代码里先判断'
+            )
+          );
+        }
+        return rpc('hotkey.register', { combo: String(combo) });
+      },
+
+      /** 解绑一条组合键。**不做权限检查**：一条解不掉的绑定就是一个泄漏。 */
+      unregister: function (combo) {
+        return rpc('hotkey.unregister', { combo: String(combo) });
+      },
+
+      /** 这个插件当前注册的组合键（规范化形式）。 */
+      list: function () {
+        return rpc('hotkey.list', {}).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /**
+       * 订阅"我注册的组合键被按下了"。返回取消订阅函数。
+       *
+       * 处理函数收到一个参数 `{ combo }` —— 契约里的 `handler()` 说的是"不要求
+       * 参数"，而一个插件最多能注册 4 条组合（`MAX_COMBOS_PER_PLUGIN`），
+       * 因此多给这一个字段，否则处理函数分不清是哪一条触发了。
+       */
+      subscribe: function (handler) {
+        if (typeof handler !== 'function') {
+          throw new TypeError('hotkey.subscribe 需要一个函数');
+        }
+        if (!allowed) {
+          warnOnce();
+          return function () {};
+        }
+        if (!HOTKEY_SUPPORTED) {
+          // 与剪贴板那一条同一条规矩：**空订阅 + 一次告警**，而不是抛错。
+          // 抛错会让一个只是想在 Windows 上做特性的插件整体加载失败，而它是可以
+          // `isAvailable()` 自查的。
+          console.warn(
+            '[Modulith] 订阅了全局热键，但当前平台不支持（只在 Windows 上可用）。' +
+              '订阅被忽略 —— 调用 ctx.hotkey.isAvailable() 可以在代码里先判断'
+          );
+          return function () {};
+        }
+
+        var isFirst = HOTKEY_HANDLERS.size === 0;
+        HOTKEY_HANDLERS.add(handler);
+        if (isFirst) {
+          rpc('hotkey.subscribe', {}).catch(function (error) {
+            // 失败**必须说出来**：插件会以为自己订阅成功了（`subscribe()` 没有抛），
+            // 而宿主那边一次触发都不会来。
+            console.warn('[Modulith] 全局热键订阅没有登记成功，将收不到触发：' + error);
+          });
+        }
+
+        var released = false;
+        return function () {
+          // 幂等：插件把它存进 `disposables` 之后又自己调一次是常见写法。
+          if (released) return;
+          released = true;
+          HOTKEY_HANDLERS.delete(handler);
+
+          // **只有最后一个处理函数离开时才通知宿主。**
+          if (HOTKEY_HANDLERS.size === 0) {
+            rpc('hotkey.unsubscribe', {}).catch(function () {});
+          }
+        };
+      },
+    };
+  })();
+
+  // ============================================================
+  // 读取选中文本（`ctx.selection`）
+  // ============================================================
+  //
+  // ============================================================
+  // 为什么它只有一个方法，而且只能经宿主
+  // ============================================================
+  //
+  // 它要的是"**前台应用程序**里选中的文本" —— 而前台程序可能是任何一个程序。
+  // 这一侧的 `window.getSelection()` 只覆盖本文档，`navigator.clipboard` 读不到
+  // 别的程序的选区。宿主用的是"合成 Ctrl+C 再读剪贴板"（见 `selection.rs`），
+  // 因此它会**短暂覆盖用户的剪贴板** —— 那个代价写在权限描述与用户文档里，
+  // 而这一层能做的是在缺权限时给出可读的拒绝，而不是一个看起来正常的 `null`。
+
+  var selection = (function () {
+    var allowed = has('read-selection');
+
+    var warned = false;
+    function warnOnce() {
+      if (warned) return;
+      warned = true;
+      console.warn(
+        '[Modulith] 插件读取了选中文本，但清单里没有声明 "read-selection" 权限，' +
+          '调用被拒绝（后续同类调用不再重复提示）'
+      );
+    }
+
+    return {
+      /**
+       * 现在能不能读取选中文本。**同步**，用于特性探测。
+       *
+       * 两个条件都满足才为真：清单里声明了 `read-selection`，**且**这个平台支持
+       * （只有 Windows 有 `SendInput`）。
+       */
+      isAvailable: function () {
+        return allowed && SELECTION_SUPPORTED;
+      },
+
+      /**
+       * 读一次前台应用程序里选中的文本。
+       *
+       * 三种结果必须分得开，调用方要照各自的含义处理：
+       *   * `string` —— 读到了；
+       *   * **`null`** —— 捕获成功了，但剪贴板上最终没有文本（用户选中的是一段
+       *     空白，或者那个程序放了一份没有文本的东西）；
+       *   * **抛错** —— 这次捕获根本没成功（前台窗口是本应用、没有前台窗口、
+       *     那个程序不响应 Ctrl+C —— 宿主会说明是哪一种）。
+       *
+       * 把后两者混成 `null` 是最糟的处理：作者会写"没有选中就提示用户先选一段"，
+       * 而用户明明选中了 —— 那个分支永远走不到，也没有任何线索。
+       */
+      read: function () {
+        if (!allowed) {
+          warnOnce();
+          return Promise.reject(
+            new Error(
+              '插件未声明 "read-selection" 权限，无法读取选中的文本。' +
+                '这一项必须显式声明：它读的是你在**任何程序**里选中的内容，' +
+                '而且会短暂覆盖你的剪贴板'
+            )
+          );
+        }
+        if (!SELECTION_SUPPORTED) {
+          return Promise.reject(
+            new Error(
+              '当前平台不支持读取选中文本（它需要合成 Ctrl+C，只在 Windows 上可用）。' +
+                '调用 ctx.selection.isAvailable() 可以在代码里先判断'
+            )
+          );
+        }
+        return rpc('selection.read', {});
       },
     };
   })();
@@ -2216,6 +2451,27 @@
       });
     },
 
+    // 全局热键触发。与 `clipboard` / `file-drop` **同一条形状**：扇出给插件自己
+    // 注册的那些处理函数 —— 因为 `ctx.hotkey.subscribe(handler)` 的形态就是这样。
+    //
+    // 权限**不在这里判**：宿主只在订阅登记成功之后才推（那一步已经过了
+    // `require_permission`），因此走到这里的每一条都是该收的。在这里再查一遍
+    // `PERMISSIONS` 只会让人以为那是一道边界。
+    //
+    // 负载是 `{ combo }`：一个插件最多能注册 4 条组合，处理函数必须能分辨是哪一条。
+    hotkey: function (payload) {
+      // 快照后再遍历：处理器里退订是合法用法，边遍历边删会让 Set 的迭代行为
+      // 变得难以推理（某些实现会因此跳过一项）。
+      Array.from(HOTKEY_HANDLERS).forEach(function (handler) {
+        try {
+          handler(payload || null);
+        } catch (error) {
+          // 与宿主侧的前端扇出同一条规矩：一个处理器出错不该让别的收不到。
+          console.error('[Modulith] hotkey 处理器抛出异常，已隔离：' + error);
+        }
+      });
+    },
+
     // 文件拖放。**与别的通道不同，这一条不是"转发给某个全局钩子"，而是扇出给
     // 插件自己注册的那些处理器** —— 因为 `ctx.fileDrop` 的形态就是这样：
     // `subscribe(handler)` 收一个回调，而不是让插件去挂一个全局名字。
@@ -3105,6 +3361,22 @@
     },
 
     clipboard: clipboard,
+
+    /**
+     * 全局热键。**与剪贴板的监测那一半同一形态**：宿主进程里的 Win32 是唯一
+     * 出口，因此权限由 Rust 侧强制，这一层只负责缺权限时的降级与一次告警。
+     */
+    hotkey: hotkey,
+
+    /**
+     * 读取**前台应用程序**里选中的文本。
+     *
+     * ⚠️ 它在宿主那一侧会向前台程序**合成一次 Ctrl+C**，因此会短暂覆盖用户的
+     * 剪贴板（文本会被还原，图片/富文本/文件无法还原）。那段代价写在权限描述与
+     * 用户文档里 —— 这里重复一次是因为读这个文件的人多半正在排查"为什么我的
+     * 剪贴板被换掉了"。
+     */
+    selection: selection,
 
     /** 文件拖放。形态与 in-process 一致，语义差别见上面的 `fileDrop`。 */
     fileDrop: fileDrop,

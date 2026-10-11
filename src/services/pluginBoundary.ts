@@ -356,6 +356,18 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     migration: 'rpc',
     note: '宿主渲染的**结果卡片**。三个运行位置都有，但**只有 `popover` 一个方法**：沙箱那一侧还有 dialog / contextMenu / openSurface / closeSurface / listSurfaces / badge / progress / splash，它们要么挂在"我在哪个界面里"、要么要一块属于插件的 webview，因此刻意不进这一份（这一份描述的是 in-process 的 `ctx`）。需要 notification 权限，Rust 侧强制 —— 它与其他几条一样会打断用户',
   },
+  {
+    name: 'hotkey',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '全局热键。需要 global-hotkey 权限，Rust 侧强制 —— `RegisterHotKey` 在宿主进程里，而浏览器里没有任何 API 能让一个页面在**别的程序**聚焦时收到按键。**订阅是回调（`subscribe`），而触发是宿主主动推的**，因此它比 `events.subscribe` 多一件事：v2 要把它写成"宿主按插件 id 推触发、插件按 id 认领"，与 fileDrop / clipboard 的 subscribe 同一条路',
+  },
+  {
+    name: 'selection',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '读取**前台应用程序**里选中的文本。需要 read-selection 权限，Rust 侧强制（`SendInput` 合成 Ctrl+C + 读剪贴板都在宿主进程里）。它**会短暂覆盖用户的剪贴板** —— 文本会被还原，图片/富文本/文件无法还原，那段代价写在权限描述与 `selection.rs` 的文件头里',
+  },
 ];
 
 // ============================================================
@@ -520,6 +532,21 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
       migration: 'as-is',
       note: '入参是 { title?, body, tone?, actions?, timeoutMs?, at? }，返回 { action }（值为 string 或 null）。**两端都是纯数据**：插件不交函数、也拿不到宿主对象，所以它跨 realm 时一行都不用改',
     },
+  ],
+  hotkey: [
+    // `ctx.hotkey` 上有两种东西：同步探测、以及**异步**的注册/解绑/列举。
+    // 后者全部是"字符串进、字符串或数组出"，因此换成消息往返是机械的。
+    { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔：声明了 global-hotkey **且**这个平台支持（只有 Windows 有 RegisterHotKey）' },
+    { name: 'register', io: 'value', migration: 'as-is', note: '返回 Promise<string>，**宿主实际绑定的规范化组合键**（`Ctrl+Q` 回来是 `mod+q`）。冲突时拒绝，消息里点名是谁占着它 —— 那句原样来自宿主，这一层不改写' },
+    { name: 'unregister', io: 'value', migration: 'as-is', note: '返回 Promise<void>。**不做权限检查**：一条解不掉的绑定就是一个泄漏（它偷的是用户整台机器上的一个按键）' },
+    { name: 'list', io: 'value', migration: 'as-is', note: '返回 Promise<string[]>，规范化形式，最多 4 条' },
+    { name: 'subscribe', io: 'callable', migration: 'message', note: '**入参是触发处理函数（收到 `{ combo }`）、返回值是取消订阅函数**。触发方向是**宿主 → 插件**（按键发生在别的程序里，这一侧观察不到），因此 v2 与 `fileDrop.subscribe` / `clipboard.subscribe` 同一条路：改成"宿主推触发、插件按 ID 认领"' },
+  ],
+  selection: [
+    // 只有两个方法，但 `read` 的返回形状是整个 `ctx` 里最需要说清楚的一个：
+    // `null`（捕获成功但剪贴板上没有文本）与抛错（这次捕获根本没成功）必须分得开。
+    { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔：声明了 read-selection **且**这个平台支持（只有 Windows 有 SendInput）' },
+    { name: 'read', io: 'value', migration: 'as-is', note: '返回 Promise<string \\| null>。**`null` 是"捕获成功但没有文本"，而"这次捕获根本没成功"是抛错** —— 两者混成一个会让作者写出一个永远走不到的分支。宿主侧会短暂覆盖用户的剪贴板（文本还原，非文本格式不还原）' },
   ],
 };
 

@@ -1123,6 +1123,167 @@ pub async fn plugin_clipboard_read_image(
     super::clipboard::read_image()
 }
 
+// ============================================================
+// `ctx.hotkey` 与 `ctx.selection`：in-process 插件那一条路径
+// ============================================================
+//
+// ============================================================
+// 为什么它们与 `ctx.clipboard` 的监测那一半是同一形态
+// ============================================================
+//
+// 两项能力都只有一个出口：**宿主进程里的 Win32**。`RegisterHotKey` 让插件在别的
+// 程序聚焦时被唤醒，`SendInput` + 读剪贴板让插件拿到用户在别的程序里选中的文本 ——
+// 浏览器里没有任何 API 能表达这两件事（`addEventListener('keydown')` 只在本文档
+// 聚焦时有效，`navigator.clipboard` 读不到别的程序的选区）。
+//
+// 因此与 `secrets`、`clipboard-monitor` 一样，这里的 `require_permission` 就是
+// 这项能力的**全部边界**，而它是真的边界：插件没有第二条路。
+//
+// ============================================================
+// `id` 由前端给，因此 in-process 上买到的是"权限列表诚实"
+// ============================================================
+//
+// 与 `plugin_storage_*` 完全一样：in-process 插件与宿主在同一个 realm 里，这条
+// 命令**无法**分辨调用者是宿主还是插件。一条
+// `invoke('plugin_hotkey_register', { id: '别的插件', combo: 'mod+q' })` 会以那个
+// 插件的名义占走一个按键，而 `require_permission` 挡不住它 —— 它检查的是被冒充的
+// 那个插件有没有声明 `global-hotkey`，而不是"你是谁"。
+//
+// 后果比剪贴板那一条更重（热键是系统级独占资源），但**没有更轻的替代**：真正的
+// 边界要等进程级隔离。沙箱那条路径不存在这个问题 —— 身份来自 webview 标签。
+
+/// 校验 `global-hotkey` 权限（in-process 路径）。
+///
+/// 与 `rpc.rs::checked_hotkey` 是同一条判据的两个传输。权限守卫在内部作用域里就被
+/// 丢掉，`await` 全部发生在它之外。
+async fn checked_hotkey(app: &AppHandle, plugin_id: &str) -> Result<(), String> {
+    let state = app.state::<PluginState>().inner().0.clone();
+
+    {
+        let manager = state.read().await;
+        super::hotkey::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
+/// 校验 `read-selection` 权限（in-process 路径）。
+async fn checked_selection(app: &AppHandle, plugin_id: &str) -> Result<(), String> {
+    let state = app.state::<PluginState>().inner().0.clone();
+
+    {
+        let manager = state.read().await;
+        super::selection::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
+/// 这个平台支不支持全局热键。
+///
+/// **不需要权限**：它回答的是"这台机器上有没有这项能力"，与调用者是谁无关，也不
+/// 泄露任何用户数据。前端的 `isAvailable()` 把它与"清单里声明了没有"相与。
+#[tauri::command]
+pub fn plugin_hotkey_can_register() -> bool {
+    super::hotkey::HotkeyRegistry::is_supported()
+}
+
+/// 注册一条全局热键，成功时返回**规范化之后**的组合键。
+///
+/// 返回规范化结果而不是回显输入：插件拿它去 `unregister` 或显示给用户时，
+/// 应当看到宿主实际绑定的那一条，而不是自己写下的别名（`Ctrl+Q` / `cmd+q`）。
+#[tauri::command]
+pub async fn plugin_hotkey_register(
+    app: AppHandle,
+    id: String,
+    combo: String,
+) -> Result<String, String> {
+    checked_hotkey(&app, &id).await?;
+
+    let owned = app.clone();
+    // `register` 会**阻塞**到窗口线程回话（最多 2 秒），因此放进阻塞线程池 ——
+    // 让一次 `RegisterHotKey` 把 tokio 的工作线程占住，会让同一时间别的插件的
+    // 调用一起变慢，而那种关联在排查时几乎看不出来。
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = owned
+            .try_state::<super::hotkey::HotkeyRegistry>()
+            .ok_or_else(|| "热键注册表尚未就绪".to_string())?;
+        state.register(&owned, &id, &combo)
+    })
+    .await
+    .map_err(|e| format!("注册热键的任务没能完成：{e}"))?
+}
+
+/// 撤销一条全局热键。**没有权限检查** —— 一条解不掉的绑定就是一个泄漏。
+#[tauri::command]
+pub async fn plugin_hotkey_unregister(
+    app: AppHandle,
+    id: String,
+    combo: String,
+) -> Result<(), String> {
+    if let Some(state) = app.try_state::<super::hotkey::HotkeyRegistry>() {
+        state.unregister(&id, &combo);
+    }
+    Ok(())
+}
+
+/// 这个插件当前注册的组合键。**不需要权限**：它只回答"我自己绑了什么"，既没有
+/// 别的插件的信息，也不泄露任何用户数据。
+#[tauri::command]
+pub fn plugin_hotkey_list(app: AppHandle, id: String) -> Vec<String> {
+    app.try_state::<super::hotkey::HotkeyRegistry>()
+        .map(|state| state.list(&id))
+        .unwrap_or_default()
+}
+
+/// 登记一条 in-process 订阅，让宿主在这个插件的组合键被按下时广播事件。
+#[tauri::command]
+pub async fn plugin_hotkey_subscribe(app: AppHandle, id: String) -> Result<(), String> {
+    checked_hotkey(&app, &id).await?;
+
+    let Some(state) = app.try_state::<super::hotkey::HotkeyRegistry>() else {
+        return Err("热键注册表尚未就绪".to_string());
+    };
+    // `surface = None` + `background = false` = in-process 那一条。
+    state.subscribe(&app, &id, None, false)
+}
+
+/// 撤销一条 in-process 订阅。**没有权限检查**，理由同 `unregister`。
+///
+/// 它同时服务插件自己的 `unsubscribe()` 与宿主侧的停用/卸载收尾
+/// （见 `cleanupPluginResources`），因此这里不能有任何"因为权限变了就拒绝"的路径。
+#[tauri::command]
+pub async fn plugin_hotkey_unsubscribe(app: AppHandle, id: String) -> Result<(), String> {
+    if let Some(state) = app.try_state::<super::hotkey::HotkeyRegistry>() {
+        state.unsubscribe(&id, None, false);
+    }
+    Ok(())
+}
+
+/// 这个平台支不支持读取选中文本。
+///
+/// **不需要权限**：它回答的是"这台机器上有没有这项能力"，与调用者是谁无关，也不
+/// 泄露任何用户数据。前端的 `isAvailable()` 把它与"清单里声明了没有"相与。
+#[tauri::command]
+pub fn plugin_selection_can_read() -> bool {
+    super::selection::is_supported()
+}
+
+/// 读一次**前台应用程序**里选中的文本。
+///
+/// 这一次调用会**真的按一次 Ctrl+C**（合成），因此它会短暂覆盖用户的剪贴板 ——
+/// 代价与限制写在 `selection.rs` 的文件头里，而还原是那一段代码的强制步骤。
+#[tauri::command]
+pub async fn plugin_selection_read(app: AppHandle, id: String) -> Result<Option<String>, String> {
+    checked_selection(&app, &id).await?;
+
+    let owned = app.clone();
+    // 最长 400 ms 的等待，理由与 `plugin_hotkey_register` 逐字相同。
+    tauri::async_runtime::spawn_blocking(move || super::selection::read(&owned))
+        .await
+        .map_err(|e| format!("读取选中文本的任务没能完成：{e}"))?
+}
+
 #[tauri::command]
 pub async fn plugin_http_request(
     state: State<'_, PluginState>,

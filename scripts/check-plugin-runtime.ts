@@ -18,6 +18,12 @@
 
 import { createPluginHost, fixtureIds } from './harness/plugin-host.ts';
 import { settingStorageKey } from '../src/services/pluginContributions.ts';
+import { normalizeCombo } from '../src/services/shortcutRegistry.ts';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 let failed = 0;
 let total = 0;
@@ -430,6 +436,67 @@ console.log('\nSVG 图标在目录重建后的存活：');
   check(
     host.backendCalls.filter((command) => command === 'read_plugin_asset').length > 0,
     '★ 重新启用后**重新读了图标文件** —— 说明卸载时缓存被清掉了，用的不是上一份'
+  );
+}
+
+// ------------------------------------------------------------
+// 组合键语法：Rust 侧那份实现必须与前端这一份**逐条同义**
+// ------------------------------------------------------------
+//
+// ============================================================
+// 这一节存在的理由：`ctx.hotkey.register` 让这套语法有了第二个实现
+// ============================================================
+//
+// 组合键的唯一语法一直是前端这一份（`shortcutRegistry.ts` 的 `parseCombo` /
+// `normalizeCombo`）。`ctx.hotkey` 进来之后，Rust 侧**必须**也有一份 ——
+// `RegisterHotKey` 拿到的是一个整数，它不知道 `mod+k` 是什么意思。
+//
+// 两份实现一定会漂，除非有东西钉住它们。钉的方式是：Rust 侧那份语料表
+// （`hotkey.rs::GRAMMAR_CASES`）是**公开数据**，这里把它读出来，用**真正的**
+// `normalizeCombo()` 逐条重算一遍，两边对不上就点名是哪一条。
+//
+// 为什么这一条比"两边各写一份单测"强：各自单测只能证明各自内部一致 ——
+// 而漂移恰恰是在两边各自都自洽的时候发生的（改了一侧的别名表，那一侧的测试
+// 跟着改，全绿）。只有把两份实现放在同一次断言里，漂移才会红。
+console.log('\n组合键语法（Rust ↔ 前端）：');
+
+{
+  const hotkeyRs = readFileSync(
+    resolve(here, '../src-tauri/src/modules/plugins/hotkey.rs'),
+    'utf8'
+  );
+
+  const start = hotkeyRs.indexOf('pub const GRAMMAR_CASES');
+  const end = hotkeyRs.indexOf('\n];', start);
+  check(start >= 0 && end > start, '能从 hotkey.rs 定位到 GRAMMAR_CASES');
+
+  // 只认**整行**是 `("输入", Some("输出"))` 或 `("输入", None)` 的那些行 ——
+  // 注释行与 `&[(` 那一行都不会命中。宽松的匹配会把注释里举的例子也算成语料，
+  // 而那会让这条断言在"文档写了例子、实现没跟上"时给出一个假失败。
+  const CASE = /^\s*\("((?:[^"\\]|\\.)*)",\s*(?:None|Some\("((?:[^"\\]|\\.)*)"\))\),\s*$/;
+  const cases: Array<[string, string | null]> = [];
+  for (const line of hotkeyRs.slice(start, end).split(/\r?\n/)) {
+    const match = CASE.exec(line);
+    if (match) cases.push([match[1], match[2] ?? null]);
+  }
+
+  check(cases.length >= 15, `语料表读到 ${cases.length} 条（少于 15 条说明解析或表被削了）`);
+
+  const mismatched = cases
+    .filter(([input, expected]) => normalizeCombo(input) !== expected)
+    .map(([input, expected]) => `"${input}" → 前端 ${JSON.stringify(normalizeCombo(input))}，Rust ${JSON.stringify(expected)}`);
+
+  check(
+    mismatched.length === 0,
+    mismatched.length === 0
+      ? `Rust 侧的组合键语法与 shortcutRegistry.ts 逐条一致（${cases.length} 条，含反例）`
+      : `★ 组合键语法在两份实现之间漂了 —— 同一个组合在宿主里会被绑成另一个键：\n      ${mismatched.join('\n      ')}`
+  );
+
+  // 反例必须真的在表里：只留正例的话，两边同时把 `mod+a+b` 放行也不会有任何一条红。
+  check(
+    cases.some(([, expected]) => expected === null),
+    '语料表里保留了**不合法**的反例（只有正例会让"两边一起放宽"无法被发现）'
   );
 }
 

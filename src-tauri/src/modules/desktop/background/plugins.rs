@@ -559,6 +559,58 @@ impl BackgroundPlugins {
         }
     }
 
+    /// 把一次**全局热键触发**投递给正在跑的那个后台插件。
+    ///
+    /// ============================================================
+    /// 它与 `dispatch_event` 的分工
+    /// ============================================================
+    ///
+    /// `dispatch_event` 面向的是"某个插件发了事件，所有订阅了它的插件都要收到"；
+    /// 这一条只面向**一个**插件，而且那个插件未必在跑 —— 后台进程是按需拉起的，
+    /// 而一个"没跑"的插件不会因为有人按了热键而被拉起来。
+    ///
+    /// 这个取舍是刻意的，而且必须说清楚：热键触发的语义是"用户现在就要那个结果"，
+    /// 而拉起一个 Node 进程（几百毫秒、上百 MB）再让它做一次翻译，用户等到的会是
+    /// 一次莫名其妙的延迟。它同时意味着**一个后台插件要在启动时就跑起来**
+    /// （清单里 `onStartup`）才能可靠地收到热键。
+    ///
+    /// 由 `hotkey::deliver` 调用（那一条把任务丢给 tokio，自己不 await）。
+    pub async fn dispatch_hotkey(&self, plugin_id: &str, combo: &str) {
+        // 先把宿主持有的一份拿出来，然后**放掉锁**再 await —— 临界区里 await 会让
+        // 一个插件的投递卡住另一个插件的启动（与 `dispatch_event` 同一条纪律）。
+        let host = {
+            let running = self.running.lock().unwrap();
+            running
+                .get(plugin_id)
+                .map(|entry| Arc::clone(&entry.host))
+        };
+        let Some(host) = host else {
+            // 不在跑就是没人在听。**不拉起它**，理由见上面的说明。
+            log::debug!("全局热键 {combo} 触发，但后台插件 {plugin_id} 没有在运行");
+            return;
+        };
+
+        let outcome = host
+            .call(
+                BackgroundMethod::PluginDispatch,
+                Some(serde_json::json!({
+                    "id": plugin_id,
+                    // 与 `ctx.background.on('hotkey', handler)` 登记的那个类型逐字
+                    // 相同 —— 类型名对不上时处理器一个都收不到，而那是静默的。
+                    "type": "hotkey",
+                    "payload": { "combo": combo },
+                })),
+            )
+            .await;
+
+        if !outcome.ok {
+            log::debug!(
+                "向后台插件 {plugin_id} 投递热键 {combo} 失败：{}",
+                outcome.error.unwrap_or_default()
+            );
+        }
+    }
+
     /// 这个 Node 支不支持引擎级权限模型。
     ///
     /// 结果被缓存：它要启动一次子进程问版本，而版本在一次运行里不会变。
@@ -674,10 +726,30 @@ async fn handle_inbound(
             .unwrap_or(&request.method)
             .to_string();
 
-        let args = request.params.unwrap_or(Value::Null);
+        let mut args = request.params.unwrap_or(Value::Null);
         // 第三个参数是**界面身份**。后台插件没有界面 —— 因此是 `None`，
         // 而不是一个空字符串。`ctx.ui.openSurface` 这类成员在它这里会以
         // "你不在任何一个界面里" 失败，而那正是事实。
+        //
+        // ============================================================
+        // 一个例外：热键订阅
+        // ============================================================
+        //
+        // `ctx.hotkey.subscribe` 在 in-process 与沙箱里都会走到 RPC 的同一个分支，
+        // 而那个分支需要知道"这个订阅属于哪一侧" —— 三种运行位置的投递方式完全不同
+        // （Tauri 事件 / 推进 iframe / 派发进本进程）。界面身份那一栏对后台插件是
+        // `None`，而 in-process 也是 `None`，两者在 RPC 那一层分不开。
+        //
+        // 因此这里补一个 `background` 标注。它与剥掉 `ctx.` 前缀同一层：都是**传输**
+        // 知道、而共用实现不可能知道的事。**只对这两个方法写**，因为只有它们需要
+        // 区分"我是哪一侧"。
+        if matches!(method.as_str(), "hotkey.subscribe" | "hotkey.unsubscribe") {
+            if let Value::Object(map) = &mut args {
+                map.insert("background".to_string(), Value::Bool(true));
+            } else {
+                args = serde_json::json!({ "background": true });
+            }
+        }
         let result = rpc::dispatch(&app, &plugin_id, None, &method, &args).await;
 
         if let Err(message) = &result {

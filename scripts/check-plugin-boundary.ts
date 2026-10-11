@@ -380,6 +380,11 @@ section('能力方法');
     { member: 'dataDir', factory: 'pluginDataDir', path: ['return'] },
     { member: 'db', factory: 'pluginDatabase', path: ['return'] },
     { member: 'secrets', factory: 'pluginSecrets', path: ['return'] },
+    // 全局热键与读取选中文本。两者与 `secrets` / `clipboard-monitor` 同一形态：
+    // 唯一的出口在宿主进程里（`RegisterHotKey` / `SendInput`），因此前端这一层
+    // 的降级不是边界，Rust 侧的 `require_permission` 才是。
+    { member: 'hotkey', factory: 'pluginHotkey', path: ['return'] },
+    { member: 'selection', factory: 'pluginSelection', path: ['return'] },
     // 唯一一个**方法比同名的沙箱成员少**的能力对象：in-process 的 `ui` 只有
     // `popover`。少的那 8 个（dialog / contextMenu / 多界面三条 / 状态指示三条）
     // 要么挂在"我在哪个界面里"，要么要一块属于插件的 webview —— in-process
@@ -519,8 +524,8 @@ section('迁移面');
     `ctx 上没有函数形态的**成员**（当前 ${contextCallables.length} 个）`
   );
   check(
-    contextHandles.length === 17,
-    `ctx 上有 17 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
+    contextHandles.length === 19,
+    `ctx 上有 19 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
   );
   // 这一条是 v1.5 最该被看见的数字：方法层面的真实工作量。
   check(

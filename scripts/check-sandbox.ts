@@ -88,6 +88,8 @@ const BRIDGE_JSON = [
   '__PLUGIN_PERMISSIONS__',
   '__PLUGIN_DATA_AVAILABLE__',
   '__PLUGIN_CLIPBOARD_MONITOR__',
+  '__PLUGIN_HOTKEY__',
+  '__PLUGIN_SELECTION__',
   '__PLUGIN_SURFACES__',
   '__PLUGIN_THEME__',
   '__PLUGIN_SHORTCUTS__',
@@ -119,6 +121,8 @@ function renderBridge(
     permissions?: string;
     dataAvailable?: string;
     clipboardMonitor?: string;
+    hotkeySupported?: string;
+    selectionSupported?: string;
     surfaces?: string;
     theme?: string;
     shortcuts?: string;
@@ -140,6 +144,11 @@ function renderBridge(
     // "桥接层的方法名与形状"，而在 `false` 下 `subscribe()` 会走降级分支，
     // 那条分支返回的空函数会把"方法在不在"这件事测成一个永远通过的假象。
     .replaceAll('__PLUGIN_CLIPBOARD_MONITOR__', options.clipboardMonitor ?? 'true')
+    // 全局热键与读取选中文本的平台能力。默认 `true` 的理由与上面那条逐字相同：
+    // 这一节要验的是"桥接层的方法名与形状"，而 `false` 会让 `register()` /
+    // `read()` 走降级分支，那条分支返回的拒绝会把"方法在不在"测成一个假象。
+    .replaceAll('__PLUGIN_HOTKEY__', options.hotkeySupported ?? 'true')
+    .replaceAll('__PLUGIN_SELECTION__', options.selectionSupported ?? 'true')
     .replaceAll(
       '__PLUGIN_SURFACES__',
       options.surfaces ?? '[{"id":"main","name":"主界面","primary":true}]'
@@ -4575,7 +4584,7 @@ section('服务对象的方法（白屏两次都出在这里）');
     // 权限**要给全**：缺哪一项，对应那个服务对象就会降级成空壳，
     // 于是"方法名对不对"这件事在那个成员上根本没被测到。
     permissions:
-      '["storage","notification","plugin-communicate","clipboard","filesystem-read","secrets","clipboard-monitor"]',
+      '["storage","notification","plugin-communicate","clipboard","filesystem-read","secrets","clipboard-monitor","global-hotkey","read-selection"]',
     surfaces: '[]',
     theme: '{}',
     shortcuts: '{"entries":[]}',
@@ -4645,6 +4654,11 @@ section('服务对象的方法（白屏两次都出在这里）');
     // 全部。多出来的 8 个是沙箱独有，由文件末尾的 `EXPECTED_SANDBOX_ONLY_UI_METHODS`
     // 逐条钉住（这一张表只保证"绝不少"，那一张负责"多的那些是哪几个"）。
     ['ui', ['popover'], 'createContextFor'],
+    // 全局热键与读取选中文本。两者都**只有宿主一条出口**（`RegisterHotKey` /
+    // `SendInput` 在宿主进程里），因此这里的五个方法名必须与宿主工厂逐字一致 ——
+    // 少一个就是插件调用时白屏，而白屏两次都出在这一节。
+    ['hotkey', ['isAvailable', 'register', 'unregister', 'list', 'subscribe'], 'pluginHotkey'],
+    ['selection', ['isAvailable', 'read'], 'pluginSelection'],
   ];
 
   for (const [member, methods, source] of REQUIRED) {

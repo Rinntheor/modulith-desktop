@@ -87,6 +87,16 @@ const LOAD_TIMEOUT_MS = 5_000;
 /** 进程启动时刻，用于 `status` 与 `shutdown` 上报的运行时长。 */
 const startedAt = Date.now();
 
+/**
+ * 这个进程跑在 Windows 上吗。
+ *
+ * 它只服务两个同步的 `isAvailable()`（`ctx.hotkey` 与 `ctx.selection`）：两者的
+ * 底层接口（`RegisterHotKey` / `SendInput`）都只存在于 Windows。**不问宿主**是有
+ * 原因的 —— 那两个方法是同步的（插件在 bundle 顶层用它做特性探测），而这一侧与
+ * 宿主只有请求—应答式的一条通道，等它回来时顶层早就跑完了。
+ */
+const WINDOWS = process.platform === 'win32';
+
 /** 已处理过的请求数 */
 let handled = 0;
 
@@ -220,6 +230,9 @@ function pluginConsole(pluginId) {
 function createPluginSandbox(identity, _unused) {
   const pluginId = identity.id;
 
+  /** 清单里声明了某一项权限吗。与界面两侧的 `has('x')` 是同一条判据。 */
+  const hasPermission = (permission) => identity.permissions.indexOf(permission) !== -1;
+
   // 定时器要**登记**才能被 unload 收掉。不登记的话，一个插件被卸载之后它的
   // setInterval 还在跑 —— 而它已经没有任何办法被停下来了（宿主手里没有句柄）。
   const timers = new Set();
@@ -275,6 +288,17 @@ function createPluginSandbox(identity, _unused) {
   // `pluginRuntime.ts` 的对应关系写清楚（见插件开发文档的"两个运行位置"一节）。
   //
   // ============================================================
+  // 两个**不是子集**的例外：`ctx.ui.popover` 与 `ctx.hotkey` / `ctx.selection`
+  // ============================================================
+  //
+  // 上面那句话说的是"界面位置有、这里没有"，而下面这三个是反过来的：它们在这里
+  // 不只是"也有"，而是**主要用途就在这里**。`ctx.ui.popover` 是后台插件唯一的
+  // 结果出口，而 `ctx.hotkey` + `ctx.selection` 合起来正是"选中即翻译"型插件的
+  // 全部：一个没有窗口的进程，要在用户**在别的程序里**选中文本并按键时被唤醒。
+  // 把它们当成"界面的子集"来理解会得出错误的结论（"后台少一个能力"），而事实是
+  // 后台位置才是它们最该被用到的地方。
+  //
+  // ============================================================
   // 唯一的例外：`ctx.ui.popover`
   // ============================================================
   //
@@ -306,6 +330,86 @@ function createPluginSandbox(identity, _unused) {
     pluginName: identity.name,
     manifest: identity.manifest,
     activationEvent: identity.activation,
+
+    // ---- 全局热键（`ctx.hotkey`）----
+    //
+    // ============================================================
+    // 后台位置**恰恰是**全局热键最该用的地方
+    // ============================================================
+    //
+    // 这一个成员在界面位置上是"方便"，而在后台位置上是**这项能力成立的前提**：
+    // 用户按 Ctrl+Q 时焦点在别的程序里，而一个没有界面的翻译插件要做到"选中即翻译"，
+    // 它必须能在没有窗口的情况下被唤醒。换句话说，`ctx.hotkey` 是后台运行位置上
+    // **唯一一个**"不是子集、而是主要用途"的能力。
+    //
+    // ============================================================
+    // 触发是宿主 → 这里的，因此有一处与别处不同的形状
+    // ============================================================
+    //
+    // 这一侧唯一与宿主通话的方式是 `callHost`（请求—应答），而"用户按了键"是
+    // **反向**的。因此宿主用 `plugin.dispatch` 的 `hotkey` 类型派发进来（与
+    // `start` / `interval` / `command` / `event` 完全同一条路，见下面的方法表），
+    // 而 `subscribe` 除了登记处理函数，还要**告诉宿主"这个插件想收"** ——
+    // 宿主那一侧的表决定触发时往哪几处投。
+    //
+    // `isAvailable()` 是同步的，因此它只能靠**本地**能知道的两件事：清单里声明了
+    // 没有、以及这个进程跑在哪个平台上（`RegisterHotKey` 只在 Windows 上存在）。
+    // 它与另外两个位置上的同一句话是同一条判据 —— 三处的答案必须一样，否则
+    // "同一个插件换个运行位置"就会表现不同。
+    hotkey: {
+      isAvailable: () => hasPermission('global-hotkey') && WINDOWS,
+
+      register: (combo) => callHost('ctx.hotkey.register', { combo: String(combo) }),
+
+      unregister: (combo) => callHost('ctx.hotkey.unregister', { combo: String(combo) }),
+
+      list: () => callHost('ctx.hotkey.list', {}).then((value) => value || []),
+
+      subscribe: (handler) => {
+        // `subscribe('hotkey', …)` 登记的键与宿主派发时的 `type` 逐字相同 ——
+        // 对不上时处理器一个都收不到，而那是静默的。
+        const release = subscribe('hotkey', handler, 'ctx.hotkey.subscribe');
+
+        // 宿主那一侧的表按插件 id 记，因此**第一个**处理函数到来时才需要通知它。
+        const list = handlers.get('hotkey') || [];
+        if (list.length === 1) {
+          callHost('ctx.hotkey.subscribe', {}).catch((error) => {
+            // 失败**必须说出来**：插件会以为自己订阅成功了（`subscribe()` 没有抛），
+            // 而宿主那边一次触发都不会来。
+            process.stderr.write(
+              `${LOG_PREFIX} [${pluginId}] 热键订阅没有登记成功，将收不到触发：${error}\n`
+            );
+          });
+        }
+
+        let released = false;
+        return () => {
+          // 幂等：插件把它存进 `disposables` 之后又自己调一次是常见写法。
+          if (released) return;
+          released = true;
+          release();
+          if ((handlers.get('hotkey') || []).length === 0) {
+            callHost('ctx.hotkey.unsubscribe', {}).catch(() => {});
+          }
+        };
+      },
+    },
+
+    // ---- 读取选中文本（`ctx.selection`）----
+    //
+    // ============================================================
+    // 它在宿主那一侧会**改用户的剪贴板**
+    // ============================================================
+    //
+    // 实现是"向前台程序合成 Ctrl+C → 读剪贴板 → 把原内容写回"（见宿主侧
+    // `selection.rs` 的文件头）。因此 `read()` 的三种结果必须被分开处理：
+    // `string`（读到了）、`null`（捕获成功但剪贴板上没有文本）、以及**抛错**
+    // （这次捕获根本没成功）。把后两者混成 `null` 会让作者写出一个永远走不到的分支。
+    selection: {
+      isAvailable: () => hasPermission('read-selection') && WINDOWS,
+
+      read: () => callHost('ctx.selection.read', {}),
+    },
 
     // ---- 日志 ----
     logger: {
@@ -673,9 +777,12 @@ const methods = {
   /**
    * 向一个已加载的插件投递一件事。
    *
-   * `type` 的取值是 `start` / `interval` / `command` / `event`，与清单里
+   * `type` 的取值是 `start` / `interval` / `command` / `event` / `hotkey`，与清单里
    * `contributes.background` 的声明对应。返回处理器的个数 —— 为 0 说明
    * 插件没有登记这一类，那通常意味着清单声明了它却不处理，值得在宿主日志里说一句。
+   *
+   * `hotkey` 是唯一一个**不是**由清单声明驱动的类型：它的"什么时候"由用户按键决定，
+   * 而 `payload` 是 `{ combo }`（一个插件最多能注册 4 条组合，处理函数要能分辨）。
    */
   async 'plugin.dispatch'(params) {
     const id = params?.id;

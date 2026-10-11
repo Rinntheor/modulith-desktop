@@ -245,6 +245,41 @@ async fn checked_clipboard_monitor<R: Runtime>(
     Ok(())
 }
 
+/// 校验 `global-hotkey` 权限（沙箱与后台两条路径共用）。
+///
+/// 与 `checked_clipboard_monitor` 同一条纪律：权限守卫在**内部的作用域里**就被
+/// 丢掉，`await` 全部发生在它之外 —— 持着读锁去注册一个系统热键会让整个插件系统
+/// 停摆（注册本身最多要等窗口线程 2 秒）。
+async fn checked_hotkey<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::hotkey::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
+/// 校验 `read-selection` 权限。
+///
+/// 与上面逐字相同的一条纪律，理由更硬：这一次的 `await` 之外是**最多 400 ms 的
+/// 剪贴板等待**，持着插件系统的读锁去等它会让同一时间所有别的插件的调用一起卡住。
+async fn checked_selection<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::selection::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
 /// 执行一次 ctx 调用。
 ///
 /// 参数与返回都是 `serde_json::Value` —— 这一层不认识 HTTP，也不认识 stdio。
@@ -1714,6 +1749,147 @@ pub async fn dispatch<R: Runtime>(
             }
         }
 
+        // ---- 全局热键（`ctx.hotkey`）---------------------------------------
+        //
+        // ============================================================
+        // 为什么这几条必须走 RPC，而且只能在这里强制
+        // ============================================================
+        //
+        // `RegisterHotKey` 在宿主进程里，而浏览器**没有任何**能让一个页面在别的
+        // 程序聚焦时收到按键的 API（`addEventListener('keydown')` 只在本文档聚焦时
+        // 有效）。因此这一项在前端没有等价的绕行路径 —— 与 `clipboard-monitor`、
+        // `secrets` 同一形态，与 `ctx.clipboard.readText` 相反。
+        //
+        // `hotkey.subscribe` 与其它几条的区别是它带 `surface`：订阅是**界面级**的
+        // 资源（一块界面关掉就不该再有人往它推），而热键的**注册**是插件级的
+        // （后台插件没有界面，它却正是最需要热键的那一种）。
+        //
+        // 拒绝的路径有两条，而且必须分开：
+        //   * 没声明 `global-hotkey` —— 那是权限问题，`checked_hotkey` 给的话
+        //     会带着权限名；
+        //   * 平台不支持 —— 那是能力问题，由 `hotkey::register` 自己给出
+        //     `UNSUPPORTED_PLATFORM`。前端也有一个同步的 `isAvailable()` 可以先判。
+
+        "hotkey.register" => {
+            let Some(combo) = arg_str(args, "combo") else {
+                return rpc_error("缺少 combo");
+            };
+            if let Err(e) = checked_hotkey(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+
+            let owned = app.clone();
+            let plugin = plugin_id.to_string();
+            let combo = combo.to_string();
+            // `register` 会**阻塞**到窗口线程回话（最多 2 秒）。放进阻塞线程池，
+            // 而不是让一次 `RegisterHotKey` 把 tokio 的一个工作线程占住。
+            match tauri::async_runtime::spawn_blocking(move || {
+                let state = owned.try_state::<super::hotkey::HotkeyRegistry>()?;
+                Some(state.register(&owned, &plugin, &combo))
+            })
+            .await
+            {
+                Ok(Some(Ok(normalized))) => json_value(serde_json::json!(normalized)),
+                Ok(Some(Err(e))) => rpc_error(&e),
+                Ok(None) => rpc_error("热键注册表尚未就绪"),
+                Err(e) => rpc_error(&format!("注册热键的任务没能完成：{e}")),
+            }
+        }
+
+        // 撤销**不做权限检查**：一条解不掉的绑定就是一个泄漏 —— 而热键泄漏的后果
+        // 比订阅泄漏严重得多（它偷的是用户整台机器上的一个按键）。
+        "hotkey.unregister" => {
+            if let (Some(state), Some(combo)) = (
+                app.try_state::<super::hotkey::HotkeyRegistry>(),
+                arg_str(args, "combo"),
+            ) {
+                state.unregister(plugin_id, combo);
+            }
+            json_ok()
+        }
+
+        "hotkey.list" => {
+            let list = app
+                .try_state::<super::hotkey::HotkeyRegistry>()
+                .map(|state| state.list(plugin_id))
+                .unwrap_or_default();
+            json_value(serde_json::json!(list))
+        }
+
+        "hotkey.subscribe" => {
+            // ============================================================
+            // 同一个方法与两条通道：`background` 是**传输层**的标注
+            // ============================================================
+            //
+            // 订阅要落在哪一侧，只有"谁在调用"知道，而 in-process 与后台插件在这一层
+            // 都是 `surface = None`（两者都没有界面）。让后台那条路径另外叫一个 RPC
+            // 名字会把"同一个操作"拆成两条分支，而它们的区别只有一个布尔 ——
+            // 因此这里读 `background`，由 `background/plugins.rs` 在转发时写上
+            // （与它剥掉 `ctx.` 前缀同一层：那是传输的一部分）。
+            let background = arg(args, "background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if let Err(e) = checked_hotkey(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+
+            let target = if background {
+                None
+            } else {
+                let Some(surface) = surface else {
+                    return rpc_error(
+                        "ctx.hotkey.subscribe 需要界面上下文：后台插件那条通道会带上 \
+                         background 标注，别的调用方必须说明自己在哪一个界面里",
+                    );
+                };
+                Some(surface)
+            };
+
+            let Some(state) = app.try_state::<super::hotkey::HotkeyRegistry>() else {
+                return rpc_error("热键注册表尚未就绪");
+            };
+            match state.subscribe(app, plugin_id, target, background) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "hotkey.unsubscribe" => {
+            let background = arg(args, "background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(state) = app.try_state::<super::hotkey::HotkeyRegistry>() {
+                if background {
+                    state.unsubscribe(plugin_id, None, true);
+                } else {
+                    state.unsubscribe(plugin_id, surface, false);
+                }
+            }
+            json_ok()
+        }
+
+        // ---- 读取选中文本（`ctx.selection`）--------------------------------
+        //
+        // 与热键同一条理由：合成 Ctrl+C（`SendInput`）与读剪贴板都在宿主进程里。
+        // 它还会**阻塞**最多 400 ms（等前台程序复制完），因此必须放进阻塞线程池 ——
+        // 让一次捕获把 tokio 的工作线程占住，会让同一时间别的插件的 RPC 一起变慢，
+        // 而那种关联在排查时几乎看不出来。
+
+        "selection.read" => {
+            if let Err(e) = checked_selection(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+
+            let owned = app.clone();
+            match tauri::async_runtime::spawn_blocking(move || super::selection::read(&owned)).await
+            {
+                Ok(Ok(text)) => json_value(serde_json::json!(text)),
+                Ok(Err(e)) => rpc_error(&e),
+                Err(e) => rpc_error(&format!("读取选中文本的任务没能完成：{e}")),
+            }
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
     }
 }
@@ -1906,6 +2082,23 @@ pub const PLUGIN_UI: &str = "modulith://plugin-ui";
 /// 沙箱插件不走这条：它的回调在另一个 realm，由宿主直接推进它的界面
 /// （`clipboard::PUSH_CHANNEL`）。两条都保留，与 `PLUGIN_UI` / 下载进度同一形态。
 pub const CLIPBOARD_CHANGE: &str = "modulith://plugin-clipboard-change";
+
+/// 一条全局热键被按下时，广播给 **in-process** 插件的事件名。
+///
+/// ============================================================
+/// 为什么它是一条广播，而且**只有 in-process 走它**
+/// ============================================================
+///
+/// 观察按键的是**宿主进程里的 Win32**（`RegisterHotKey` + 一个消息窗口，见
+/// `hotkey.rs`）：浏览器里没有任何 API 能让一个页面在**别的程序**聚焦时收到按键。
+/// 因此方向只能是宿主 → 插件，而三条通道各不相同：
+///
+///   * in-process —— 回调就在宿主这个 realm，走这条广播；
+///   * sandboxed —— 回调在另一个 realm，宿主直接推进它的界面
+///     （`hotkey::PUSH_CHANNEL`）；
+///   * background —— 插件在 Node 子进程里，宿主按 `plugin.dispatch` 的
+///     `hotkey` 类型派发进去。
+pub const HOTKEY_FIRED: &str = "modulith://plugin-hotkey";
 
 /// 下载进度广播给**前端**时的事件名。
 ///
