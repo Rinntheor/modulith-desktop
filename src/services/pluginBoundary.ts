@@ -330,7 +330,7 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     name: 'clipboard',
     kind: 'handle',
     migration: 'rpc',
-    note: '读写系统剪贴板，并（另一个权限）观察它的变化。读写需要 clipboard，**前端强制** —— 那三个方法调的是浏览器 API，后端加门不会让强制变强；canMonitor / subscribe / readFormats / readImage 需要 clipboard-monitor，**Rust 强制** —— 浏览器 API 没有变化通知，也没有格式列表与原始图片，因此那一半绕不过去',
+    note: '读写系统剪贴板，并（另一个权限）观察它的变化。读写需要 clipboard，in-process / 沙箱两侧**前端强制** —— 那三个方法调的是浏览器 API，后端加门不会让强制变强；**后台位置是例外的一条**：它只有 isAvailable / writeText，且写入走 rpc.rs 的 clipboard.write，在 Rust 侧判权限（那里没有 document，浏览器 API 用不上，因此这一条是真强制）。canMonitor / subscribe / readFormats / readImage 需要 clipboard-monitor，**Rust 强制** —— 浏览器 API 没有变化通知，也没有格式列表与原始图片，因此那一半绕不过去，而且后台位置整族都没有（观察需要一条"宿主 → 订阅者界面"的推送通道，那里没有界面承载它）',
   },
   {
     name: 'settings',

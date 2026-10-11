@@ -1832,11 +1832,37 @@ section('完整 API 表面');
 
     // 反方向：留着一个永远调不到的分支同样是缺陷 —— 它看起来"已经实现了"，
     // 而实际上没有任何代码路径能到达它。
-    const dead = [...handled].filter((name) => !called.has(name));
+    //
+    // ============================================================
+    // "调得到"的判据是**两条运输通道的并集**，不是沙箱一条
+    // ============================================================
+    //
+    // `rpc.rs` 的这张表有**两个**调用方：沙箱界面插件（`sandbox-bridge.js` → HTTP
+    // → `sandbox.rs`）与后台插件（`background-host.mjs` → stdio →
+    // `background/plugins.rs` → `rpc::dispatch`）。只拿桥接层那份调用清单来算
+    // "能不能到达"，会把一个**只有后台位置需要**的分支判成死代码 —— 而那个形状
+    // 从后台插件存在起就有了（例如 `clipboard.write`：它只为没有 `document` 的
+    // 后台进程存在，沙箱那一侧的同名方法调的是浏览器 API，永远走不到这里）。
+    //
+    // 因此把两个调用方都算进来。这**不是**在放宽断言：两个方向的反向检查都还在 ——
+    // `check-background.ts` 断言后台调用的每一个成员在共用实现里都有分支，上面那条
+    // 断言断言沙箱调用的每一个成员也都有。并集之外的任何分支仍然是死的。
+    const backgroundHostJs = read('../src-tauri/resources/background-host.mjs');
+    const calledByBackground = new Set(
+      [...backgroundHostJs.matchAll(/callHost\(\s*'ctx\.([a-zA-Z.]+)'/g)].map((match) => match[1])
+    );
+    check(
+      calledByBackground.size > 0,
+      `后台宿主脚本调用了 ${calledByBackground.size} 个 ctx 成员（"能不能到达"必须把它算进来）`
+    );
+
+    const dead = [...handled].filter(
+      (name) => !called.has(name) && !calledByBackground.has(name)
+    );
     check(
       dead.length === 0,
       dead.length === 0
-        ? '宿主侧的每一条 RPC 分支都真的被桥接层调用'
+        ? '宿主侧的每一条 RPC 分支都真的被某一条运输通道调用'
         : `宿主侧有调不到的分支（要么桥接层漏了，要么分支名写错了）：${dead.join('、')}`
     );
 

@@ -720,6 +720,26 @@ try {
 在按钮点击里有效，在定时器或后台回调里无效。失败时会抛出说明原因的错误，
 而不是无声失败 —— 无声失败会让作者以为是自己传的值不对。
 
+### 平台与运行位置
+
+`ctx.clipboard` 在三个运行位置上**不是同一个成员集合**：
+
+| 位置 | 有 | 没有 |
+| --- | --- | --- |
+| in-process / 沙箱界面 | `isAvailable` `readText` `writeText` `canMonitor` `subscribe` `readFormats` `readImage` | — |
+| **后台插件**（`contributes.background`） | `isAvailable` `writeText` | 读、`canMonitor`、`subscribe`、`readFormats`、`readImage` |
+
+后台那一侧少了读与观察，两条理由都很硬：观察依赖一条**宿主 → 订阅者界面**的推送
+通道，而后台插件没有界面承载它；读在界面位置上是 `navigator.clipboard`，而那个进程里
+没有 `document`。
+
+**但 `writeText` 在后台位置上是有的，而且走的是宿主。** 沙箱那条实现是浏览器 API
+（前端强制）；后台这条走 `rpc.rs` 的 `clipboard.write`，在 **Rust 侧判 `clipboard`
+权限**（比前端强制更强一档）。方法名与形状两边**逐字相同**，差别只在机制 ——
+因此"结果卡片上的一个按钮把译文放进剪贴板"这件事在后台上是成立的。这也顺带说明了
+11.1 开头那句话的准确范围：弱的只是**sandbox/in-process 那一条实现**的强制力，
+后台这一条是真强制。
+
 ## 11.2 clipboard 的变化观察 —— 需要 `clipboard-monitor`
 
 做剪贴板历史、或者「我刚复制了什么」这类功能的地方。
@@ -1157,6 +1177,23 @@ await ctx.secrets.set('apiToken', 'sk-live-...');
 > **不要用 `ctx.secrets` 存非凭据的东西。** 它不进备份、换机器后不可读，而这两条对
 > "用户的笔记"是灾难。反过来，**也不要把令牌放进 `ctx.storage`**：那是明文，而且会
 > 随备份一起被复制到别的机器上。
+
+### 平台与运行位置
+
+三个运行位置都有 `ctx.secrets`：in-process、沙箱界面插件、以及**后台插件**
+（`contributions.background`）。六方法形状逐条相同 —— 同一个插件换个运行位置不该
+改代码。
+
+**后台位置曾经是缺的**（1.6.x 补上），而它恰恰是最需要这个成员的地方：一个无界面的
+插件没有任何别的落盘方式能避开明文 —— `ctx.storage` 与 `ctx.dataDir` 都是它自己
+读得到的文件，只有 `ctx.secrets` 的密文落在插件数据目录**之外**。这也是为什么
+「本机硬件指纹派生的密文、换机器解不开」这条代价在后台插件上要提前想清楚：用户
+换机器之后 `get` 会抛错，插件必须把那条错误原样展示出来（见 13.3），而不是静默地
+当作"还没配置"。
+
+未声明 `secrets` 权限时三处的降级也一致：`isAvailable()` 返回 `false`，`keys()`
+返回空数组，其余四个方法**抛错**（错误里说明是权限没声明）。别把 `get` 的抛错
+当成"这个键不存在"。
 
 ## 14. ui —— 宿主渲染的结果卡片（`ctx.ui.popover`）
 

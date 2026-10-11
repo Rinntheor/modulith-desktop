@@ -1749,6 +1749,59 @@ pub async fn dispatch<R: Runtime>(
             }
         }
 
+        // ---- 剪贴板写入（`ctx.clipboard.writeText`）--------------------------
+        //
+        // ============================================================
+        // 这一条**只为后台运行位置存在**
+        // ============================================================
+        //
+        // 沙箱界面的 `ctx.clipboard.writeText` 调的是**浏览器 API**
+        // （`navigator.clipboard`），因此它在权限表里是前端强制，也从不经过这张表。
+        // 后台插件没有 `document`、没有 `navigator`，那个实现它一行都用不上 ——
+        // 而"把结果放回剪贴板"恰恰是它最需要的动作之一：结果卡片上的按钮只回一个
+        // **action id**，真正写入的必须是插件这一侧。
+        //
+        // 于是同一件事在第三个运行位置上由宿主代做。方法名与形状与另外两处
+        // **逐字相同**（`writeText(text)`），差别只在机制 —— 这是"同一个插件换个
+        // 运行位置不必改代码"能成立的前提；反过来，如果这里没有它，插件就只能
+        // 自己探 `typeof ctx.clipboard === 'object'` 再降级，那是把宿主的一处
+        // 缺失变成每个后台插件都要写一遍的分支。
+        //
+        // 权限用 `Clipboard`（读写那一项），不是 `ClipboardMonitor`：这是一次
+        // "插件调一次、写一次"，与"观察用户在**所有程序里**复制的每一样东西"
+        // 是完全不同的作用面（分界写在 `permissions.rs` 与 `types.rs` 里）。
+        //
+        // ⚠️ 它会**覆盖用户的整个剪贴板**（内部是 `EmptyClipboard` + 写 CF_UNICODETEXT，
+        // 非文本格式不会还原）—— 与 `selection.rs` 那条还原路径同一条 Win32 语义。
+        // 这是"复制"这个动作本身的含义，不是副作用；也因此它不该被用在任何
+        // 用户没有主动要求的地方。
+        "clipboard.write" => {
+            let Some(text) = arg_str(&args, "text") else {
+                return rpc_error("缺少 text");
+            };
+
+            // 权限守卫在**内部的作用域里**就被丢掉，`replace_text` 发生在它之外 ——
+            // 与 `checked_secrets_dir` 同一条纪律：握着插件系统的读锁去碰剪贴板，
+            // 会让一次写入把整个插件系统堵住（剪贴板可能被别的进程占着）。
+            {
+                let manager = locked!(app);
+                if let Err(e) = manager
+                    .require_permission(plugin_id, super::types::PluginPermission::Clipboard)
+                {
+                    return rpc_error(&e.to_string());
+                }
+            }
+
+            if !super::clipboard::is_supported() {
+                return rpc_error(super::clipboard::UNSUPPORTED_PLATFORM);
+            }
+
+            match super::clipboard::replace_text(text) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
         // ---- 全局热键（`ctx.hotkey`）---------------------------------------
         //
         // ============================================================
