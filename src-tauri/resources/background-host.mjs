@@ -146,16 +146,38 @@ let nextCallId = 1;
  * 超时是**必须**的：宿主若因为任何原因没有回答（崩了、卡住了、这条消息丢了），
  * 插件那边的 await 会永远挂着 —— 而"一个永远不 resolve 的 Promise"在插件作者
  * 看来是"我的代码没问题，就是没反应"，比一句错误难查得多。
+ *
+ * ============================================================
+ * 唯一的例外：`untilUserAnswers`
+ * ============================================================
+ *
+ * `ctx.ui.popover` 是**唯一**一条会等到用户做出动作的调用，而它的缺省形态是
+ * "用户不关它就一直等着"。给它套一个 10 秒的计时器等于让那张卡片在用户还在看
+ * 的时候被单方面作废：后台这一侧到点丢掉等待，宿主那一侧十秒之后才回话 ——
+ * 答复落在一条没有人等的通道上（`收到没有等待者的响应 id=17`），
+ * 而插件看到的是"调用宿主超时"，用户看到的是一张还留在屏幕上的卡片。
+ *
+ * 因此这一条**不给计时器**。它换来的代价必须说清楚：如果宿主那一侧永远不回答，
+ * 这次等待就永远不结束。那一侧为此给了四条收场路径（用户关掉它 / 插件被停用
+ * 或卸载 / 第二条卡片顶掉它 / 应用退出），而它们**都在宿主里**，插件不需要做
+ * 任何事。宿主进程若整个消失，这个子进程也会被一起收掉 —— 那是最后一道兜底。
+ *
+ * `true` 只允许出现在一处（`ctx.ui.popover`）。给它再加一处，就意味着某条会
+ * 自己结束的调用也永远不会超时。
  */
-function callHost(method, params) {
+function callHost(method, params, options) {
   const id = nextCallId;
   nextCallId += 1;
 
+  const untilUserAnswers = Boolean(options && options.untilUserAnswers);
+
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pendingCalls.delete(id);
-      reject(new Error(`调用宿主超时（${HOST_CALL_TIMEOUT_MS}ms）：${method}`));
-    }, HOST_CALL_TIMEOUT_MS);
+    const timer = untilUserAnswers
+      ? null
+      : setTimeout(() => {
+          pendingCalls.delete(id);
+          reject(new Error(`调用宿主超时（${HOST_CALL_TIMEOUT_MS}ms）：${method}`));
+        }, HOST_CALL_TIMEOUT_MS);
 
     pendingCalls.set(id, { resolve, reject, timer });
     write({ v: PROTOCOL_VERSION, id, method, params });
@@ -173,7 +195,7 @@ function deliverResponse(message) {
   }
 
   pendingCalls.delete(message.id);
-  clearTimeout(waiter.timer);
+  if (waiter.timer) clearTimeout(waiter.timer);
 
   if (message.error !== undefined) {
     waiter.reject(new Error(String(message.error)));
@@ -709,11 +731,14 @@ function createPluginSandbox(identity, _unused) {
      *
      * 参数**原样交给宿主**（`ctx.ui.popover`），校验与钳制都在那一侧：三个运行
      * 位置共用 `rpc.rs` 的同一个方法表，因此"最多 3 个按钮""id 只允许 [a-z0-9-]"
-     * "超时钳制到 1..30 秒"只可能有一份实现。
+     * "给了 `timeoutMs` 才钳制到 1..60 秒"只可能有一份实现。
+     *
+     * **不传 `timeoutMs` 就是"一直待到用户关掉它"**（缺省），因此这一条必须走
+     * `untilUserAnswers` 那条豁免 —— 理由见 `callHost`。
      */
     ui: {
       popover: (input) =>
-        callHost('ctx.ui.popover', input || {}).then((value) => ({
+        callHost('ctx.ui.popover', input || {}, { untilUserAnswers: true }).then((value) => ({
           // 字段缺失（更老的宿主）与宿主的 `null` 收敛成同一个取值：契约里
           // "没回答"就是一个值，不该让插件去分辨 `undefined` 与 `null`。
           action: value && value.action ? value.action : null,

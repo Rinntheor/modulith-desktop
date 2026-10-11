@@ -46,17 +46,34 @@
 // 第三种：结果卡片（`ctx.ui.popover`）
 // ============================================================
 //
-// 它复用同一个窗口、同一套 id 配对，但与对话框有三处**刻意不同**：
+// 它复用同一个窗口、同一套 id 配对，但与对话框有两处**刻意不同**：
 //
-//   1. **不聚焦。** 聚焦是"点别处关闭"那条路径的前提（见 `show`），而卡片不要
-//      那个前提。插件一次调用就把用户正在输入的光标抢走，那是比"打断一下"
-//      更强的一类能力，而卡片刻意停在 `notification` 那一档风险上。
-//   2. **到点自己消失。** 超时在这里**不是**错误兜底，而是产品行为：卡片等
-//      `timeoutMs` 之后自动收起，调用方拿到的是"用户没回答"。
-//   3. **同一时刻只有一张。**
+//   1. **默认没有截止时间。** 不传 `timeoutMs` 就是"一直待到用户把它关掉" ——
+//      超时在这里**不是**兜底，而是一个可选的产品行为（见 `rpc::popover_deadline`）。
+//      带截止时间的调用仍然会到点自己收起（那也不是错误，而是"用户没回答"）。
+//   2. **同一时刻只有一张。**
 //
-// 三条合起来是同一句话：插件能让一张卡片出现，但不能把用户的光标抢走、
-// 也不能让它赖在屏幕上。
+// ============================================================
+// 「不聚焦」这条设计被推翻了（v1.6.x）
+// ============================================================
+//
+// 卡片原先**刻意不抢焦点**，理由是"插件一次调用就把用户正在输入的光标抢走，
+// 那是比打断一下更强的一类能力"。那个取舍在纸面上成立，在真机上失败了：
+//
+//   * 「点别处关闭」这条路径在本平台上的**唯一**来源是 `WM_KILLFOCUS` ——
+//     tao 的 `Focused(false)` 只在它上面发出来，而一个**从未拿到过焦点**的窗口
+//     永远收不到它。于是卡片既不能被点别处关掉，也不能用 Esc 关掉，
+//     只能等自动超时；维护者实测到的正是"要点一下卡片、再点别处才会关"。
+//   * 要绕开焦点去做"点别处关闭"，就得上一条系统级鼠标钩子或
+//     `GetAsyncKeyState` 轮询 —— 那是一整套比一张卡片大得多的能力，
+//     而且要在**永远**在跑的循环里读全局输入状态。
+//
+// 因此卡片现在与对话框一样**取得焦点**（见 `show_popover`）。代价如实写在这里：
+// 卡片显示期间用户原来的窗口失去前台，直到他点一下别处（那一下正好就是关闭它，
+// 因此"关得快"这个诉求本身是满足的）。这不是漏掉的 `set_focus`，是刻意的。
+//
+// Esc 因此也**立刻**可用（焦点在卡片上），但"任何时候按 Esc 都能收起"仍然做不到：
+// 那需要一个系统级键盘通道，把按键从别的应用手里抢过来 —— 卡片不值得拥有那种能力。
 //
 // ============================================================
 // 「把内容交给浮层窗口」这一步有一条容易漏掉的前提
@@ -129,9 +146,13 @@ pub enum OverlayRequest {
         /// 什么内容都可能有，而长短完全由用户决定。
         body: String,
         actions: Vec<PopoverAction>,
-        /// 到点自动收起的毫秒数。带着它只是为了让"这一次浮层是什么"自明；
-        /// **计时由宿主做**，前端不设第二个定时器 —— 两个来源必然漂开。
-        timeout_ms: u64,
+        /// 到点自动收起的毫秒数。`None`（不传）= **一直待到用户把它关掉**，
+        /// 那是缺省 —— 一张要用户读、要用户点的卡片不该自己跑掉。
+        ///
+        /// 带着它只是为了让"这一次浮层是什么"自明；**计时由宿主做**，前端不设
+        /// 第二个定时器 —— 两个来源必然漂开。
+        #[serde(default)]
+        timeout_ms: Option<u64>,
         at: PopoverAnchor,
     },
 }
@@ -214,7 +235,25 @@ pub struct OverlayResponse {
 }
 
 /// 等待中的浮层：id → 回收回答的通道
-type PendingMap = Mutex<HashMap<u64, tokio::sync::oneshot::Sender<OverlayResponse>>>;
+///
+/// ============================================================
+/// 为什么表里还要记着"是哪个插件问的"
+/// ============================================================
+///
+/// 卡片缺省**没有截止时间**，于是它唯一的收场方式变成了"有人把它关掉"。
+/// 而"插件被停用 / 卸载"是其中一条：插件不在了，它留在屏幕上的那张卡片
+/// 就没有任何人能关（用户没点过它，它也不再自己消失）—— 表现是一个**永远
+/// 关不掉的窗口**，而唯一的补救是重启应用。
+///
+/// 因此每一条等待都记下它的发起者，`close_all_surfaces` 才能按插件把它们收掉。
+/// 只记 id 的话，那一层能做的只有 `cancel_all()` —— 把**所有人**的浮层一起
+/// 撤掉，包括另一个插件的对话框。
+struct Pending {
+    sender: tokio::sync::oneshot::Sender<OverlayResponse>,
+    plugin: String,
+}
+
+type PendingMap = Mutex<HashMap<u64, Pending>>;
 
 /// 同一时刻只允许一张结果卡片。
 ///
@@ -313,10 +352,13 @@ impl Overlay {
     /// 显示一次浮层并等用户的回答。
     ///
     /// 由 `rpc::dispatch` 的 `ui.dialog` / `ui.contextMenu` 调用。
+    ///
+    /// `plugin` 是发起者：插件被停用/卸载时靠它把这一次等待撤掉（见 `Pending`）。
     pub async fn ask<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         mut request: OverlayRequest,
+        plugin: &str,
     ) -> Result<OverlayResponse, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -332,7 +374,13 @@ impl Overlay {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, sender);
+            .insert(
+                id,
+                Pending {
+                    sender,
+                    plugin: plugin.to_string(),
+                },
+            );
 
         if let Err(error) = show(app, &request) {
             // 显示失败必须**把登记撤掉**：留着的话那条等待会一直挂到超时，
@@ -374,11 +422,27 @@ impl Overlay {
     /// 去分辨"这个 Err 是故障还是正常收尾"，而那种判断一定会有人写错。
     ///
     /// 因此这里返回 `Ok(None)` 而不是 `Err`：**只有"窗口没能显示出来"才是错误**。
+    ///
+    /// ============================================================
+    /// `deadline` 是 `Option`，而 `None` 是**缺省**
+    /// ============================================================
+    ///
+    /// `None` = 一直等到有人回答（用户关掉它 / 插件被停用 / 第二条卡片顶掉它 /
+    /// 应用退出）。它**不是**"忘了设超时"：一张要用户读、要用户点的卡片默认
+    /// 不该自己跑掉，那正是维护者要的行为。
+    ///
+    /// ⚠️ 这一条与**跨进程那条传输预算**是一对，改一个必须看另一个：
+    /// 后台插件调一次宿主的等待上限是 `background-host.mjs` 的
+    /// `HOST_CALL_TIMEOUT_MS`（10 秒），而 `ctx.ui.popover` 那一条是**唯一**
+    /// 豁免它的调用（`callHost(..., { untilUserAnswers: true })`）。两边一起改之前，
+    /// 会出现"宿主的答复落在一条没人等的通道上"—— 真实撞上过，日志里是
+    /// `收到没有等待者的响应 id=17`，插件看到的是"调用宿主超时"。
     pub async fn popover<R: Runtime>(
         &self,
         app: &AppHandle<R>,
         mut request: OverlayRequest,
-        timeout: std::time::Duration,
+        deadline: Option<std::time::Duration>,
+        plugin: &str,
     ) -> Result<Option<String>, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -396,7 +460,13 @@ impl Overlay {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, sender);
+            .insert(
+                id,
+                Pending {
+                    sender,
+                    plugin: plugin.to_string(),
+                },
+            );
 
         // 同一时刻只允许一张卡片：新的来，旧的当场以"用户没回答"结束。
         if let Some(previous) = self.supersede_previous(id) {
@@ -421,7 +491,14 @@ impl Overlay {
             return Err(error);
         }
 
-        let outcome = tokio::time::timeout(timeout, receiver).await;
+        // 有截止时间时才起一个计时器。没有截止时间的那一条**没有任何兜底**
+        // 是刻意的：它的收场只能来自"有人把它关掉"，而那四条路径
+        // （用户关闭 / 插件停用 / 第二条卡片 / 应用退出）已经在下面与
+        // `forget_plugin` / `cancel_all` 里各有一条实现。
+        let outcome = match deadline {
+            Some(limit) => tokio::time::timeout(limit, receiver).await,
+            None => Ok(receiver.await),
+        };
         self.popover
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -440,6 +517,9 @@ impl Overlay {
                 Ok(None)
             }
             Err(_) => {
+                // 只有带截止时间的那一条会走到这里（没有截止时间的那一条等的
+                // 是一个不带计时器的 future，它只可能以"有人回答"或"通道关闭"
+                // 结束）。
                 self.pending
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -481,9 +561,9 @@ impl Overlay {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&previous);
 
-        if let Some(sender) = waiter {
+        if let Some(pending) = waiter {
             // 回一条 `action: None` 的回答，而不是把通道丢掉。
-            let _ = sender.send(OverlayResponse {
+            let _ = pending.sender.send(OverlayResponse {
                 id: previous,
                 confirmed: false,
                 selected: None,
@@ -525,13 +605,76 @@ impl Overlay {
             .remove(&response.id);
 
         match waiter {
-            Some(sender) => {
+            Some(pending) => {
                 // 接收方可能已经因为超时走掉了；那不是错误。
-                let _ = sender.send(response);
+                let _ = pending.sender.send(response);
                 true
             }
             None => false,
         }
+    }
+
+    /// 撤掉**某一个插件**的全部等待，并把窗口上属于它的那一张收起来。
+    ///
+    /// 由 `sandbox::close_all_surfaces`（插件被停用 / 卸载）调用。
+    ///
+    /// 为什么不直接 `cancel_all()`：那会把**别的插件**正在等的对话框一起撤掉 ——
+    /// 停用插件 A 时插件 B 的问题框消失，而 B 那一侧读到的理由是"窗口不见了"。
+    /// 按插件收是唯一说得通的那一档粒度。
+    ///
+    /// 回给调用方的是一条"用户没回答"的回答（`dismissed: true`），不是把通道
+    /// 丢掉：丢掉的话卡片那一次会以 `Ok(None)` 收场（看不出区别），而对话框
+    /// 那一次会拿到"浮层窗口在回答之前关闭了"这个**不成立**的理由。
+    pub fn forget_plugin<R: Runtime>(&self, app: &AppHandle<R>, plugin_id: &str) -> usize {
+        let doomed = self.take_plugin(plugin_id);
+
+        for id in &doomed {
+            // 窗口只在"它还显示着"时才会被收起 —— 卡片被顶掉之后屏幕上是新
+            // 那一张，这里不该顺手把它关掉（同 `dismiss_window_of` 的判据）。
+            self.dismiss_window_of(app, *id);
+        }
+
+        doomed.len()
+    }
+
+    /// `forget_plugin` 里与窗口无关的那一半（抽出来是为了它能被测）。
+    ///
+    /// 返回被撤掉的那些 id。它做三件事：把等待从表里取走、回一条
+    /// "用户没回答"、清掉卡片占位。
+    fn take_plugin(&self, plugin_id: &str) -> Vec<u64> {
+        let doomed: Vec<u64> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending
+                .iter()
+                .filter(|(_, entry)| entry.plugin == plugin_id)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
+        for id in &doomed {
+            let entry = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
+
+            if let Some(entry) = entry {
+                let _ = entry.sender.send(OverlayResponse {
+                    id: *id,
+                    confirmed: false,
+                    selected: None,
+                    action: None,
+                    dismissed: true,
+                });
+            }
+
+            self.popover
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .end(*id);
+        }
+
+        doomed
     }
 
     /// 当前有多少次浮层在等回答（诊断用）
@@ -539,9 +682,12 @@ impl Overlay {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// 丢弃全部等待（浮层窗口关掉了 / 应用退出）。
+    /// 丢弃全部等待（浮层窗口关掉了 / 应用退出 / 用户点了别处）。
     ///
     /// 不丢的话那些 await 会各自挂到超时 —— 而它们已经不可能有回答了。
+    ///
+    /// ⚠️ 对**没有截止时间**的卡片来说，这一条是它最要紧的那个出口：
+    /// 它是"用户点了别处 / 按了 Esc"在失焦那条路径上的落点（见 `install`）。
     pub fn cancel_all(&self) -> usize {
         let drained: Vec<_> = self
             .pending
@@ -600,13 +746,22 @@ fn show<R: Runtime>(app: &AppHandle<R>, request: &OverlayRequest) -> Result<(), 
 
 /// 显示一张**结果卡片**。
 ///
-/// 与 `show` 共用"先推内容、再显示"的顺序与同一条理由；差别只有两处，
-/// 两处都是刻意的：
+/// 与 `show` 共用"先推内容、再显示"的顺序与同一条理由；差别只有一处：位置按
+/// `at` 选（光标处（默认）或屏幕正中）。
 ///
-///   * **不调 `set_focus`。** 聚焦是对话框"点别处关闭"那条路径的前提，而卡片靠
-///     超时收起，不需要它。反过来说，聚焦意味着插件可以让一张卡片把用户正在
-///     输入的光标抢走 —— 那是比"打断一下"更强的一类能力。
-///   * 位置按 `at` 选：光标处（默认）或屏幕正中。
+/// ============================================================
+/// 卡片**也要**拿焦点 —— 这是"点别处关闭"唯一可能的实现
+/// ============================================================
+///
+/// 「点别处关闭」在本平台上的唯一来源是 `WM_KILLFOCUS`：tao 的
+/// `Focused(false)` 只在它上面发出来（`tao-0.35.3/src/platform_impl/windows/
+/// event_loop.rs:1800`）。一个**从未**拿到过焦点的窗口永远收不到那条消息 ——
+/// 于是卡片既不能点别处关掉、也不能用 Esc 关掉，只能等自动超时。
+/// 维护者实测到的就是这一条："要点一下卡片、再点别处才会关。"
+///
+/// 因此这里与 `show` 一样调 `set_focus`。抢不到焦点**不是**显示失败：卡片照样
+/// 在屏幕上，只是"点别处"与 Esc 要等用户先点它一下 —— 因为一个已经显示出来的
+/// 卡片不该被撤销，那只会让"为什么什么都没出现"更难查。
 fn show_popover<R: Runtime>(app: &AppHandle<R>, request: &OverlayRequest) -> Result<(), String> {
     let OverlayRequest::Popover { at, .. } = request else {
         return Err("show_popover 收到了别种浮层请求".to_string());
@@ -626,11 +781,19 @@ fn show_popover<R: Runtime>(app: &AppHandle<R>, request: &OverlayRequest) -> Res
         overlay.mark_showing(request.id());
     }
 
+    // 位置在显示之前摆好：反过来的话用户会看到卡片先在旧位置闪一下再跳过去。
     place_popover(app, &window, *at)?;
 
     window
         .show()
         .map_err(|e| format!("无法显示浮层窗口：{e}"))?;
+
+    // 顺序不能反：`show` 与 `set_focus` 都是发给事件循环的消息，因此焦点是在
+    // 窗口**已经可见**之后才取的（tao 的 `set_focus` 在窗口不可见时直接返回，
+    // 见 tao-0.35.3/src/platform_impl/windows/window.rs:174）。
+    if let Err(error) = window.set_focus() {
+        log::warn!("浮层：卡片没能取得焦点（点别处关闭与 Esc 会因此失效）：{error}");
+    }
 
     Ok(())
 }
@@ -823,6 +986,15 @@ pub const MAX_HEIGHT: f64 = 720.0;
 ///
 /// 与托盘菜单同一套：没有它，用户点了别处之后浮层还挂在屏幕上挡着东西，
 /// 而它看起来像"卡住了"。
+///
+/// ============================================================
+/// 这条路径在卡片没有截止时间之后**更**承重了
+/// ============================================================
+///
+/// `cancel_all()` 是"用户点了别处 / 按了 Esc"在 Rust 这一侧的落点。卡片缺省
+/// 不再自动消失，于是这一条成了它最常用的那个收场方式 —— 而它成立的前提是
+/// **窗口拿到过焦点**（`WM_KILLFOCUS` 不会发给一个从未聚焦的窗口）。
+/// 卡片的焦点由 `show_popover` 负责取，这一条只负责"失焦之后怎么收场"。
 pub fn install<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = overlay_window(app) else {
         log::warn!("浮层窗口不存在，宿主渲染的对话框与菜单不可用（检查 tauri.conf.json 的 label）");
@@ -851,6 +1023,19 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
 mod tests {
     use super::*;
 
+    /// 造一条登记项 —— 表里的值现在是一个结构体（见 `Pending`），
+    /// 测试里逐个 `Pending { sender, plugin }` 写一遍只会让每一条都长一截。
+    fn pending_of(plugin: &str) -> (Pending, tokio::sync::oneshot::Receiver<OverlayResponse>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            Pending {
+                sender,
+                plugin: plugin.to_string(),
+            },
+            receiver,
+        )
+    }
+
     /// 回答必须**只**能被交给一次等待。
     ///
     /// 交两次的话，第二次会命中另一次请求 —— 而"回答给了别人"比没有回答更糟：
@@ -858,12 +1043,8 @@ mod tests {
     #[test]
     fn a_response_is_delivered_exactly_once() {
         let overlay = Overlay::new();
-        let (sender, mut receiver) = tokio::sync::oneshot::channel();
-        overlay
-            .pending
-            .lock()
-            .unwrap()
-            .insert(7, sender);
+        let (entry, mut receiver) = pending_of("p");
+        overlay.pending.lock().unwrap().insert(7, entry);
 
         assert_eq!(overlay.pending_count(), 1);
 
@@ -906,13 +1087,42 @@ mod tests {
     fn cancel_all_drains_every_waiter() {
         let overlay = Overlay::new();
         for id in 0..3 {
-            let (sender, _receiver) = tokio::sync::oneshot::channel();
-            overlay.pending.lock().unwrap().insert(id, sender);
+            let (entry, _receiver) = pending_of("p");
+            overlay.pending.lock().unwrap().insert(id, entry);
         }
         assert_eq!(overlay.pending_count(), 3);
         assert_eq!(overlay.cancel_all(), 3);
         assert_eq!(overlay.pending_count(), 0);
         assert_eq!(overlay.cancel_all(), 0, "再取消一次不该报错");
+    }
+
+    /// **按插件收**：被停用的插件留下的卡片要消失，而别人的浮层不许受影响。
+    ///
+    /// 卡片缺省没有截止时间，因此"插件被停用"是它四条收场路径里唯一一条
+    /// 不经过用户的那条。少了它，一个被停用插件留下的卡片会**永远**留在屏幕上
+    /// （用户没点过它，它也不再自己消失），唯一的补救是重启应用。
+    ///
+    /// 判据落在两半：目标插件的等待收到一条 `dismissed` 的回答，而另一个插件的
+    /// 等待**原样还在** —— 只钉前一半的话，一个 `cancel_all()` 的实现会全绿。
+    #[test]
+    fn forgetting_a_plugin_dismisses_only_its_own_waiters() {
+        let overlay = Overlay::new();
+        let (mine, mut mine_rx) = pending_of("com.example.mine");
+        let (theirs, mut theirs_rx) = pending_of("com.example.theirs");
+        overlay.pending.lock().unwrap().insert(1, mine);
+        overlay.pending.lock().unwrap().insert(2, theirs);
+
+        assert_eq!(overlay.take_plugin("com.example.mine"), vec![1]);
+        assert_eq!(overlay.pending_count(), 1, "别人的那一条不该被收掉");
+
+        let answer = mine_rx.try_recv().expect("被撤掉的等待应当收到回答");
+        assert_eq!(answer.id, 1);
+        assert_eq!(answer.action, None, "卡片那一边拿到的是『用户没回答』");
+        assert!(answer.dismissed, "它是被撤掉的，不是用户点的");
+        assert!(
+            theirs_rx.try_recv().is_err(),
+            "另一个插件的等待不该被回答（它还在等）"
+        );
     }
 
     /// 请求的形状要能**原样过一遍 JSON**。
@@ -992,7 +1202,7 @@ mod tests {
                 id: "copy".to_string(),
                 label: "复制译文".to_string(),
             }],
-            timeout_ms: 8000,
+            timeout_ms: Some(8000),
             at: PopoverAnchor::Cursor,
         };
 
@@ -1059,8 +1269,8 @@ mod tests {
     #[test]
     fn superseding_answers_the_previous_waiter_instead_of_dropping_it() {
         let overlay = Overlay::new();
-        let (sender, mut receiver) = tokio::sync::oneshot::channel();
-        overlay.pending.lock().unwrap().insert(1, sender);
+        let (entry, mut receiver) = pending_of("p");
+        overlay.pending.lock().unwrap().insert(1, entry);
 
         assert_eq!(overlay.supersede_previous(1), None, "第一次没有上一张");
         assert_eq!(overlay.supersede_previous(2), Some(1));
@@ -1196,7 +1406,9 @@ mod tests {
             title: None,
             body: "正文".to_string(),
             actions: Vec::new(),
-            timeout_ms: 6_000,
+            // **缺省的形态：没有截止时间。** 这一个取值必须能过 JSON ——
+            // 它是 `ctx.ui.popover({...})` 不带 `timeoutMs` 时真实发出去的那一份。
+            timeout_ms: None,
             at: PopoverAnchor::Cursor,
         };
 
@@ -1208,6 +1420,40 @@ mod tests {
         assert_eq!(request.id(), id);
     }
 
+    /// 没有截止时间的卡片要能**原样过一遍 JSON**，而且前端读到的是 `null`。
+    ///
+    /// 这一条钉的是"缺省 = 一直待到用户关掉"这件事在**线上契约**里的形状：
+    /// Rust 侧把它写成 `null` 之后，前端那个字段就不再可能被当成一个数字用，
+    /// 因此"前端再起一个自己的定时器"这条漂开的路在类型上就没了。
+    #[test]
+    fn a_card_without_a_deadline_encodes_as_null() {
+        let request = OverlayRequest::Popover {
+            id: 9,
+            tone: "success".to_string(),
+            title: None,
+            body: "已复制".to_string(),
+            actions: Vec::new(),
+            timeout_ms: None,
+            at: PopoverAnchor::Cursor,
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains(r#""timeoutMs":null"#), "实际：{encoded}");
+
+        let decoded: OverlayRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+
+        // 反向：缺字段的旧宿主也能被解析成本地这一档（前端与宿主版本可以错开）
+        let without: OverlayRequest = serde_json::from_str(
+            r#"{"kind":"popover","id":1,"tone":"info","title":null,"body":"x","actions":[],"at":"cursor"}"#,
+        )
+        .unwrap();
+        match without {
+            OverlayRequest::Popover { timeout_ms, .. } => assert_eq!(timeout_ms, None),
+            _ => panic!("它必须还被解析成一张卡片"),
+        }
+    }
+
     /// 等待表是 `id → 通道`，回答取出通道时**登记就没了**。
     ///
     /// 这一条与 `a_response_is_delivered_exactly_once` 是同一条纪律的两种读法：
@@ -1216,8 +1462,8 @@ mod tests {
     #[test]
     fn taking_a_waiter_out_of_the_table_leaves_nothing_behind() {
         let overlay = Overlay::new();
-        let (sender, mut receiver) = tokio::sync::oneshot::channel();
-        overlay.pending.lock().unwrap().insert(3, sender);
+        let (entry, mut receiver) = pending_of("p");
+        overlay.pending.lock().unwrap().insert(3, entry);
 
         let answer = OverlayResponse {
             id: 3,
@@ -1280,7 +1526,7 @@ mod tests {
             title: None,
             body: "正文".to_string(),
             actions: Vec::new(),
-            timeout_ms: 6_000,
+            timeout_ms: Some(6_000),
             at: PopoverAnchor::Cursor,
         };
         assert!(accept_popover(&card).is_ok(), "卡片当然会被收下");
@@ -1351,6 +1597,68 @@ mod tests {
         assert!(
             block.contains(&format!("\"url\": \"{OVERLAY_LABEL}.html\"")),
             "浮层窗口的 url 必须指向 overlay.html"
+        );
+    }
+
+    /// 卡片**必须**去取焦点，否则"点别处关闭"与 Esc 都不可能成立。
+    ///
+    /// 这一条钉的是一个**很容易被"顺手删掉"的调用**：`set_focus` 看起来与
+    /// "宿主渲染的卡片不抢焦点"那条旧设计冲突，而删掉它之后的症状是**完全静默**的
+    /// —— 卡片照常出现、按钮照常能用，只是点别处不关、Esc 也不响应，
+    /// 用户唯一的出路是等自动超时（而不带 `timeoutMs` 的卡片根本没有超时）。
+    #[test]
+    fn the_card_takes_focus_so_that_deactivation_can_dismiss_it() {
+        let source = include_str!("overlay.rs");
+        let start = source
+            .find("fn show_popover")
+            .expect("`show_popover` 必须还在（改名会让这条断言失效）");
+        let end = source[start..]
+            .find("\n}\n")
+            .map(|at| start + at)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        assert!(
+            body.contains("window.set_focus()"),
+            "卡片没有取焦点 —— 那么 tao 永远不会发出 `Focused(false)`，\
+             『点别处关闭』与 Esc 都是死路"
+        );
+        // 反向：这一条必须是**不致命**的（抢不到焦点时卡片仍然显示出来）。
+        assert!(
+            !body.contains("window.set_focus().map_err")
+                && !body.contains("window.set_focus()?"),
+            "抢不到焦点不该让卡片显示失败 —— 那会让『为什么什么都没出现』变成常态"
+        );
+    }
+
+    /// 拖拽把手要生效，`data-tauri-drag-region` 那条路径**必须**有 ACL 授权。
+    ///
+    /// ============================================================
+    /// 这一条为什么值得一条断言
+    /// ============================================================
+    ///
+    /// `data-tauri-drag-region` 不是纯前端行为：tauri 注入的 `drag.js` 在按下时
+    /// 调的是 `window.__TAURI_INTERNALS__.invoke('plugin:window|start_dragging')`
+    /// （`tauri-2.11.5/src/window/scripts/drag.js`）。也就是说它**是一条走 ACL 的
+    /// IPC**，而这份清单里没写的权限默认拒绝。
+    ///
+    /// 失败的形态与当初"浮层收不到内容"一模一样：**完全静默** —— 卡片照常出现、
+    /// 鼠标按在把手上什么都不发生，日志里一个字都没有。
+    #[test]
+    fn dragging_the_card_is_actually_granted() {
+        let capability = include_str!("../../../capabilities/overlay.json");
+
+        assert!(
+            capability.contains("core:window:allow-start-dragging"),
+            "浮层的 capability 里没有 `core:window:allow-start-dragging` —— \
+             拖拽是一条走 ACL 的 IPC，少了它把手按下去什么都不发生：{capability}"
+        );
+        // 反向：前端那边必须真的有一个拖拽区域（只授权不画把手的话，
+        // 这条断言会绿，而用户看到的是一张拖不动的卡片）。
+        let overlay_root = include_str!("../../../../src/overlay/OverlayRoot.tsx");
+        assert!(
+            overlay_root.contains("data-tauri-drag-region"),
+            "浮层前端没有拖拽区域"
         );
     }
 }

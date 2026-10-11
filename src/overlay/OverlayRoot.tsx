@@ -49,7 +49,8 @@ export type OverlayRequest =
       title: string | null;
       body: string;
       actions: Array<{ id: string; label: string }>;
-      timeoutMs: number;
+      /** `null` = **没有截止时间**（缺省）：一直待到用户把它关掉 */
+      timeoutMs: number | null;
       at: 'cursor' | 'center';
     };
 
@@ -158,13 +159,17 @@ const OverlayRoot: React.FC = () => {
   }, [request]);
 
   /**
-   * Esc = 没回答。菜单与对话框都是。
+   * Esc = 没回答。菜单、对话框与结果卡片都是。
    *
-   * 结果卡片有一处**已知的差别**：它不抢焦点（`overlay.rs` 的 `show_popover`），
-   * 而按键只发给**有焦点**的那个窗口 —— 因此用户没点过卡片时，Esc 落在别的
-   * 窗口上，这里收不到。卡片的正常收尾是超时；Escape 只在用户已经点进过这张
-   * 卡片之后有效。要让"任何时候按 Esc 都能收起"成立，就得有一个全局按键通道，
-   * 而那属于宿主自己的能力，不该由这一张卡片顺手带上。
+   * 结果卡片**现在会取得焦点**（见 `overlay.rs` 的 `show_popover`），因此这条
+   * 监听在卡片一出现时就是活的 —— 不再是"用户点过它之后才有效"。
+   *
+   * 但它仍然**不是**一条系统级快捷键：按键只发给有焦点的那个窗口，而"任何时候
+   * 按 Esc 都能收起"要求把那个键从系统里其它每一个应用手里抢过来（注册一个全局
+   * 热键，或者挂一条键盘钩子）。为一张卡片付那个代价不成立，因此诚实的说法是：
+   *   * 卡片有焦点时（正常情况下它一出现就有）Esc 立刻可用；
+   *   * 抢焦点失败时（前台锁、窗口管理器不放），先点一下卡片再按 Esc；
+   *   * **主要手段是 × 与点别处**，Esc 是给键盘用户的捷径。
    */
   const dismiss = useCallback(() => {
     if (!request) return;
@@ -246,6 +251,31 @@ const OverlayRoot: React.FC = () => {
     // 插件给 `<b>x</b>` 时用户看到的就是这七个字符。文件头第二条说清了为什么
     // 要让宿主渲染 —— 而"由宿主渲染"这句话只有在宿主**真的**当它是文本时才
     // 成立，否则插件只是换了一种方式在画宿主界面。
+    //
+    // ============================================================
+    // 两条"用户能把它关掉 / 搬走"的通道（v1.6.x 补上）
+    // ============================================================
+    //
+    // 维护者的原话是"它不能移动，也不能很快关掉"。两条各有各的原因：
+    //
+    //   * **不能关** —— 卡片原先只靠"到点自己消失"收场，而不带 `timeoutMs` 的
+    //     那张根本没有到点这回事（现在那是缺省）；点别处那条路径又要求窗口
+    //     先拿到过焦点（见 `overlay.rs` 的 `show_popover`）。于是屏幕上出现了一张
+    //     只能等、不能关的卡片。现在**点别处**（窗口失焦）、**×**（下面那个按钮）
+    //     与 **Esc** 三条都通。
+    //   * **不能搬** —— 窗口是无边框的，而拖动不会自己发生：它要么来自
+    //     `data-tauri-drag-region`（tauri 注入的 drag.js 在按下时 invoke
+    //     `plugin:window|start_dragging`），要么来自一次显式调用。两者都是
+    //     **走 ACL 的 IPC**，而这份清单里没写的权限默认拒绝 —— 失败形态是
+    //     "按在把手上什么都不发生"，日志里一个字都没有。
+    //
+    // 拖拽区放在**标题条**（也就是那个把手）上，而不是整张卡片：卡片正文是可以
+    // 选中的文本（译文要用鼠标选中复制），把它变成拖拽区会让"选中一段译文"变成
+    // "把窗口拖走"。
+    //
+    // `data-tauri-drag-region="deep"`：让标题条**整条**都能拖（包括点在那个语气
+    // 标签上时）。`deep` 不会把 × 也变成拖拽区 —— drag.js 遇到可点击元素
+    // （button/link/…）会直接放行，这正是我们要的。
     const tone = POPOVER_TONE_STYLES[request.tone] ?? POPOVER_TONE_STYLES.info;
 
     return (
@@ -253,11 +283,35 @@ const OverlayRoot: React.FC = () => {
         ref={panelRef}
         className="flex w-[380px] max-w-full flex-col gap-3 rounded-xl border border-gray-200/50 bg-white/95 p-4 shadow-2xl backdrop-blur-xl"
       >
-        <div className="flex items-center gap-2">
+        {/* 把手。`cursor-grab` 是"这里能拖"唯一的可见提示（窗口没有标题栏）。 */}
+        <div
+          data-tauri-drag-region="deep"
+          className="flex cursor-grab select-none items-center gap-2 active:cursor-grabbing"
+          title="按住拖动这张卡片"
+        >
+          <span className="text-gray-300" aria-hidden="true">
+            ⠿
+          </span>
           <span className={`h-2 w-2 rounded-full ${tone.badge}`} />
           <span className="text-[11px] font-medium uppercase tracking-wide text-gray-400">
             {tone.label}
           </span>
+          {/*
+            × 是**主要**的关闭手段之一（另一个是点别处）。它必须：
+              * 明显可点 —— 常驻可见，不做"悬停才出现"那一套；
+              * 够大 —— `h-6 w-6` 加内边距，比一个纯图标大一圈；
+              * 可被读屏软件读到 —— 有 `aria-label`，字符本身用 × 而不是图片。
+            它落在拖拽区里面，而 button 会让 drag.js 放过它（见上）。
+          */}
+          <button
+            type="button"
+            aria-label="关闭"
+            title="关闭（Esc）"
+            onClick={() => void answer(request, { dismissed: true })}
+            className="ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-base leading-none text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
+          >
+            ×
+          </button>
         </div>
 
         {request.title ? (
@@ -271,9 +325,11 @@ const OverlayRoot: React.FC = () => {
         </div>
 
         {request.actions.length > 0 ? (
-          // 按钮**不 autoFocus**：焦点意味着这个窗口被激活，而卡片刻意不抢焦点
-          // （见 `overlay.rs` 里 `show_popover` 那一段）。对话框那一个 `autoFocus`
-          // 是有意的差别，不是漏了。
+          // 按钮**不 autoFocus**：焦点已经由宿主交给了整张卡片（见 `overlay.rs`
+          // 里 `show_popover` 那一段），再 autoFocus 到某一个按钮上只会让
+          // "回车"变成"点了我没打算点的那个动作" —— 卡片上的动作数量与文案
+          // 都来自插件，宿主不知道哪一个才是安全的默认值。对话框那个 `autoFocus`
+          // 是有意的差别：它只有一个"确定/取消"的组合，而这里可能有三个平级动作。
           <div className="mt-1 flex flex-wrap justify-end gap-2">
             {request.actions.map((action) => (
               <button

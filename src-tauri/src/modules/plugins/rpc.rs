@@ -1173,7 +1173,7 @@ pub async fn dispatch<R: Runtime>(
                 cancel_label: arg_str(args, "cancelLabel").map(str::to_string),
             };
 
-            ask_overlay(app, request).await
+            ask_overlay(app, plugin_id, request).await
         }
 
         "ui.contextMenu" => {
@@ -1239,7 +1239,7 @@ pub async fn dispatch<R: Runtime>(
                 items,
             };
 
-            let response = ask_overlay(app, request).await?;
+            let response = ask_overlay(app, plugin_id, request).await?;
 
             // 选中了清单声明的那一条 → 交给插件的命令机制去执行。
             //
@@ -1257,9 +1257,9 @@ pub async fn dispatch<R: Runtime>(
 
         // ---- 宿主渲染的结果卡片 ----------------------------------------------
         //
-        // 与上面两条同一个窗口、同一套配对，但三处不同：**不抢焦点**、**到点
-        // 自己消失**、**同一时刻只有一张**。三条合起来是同一句话 —— 插件能让
-        // 一张卡片出现，但不能把用户正在输入的光标抢走，也不能让它赖着不走。
+        // 与上面两条同一个窗口、同一套配对，但两处不同：**缺省没有截止时间**、
+        // **同一时刻只有一张**。卡片会去取焦点（`overlay::show_popover`），
+        // 理由写在那个函数上：焦点是"点别处关闭"与 Esc 在本平台上唯一可能的来源。
         //
         // 它与其他 `ui.*` 不同的一点：**不需要界面上下文**。卡片是一个独立
         // 窗口，贴的是屏幕上的光标；而后台插件恰恰是最需要把结果拿出来的那一个
@@ -1287,7 +1287,7 @@ pub async fn dispatch<R: Runtime>(
 
             // 只算一次：卡片里带着的那个数字与真正用的这个上限必须是同一个，
             // 否则"它写着 8 秒却等了 30 秒"这类问题是查不出来的。
-            let timeout = popover_timeout(args);
+            let deadline = popover_deadline(args);
 
             let request = crate::modules::desktop::overlay::OverlayRequest::Popover {
                 // 由 overlay 分配（同 dialog / menu 的理由）
@@ -1299,11 +1299,11 @@ pub async fn dispatch<R: Runtime>(
                     .map(|value| truncate(value, MAX_POPOVER_TITLE_CHARS)),
                 body,
                 actions: popover_actions(args)?,
-                timeout_ms: timeout.as_millis() as u64,
+                timeout_ms: deadline.map(|value| value.as_millis() as u64),
                 at: popover_anchor(args),
             };
 
-            ask_popover(app, request, timeout).await
+            ask_popover(app, plugin_id, request, deadline).await
         }
 
         // ---- 宿主渲染的状态指示（徽标 / 进度 / 启动占位）-----------------------
@@ -1960,6 +1960,7 @@ pub async fn dispatch<R: Runtime>(
 /// 而它们的差别只有请求里的 `kind`。
 async fn ask_overlay<R: Runtime>(
     app: &AppHandle<R>,
+    plugin_id: &str,
     request: crate::modules::desktop::overlay::OverlayRequest,
 ) -> Result<Value, String> {
     let Some(state) = app.try_state::<crate::modules::desktop::overlay::Overlay>() else {
@@ -1968,7 +1969,7 @@ async fn ask_overlay<R: Runtime>(
 
     // 浮层窗口是**具体运行时**上声明的那个（`tauri.conf.json`），
     // 而 `Overlay` 的方法本身是泛型的 —— 因此这里不需要任何转换。
-    match state.ask(app, request).await {
+    match state.ask(app, request, plugin_id).await {
         Ok(response) => json_value(serde_json::json!({
             "confirmed": response.confirmed,
             "selected": response.selected,
@@ -1986,26 +1987,31 @@ async fn ask_overlay<R: Runtime>(
 /// 结构，而漏读 `dismissed` 恰好是"用户没回答"与"用户点了取消"混淆的来源。
 ///
 /// ============================================================
-/// `timeout` 是**宿主的截止时间**，不是"建议"
+/// `deadline` 是**宿主的截止时间**，不是"建议"；`None` 是缺省
 /// ============================================================
 ///
-/// 调用方（`popover_timeout`）已经把它钳制到宿主自己的上限之内（理由见
-/// `POPOVER_TIMEOUT_MAX_MS`）。到了这个时间还没有回答时，`Overlay::popover`
-/// **一定会**回一条 `{action: null}` 并把窗口收起来：插件因此永远拿得到一个
-/// 确定的结果，而不是一条挂在那里、只能靠传输层超时收场的 await。
+/// `Some(t)` 时，调用方（`popover_deadline`）已经把它钳制到宿主自己的上限之内
+/// （理由见 `POPOVER_TIMEOUT_MAX_MS`）。到了这个时间还没有回答时，
+/// `Overlay::popover` **一定会**回一条 `{action: null}` 并把窗口收起来：插件因此
+/// 永远拿得到一个确定的结果，而不是一条挂在那里、只能靠传输层超时收场的 await。
+///
+/// `None` 时没有任何兜底计时器 —— 收场只能来自"有人把它关掉"：用户关掉它
+/// （点别处 / × / Esc）、插件被停用或卸载、第二条卡片顶掉它、应用退出。
+/// 四条路径各有一条实现，且**都在宿主这一侧**（插件不需要做任何事）。
 ///
 /// 它**不是**错误：契约里 `null` 就是"用户没回答"这一种正常收尾，与"卡片没能
 /// 显示出来"（那一条才是 `Err`）分开。
 async fn ask_popover<R: Runtime>(
     app: &AppHandle<R>,
+    plugin_id: &str,
     request: crate::modules::desktop::overlay::OverlayRequest,
-    timeout: std::time::Duration,
+    deadline: Option<std::time::Duration>,
 ) -> Result<Value, String> {
     let Some(state) = app.try_state::<crate::modules::desktop::overlay::Overlay>() else {
         return rpc_error("浮层尚未就绪");
     };
 
-    match state.popover(app, request, timeout).await {
+    match state.popover(app, request, deadline, plugin_id).await {
         // `null` 是一个**取值**，不是"没有字段"：插件要能区分"用户没点"与
         // "宿主没回答"（后者是 Err）。省略字段会让 `value.action` 与拼错的名字
         // 长得一样。
@@ -2221,38 +2227,35 @@ const MAX_POPOVER_ACTION_ID_CHARS: usize = 32;
 /// 卡片上最多几个按钮。
 const MAX_POPOVER_ACTIONS: usize = 3;
 
-/// 卡片自动收起的缺省毫秒数。
-///
-/// 6 秒：够读完一张卡片上的短译文，又不至于在用户已经看完了之后还赖着不走。
-const POPOVER_TIMEOUT_DEFAULT_MS: u64 = 6_000;
-
-/// 自动收起的下限。低于 1 秒的卡片用户根本来不及看清，那不叫能力。
+/// 显式给出的自动收起时长的下限。低于 1 秒的卡片用户根本来不及看清，那不叫能力。
 const POPOVER_TIMEOUT_MIN_MS: u64 = 1_000;
 
-/// 自动收起的上限，也是**跨进程那一条线**的上限。
+/// 显式给出的自动收起时长的上限。
 ///
 /// ============================================================
-/// 为什么不是 30 秒（原值），以及这一个数字为什么不能只按产品口味定
+/// 它为什么从 6 秒变成 60 秒，以及为什么还是要有上限
 /// ============================================================
 ///
-/// Node 后台插件调一次宿主（`ctx.ui.popover` 就走这条）的上限是
-/// `background::protocol::REQUEST_TIMEOUT_MS` = 10 秒，而**两侧各有一个独立的
-/// 计时器**：后台那一侧到点就丢掉这次等待（`收到没有等待者的响应`），宿主这一侧
-/// 到点才回话。因此子进程里那个上限（10 秒）必须**明显长于**宿主这里这个上限。
+/// 原先这个数字是 **6000**，而它不是一个产品口味，是**跨进程契约的一半**：
+/// Node 后台插件调一次宿主的等待上限是 `background-host.mjs` 的
+/// `HOST_CALL_TIMEOUT_MS`（10 秒），而两侧各有一个独立的计时器，因此子进程
+/// 那个上限必须明显长于宿主这里这个。6 秒留出 4 秒余量，"宿主的答复永远在
+/// 对方挂断之前到达"。
 ///
-/// 反过来的表现（真实撞上过）：插件请求 20 秒 → 宿主的卡片老老实实等满 20 秒
-/// → 后台在 10 秒放下电话 → 20 秒时宿主回话，而那边已经没有人等它了。插件看到
-/// 的是"调用宿主超时"，用户看到的是一张 10 秒后才消失的卡片，而**两侧的代码
-/// 读起来都是对的** —— 因为契约从没说过这两个数字之间还有一条约束。
+/// 那条约束**已经不在了**：`ctx.ui.popover` 是唯一一条豁免传输预算的调用
+/// （`callHost(..., { untilUserAnswers: true })`，见 `background-host.mjs`）
+/// —— 因为卡片缺省的形态就是"一直等到用户回答"，而一个 10 秒的传输计时器
+/// 与它在定义上冲突。传输那一侧不再有计时器，宿主这一侧也就没有理由停在 6 秒。
 ///
-/// 6 秒把两边的关系钉死：留 4 秒给 IPC 往返与调度（正常在毫秒级），也就是
-/// "宿主的答复永远在对方挂断之前到达"。因此这个数字是**跨进程契约**的一部分，
-/// 改它必须同时看 `check:sandbox` 里那两条断言与 `background-host.mjs` 里的
-/// `HOST_CALL_TIMEOUT_MS`。
+/// **缺省没有截止时间**（见 `popover_deadline` 返回 `None` 的那一支），
+/// 因此这个数字管的是"插件**显式**要一个截止时间"的那种调用。
 ///
-/// 上限与缺省取同一个值：两个都叫"自动收起的时长"，给它们两个不同的数字只会
-/// 让"请求 9 秒却被压成 6 秒"这类问题多一层要解释的东西。
-const POPOVER_TIMEOUT_MAX_MS: u64 = 6_000;
+/// 仍然要有上限，理由是**这个数字的语义**：`timeoutMs` 说的是"到点自己收起来"，
+/// 而一张留着几分钟的卡片与"等用户关掉它"在用户看来没有区别，只是多了一条
+/// 会在中途把它抽走、还让插件拿到 `{action: null}` 的规则 —— 那是一条只制造
+/// 意外的规则。60 秒长到"用户读得完、还来得及点"，又短到它仍然是一条真正的
+/// 截止时间。真想要"一直待到用户关掉"，**不要传 `timeoutMs`**。
+const POPOVER_TIMEOUT_MAX_MS: u64 = 60_000;
 
 /// 卡片的语气。白名单而不是原样透出：它会被前端拼进 `className`。
 ///
@@ -2280,20 +2283,32 @@ fn popover_anchor(args: &Value) -> crate::modules::desktop::overlay::PopoverAnch
     }
 }
 
-/// 自动收起的时长。
+/// 自动收起的时长。**不传就是"没有截止时间"。**
 ///
-/// **钳制而不是拒绝**，这与 `actions` 那条取舍相反，理由也不同：`timeoutMs` 是
-/// 一个"想让它待多久"的愿望，钳制之后它仍然朝着作者想要的方向（1 秒到 30 秒
-/// 之间），而一张卡片该不该出现与这个数字无关。写着 0 或者 600000 说明作者
-/// 没想清楚，但那不该让整张卡片不出现。
-fn popover_timeout(args: &Value) -> std::time::Duration {
-    let requested = arg(args, "timeoutMs")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(POPOVER_TIMEOUT_DEFAULT_MS);
+/// ============================================================
+/// `None` 是缺省，而这不是"少写了一句"
+/// ============================================================
+///
+/// 维护者的原话是"它不能很快关掉，而我讨厌自动关闭"。一张要用户读、要用户点的
+/// 卡片默认不该自己跑掉 —— 因此**不传 `timeoutMs`** 就是"一直待到用户关掉它"，
+/// 收场由那四条路径负责（用户关 / 插件停用 / 第二条卡片 / 应用退出）。
+///
+/// 传了的时候仍然**钳制而不是拒绝**，这与 `actions` 那条取舍相反，理由也不同：
+/// `timeoutMs` 是一个"想让它待多久"的愿望，钳制之后它仍然朝着作者想要的方向
+/// （1 秒到 60 秒之间），而一张卡片该不该出现与这个数字无关。写着 0 或者
+/// 600000 说明作者没想清楚，但那不该让整张卡片不出现。
+///
+/// ⚠️ **它必须与后台那一条传输预算一起看。** `ctx.ui.popover` 是唯一一条豁免
+/// `HOST_CALL_TIMEOUT_MS`（10 秒）的调用 —— 少了那个豁免，任何超过 10 秒的卡片
+/// （更不用说"没有截止时间"这一档）都会在子进程那一侧先挂断，宿主的答复于是
+/// 落在一条没人等的通道上（真实撞上过：`收到没有等待者的响应 id=17`）。
+/// 判据在 `check:sandbox` 里，两处一起改才不会重新撕开这个口子。
+fn popover_deadline(args: &Value) -> Option<std::time::Duration> {
+    let requested = arg(args, "timeoutMs").and_then(|value| value.as_u64())?;
 
-    std::time::Duration::from_millis(
+    Some(std::time::Duration::from_millis(
         requested.clamp(POPOVER_TIMEOUT_MIN_MS, POPOVER_TIMEOUT_MAX_MS),
-    )
+    ))
 }
 
 /// 校验并整理卡片上的按钮。
@@ -2714,49 +2729,65 @@ mod tests {
         );
     }
 
-    /// 超时**钳制**在 1..6 秒之间，缺省 6 秒。
+    /// 显式给出的时长会被钳制；**不给出就是"没有截止时间"**。
     ///
-    /// 三个边界都要钉：0（作者以为"立刻消失"）、600000（作者想让它常驻）、
-    /// 以及一个正常值（不能被钳制改掉）。上界不是产品口味：它必须短于后台那
-    /// 一条 IPC 的上限（`the_popover_deadline_stays_inside_the_background_transport_budget`）。
+    /// 这里钉的是两件事。第一件：给出了的时候不能被原样采信 —— 0 秒的卡片用户
+    /// 来不及看清，而 600000 毫秒的卡片与"没有截止时间"在用户看来没有区别，
+    /// 只是多了一条会在中途把它抽走、还让插件拿到 `{action: null}` 的规则。
+    ///
+    /// 第二件更关键：`{}`、`{"timeoutMs": null}`、`{"timeoutMs": "3000"}` 三种
+    /// 形态都必须落到 `None`。它们曾经落到一个 6 秒的缺省值上 —— 那意味着
+    /// **一次不带参数的调用会在 6 秒后自己消失**，而"卡片不该自己跑掉"是维护者
+    /// 明确要的行为。把 `None` 与"给了但值不合法"混起来正是这条断言要防的。
     #[test]
-    fn popover_timeouts_are_clamped() {
-        let ms = |args: serde_json::Value| popover_timeout(&args).as_millis() as u64;
+    fn popover_deadlines_are_clamped_and_absent_means_no_deadline() {
+        let ms = |args: serde_json::Value| popover_deadline(&args).map(|d| d.as_millis() as u64);
 
-        assert_eq!(ms(serde_json::json!({})), POPOVER_TIMEOUT_DEFAULT_MS);
-        assert_eq!(ms(serde_json::json!({ "timeoutMs": 3000 })), 3000);
-        assert_eq!(ms(serde_json::json!({ "timeoutMs": 0 })), POPOVER_TIMEOUT_MIN_MS);
-        assert_eq!(ms(serde_json::json!({ "timeoutMs": 999 })), POPOVER_TIMEOUT_MIN_MS);
-        assert_eq!(ms(serde_json::json!({ "timeoutMs": 600000 })), POPOVER_TIMEOUT_MAX_MS);
-        // 真实撞上过的那一个取值：翻译插件写的是 20000，而调用方的上限是 10000。
-        // 压到宿主的上限之后，"卡片还没消失、后台已经挂断"那一条路径不复存在。
+        assert_eq!(ms(serde_json::json!({})), None);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": null })), None);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": "3000" })), None);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": -1 })), None);
+
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 3000 })), Some(3000));
         assert_eq!(
-            ms(serde_json::json!({ "timeoutMs": 20000 })),
-            POPOVER_TIMEOUT_MAX_MS
+            ms(serde_json::json!({ "timeoutMs": 0 })),
+            Some(POPOVER_TIMEOUT_MIN_MS)
         );
-        // 非数字（字符串、null）落到缺省值，而不是某个"差不多"的数字
-        assert_eq!(ms(serde_json::json!({ "timeoutMs": "3000" })), POPOVER_TIMEOUT_DEFAULT_MS);
-        assert_eq!(ms(serde_json::json!({ "timeoutMs": null })), POPOVER_TIMEOUT_DEFAULT_MS);
+        assert_eq!(
+            ms(serde_json::json!({ "timeoutMs": 999 })),
+            Some(POPOVER_TIMEOUT_MIN_MS)
+        );
+        assert_eq!(
+            ms(serde_json::json!({ "timeoutMs": 600000 })),
+            Some(POPOVER_TIMEOUT_MAX_MS)
+        );
+        // 真实撞上过的那一个取值：翻译插件写的是 20000 —— 在 6 秒上限的年代
+        // 它会被压到 6 秒，而**现在它是一个合法的愿望**（传输那一侧不再有计时器）。
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 20000 })), Some(20_000));
     }
 
-    /// **宿主的截止时间必须留在后台那一条 IPC 的预算之内。**
+    /// **没有截止时间的卡片必须豁免后台那一条传输预算。**
     ///
     /// ============================================================
     /// 它守的是一条跨进程、跨语言、跨仓库的约束
     /// ============================================================
     ///
     /// 后台宿主那一侧有它自己的调用上限（`resources/background-host.mjs` 的
-    /// `HOST_CALL_TIMEOUT_MS`，与 Rust 的 `REQUEST_TIMEOUT_MS` 同值），而它是**独立
-    /// 计时**的：到点它就丢掉这次等待并报"调用宿主超时"。宿主这一侧的卡片如果比
-    /// 它等得更久，答复就落在了一个没有人等的通道上 —— 真实日志里那句
-    /// `收到没有等待者的响应 id=17` 与那句 `结果卡片没有显示出来：调用宿主超时`
-    /// 就是这么来的。
+    /// `HOST_CALL_TIMEOUT_MS`），而它是**独立计时**的：到点它就丢掉这次等待并报
+    /// "调用宿主超时"。卡片缺省没有任何截止时间，因此只要那一条上限还套在
+    /// `ctx.ui.popover` 上，**每一次**不带 `timeoutMs` 的调用都会在 10 秒时被
+    /// 挂断 —— 用户看到的是一张还留在屏幕上的卡片，插件收到的却是"调用宿主超时"，
+    /// 而那一句 `收到没有等待者的响应 id=17` 就是这么来的。
     ///
     /// 两个数字分别在 `.mjs` 与 `.rs` 里，编译器与 TypeScript 都连不起来，因此
-    /// 这里把 `.mjs` 当数据读进来比一次。留 2 秒余量：IPC 的往返在毫秒级，
-    /// 余量是给调度抖动与插件那一侧的同步代码留的。
+    /// 这条断言把 `.mjs` 当数据读进来，钉住**豁免本身**：
+    ///   1. `HOST_CALL_TIMEOUT_MS` 与 Rust 的 `REQUEST_TIMEOUT_MS` 同值；
+    ///   2. 卡片的调用**显式**要求"等到用户回答"，也就是不给它挂计时器。
+    ///
+    /// 只钉第 (1) 条是不够的：把豁免删掉之后两个常量仍然同值，而那个 bug 会
+    /// 静默地回来 —— 它上一次就是这么进来的。
     #[test]
-    fn the_popover_deadline_stays_inside_the_background_transport_budget() {
+    fn the_card_is_exempt_from_the_background_transport_budget() {
         let host = include_str!("../../../resources/background-host.mjs");
         let rust = include_str!("../desktop/background/protocol.rs");
 
@@ -2780,17 +2811,40 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} 后面不是一个数字：{}", &source[at..]))
         }
 
-        let budget = ms(host, "HOST_CALL_TIMEOUT_MS");
         assert_eq!(
             ms(rust, "REQUEST_TIMEOUT_MS"),
-            budget,
-            "两侧的调用上限必须同值，否则下面这条余量算的是另一个数"
+            ms(host, "HOST_CALL_TIMEOUT_MS"),
+            "两侧的调用上限必须同值（它们描述的是同一条管道上的同一件事）"
         );
 
+        // 豁免的实现：`callHost` 接受一个"一直等到用户回答"的开关，而
+        // `ctx.ui.popover` 是唯一使用它的那一条。
         assert!(
-            POPOVER_TIMEOUT_MAX_MS + 2_000 <= budget,
-            "卡片的上限（{POPOVER_TIMEOUT_MAX_MS}ms）必须比后台那一条 IPC 的上限（{budget}ms）\
-             短出至少 2 秒，否则宿主的答复会落在没有人等的通道上"
+            host.contains("untilUserAnswers"),
+            "后台宿主那一侧没有『等到用户回答』这条豁免了 —— \
+             不带 timeoutMs 的卡片会在 {budget} 毫秒处被挂断",
+            budget = ms(host, "HOST_CALL_TIMEOUT_MS"),
+        );
+
+        // 位置判据（不用正则：这条链上要跨几十行，而"哪一行是哪一个调用"
+        // 用两次数位置就够了）。`ctx.ui.popover` 那一行**之后**到下一个 `}` 之前
+        // 必须出现那个开关 —— 只看 `contains` 的话，"豁免加在别的调用上"
+        // 这条断言照样会绿。
+        let at = host
+            .find("callHost('ctx.ui.popover'")
+            .expect("`ctx.ui.popover` 必须仍然经过 `callHost`（它是唯一一条等到用户回答的调用）");
+        let call = &host[at..(at + 200).min(host.len())];
+        assert!(
+            call.contains("untilUserAnswers: true"),
+            "`ctx.ui.popover` 没有走那条豁免 —— 不带 timeoutMs 的卡片会被传输层先挂断：{call}"
+        );
+
+        // 反向：豁免只该有这一处。多一处意味着某条会自己结束的调用也永远不超时，
+        // 那正是"一条永远不 resolve 的 Promise"那一类难查的问题。
+        let uses = host.matches("untilUserAnswers: true").count();
+        assert_eq!(
+            uses, 1,
+            "`untilUserAnswers: true` 只该出现在 `ctx.ui.popover` 这一处（实际 {uses} 处）"
         );
     }
 
@@ -2897,7 +2951,7 @@ mod tests {
             .expect("`ui.popover` 那一个分支必须还在（方法表被改名会让这条测试失效）");
         let rest = &source[start..];
         let end = rest
-            .find("ask_popover(app, request, timeout).await")
+            .find("ask_popover(app, plugin_id, request, deadline).await")
             .expect("那个分支必须仍然以 `ask_popover` 收尾");
 
         let arm = &rest[..end];

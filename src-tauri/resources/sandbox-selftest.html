@@ -16,11 +16,17 @@
         2. 调一条应用命令会被拒绝吗     —— ACL 真的生效的正面证据
         3. 自定义协议的 RPC 通吗         —— 通道可用，且宿主认得出是谁发的
         4. CSP 生效吗                   —— 网络与资源边界是不是引擎在执行
-        5. **一个 iframe 里还有没有 IPC** —— 真插件界面用的就是那个模型
+        5. **一个 iframe 里的宿主 IPC 是什么状态** —— 真插件界面用的就是那个模型
 
-      第 5 条是 v1.6.0 加的，而它才是在验"插件界面"本身：这一页所在的那个窗口是
-      主框架，Tauri 会给它注入引导脚本；插件界面是一个 iframe，子框架什么都拿不到。
-      只验前者会把"自检窗口被 ACL 挡住了"误当成"插件界面拿不到 IPC"。
+      第 5 条是 v1.6.0 加的，而它测的是**平台**：这一页所在的那个窗口是主框架，
+      Tauri 会给它注入引导脚本；插件界面是一个 iframe。
+
+      ⚠️ **"子框架什么都拿不到"这句话在 Windows 上是错的。** wry 不理会 Tauri
+      传下来的 `for_main_frame_only`（它自己的文档写着：scripts are always added
+      to subframes …），因此子框架里那些名字**一定**都在。真正拦住插件界面的是
+      桥接层掐断最后那一跳（见 `sandbox-bridge.js` 的 `neutralizeHostIpc`），
+      而这一份探针里没有桥接层 —— 所以第 5 条给出的是**平台事实**：最后那一跳
+      通不通。它不当作"沙箱成立"的判据，那个判据在真插件文档里。
 
       第 4 条用的是 **data: 地址**这种不需要网络的探针，不看"请求是否失败"。
       这个判据换过一次：最初测的是 fetch example.com 是否被挡下，而断网时它同样会
@@ -82,7 +88,7 @@
           { id: 'invoke_denied', name: '调用应用命令是否被拒绝' },
           { id: 'rpc', name: '自定义协议 RPC 是否可用' },
           { id: 'csp_active', name: 'CSP 是否真的生效' },
-          { id: 'iframe_no_ipc', name: 'iframe 里是否真的没有 IPC（真插件界面）' },
+          { id: 'iframe_no_ipc', name: 'iframe 里的宿主 IPC 状态（平台事实，不是沙箱判据）' },
         ];
 
         // 不计入总成绩的附加观察。它是环境相关的，不能用来判定沙箱成不成立。
@@ -254,19 +260,26 @@
             report('rpc', false, 'RPC 失败：' + (error && error.message ? error.message : error));
           });
 
-        // ---- 5. 真插件界面用的那个模型：iframe 里还有没有 IPC -------------
+        // ---- 5. 真插件界面用的那个模型：iframe 里的宿主 IPC -------------
         //
-        // 这一条探的**才是插件界面**。
+        // 这一条探的是**插件界面那个模型**。
         //
         // 这一页自己所在的那个窗口是一个 webview 的**主框架**，Tauri 会给它注入
         // `__TAURI_INTERNALS__`（第 1 条验的正是这件事）。插件界面不是那样：它是
-        // 一个 iframe，而 Tauri 的每一个内部初始化脚本都带 `for_main_frame_only`。
+        // 一个 iframe。
         //
-        // 所以这里嵌一个同源的 iframe 进去问同一个问题。它拿不到 IPC，才说明
-        // "插件界面拿不到 IPC"成立 —— 否则第 2 条那声"被拒绝"只证明了 ACL 生效。
+        // ⚠️ **"iframe 里没有 IPC"这句话在 Windows 上是错的。** wry 不理会
+        // Tauri 传下来的 `for_main_frame_only`（它自己的文档写着：scripts are
+        // always added to subframes …），因此子框架里那四个名字**一定**都在。
+        // 真正拦住**插件界面**的是桥接层掐断最后那一跳（`sandbox-bridge.js` 的
+        // `neutralizeHostIpc`），而这一份探针里**没有桥接层** —— 所以它测到的
+        // 是**平台**，不是插件边界。判据因此分成两句：
         //
-        // 两条判据缺一不可：**没有 IPC**，且**协议仍然通**。只看前者的话，
-        // "沙箱成立"与"它整个坏了"长得一模一样。
+        //   * 最后那一跳还通 → **通过，但如实记下平台事实**（它不是沙箱成立的
+        //     依据，依据在真插件文档里那条 `hostIpcIsReachable`）；
+        //   * 最后那一跳不通 → 引擎的行为变了，无论变松还是变紧都值得看一眼。
+        //
+        // 两条判据缺一不可：**协议仍然通**，否则"沙箱成立"与"它整个坏了"长得一样。
         (function () {
           var frame = document.createElement('iframe');
           frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
@@ -299,28 +312,52 @@
             if (r.isTauri) leaked.push('isTauri');
             if (r.ipc) leaked.push('ipc');
 
-            if (leaked.length > 0) {
+            if (!r.protocol) {
               finish(
                 false,
-                'iframe 里出现了宿主 IPC（' + leaked.join('、') + '）—— 插件界面本应' +
-                  '拿不到它们。这通常意味着 Tauri 不再把内部初始化脚本限制在主框架，' +
-                  '而那会让沙箱**静默地**变成假的。'
+                '自定义协议在 iframe 里不通（' +
+                  (r.protocolDetail || '无详情') +
+                  '）—— 那样"沙箱成立"的原因是"它整个坏了"。'
               );
               return;
             }
 
-            if (!r.protocol) {
+            if (r.nativeBridge) {
+              // ★ Windows 上的**预期**结果，因此通过 —— 但结论必须说清楚：
+              // 这一个探针测不到插件边界，它只测到了平台。
+              finish(
+                true,
+                '子框架里**有**可用的宿主 IPC（最后那一跳 chrome.webview.postMessage 通；' +
+                  '注入的名字：' +
+                  (leaked.join('、') || '（一个都没有）') +
+                  '）。**这是 Windows 上的平台行为**：wry 不理会 for_main_frame_only，' +
+                  '初始化脚本对每一个 frame 生效（它自己的文档写着这一条）。因此' +
+                  '"插件界面拿不到 IPC"在这一平台上**不是引擎给的**，而是桥接层掐断最后' +
+                  '那一跳挣来的（sandbox-bridge.js 的 neutralizeHostIpc）。' +
+                  '这一项只记录平台事实，不当作沙箱成立的判据 —— 真正的判据在' +
+                  '**真插件文档**里（那里的桥接层会先掐断再问"还通不通"）。' +
+                  '协议与令牌照旧都通。'
+              );
+              return;
+            }
+
+            if (leaked.length > 0) {
+              // 名字在、而最后那一跳不通：引擎的注入行为变了（无论变松还是变紧，
+              // 都说明"这一层不再是我们以为的那一层"）。
               finish(
                 false,
-                'iframe 拿不到 IPC（对），但自定义协议也不通（' +
-                  (r.protocolDetail || '无详情') + '）—— 那样沙箱成立的原因是"它整个坏了"。'
+                '子框架里有宿主 IPC 的名字（' +
+                  leaked.join('、') +
+                  '），但最后那一跳 `chrome.webview.postMessage` 不通了 —— ' +
+                  '引擎的注入方式变过，这一节的两句结论都需要重新确认。'
               );
               return;
             }
 
             finish(
               true,
-              'iframe 里没有 __TAURI_INTERNALS__ / __TAURI__ / isTauri / ipc，且协议与令牌都通'
+              'iframe 里没有 __TAURI_INTERNALS__ / __TAURI__ / isTauri / ipc，' +
+                '也没有可用的原生桥，且协议与令牌都通'
             );
           }
 

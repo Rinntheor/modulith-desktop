@@ -121,18 +121,118 @@
   var DATA_ROOT = '/' + TOKEN + '/data/';
 
   // ============================================================
-  // 守卫：这个文档里**不该**有宿主的 IPC
+  // 守卫：这个文档里**还有没有一条通到宿主的 IPC**
   // ============================================================
   //
-  // 沙箱依赖 Tauri 一侧的两件事：它不给子框架注入 IPC 初始化脚本，且 IPC 处理器
-  // 要求一个只注入主框架的随机键。这两件事**都会静默失效** —— 哪一天不成立了，
-  // 这里不会报错、不会变慢、没有任何症状，只是插件忽然能 invoke 全部应用命令。
+  // ============================================================
+  // 先纠正一句曾经写在这里、而且写错了的话
+  // ============================================================
   //
-  // 所以这里主动查一次，查到就大声说出来。**它不是一道拦截**（插件也不该靠它），
-  // 它是一盏灯：正常运行时什么都不做，边界塌了的时候立刻进日志与自检页。
+  // 这里与 `sandbox.rs` 的文件头都曾写着"Tauri 的每一个内部初始化脚本都带
+  // `for_main_frame_only`，因此 iframe 里没有这些全局"。**那句话在 Windows 上
+  // 是错的**，而且错得很安静：
+  //
+  //   * wry 0.55.1 自己的文档就写着 ——
+  //     "Windows: scripts are always added to subframes regardless of the
+  //      `for_main_frame_only` option. This will be the case until Webview2
+  //      implements a proper API to inject a script only on the main frame."
+  //     （`wry-0.55.1/src/lib.rs`，`InitializationScript::for_main_frame_only`，
+  //     以及 `webview2/mod.rs`：Windows 那一侧用的是
+  //     `AddScriptToExecuteOnDocumentCreated`，它对**每一个 frame** 生效）；
+  //   * 而 `tauri-runtime-wry` 把每一个初始化脚本原样交给 wry
+  //     （`tauri-runtime-wry-2.11.4/src/lib.rs:5174`，`with_initialization_script_for_main_only`）
+  //     —— 也就是说 `for_main_frame_only` 这个标志在 Windows 上**被忽略**。
+  //
+  // 结论：`__TAURI_INTERNALS__`、`isTauri`、**那条带 invoke key 的 IPC 脚本**
+  // 以及 ISOLATION 相关脚本，全都会落进插件 iframe；再加上 wry 自己注入的
+  // `window.ipc`（`Object.defineProperty(window,'ipc',{value:Object.freeze({...})})`）。
+  //
+  // 因此维护者日志里那些「沙箱边界失效」ERROR **不是误报，也不是开发链接插件
+  // 特有的** —— 每一个插件界面在 Windows 上都是这样，装好的插件与开发链接的
+  // 插件走的是同一份入口文档（`sandbox.rs::entry_document_html`）。
+  // 真正错的是把这条断言写成"名字在不在"：那个判据在 Windows 上**恒为真**，
+  // 于是它既永远正确又永远没用 —— 一句每天都在喊的警报最后只会被无视。
+  //
+  // ============================================================
+  // 因此分两步：先尽力掐死，再如实报告"还能不能用"
+  // ============================================================
+  //
+  // 第一步是**真的把通道掐掉**，而不是只把它记下来。桥接层是宿主的一部分，
+  // 而且**先于插件代码**加载（入口文档里的脚本顺序由宿主写死，见
+  // `sandbox.rs::entry_document_html`），因此它有机会做这件事。
+  //
+  // 第二步的判据换了一个更诚实的问题：**从这个文档出发，还有没有一条能到宿主的
+  // IPC 通道。** 名字还在、而通道已经死了（第一步成功）属于预期，只留一句
+  // `console.info`；名字还在**且通道还活着**才是那条 ERROR —— 它现在只在真的
+  // 出事时亮。**它不是一道拦截（插件也不该靠它），它是一盏灯。**
   //
   // 为什么放在这里而不是等插件来问：插件不一定会问，而这件事不该由插件决定
   // 自己要不要被检查。
+
+  /**
+   * 掐断宿主 IPC 的**最后那一跳**。返回掐掉了什么（空数组 = 一个都没掐掉）。
+   *
+   * 最后那一跳是 WebView2 的原生桥 `window.chrome.webview.postMessage`。
+   * 选它而不是删那几个全局，有两个具体理由：
+   *
+   *   * `window.__TAURI_INTERNALS__` 与 `window.ipc` 都是
+   *     `Object.defineProperty(..., { value })` 定义的，也就是**不可重定义、
+   *     不可写** —— 删不掉也换不掉。但 `window.ipc` 里那个 `postMessage` 是
+   *     `s => window.chrome.webview.postMessage(s)`：它在**调用时**才去取最后
+   *     那一跳。换掉那一跳，两条路（`ipc` 与 `__TAURI_INTERNALS__.postMessage`）
+   *     就一起断了。
+   *   * 另一条传输（`fetch('http://ipc.localhost/…')`）由文档的 CSP 挡着：
+   *     `connect-src` 只留了插件自己的来源，而那一份 CSP 由宿主生成。**引擎
+   *     执行它**，插件改不掉。
+   *
+   * 这一切都裹在 try/catch 里，而且**拿不准就什么都不做**：任何一个属性在不同
+   * 的 WebView2 版本上形状不同，都不该让插件界面起不来 —— 那比"多一条通道"
+   * 严重得多。
+   */
+  function neutralizeHostIpc() {
+    var neutralized = [];
+
+    try {
+      var webview = window.chrome && window.chrome.webview;
+      if (webview && typeof webview.postMessage === 'function') {
+        var deny = function () {
+          throw new Error('[Modulith] 沙箱插件不能通过宿主 IPC 通道发消息');
+        };
+        try {
+          webview.postMessage = deny;
+        } catch (error) {
+          // 只读（或被冻结）：掐不掉。下面的判据会如实把它说出来。
+        }
+        if (webview.postMessage === deny) neutralized.push('chrome.webview.postMessage');
+      }
+    } catch (error) {
+      // 拿不到那个对象（非 Windows、或引擎改了形状）：什么都不做。
+    }
+
+    return neutralized;
+  }
+
+  /**
+   * 从这个文档出发，还有没有一条能到宿主的 IPC 通道。
+   *
+   * 判据落在**最后那一跳**上，因为 Tauri 的两条传输最终都要经过它，而
+   * `fetch` 那条被 CSP 挡着。取不到那个对象时按**最坏情况**算：宁可多报一次，
+   * 也不要因为"读不到"而把一条真通道报成不存在。
+   */
+  function hostIpcIsReachable() {
+    try {
+      var webview = window.chrome && window.chrome.webview;
+      if (webview && typeof webview.postMessage === 'function') return true;
+
+      return (
+        typeof window.ipc !== 'undefined' ||
+        typeof window.__TAURI_INTERNALS__ !== 'undefined'
+      );
+    } catch (error) {
+      return true;
+    }
+  }
+
   function assertNoHostIpc() {
     var found = [];
 
@@ -143,11 +243,26 @@
     // 它是"fetch 那条被 connect-src 挡住了"之后还会剩下的那一条路。
     if (typeof window.ipc !== 'undefined') found.push('ipc');
 
+    // 名字还在、但掐断成功了：这是 Windows 上的**预期状态**。
+    // 记一条 info（而不是 error）是刻意的 —— 见上面那两段说明：
+    // 一个恒为真的判据只会训练人无视日志。
+    if (found.length > 0 && !hostIpcIsReachable()) {
+      console.info(
+        '[Modulith] 这个文档里出现了宿主 IPC 的名字（' +
+          found.join('、') +
+          '），但它们已经**不通**了：wry 在 Windows 上不理会 for_main_frame_only，' +
+          '注入是平台行为；桥接层已经把最后那一跳换成了桩。'
+      );
+      return true;
+    }
+
     if (found.length === 0) return true;
 
     var detail =
-      '这个插件文档里出现了宿主 IPC（' + found.join('、') + '）。插件界面本应跑在一个' +
-      '拿不到 IPC 的跨源 iframe 里 —— 出现这些名字意味着它不在。';
+      '这个插件文档里出现了宿主 IPC（' + found.join('、') + '），而且它**还能用**。' +
+      '插件界面本应跑在一个拿不到 IPC 的跨源 iframe 里 —— 现在它拿得到。' +
+      '（名字出现在 Windows 上是正常的：wry 不理会 for_main_frame_only。' +
+      '这一条报的是"桥接层没能掐断最后那一跳"。）';
     console.error('[Modulith] 沙箱边界失效：' + detail);
 
     // 也交给宿主写进文件日志：控制台在 release 版里看不到，而这一条恰恰是最不该
@@ -161,7 +276,11 @@
     return false;
   }
 
-  /** 这个文档里有没有宿主 IPC。自检页会读它。 */
+  // 顺序不能反：先掐断，再问"还通不通"。反过来的话，判据会稳定地报出一件
+  // 桥接层马上就要修好的事。
+  var NEUTRALIZED_HOST_IPC = neutralizeHostIpc();
+
+  /** 这个文档里有没有**可用**的宿主 IPC。自检页会读它。 */
   var HOST_IPC_ABSENT = assertNoHostIpc();
 
   // ============================================================

@@ -9,11 +9,16 @@
       这一份**只在自检页里的一个 iframe 中**运行，不直接面向人。
 
       它存在的理由：自检页自己跑在一个独立窗口里，而独立窗口的主框架**会**被
-      Tauri 注入 `__TAURI_INTERNALS__`（那是第 1 条要验的事）。插件界面不是那样 ——
-      它是 iframe，而 Tauri 的每一个内部初始化脚本都带 `for_main_frame_only`。
+      Tauri 注入 `__TAURI_INTERNALS__`（那是第 1 条要验的事）。插件界面不是那样：
+      它是一个 iframe。
 
-      所以要验"插件界面拿不到 IPC"，必须在**一个 iframe 里**问这个问题。这一份
-      就是那个 iframe 的文档。
+      ⚠️ **但"iframe 里就没有 IPC"这句话在 Windows 上是错的。** wry 不理会
+      Tauri 传下来的 `for_main_frame_only`（它自己的文档写着：scripts are always
+      added to subframes …），因此下面那四个名字在这一平台上**一定**都在。
+      真正拦住插件界面的是桥接层掐断最后那一跳（见 `sandbox-bridge.js` 的
+      `neutralizeHostIpc`），而**这一份探针里没有桥接层** —— 因此它测到的是
+      **平台**，不是插件边界。下面多报一个 `nativeBridge`（最后那一跳还通不通），
+      让自检页能把"平台行为"与"边界失效"分开说。
 
       它把结论用 `postMessage` 投回父页面，自己不画任何东西。
     -->
@@ -39,6 +44,20 @@
           invoke:
             !!(window.__TAURI_INTERNALS__ &&
               typeof window.__TAURI_INTERNALS__.invoke === 'function'),
+          // 宿主 IPC 的**最后那一跳**。Tauri 的两条传输（fetch 与 postMessage）
+          // 最终都要经过它，因此"还通不通"落在它上面 —— 判据不能是名字在不在
+          // （那在 Windows 上恒为真，见文件头的说明）。
+          nativeBridge: (function () {
+            try {
+              return !!(
+                window.chrome &&
+                window.chrome.webview &&
+                typeof window.chrome.webview.postMessage === 'function'
+              );
+            } catch (error) {
+              return false;
+            }
+          })(),
           protocol: false,
           protocolDetail: '',
         };

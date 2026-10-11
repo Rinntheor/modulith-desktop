@@ -425,6 +425,36 @@ impl BackgroundHost {
         method: BackgroundMethod,
         params: Option<serde_json::Value>,
     ) -> CallOutcome {
+        self.call_within(
+            method,
+            params,
+            Duration::from_millis(protocol::REQUEST_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    /// 同 `call`，但换一个等待上限。
+    ///
+    /// ============================================================
+    /// 为什么需要这个参数：有一类方法的时长**不由我们决定**
+    /// ============================================================
+    ///
+    /// `REQUEST_TIMEOUT_MS`（10 秒）是给"宿主发起、宿主知道要多久"的那些调用用的。
+    /// `plugin.dispatch` 不是那一类：它是把一件事**投给插件的处理器**，而处理器
+    /// 可以合法地等一个用户动作 —— 比如 `ctx.ui.popover`，它缺省**没有截止时间**。
+    ///
+    /// 用 10 秒去卡它，得到的是：宿主这边记一句"后台宿主在 10000 毫秒内没有响应"
+    /// （`outcome.ok == false`，而插件那一侧其实好好地跑着），随后子进程回话时再
+    /// 记一句"收到没有等待者的后台响应"—— 两条日志都指向一个不存在的问题。
+    /// 它与卡片那一条传输预算（`ctx.ui.popover` 豁免 `HOST_CALL_TIMEOUT_MS`）
+    /// 是同一个道理的两半：**不能让一个"等到用户做出动作"的等待被一个固定的
+    /// 秒数单方面作废。**
+    pub async fn call_within(
+        &self,
+        method: BackgroundMethod,
+        params: Option<serde_json::Value>,
+        budget: std::time::Duration,
+    ) -> CallOutcome {
         let node = match self.probe_node() {
             Ok(path) => path,
             Err(reason) => {
@@ -448,7 +478,7 @@ impl BackgroundHost {
             };
         }
 
-        self.send(method, params).await
+        self.send(method, params, budget).await
     }
 
     /// 把一条请求写到子进程并等它的响应。**不负责拉起子进程。**
@@ -459,6 +489,7 @@ impl BackgroundHost {
         &self,
         method: BackgroundMethod,
         params: Option<serde_json::Value>,
+        budget: std::time::Duration,
     ) -> CallOutcome {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = protocol::Request {
@@ -526,7 +557,7 @@ impl BackgroundHost {
             };
         }
 
-        match tokio::time::timeout(Duration::from_millis(protocol::REQUEST_TIMEOUT_MS), receiver).await {
+        match tokio::time::timeout(budget, receiver).await {
             Ok(Ok(response)) => match response.validate() {
                 Ok(()) => {
                     let mut state = self.lives.lock().unwrap();
@@ -556,7 +587,7 @@ impl BackgroundHost {
                     result: None,
                     error: Some(format!(
                         "后台宿主在 {} 毫秒内没有响应",
-                        protocol::REQUEST_TIMEOUT_MS
+                        budget.as_millis()
                     )),
                 }
             }

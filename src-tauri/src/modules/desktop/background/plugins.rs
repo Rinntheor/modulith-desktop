@@ -86,6 +86,31 @@ const PERMISSION_MODEL_MIN_MAJOR: u64 = 23;
 /// "网络没被管住" —— 一个**听起来更安全**的假警报，没人会去查它。
 const NET_SCOPE_FLAG: &str = "--allow-net";
 
+/// `plugin.dispatch` 的等待上限（**不是**那 10 秒的传输预算）。
+///
+/// ============================================================
+/// 为什么这一个方法要另算一个上限
+/// ============================================================
+///
+/// 别的调用（`ping` / `plugin.load` / …）的时长由宿主决定，10 秒是个正经的兜底。
+/// `plugin.dispatch` 不是：它把一件事交给**插件的处理器**，而处理器可以合法地
+/// 等到用户做出动作 —— `ctx.ui.popover` 缺省**没有截止时间**，它要等到用户把
+/// 卡片关掉为止。
+///
+/// 用 10 秒去卡它，会发生两件**互为因果、而且都指向一个不存在的问题**的事：
+/// 宿主记一句"后台宿主在 10000 毫秒内没有响应"（像是子进程卡死了），随后子进程
+/// 回话时再记一句"收到没有等待者的后台响应"（像是协议实现有问题）。而插件那一侧
+/// 一直好好地跑着。
+///
+/// 5 分钟与浮层的 `RESPONSE_TIMEOUT`（对话框/菜单那一条）取同一个数量级：
+/// 长到"用户读完一张卡片、点一下"绰绰有余，短到一条真正挂住的投递不会永远留着。
+/// 它不是"允许多久"，而是"超过它我们就可以断定这次投递不对劲了"。
+///
+/// 写成毫秒而不是 `Duration::from_secs`：它与 `protocol::REQUEST_TIMEOUT_MS`
+/// 是同一把尺子上的两个刻度，而 `check:sandbox` 会把它们读出来比一次 ——
+/// 那个判据要能在常量被改小、或被删掉时真的变红。
+const DISPATCH_TIMEOUT_MS: u64 = 300_000;
+
 /// 一个正在跑的后台插件。
 struct Running {
     host: Arc<BackgroundHost>,
@@ -652,7 +677,7 @@ impl BackgroundPlugins {
 
         for (id, host) in targets {
             let outcome = host
-                .call(
+                .call_within(
                     BackgroundMethod::PluginDispatch,
                     Some(serde_json::json!({
                         "id": id,
@@ -660,6 +685,7 @@ impl BackgroundPlugins {
                         "name": name,
                         "payload": { "source": source, "payload": payload },
                     })),
+                    Duration::from_millis(DISPATCH_TIMEOUT_MS),
                 )
                 .await;
 
@@ -704,7 +730,7 @@ impl BackgroundPlugins {
         };
 
         let outcome = host
-            .call(
+            .call_within(
                 BackgroundMethod::PluginDispatch,
                 Some(serde_json::json!({
                     "id": plugin_id,
@@ -713,6 +739,7 @@ impl BackgroundPlugins {
                     "type": "hotkey",
                     "payload": { "combo": combo },
                 })),
+                Duration::from_millis(DISPATCH_TIMEOUT_MS),
             )
             .await;
 
@@ -824,6 +851,26 @@ fn parse_major_version(text: &str) -> Option<u64> {
 ///
 /// 与沙箱界面插件走的是同一个 `rpc::dispatch` —— 也就是说"能不能做这件事"
 /// 只有一处定义，两条路径的区别只在传输。
+///
+/// ============================================================
+/// 每一条请求**各自一个任务**，而这不是为了快
+/// ============================================================
+///
+/// 这个循环曾经是串行的：取一条、`rpc::dispatch(...).await`、回话，然后才取
+/// 下一条。那在"每一次调用都会很快结束"的前提下没问题 —— 而**结果卡片**恰好
+/// 不是：`ctx.ui.popover` 缺省**没有截止时间**，它要等到用户把它关掉为止。
+///
+/// 串行的代价因此是：一张卡片挂在屏幕上的那段时间里，**这个插件的每一次 ctx
+/// 调用都排在它后面**。用户看到的是"卡片还开着的时候，定时器不触发、热键按了
+/// 没反应"—— 而两侧的代码读起来都是对的。这正是维护者说的"它不能很快关掉"之外
+/// 的第二个后果：它会把那个插件整个卡住。
+///
+/// 因此循环现在只做收件，每一条请求各自 `spawn`。响应本来就靠 id 配对，
+/// 顺序没有任何东西依赖它（`rpc::dispatch` 自己也是被多个界面、多个插件并发
+/// 调用的）。
+///
+/// 并发度不是无界的：请求只能由那个子进程发出来，而它的每一句话都来自插件
+/// 自己（它没有能力凭空造出无限条 ctx 调用而不被自己拖垮）。
 async fn handle_inbound(
     app: AppHandle,
     host: Arc<BackgroundHost>,
@@ -863,13 +910,21 @@ async fn handle_inbound(
                 args = serde_json::json!({ "background": true });
             }
         }
-        let result = rpc::dispatch(&app, &plugin_id, None, &method, &args).await;
 
-        if let Err(message) = &result {
-            log::debug!("后台插件 {plugin_id} 的 ctx.{method} 被拒绝：{message}");
-        }
+        let id = request.id;
+        let task_app = app.clone();
+        let task_host = Arc::clone(&host);
+        let task_plugin = plugin_id.clone();
 
-        host.respond(request.id, result).await;
+        tokio::spawn(async move {
+            let result = rpc::dispatch(&task_app, &task_plugin, None, &method, &args).await;
+
+            if let Err(message) = &result {
+                log::debug!("后台插件 {task_plugin} 的 ctx.{method} 被拒绝：{message}");
+            }
+
+            task_host.respond(id, result).await;
+        });
     }
 }
 

@@ -2314,8 +2314,8 @@ section('宿主浮层');
       // 两条分支各自**在自己的分支体里**调 `ask_overlay`。用"分支起点往后找
       // N 个字符"那种写法会随着分支里的说明文字变长而失效 —— 而它失效的方向是
       // 假红（明明没坏却报错），这一条已经因此误报过一次。
-      /"ui\.dialog"[\s\S]{0,1200}?ask_overlay\(app, request\)\.await/.test(rpcRs) &&
-      /"ui\.contextMenu" => \{[\s\S]*?ask_overlay\(app, request\)\.await/.test(rpcRs),
+      /"ui\.dialog"[\s\S]{0,1200}?ask_overlay\(app, plugin_id, request\)\.await/.test(rpcRs) &&
+      /"ui\.contextMenu" => \{[\s\S]*?ask_overlay\(app, plugin_id, request\)\.await/.test(rpcRs),
     '对话框与菜单走同一条配对/超时路径（两份实现会各自漂）'
   );
 
@@ -2398,11 +2398,21 @@ section('宿主浮层');
     );
   }
 
-  // 卡片自己的截止时间必须**留在后台那一条 IPC 的预算之内**。
+  // 卡片的截止时间与后台那一条传输预算的关系。
   //
-  // 两次计时是独立的：后台那一侧到点就丢掉这次等待（`收到没有等待者的响应`），
-  // 宿主这一侧到点才回话。子进程里那个上限（10 秒）必须明显长于卡片的上限，
-  // 否则宿主的答复落在一条没有人等的通道上 —— 而两侧的代码读起来都是对的。
+  // ============================================================
+  // 这条关系**变过**，而变化的正是"谁给谁让路"
+  // ============================================================
+  //
+  // 从前：卡片的上限（6 秒）必须**短于**后台那条 IPC 的上限（10 秒），否则
+  // 宿主的答复会落在一条没有人等的通道上（真实撞上过：`收到没有等待者的响应
+  // id=17`）。
+  //
+  // 现在：卡片**缺省没有截止时间**，而 `ctx.ui.popover` 是唯一一条**豁免**
+  // 那条预算的调用。因此要钉的不再是两个数字的大小关系，而是**豁免本身**：
+  // 少了它，一次不带 `timeoutMs` 的调用会在 10 秒处被传输层单方面挂断 ——
+  // 用户看到的是一张还留在屏幕上的卡片，插件拿到的是"调用宿主超时"。
+  // 那个 bug 上一次就是这么静默地进来的，因此这里两头都钉。
   {
     const backgroundHost = read('../src-tauri/resources/background-host.mjs');
     const protocol = read('../src-tauri/src/modules/desktop/background/protocol.rs');
@@ -2420,15 +2430,134 @@ section('宿主浮层');
 
     const hostBudget = numberAfter(backgroundHost, 'HOST_CALL_TIMEOUT_MS');
     const rustBudget = numberAfter(protocol, 'REQUEST_TIMEOUT_MS');
-    const cardDeadline = numberAfter(rpcRs, 'POPOVER_TIMEOUT_MAX_MS');
 
     check(
       hostBudget !== null && hostBudget === rustBudget,
       '后台两侧的单次调用上限同值（两个数字各写一处，漂开时余量算的是另一个数）'
     );
+
+    // 豁免的实现面：`callHost` 有一个"等到用户回答"的开关，而且只该有一处用它。
     check(
-      cardDeadline !== null && hostBudget !== null && cardDeadline + 2_000 <= hostBudget,
-      `卡片的上限比后台那一条 IPC 的上限短出至少 2 秒（否则答复会落在没有人等的通道上）`
+      backgroundHost.includes('untilUserAnswers'),
+      '后台宿主那一侧有「等到用户回答」这条豁免（少了它，没有截止时间的卡片会被传输层先挂断）'
+    );
+    const popoverCallAt = backgroundHost.indexOf("callHost('ctx.ui.popover'");
+    check(
+      popoverCallAt !== -1 &&
+        backgroundHost
+          .slice(popoverCallAt, popoverCallAt + 200)
+          .includes('untilUserAnswers: true'),
+      '`ctx.ui.popover` 走那条豁免（它是唯一一条会等到用户做出动作的调用）'
+    );
+    check(
+      backgroundHost.split('untilUserAnswers: true').length - 1 === 1,
+      '`untilUserAnswers: true` 只出现在 `ctx.ui.popover` 那一处（多一处 = 某条会自己结束的调用也永远不超时）'
+    );
+
+    // 另一头：Rust 侧必须**允许**没有截止时间（`Option`），否则豁免过去之后
+    // 仍然会有一个数字填在那里，而那个数字迟早再一次短于用户的耐心。
+    check(
+      /timeout_ms:\s*Option<u64>/.test(overlayRs),
+      '卡片的 timeoutMs 是 Option（没有截止时间必须是能表达出来的一种取值）'
+    );
+    check(
+      /fn popover_deadline\(args: &Value\) -> Option<std::time::Duration>/.test(rpcRs) &&
+        /arg\(args, "timeoutMs"\)\.and_then\(\|value\| value\.as_u64\(\)\)\?/.test(rpcRs),
+      '宿主侧「不传 timeoutMs」= 没有截止时间（不是回到某个缺省秒数）'
+    );
+    check(
+      overlayRs.includes('Some(limit) => tokio::time::timeout(limit, receiver).await') &&
+        overlayRs.includes('None => Ok(receiver.await)'),
+      '没有截止时间时宿主真的**不设计时器**（只写文档不写代码等于没改）'
+    );
+  }
+
+  // ============================================================
+  // B2 · 快速关闭：失焦这条路必须真的通
+  // ============================================================
+  //
+  // 「点别处关闭」在本平台上的唯一来源是 `WM_KILLFOCUS` —— tao 的
+  // `Focused(false)` 只在它上面发出来（`tao-0.35.3/src/platform_impl/windows/
+  // event_loop.rs:1800`）。一个**从未**拿到过焦点的窗口永远收不到它，这正是
+  // 维护者报的"要点一下卡片、再点别处才会关"。
+  //
+  // 因此这里钉两头，而**只钉一头是假绿**：
+  //   * 前端有那个关闭按钮（用户看得见的手段）；
+  //   * 宿主那一边**卡片会去取焦点**（失焦事件因此才可能发生），
+  //     而且取不到焦点时不会把已经显示出来的卡片撤掉。
+  {
+    const showPopoverStart = overlayRs.indexOf('fn show_popover');
+    const showPopoverEnd =
+      showPopoverStart === -1 ? -1 : overlayRs.indexOf('\n}\n', showPopoverStart);
+    const showPopoverBody =
+      showPopoverStart === -1 || showPopoverEnd === -1
+        ? ''
+        : overlayRs.slice(showPopoverStart, showPopoverEnd);
+
+    check(
+      showPopoverBody.length > 0,
+      '能定位到 show_popover 的函数体（定位失败时下面两条是假绿）'
+    );
+    check(
+      showPopoverBody.includes('window.set_focus()'),
+      '卡片会取焦点（不取的话 tao 永远不会发出 Focused(false)，点别处与 Esc 都是死路）'
+    );
+    check(
+      !showPopoverBody.includes('window.set_focus().map_err') &&
+        !showPopoverBody.includes('window.set_focus()?'),
+      '抢不到焦点不该让卡片显示失败（那会让「为什么什么都没出现」变成常态）'
+    );
+
+    // 前端：常驻可见的关闭按钮。判据落在 `aria-label="关闭"` 上，而不是
+    // "文件里出现过 ×" —— 后者在注释里写一个字就能满足。
+    check(
+      /aria-label="关闭"/.test(overlayRoot) && /answer\(request, \{ dismissed: true \}\)/.test(overlayRoot),
+      '卡片上有一个常驻可见的关闭按钮（× 是两条主要关闭手段之一）'
+    );
+
+    // Esc：得有监听，而且注释里必须**说清它不是系统级快捷键**。
+    //
+    // 这一条防的是"顺手把 Esc 描述成任何时候都能用"：那需要一个全局键盘通道，
+    // 而它是卡片不该拥有的能力。要求注释里出现这句话，是为了让下一个改这段
+    // 代码的人先看到限制，而不是自己去猜。
+    check(
+      /event\.key === 'Escape'/.test(overlayRoot) && /系统级/.test(overlayRoot),
+      'Esc 有监听，且注释里写清它不是系统级快捷键（否则会被当成随时可用）'
+    );
+  }
+
+  // ============================================================
+  // B3 · 拖动：把手 + 让把手生效的 ACL 授权
+  // ============================================================
+  //
+  // 这是**当初整条浮层机制静默失效**的那一类：`data-tauri-drag-region` 不是纯
+  // 前端行为 —— tauri 注入的 `drag.js` 在按下时 invoke `plugin:window|start_dragging`
+  // （`tauri-2.11.5/src/window/scripts/drag.js`），也就是说它**走 ACL**，
+  // 而清单里没写的权限默认拒绝。少了授权时按在把手上什么都不发生，
+  // 日志里一个字都没有 —— 与当初"浮层收不到内容"逐字相同的失败形态。
+  {
+    check(
+      overlayRoot.includes('data-tauri-drag-region'),
+      '卡片上有拖拽区（没有的话，无边框窗口根本拖不动）'
+    );
+    check(
+      /cursor-grab/.test(overlayRoot),
+      '拖拽区有可见的提示（cursor-grab / 把手）—— 否则用户不知道它能拖'
+    );
+
+    const capability = JSON.parse(read('../src-tauri/capabilities/overlay.json')) as {
+      permissions?: string[];
+    };
+    check(
+      (capability.permissions ?? []).includes('core:window:allow-start-dragging'),
+      '浮层的 capability 里授了 core:window:allow-start-dragging（拖拽是一条走 ACL 的 IPC）'
+    );
+    // 反向：**不要**顺手把整个窗口命令集授进去。这个窗口的职责只有三件事。
+    check(
+      !(capability.permissions ?? []).some((permission) =>
+        permission.startsWith('core:window:default')
+      ),
+      '浮层没有整包授 core:window:default（拖动只需要 start-dragging，多授等于多开面）'
     );
   }
 
@@ -2449,13 +2578,75 @@ section('宿主浮层');
   // 调试看不见它。判据因此落在那一个分支的**分支体**里（到 `ask_popover` 为止）。
   {
     const start = rpcRs.indexOf('"ui.popover" => {');
-    const end = start === -1 ? -1 : rpcRs.indexOf('ask_popover(app, request, timeout)', start);
+    const end =
+      start === -1 ? -1 : rpcRs.indexOf('ask_popover(app, plugin_id, request, deadline)', start);
     const body = start === -1 || end === -1 ? '' : rpcRs.slice(start, end);
     // 定位失败必须**报红**，而不是让下面那条断言在一个空串上悄悄通过。
     check(body.length > 0, '能定位到 ui.popover 那一分支（定位失败时下面那条是假绿）');
     check(
       !/let Some\(surface\) = surface/.test(body) && !/FILES_NEEDS_A_SURFACE/.test(body),
       'ui.popover 不要求界面上下文（后台插件传的永远是 surface: None）'
+    );
+  }
+
+  // 卡片必须**跟着插件一起消失**。
+  //
+  // 卡片缺省没有截止时间，而"插件被停用/卸载"是它四条收场路径里唯一一条
+  // **不经过用户**的。少了它，一个被停用插件留下的卡片会永远留在屏幕上
+  // （用户没点过它，它也不再自己消失），唯一的补救是重启应用。
+  check(
+    /fn forget_plugin<R: Runtime>\(/.test(overlayRs) &&
+      /overlay\.forget_plugin\(app, plugin_id\)/.test(read('../src-tauri/src/modules/plugins/sandbox.rs')),
+    '插件被停用/卸载时它的浮层等待被撤掉（否则没截止时间的卡片会永远关不掉）'
+  );
+  check(
+    /\.filter\(\|\(_, entry\)\| entry\.plugin == plugin_id\)/.test(overlayRs),
+    '那条撤销是**按插件**收的，不是 cancel_all（后者会把别的插件的对话框一起撤掉）'
+  );
+
+  // 后台的 ctx 分发**不许被一张卡片堵住**。
+  //
+  // `handle_inbound` 曾经是串行的：一条请求处理完才取下一条。卡片缺省没有
+  // 截止时间，于是它挂在屏幕上的整段时间里这个插件的每一次 ctx 调用都排在
+  // 后面 —— 定时器不触发、热键没反应，而两侧代码读起来都是对的。
+  {
+    const inbound = read('../src-tauri/src/modules/desktop/background/plugins.rs');
+    // 与上面那一块同一个理由：**锚在行首的常量定义上**，不要在文档注释里
+    // 抓到同一个名字（那会让这条判据永远成立）。
+    const numberAfter = (source: string, name: string): number | null => {
+      const match = new RegExp(
+        `^\\s*(?:(?:export|pub)\\s+)?const\\s+${name}\\s*(?::\\s*\\w+)?\\s*=\\s*([0-9_]+)`,
+        'm'
+      ).exec(source);
+      return match ? Number(match[1].replace(/_/g, '')) : null;
+    };
+
+    check(
+      /tokio::spawn\(async move \{[\s\S]{0,400}?rpc::dispatch\(/.test(inbound),
+      '后台的 ctx 分发每条请求各自一个任务（串行时一张卡片会把整个插件堵住）'
+    );
+
+    // 反方向那一半：**投递给插件的处理器**不许被那 10 秒卡住。
+    //
+    // `plugin.dispatch` 的时长由插件的处理器决定，而处理器可以合法地等用户
+    // （`ctx.ui.popover` 缺省没有截止时间）。用传输预算去卡它，会同时产生
+    // "后台宿主在 10000 毫秒内没有响应"与"收到没有等待者的后台响应"两条日志 ——
+    // 两条都指向一个不存在的问题，而插件那一侧一直好好地跑着。
+    const dispatchTimeout = numberAfter(inbound, 'DISPATCH_TIMEOUT_MS');    const transportBudget = numberAfter(
+      read('../src-tauri/src/modules/desktop/background/protocol.rs'),
+      'REQUEST_TIMEOUT_MS'
+    );
+    check(
+      dispatchTimeout !== null &&
+        transportBudget !== null &&
+        dispatchTimeout > transportBudget,
+      `投递的上限（${dispatchTimeout}ms）必须宽于传输预算（${transportBudget}ms）—— 处理器可以等到用户回答`
+    );
+    check(
+      inbound.split('call_within(').length - 1 >= 2 &&
+        inbound.split('DISPATCH_TIMEOUT_MS').length - 1 === 3 &&
+        /PluginDispatch\n?[\s\S]{0,900}?DISPATCH_TIMEOUT_MS/.test(inbound),
+      '两条 plugin.dispatch 都走 call_within(..., DISPATCH_TIMEOUT_MS)（漏一条就还会报那个假故障）'
     );
   }
 
@@ -4438,11 +4629,27 @@ section('桥接层的运行时守卫');
     );
   }
 
-  // ---- 1. 这个文档里不该有宿主 IPC ----
+  // ---- 1. 这个文档里还有没有一条通到宿主的 IPC ----
   //
-  // 沙箱依赖 Tauri 一侧的两件事：它不给子框架注入 IPC 初始化脚本，且 IPC 处理器
-  // 要求一个只注入主框架的随机键。**两件事都会静默失效** —— 哪一天不成立了，
-  // 这里不会报错、不会变慢、没有任何症状，只是插件忽然能 invoke 全部应用命令。
+  // ============================================================
+  // 这里的判据换过一次，而换的理由是一条平台事实
+  // ============================================================
+  //
+  // 曾经这里写着"沙箱依赖 Tauri 不给子框架注入 IPC 初始化脚本"。**那句话在
+  // Windows 上是错的**：wry 0.55.1 自己的文档写着
+  //   "Windows: scripts are always added to subframes regardless of the
+  //    for_main_frame_only option."
+  // （`wry-0.55.1/src/lib.rs`；`webview2/mod.rs` 用的
+  //  `AddScriptToExecuteOnDocumentCreated` 对每个 frame 生效），而
+  // tauri-runtime-wry 把每个脚本原样交给它（`tauri-runtime-wry-2.11.4/src/lib.rs:5174`）。
+  //
+  // 于是"名字在不在"这个判据在 Windows 上**恒为真**，那条 ERROR 在真实日志里
+  // 刷了一整屏（维护者看到的那些「沙箱边界失效」）而它其实什么都没说明。
+  // 现在的判据是"**这个文档还够不够得着宿主**"，而桥接层会先**尽力掐断**
+  // 最后那一跳。因此这一节钉的是三件事：
+  //   1. 四个名字仍然要查（它们是"注入发生了"的证据，只是不再直接等于失败）；
+  //   2. 掐断那一步真的存在、而且用的是**最后那一跳**；
+  //   3. 报告的是"还能不能用"，不是"名字在不在"。
   const assertFn = /function assertNoHostIpc\(\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? '';
   check(assertFn.length > 0, '桥接层里有 assertNoHostIpc()');
   // 四个名字一个都不能少：前两个是 Tauri 的注入面，`isTauri` 是它的探测标志，
@@ -4469,6 +4676,45 @@ section('桥接层的运行时守卫');
     /var HOST_IPC_ABSENT = assertNoHostIpc\(\)/.test(bridgeJs),
     'assertNoHostIpc 在文档加载时真的跑了一次（定义了却不调用等于没查）'
   );
+
+  // 掐断那一步：必须存在、必须**先于**判据、而且必须落在最后那一跳上。
+  {
+    const neutralizeFn = /function neutralizeHostIpc\(\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? '';
+    check(neutralizeFn.length > 0, '桥接层里有 neutralizeHostIpc()（它才是真正掐断那一步）');
+    const neutralizeCode = strip(neutralizeFn);
+    check(
+      /chrome\s*&&\s*window\.chrome\.webview/.test(neutralizeCode) &&
+        /webview\.postMessage\s*=/.test(neutralizeCode),
+      '掐的是最后那一跳 `window.chrome.webview.postMessage`（两条传输都经过它，因此换掉它就够了）'
+    );
+    // 拿不准就什么都不做：任何一个属性在不同 WebView2 版本上形状不同，都不该让
+    // 插件界面起不来 —— 那比"多一条通道"严重得多。
+    check(
+      /try \{/.test(neutralizeCode) && /catch \(error\)/.test(neutralizeCode),
+      '掐断那一步裹在 try/catch 里（拿不准就什么都不做，而不是让界面起不来）'
+    );
+    check(
+      bridgeJs.indexOf('neutralizeHostIpc()') < bridgeJs.indexOf('assertNoHostIpc()'),
+      '先掐断、再问「还通不通」（顺序反了会稳定地报出一件马上就要被修好的事）'
+    );
+
+    const reachableFn = /function hostIpcIsReachable\(\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? '';
+    check(reachableFn.length > 0, '桥接层里有 hostIpcIsReachable()');
+    const reachableCode = strip(reachableFn);
+    check(
+      /typeof webview\.postMessage === 'function'/.test(reachableCode),
+      '「还通不通」的判据落在最后那一跳上（只看名字在不在 = Windows 上恒为真）'
+    );
+    // 读不到时按最坏情况算：宁可多报一次，也不要把一条真通道报成不存在。
+    check(
+      /return true;/.test(reachableCode),
+      '取不到那个对象时按最坏情况算（读不到 ≠ 不存在）'
+    );
+    check(
+      /found\.length > 0 && !hostIpcIsReachable\(\)/.test(assertCode),
+      '名字在、而通道已死 = 预期（只记 info）；只在通道**还活着**时报 ERROR'
+    );
+  }
 
   // ---- 2. 同一个来源带来的共享存储必须封掉 ----
   //

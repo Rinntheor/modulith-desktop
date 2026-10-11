@@ -19,22 +19,48 @@
 // 三条边界，以及它们各自依赖什么
 // ============================================================
 //
-//   1. **子框架拿不到 IPC。** Tauri 注入的每一个内部初始化脚本
-//      （`__TAURI_INTERNALS__`、invoke 脚本、metadata、IPC 脚本）都经过
-//      `main_frame_script()` 包装，而它设的是 `for_main_frame_only: true` ——
-//      iframe 里没有这些全局。见 tauri-2.11.5/src/manager/webview.rs。
+//   1. ~~**子框架拿不到 IPC。**~~ **这一条在 Windows 上不成立**（下同）。
+//      Tauri 确实把每一个内部初始化脚本都包进 `main_frame_script()`
+//      （`tauri-2.11.5/src/manager/webview.rs:158`，`for_main_frame_only: true`），
+//      也确实把那个标志一路交给了 wry（`tauri-runtime-wry-2.11.4/src/lib.rs:5174`）
+//      —— 但 **wry 在 Windows 上忽略它**，而且把它写进了自己的文档：
+//
+//        "Windows: scripts are always added to subframes regardless of the
+//         `for_main_frame_only` option. This will be the case until Webview2
+//         implements a proper API to inject a script only on the main frame."
+//        （`wry-0.55.1/src/lib.rs`；实现见 `webview2/mod.rs` 的
+//         `AddScriptToExecuteOnDocumentCreated`，它对每一个 frame 生效）
+//
+//      因此 `__TAURI_INTERNALS__`、`isTauri` **以及那条带 invoke key 的 IPC 脚本**
+//      都会出现在插件 iframe 里，再加上 wry 自己注入的 `window.ipc`。这不是
+//      "开发链接插件特有"的：装好的插件与开发链接的插件走的是同一份入口文档。
+//      维护者日志里那些「沙箱边界失效」ERROR 就是它，**它们不是误报**。
+//
+//      真正能用的那一半现在是**桥接层**承担：它是宿主的一部分、先于插件代码加载，
+//      因此它把最后那一跳（`window.chrome.webview.postMessage`，两条传输的汇合点）
+//      换成了桩。`__TAURI_INTERNALS__` / `window.ipc` 本身不可重定义、删不掉，
+//      但它们的实现体是**调用时**才去取那一跳的，因此换掉它就够了。判据与理由
+//      见 `resources/sandbox-bridge.js` 的 `neutralizeHostIpc` / `hostIpcIsReachable`。
 //   2. **手工拼一条 IPC 也不行。** IPC 处理器第一件事是比对 `invoke_key`
 //      （每次运行随机、只注入主框架），不匹配就**静默丢弃**。
 //      见 tauri-2.11.5/src/webview/mod.rs 的 `on_message`。
+//      ⚠️ 第 1 条塌掉之后，这一条**也不再承重**：那个脚本连同 key 一起落进了
+//      插件 iframe（`invoke_key` 由 `app.rs:1687` 内联进脚本文本）。因此真正
+//      承重的是上面那个桩，以及下一条。
 //   3. **同源策略。** 插件来源是 `http://modulith-plugin.localhost`，与宿主
 //      不同源，因此插件文档够不到 `parent` —— 也就枚举不出兄弟界面。
 //
-// ⚠️ **第 2 条是承重的，而且它会静默失效。** `webview/mod.rs::is_local_url` 把
-// 自定义协议的 `.localhost` 也算 `Local`，于是主窗口的 capability 在**形式上**
-// 适用于插件来源；真正拦住它的只有 `invoke_key` 那一次比对。Tauri 哪天不再要求
-// 它，沙箱会**无声地**变成假的 —— 没有报错、没有症状。因此桥接层里有一条守卫会
-// 主动检查 `__TAURI_INTERNALS__` / `invoke` / `window.ipc` 在不在，在就大声报出来
-// —— 见 `resources/sandbox-bridge.js` 的 `assertNoHostIpc`。
+// ⚠️ **`invoke_key` 那一次比对并不承重，而这一点曾经被写反。**
+// `webview/mod.rs::is_local_url` 把自定义协议的 `.localhost` 也算 `Local`
+// （`tauri-2.11.5/src/webview/mod.rs:1724` 起的那一支），于是主窗口的 capability
+// 在**形式上**适用于插件来源；而 key 本身与脚本一起落进了 iframe（见第 1 条）。
+// 因此现在唯一拦住"插件直接 invoke 宿主命令"的是**桥接层那个桩**：
+// `resources/sandbox-bridge.js` 的 `neutralizeHostIpc` 换掉最后那一跳，
+// `hostIpcIsReachable` 在它没能换掉时大声报出来。
+//
+// 一盏只检查名字在不在的灯是没有用的：那个判据在 Windows 上恒为真
+// （它就是这样在维护者日志里刷了一整屏 ERROR，而真正的问题另有其物）。
+// 判据必须是"这个文档还够不够得着宿主"，而那正是现在这一条。
 //
 // 顺带一提，**引擎那一侧是支持 iframe 的**：wry 注册自定义协议时会优先用
 // `AddWebResourceRequestedFilterWithRequestSourceKinds(..., SOURCE_KINDS_ALL)`，
@@ -1883,6 +1909,22 @@ pub fn close_all_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) {
     // 与剪贴板订阅同一取舍：按**插件**收，不是按界面收。
     if let Some(registry) = app.try_state::<super::hotkey::HotkeyRegistry>() {
         registry.forget_plugin(plugin_id);
+    }
+
+    // 结果卡片也要跟着插件一起消失，而且**必须在这里**。
+    //
+    // 卡片缺省**没有截止时间**：它的四条收场路径是"用户关掉它 / 插件被停用或
+    // 卸载 / 第二条卡片顶掉它 / 应用退出"，而这一条是其中唯一**不经过用户**的。
+    // 少了它，一个被停用或卸载的插件会把它那张卡片永远留在屏幕上（用户没点过它，
+    // 它也不再自己消失），唯一的补救是重启应用 —— 与上面那些界面完全同一种失败。
+    //
+    // **按插件收，不是 `cancel_all()`**：那会把另一个插件正在等的对话框一起撤掉，
+    // 而那一侧读到的理由是"浮层窗口在回答之前关闭了"——一句不成立的话。
+    if let Some(overlay) = app.try_state::<crate::modules::desktop::overlay::Overlay>() {
+        let dismissed = overlay.forget_plugin(app, plugin_id);
+        if dismissed > 0 {
+            log::debug!("[sandbox] 插件 {plugin_id} 停用/卸载，撤销 {dismissed} 次浮层等待");
+        }
     }
 
     let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {
