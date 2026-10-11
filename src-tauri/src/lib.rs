@@ -341,6 +341,7 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_selection_read,
         plugin_http_request,
         plugin_launch_program,
+        plugin_open_target,
         plugin_extract_icon,
         plugin_reveal_in_folder,
         plugin_pick_audio,

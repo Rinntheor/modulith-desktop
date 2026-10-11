@@ -878,6 +878,23 @@ export interface PluginLauncherAPI {
    * 依赖 PATH 解析的程序名。`args` 作为独立参数传递，不经过 shell。
    */
   launch(program: string, args?: string[]): Promise<void>;
+
+  /**
+   * 用**系统默认方式**打开一个目标：快捷方式（`.lnk` / `.url`）、网址、
+   * 文档、目录。
+   *
+   * **需要哪个就用哪个，别用 `launch` 凑合。** `launch` 走 `CreateProcess`，
+   * 只认可执行映像 —— 把 `.lnk` 交给它会得到 `os error 193`
+   * （"%1 不是有效的 Win32 应用程序"），因为快捷方式不是可执行映像，它是给
+   * shell 看的一份数据。网址同理：`CreateProcess` 不认识 `https://…`。
+   *
+   * 同样需要 `process-spawn`（它没有扩大能力面，理由见 Rust 侧
+   * `PluginManager::open_target` 的注释）。
+   *
+   * URL 只放行 `http` / `https` / `mailto` 三种方案，其余一律按**本机路径**
+   * 处理 —— 这样"插件能触发哪些本机处理器"是可枚举的。
+   */
+  open(target: string): Promise<void>;
 }
 
 /**

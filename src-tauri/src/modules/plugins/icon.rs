@@ -299,10 +299,14 @@ mod win {
         };
 
         if extracted == 0 || hicon.is_null() {
-            return Err(PluginError::IconExtractionFailed(format!(
-                "该文件没有可提取的图标: {}",
-                path.display()
-            )));
+            // 内嵌图标资源那条路走不通（快捷方式、`.url`、文档都会走到这里），
+            // 退到 shell 去问 —— 见 `shell_icon` 的说明。
+            hicon = unsafe { shell_icon(path) }.ok_or_else(|| {
+                PluginError::IconExtractionFailed(format!(
+                    "该文件没有可提取的图标: {}",
+                    path.display()
+                ))
+            })?;
         }
 
         // HICON 必须被销毁，否则每提取一次就泄漏一个 GDI 对象 ——
@@ -310,6 +314,74 @@ mod win {
         let result = unsafe { hicon_to_rgba(hicon, path) };
         unsafe { DestroyIcon(hicon) };
         result
+    }
+
+    /// 走 shell 取图标。**快捷方式、`.url`、文档、目录只有这一条路。**
+    ///
+    /// `PrivateExtractIconsW` 读的是 PE 文件里的图标资源，因此它只对 `.exe` /
+    /// `.dll` / `.ico` 有效。而"快捷启动"这类插件最需要显示的东西恰恰是 `.lnk`
+    /// —— 它是一份**给 shell 看的数据**，本身没有图标资源，于是上面那条路必然
+    /// 失败（而且它失败得很安静：返回 0，不报错）。
+    ///
+    /// `SHGetFileInfoW` 会先把 `.lnk` 解析到它的目标、再按扩展名关联拿到**用户
+    /// 实际看到的那个图标**，因此这一条同时覆盖快捷方式、`.url`、各种文档与目录。
+    ///
+    /// 代价是尺寸：shell 给的是系统的"大图标"（通常 32×32），比上面那条按
+    /// `ICON_SIZE` 取的 64×64 小。因此它只作为**回退**，不是首选。
+    ///
+    /// **COM 必须初始化。** `SHGetFileInfoW` 取图标时走 shell 命名空间（内部用
+    /// `IShellIcon`），而调用它的是 Tauri 的任意一个工作线程 —— 在没有初始化过
+    /// COM 的线程上这一条不保证可用。返回值要区别对待，否则要么漏掉一次
+    /// `CoUninitialize`（该线程的 COM 引用计数永远不归零），要么多调一次
+    /// （把别的代码的初始化一起拆掉）：
+    ///
+    /// * `S_OK` —— 这次初始化的是我们，必须配一次 `CoUninitialize`；
+    /// * `S_FALSE` —— 该线程已经初始化过**同一种**模式，仍然要配一次；
+    /// * 其余（典型是 `RPC_E_CHANGED_MODE`，异步运行时可能已经把线程开成 MTA）
+    ///   —— 我们**没有**增加引用计数，因此不能 uninit；而 shell 查询在 MTA 下
+    ///   仍然可用，所以继续往下走，不是失败。
+    unsafe fn shell_icon(path: &Path) -> Option<HICON> {
+        use windows_sys::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+        };
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+        };
+
+        /// `S_OK`
+        const S_OK: i32 = 0;
+        /// `S_FALSE`
+        const S_FALSE: i32 = 1;
+
+        // windows-sys 把 `COINIT_APARTMENTTHREADED` 声明成 `i32`，而这个函数的
+        // 形参是 `u32`（位标志）—— 转换在这里是安全的：它是一个小的正数常量。
+        let hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let ours = hr == S_OK || hr == S_FALSE;
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut info: SHFILEINFOW = std::mem::zeroed();
+        let ok = SHGetFileInfoW(
+            wide.as_ptr(),
+            0,
+            &mut info,
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        ) != 0;
+
+        // HICON 是 GDI 对象，与 COM 的引用计数无关，因此这里先收尾 COM 再用图标。
+        if ours {
+            CoUninitialize();
+        }
+
+        if ok && !info.hIcon.is_null() {
+            Some(info.hIcon)
+        } else {
+            None
+        }
     }
 }
 
@@ -548,21 +620,54 @@ mod tests {
         assert!(!all_zero, "取到的图标像素全为 0，说明像素读取失败");
     }
 
-    /// 没有图标资源的文件应当明确失败，而不是返回一张空图
+    /// 没有**内嵌**图标资源的文件，现在会退到 shell 拿一张真图标，而不是报错。
+    ///
+    /// 这条断言在 1.7.0 之前是反过来的（"非 PE 文件必须失败"）。它必须改，因为
+    /// 那个旧契约把**实现细节当成了产品语义**："有没有图标"被定义成了"有没有 PE
+    /// 图标资源"，而用户在资源管理器里看到的每一个文件都有图标。快捷方式
+    /// （`.lnk`）是这个契约下第一个被牺牲的对象 —— 它没有图标资源，于是一个
+    /// 快捷启动插件连自己条目的图标都拿不到。
+    ///
+    /// 因此这里守的性质换成了**更强**的一条：要么给出一张能解码、像素非零的
+    /// 真 PNG，要么明确报错。**不允许返回空图或占位图**让调用方以为拿到了图标
+    /// —— 那是原来那条断言真正要防的事，它没有被放宽。
     #[cfg(windows)]
     #[test]
-    fn reports_failure_for_a_file_without_icon_resource() {
+    fn falls_back_to_the_shell_icon_for_files_without_an_embedded_resource() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
         let plain = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         assert!(plain.is_file(), "样本文件应当存在: {}", plain.display());
 
-        let err = extract_icon_data_url(&plain).expect_err("非 PE 文件不应有图标资源");
+        let url = extract_icon_data_url(&plain)
+            .expect("没有内嵌图标资源时应当退到 shell，而不是失败");
         assert!(
-            matches!(
-                err,
-                super::super::types::PluginError::IconExtractionFailed(_)
-            ),
-            "期望 IconExtractionFailed，实际: {:?}",
-            err
+            url.starts_with("data:image/png;base64,"),
+            "应当返回 PNG data URL，实际前缀: {}",
+            &url[..url.len().min(40)]
         );
+
+        let bytes = BASE64
+            .decode(url.trim_start_matches("data:image/png;base64,"))
+            .expect("data URL 的 base64 部分应当可解码");
+        assert_eq!(&bytes[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], "PNG 签名");
+
+        let parsed = chunks(&bytes);
+        assert!(
+            parsed.len() >= 3,
+            "应当至少有 IHDR / IDAT / IEND，实际: {:?}",
+            parsed.iter().map(|c| c.0.as_str()).collect::<Vec<_>>()
+        );
+
+        let ihdr = &parsed[0].1;
+        let width = u32::from_be_bytes(ihdr[0..4].try_into().unwrap());
+        let height = u32::from_be_bytes(ihdr[4..8].try_into().unwrap());
+        assert!(width > 0 && height > 0, "尺寸不应为零：{width}×{height}");
+
+        // 与上面那条真实 Win32 测试同样的判据：IDAT 里只有滤波器字节与全零像素，
+        // 说明取到的是一张空图 —— 那正是这条测试要挡住的东西。
+        let idat = &parsed[1].1;
+        let all_zero = idat[5..idat.len() - 4].iter().all(|b| *b == 0);
+        assert!(!all_zero, "取到的图标像素全为 0，说明像素读取失败");
     }
 }

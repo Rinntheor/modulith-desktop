@@ -1297,6 +1297,13 @@ function pluginLauncher(pluginId: string) {
         program,
         args: args ?? [],
       }),
+    // 用系统默认方式打开：`.lnk` / 网址 / 文档 / 目录。
+    //
+    // 与 `launch` 并存而不是二选一，理由见 `PluginLauncherAPI.open`：两者的
+    // 失败原因不同（"不是有效的 Win32 应用程序" vs "没有关联的程序"），调用方
+    // 要靠这个区分决定改用哪一条。
+    open: (target: string) =>
+      invoke<void>('plugin_open_target', { id: pluginId, target }),
   };
 }
 
