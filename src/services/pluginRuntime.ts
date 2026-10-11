@@ -294,6 +294,29 @@ const injectedAssets = new Map<string, { scripts: HTMLScriptElement[]; styles: H
  */
 const pluginIcons = new Map<string, string>();
 
+/**
+ * 已读到的图标资源内容：`"<插件 id>\u0000<包内相对路径>"` → SVG 源码。
+ *
+ * 与 `pluginIcons` 的分工：那一个是"插件级图标"（清单顶层 `icon`）的**入口**，
+ * `resolveInlineIconSvg()` 与模块描述符都要用它；这一张是**按包内路径**的读盘结果，
+ * 因为一个模块可以声明自己那张图（`contributes.modules[].icon: "icons/a.svg"`），
+ * 而它与插件级图标不是同一张。
+ *
+ * 只缓存**读成功**的结果：读失败不缓存，下一趟补全还会再试一次 —— 把失败也缓存
+ * 下来会让一次偶发的 IPC 错误变成"这个插件这次启动永远没有图标"。
+ */
+const pluginIconAssets = new Map<string, string>();
+
+/**
+ * 目录纪元：每次 `reloadPluginRuntime` 重建目录时 +1。
+ *
+ * 错峰补图标是**异步**的（读盘之间让出事件循环），因此一趟补全可能在它读到一半时
+ * 被另一次重载换掉了整份目录。没有这个记号，"上一代的图标"会被写进新建的条目里
+ * （表现是插件更新了图标却仍显示旧那张）；有了它，过期的那一趟会在下一个循环
+ * 边界上安静地停下来 —— 新目录由新一趟负责，它们读的是同一份清单。
+ */
+let catalogEpoch = 0;
+
 // ============================================================
 // 贡献与激活（1.2.0）
 //
@@ -847,6 +870,16 @@ export interface PluginContextMenuEntry {  pluginId: string;
   id: string;
   label: string;
   icon?: string;
+  /**
+   * 这个菜单项该画的那张图（插件自己的 SVG），由宿主提前读好。
+   *
+   * 为什么需要它：`contributes.contextMenus[].icon` 在运行时**不做 svg 路径解析**
+   * —— 它可能是一个 lucide 图标名，也可能是一个包内路径（`icon.svg`）。后者不是
+   * 图标名，`ModuleIcon` 只会把它判成"没有图标"然后落 `Box`，用户看到的就是
+   * "找不到"。侧边栏与仪表盘早已把插件那张图放进 `iconSvg`，这里补上同一份，
+   * 两处才显示同一个图标。
+   */
+  iconSvg?: string;
   group?: string;
   /** 该插件是否已经激活（界面上可以据此做些区分） */
   active: boolean;
@@ -868,6 +901,7 @@ export function getPluginContextMenuEntries(): PluginContextMenuEntry[] {
         id: menu.id,
         label: menu.label,
         icon: menu.icon,
+        iconSvg: contextMenuIconSvg(plugin.id, menu.icon),
         group: menu.group,
         active: isPluginActive(plugin.id),
       });
@@ -2659,6 +2693,41 @@ function isSvgMarkup(value: string | undefined): value is string {
 }
 
 /**
+ * 读一个插件包内的 SVG 资源（按包内相对路径），成功时记忆它。
+ *
+ * 读取失败只警告、不抛错：图标缺失不该让插件加载失败 —— 渲染端会落到通用图标。
+ * 失败**不缓存**（见 `pluginIconAssets` 的说明），因此重载或下一次补全会再试。
+ *
+ * `fresh` 用来要求"这次必须重新读盘"：`loadPlugin()` 在 bundle 执行前那一次读取
+ * 需要它 —— 开发模式里插件的资源文件是会被改的，而缓存只由 `cleanupPluginResources`
+ * 释放（禁用/卸载/重装）。
+ */
+async function readPluginIconAsset(
+  pluginId: string,
+  rel: string,
+  options: { fresh?: boolean } = {}
+): Promise<string | undefined> {
+  const key = `${pluginId}\u0000${rel}`;
+  if (!options.fresh) {
+    const cached = pluginIconAssets.get(key);
+    if (cached !== undefined) return cached;
+  }
+
+  try {
+    const text = await invoke<string>('read_plugin_asset', { id: pluginId, rel });
+    if (!isSvgMarkup(text)) return undefined;
+    pluginIconAssets.set(key, text);
+    return text;
+  } catch (error) {
+    console.warn(
+      `[pluginRuntime] 读取插件 "${pluginId}" 的图标 "${rel}" 失败，将使用通用图标:`,
+      error
+    );
+    return undefined;
+  }
+}
+
+/**
  * 插件声明的图标若是 SVG 文件，就在加载期把它读出来缓存。
  *
  * 为什么必须提前读、而不是渲染时读：模块图标的渲染路径是同步的
@@ -2668,21 +2737,15 @@ function isSvgMarkup(value: string | undefined): value is string {
  * 读取失败不抛错：图标缺失不该让整个插件加载失败，
  * 渲染端会回落到通用图标。
  */
-async function prefetchPluginIcon(plugin: InstalledPlugin): Promise<void> {
+async function prefetchPluginIcon(
+  plugin: InstalledPlugin,
+  options: { fresh?: boolean } = {}
+): Promise<void> {
   const icon = plugin.manifest.icon;
   if (!iconIsSvgFile(icon)) return;
 
-  try {
-    const svg = await invoke<string>('read_plugin_asset', { id: plugin.id, rel: icon.trim() });
-    if (isSvgMarkup(svg)) {
-      pluginIcons.set(plugin.id, svg);
-    }
-  } catch (error) {
-    console.warn(
-      `[pluginRuntime] 读取插件 "${plugin.id}" 的图标 "${icon}" 失败，将使用通用图标:`,
-      error
-    );
-  }
+  const svg = await readPluginIconAsset(plugin.id, icon.trim(), options);
+  if (svg) pluginIcons.set(plugin.id, svg);
 }
 
 /** 解析注册模块时要携带的内联 SVG（可能来自加载期预取，也可能是清单内联） */
@@ -2692,6 +2755,48 @@ function resolveInlineIconSvg(
 ): string | undefined {
   if (isSvgMarkup(manifest?.iconSvg)) return manifest?.iconSvg;
   return pluginIcons.get(pluginId);
+}
+
+/**
+ * 某个插件**自己那张图**的内联 SVG，同步可读。
+ *
+ * 给"渲染路径是同步的、又拿不到模块描述符"的调用方用 —— 目前只有右键菜单项
+ * （`getPluginContextMenuEntries`）。侧边栏与仪表盘读的是模块描述符上的 `iconSvg`，
+ * 而那个字段由 `prefetchDeclaredIcons` 从**同一份缓存**（`pluginIcons` /
+ * 清单里的 `iconSvg`）填进去，因此同一个插件在这两处的图标必然一致。
+ *
+ * 没读到就返回 `undefined`，由 `ModuleIcon` 按它既有的顺序兜底 —— 这个函数
+ * 绝不返回占位图。
+ */
+export function getPluginIconSvg(pluginId: string): string | undefined {
+  const plugin = installed.find((item) => item.id === pluginId);
+  return resolveInlineIconSvg(pluginId, plugin?.manifest);
+}
+
+/** 已经按包内路径读回来的图标资源（纯读缓存，不发 IPC） */
+function cachedPluginIconAsset(pluginId: string, rel: string): string | undefined {
+  return pluginIconAssets.get(`${pluginId}\u0000${rel}`);
+}
+
+/**
+ * 一条右键菜单贡献该用哪张内联 SVG。
+ *
+ * 规则与 `prefetchDeclaredIcons` 给模块用的那条**逐字一致**（"同一个插件的图标
+ * 在哪儿都该是同一张"）：菜单项自己声明了包内 SVG 路径就以它为准，读不到
+ * （或压根没声明）就退回插件级那张。
+ *
+ * 为什么这里必须是**同步读缓存**：`ModuleIcon` 的渲染路径是同步的，而
+ * `read_plugin_asset` 是异步命令 —— 渲染时去读会先闪一帧空图标。缓存由
+ * `prefetchDeclaredIcons` 在目录建好后填（它现在也会读右键菜单声明的那张图）。
+ */
+function contextMenuIconSvg(pluginId: string, icon: string | undefined): string | undefined {
+  const rel = iconIsSvgFile(icon) ? icon.trim() : '';
+  if (rel) {
+    const own = cachedPluginIconAsset(pluginId, rel);
+    if (own) return own;
+    // 读不到就往下退回插件级图标，而不是让这一项只剩 Box 兜底。
+  }
+  return getPluginIconSvg(pluginId);
 }
 
 // ============================================================
@@ -3060,6 +3165,12 @@ function cleanupInjected(pluginId: string): void {
  */
 function cleanupPluginResources(pluginId: string): void {
   pluginIcons.delete(pluginId);
+  // 按包内路径读到的那些图也要一起清：它们的键前缀是这个插件 id，
+  // 留着的话"禁用 → 重新启用（或重装同一份包）"会继续用上一份内容。
+  const iconAssetPrefix = `${pluginId}\u0000`;
+  for (const key of [...pluginIconAssets.keys()]) {
+    if (key.startsWith(iconAssetPrefix)) pluginIconAssets.delete(key);
+  }
   activationStates.delete(pluginId);
   activationReasons.delete(pluginId);
 
@@ -3231,7 +3342,10 @@ async function loadPluginInner(plugin: InstalledPlugin): Promise<PluginLoadState
   try {
     // 图标要在 bundle 执行前读好：registerModule() 是 bundle 顶层同步调用的，
     // 它需要立刻拿到 iconSvg 一起写进模块描述符。
-    await prefetchPluginIcon(plugin);
+    //
+    // `fresh`：这一份必须是**当前磁盘上**的图 —— 开发模式下插件的资源文件会被改，
+    // 而缓存只在禁用/卸载时才释放。
+    await prefetchPluginIcon(plugin, { fresh: true });
 
     if (manifest.style) {
       const css = await invoke<string>('read_plugin_asset', { id: pluginId, rel: manifest.style });
@@ -3395,6 +3509,10 @@ export async function reloadPluginRuntime(
 
   // 清空全部动态模块，避免残留已卸载插件注册的模块
   clearDynamicModules();
+  // 目录**换了一代**。错峰补图标是异步的，上一趟可能在它读到一半时被这一次换掉，
+  // 因此用纪元号让它自己停下（见 `catalogEpoch`）。必须在建目录之前自增：
+  // 下面新起的那一趟补全要拿到的是新纪元。
+  catalogEpoch += 1;
   // 次级界面模块的记账要一起清：那张表决定"`ui.openSurface` 能不能开"，
   // 留着重载前的条目会让插件去开一个目录里已经不存在的 id。
   clearSurfaceModules();
@@ -3439,6 +3557,17 @@ export async function reloadPluginRuntime(
     registerDeclaredCommands(plugin.id, contract.contributions.commands);
     registerPluginSettings(plugin.id, contract.contributions.settings);
   }
+
+  // ---- 图标：目录一建好就**在后台**开始补 ----
+  //
+  // 放在这里（而不是只在函数末尾）是为了"启动路径也能补上图标"：`listOnly` 那一趟
+  // 在下面 `if (options.listOnly)` 处就 `return` 了，末尾那一趟它根本走不到；
+  // 而模块描述符建立时 `iconSvg` 必然是空的（SVG 内容要异步读，见
+  // `prefetchPluginIcon`），于是 `listOnly` 之后立刻画出来的侧边栏只能是宿主的
+  // lucide 图标或 Box 兜底 —— 正是用户报的那两句。
+  //
+  // 这是**起一趟、不等它**：界面立刻可用，图标由它错峰补上并通知目录。
+  startDeclaredIconPrefetch();
 
   // ---- 多界面：把次级界面登记成可按 id 打开的隐藏模块 ----
   //
@@ -3489,10 +3618,15 @@ export async function reloadPluginRuntime(
   // 声明式插件同样会在里面留下一条。卸载时漏掉它，重装后那份**旧图标**会被后面
   // 的 `prefetchDeclaredIcons` 当成"已经有了"继续使用（`iconIsSvgFile` 只看清单里
   // 的路径，路径没变），表现是「重装之后显示的仍是上一个插件的图标」。
+  //
+  // 同一件事对 `pluginIconAssets`（按包内路径读到的那些图）逐字成立，因此它的
+  // 归属也要一起进 `knownIds` —— 那张表的键是 `"<插件 id>\u0000<路径>"`，
+  // 这里取前缀还原出插件 id。**每新增一张按插件 id 记账的表，这一行都要跟着加**。
   const activeIds = new Set(enabledPlugins.map((p) => p.id));
   const knownIds = new Set<string>([
     ...injectedAssets.keys(),
     ...pluginIcons.keys(),
+    ...[...pluginIconAssets.keys()].map((key) => key.slice(0, key.indexOf('\u0000'))),
     ...loadStates.keys(),
     ...activationStates.keys(),
   ]);
@@ -3592,6 +3726,13 @@ export async function reloadPluginRuntime(
   // 「安装 / 卸载 / 启用 / 禁用」这四条路径只调 `reloadPluginRuntime()`，
   // 重建完目录就没有下文了 —— 表现正是「装完插件图标不出现，重启之后才出现」。
   //
+  // 上面目录建好时已经另起了一趟（不 await），这里**再 await 一趟**是刻意的：
+  //   * `reloadPluginRuntime()` 的调用方（安装/启用之后立刻看侧边栏）需要一条
+  //     确定性保证 —— 它返回时图标就该在描述符上；
+  //   * 两趟之间不会重复读盘（`pluginIconAssets` 会命中），也不会互相写坏
+  //     （`catalogEpoch` 守卫），因此这里通常只是把已经补好的图标再设一遍
+  //     （`setModuleIconSvg` 对同值直接返回 false，不会触发多余通知）。
+  //
   // 补全是错峰的（内部每次读盘之间让出事件循环），不是在这里同步读完。
   await prefetchDeclaredIcons();
 
@@ -3621,16 +3762,35 @@ export interface PluginLoadSummary {
  * 只处理**声明式且尚未激活**的插件：已经激活的插件在 `prefetchPluginIcon`
  * 里读过了 —— 那条路径必须同步读好，因为 `registerModule()` 在 bundle 顶层
  * 就要把 `iconSvg` 写进描述符。
+ *
+ * `epoch` 是**发起这一趟时的目录纪元**（见 `catalogEpoch`）：读到一半目录被下一次
+ * 重载换掉时，这一趟必须停下 —— 它的结果已经没有归处了。
  */
-async function prefetchDeclaredIcons(): Promise<void> {
+async function prefetchDeclaredIcons(epoch: number = catalogEpoch): Promise<void> {
+  // 这一趟有没有真的往缓存里写进新东西。有的话末尾要**通知插件订阅者**：
+  // 右键菜单的条目是在渲染期同步拼出来的（`getPluginContextMenuEntries`），
+  // 而 `listOnly` 那一趟的 `notify()` 发生在补图**之前** —— 不补这一次通知，
+  // 菜单项会一直停在"没有 iconSvg"的那一版上，直到下一次插件事件。
+  const iconsBefore = pluginIcons.size;
+  const assetsBefore = pluginIconAssets.size;
+
   const candidates = installed.filter((plugin) => {
     if (!plugin.enabled || plugin.status === 'error') return false;
     const contract = contracts.get(plugin.id);
     if (!contract?.declarative) return false;
-    return iconIsSvgFile(plugin.manifest.icon);
+    // 有图标可补的有三种：插件级图标是 SVG 文件、它某个模块自己声明了 SVG 路径、
+    // **或它某条右键菜单项声明了 SVG 路径**。只看插件级那一份是不够的 —— 一个
+    // "顶层没写图标、模块写了 `icon.svg`"的插件会被整条过滤掉（`declarative-icon`
+    // 那一类夹具正是用来钉这件事的），右键菜单项同理。
+    if (iconIsSvgFile(plugin.manifest.icon)) return true;
+    if (contract.contributions.modules.some((module) => iconIsSvgFile(module.icon))) {
+      return true;
+    }
+    return contract.contributions.contextMenus.some((menu) => iconIsSvgFile(menu.icon));
   });
 
   for (const plugin of candidates) {
+    if (epoch !== catalogEpoch) return;
     // 缓存只用来省掉**读盘**，不能用来省掉 `setModuleIconSvg`。
     //
     // 这里原先写的是「已经有图标就整个跳过」，那是一个真实的缺陷：目录在每次
@@ -3640,14 +3800,72 @@ async function prefetchDeclaredIcons(): Promise<void> {
     if (!pluginIcons.has(plugin.id)) {
       await prefetchPluginIcon(plugin);
     }
-    const svg = pluginIcons.get(plugin.id);
-    if (!svg) continue;
+    const pluginSvg = pluginIcons.get(plugin.id);
+    const manifestIcon = iconIsSvgFile(plugin.manifest.icon) ? plugin.manifest.icon.trim() : '';
+
     for (const contribution of contracts.get(plugin.id)?.contributions.modules ?? []) {
-      setModuleIconSvg(contribution.id, svg);
+      // 模块自己写了一个 SVG 路径（`contributes.modules[].icon: "icons/a.svg"`）：
+      // **以它为准**。`ModuleIcon` 的第一优先级就是描述符上的 `iconSvg`，因此这里
+      // 要给的是"那个模块自己那张图"，而不是插件级的默认图标 —— 一个插件有多个
+      // 界面时，它们本来就可以各带各的图标。
+      const moduleIcon = iconIsSvgFile(contribution.icon) ? contribution.icon.trim() : '';
+      if (moduleIcon && moduleIcon !== manifestIcon) {
+        const moduleSvg = await readPluginIconAsset(plugin.id, moduleIcon);
+        if (moduleSvg) {
+          setModuleIconSvg(contribution.id, moduleSvg);
+          continue;
+        }
+        // 读不到就退回插件级图标，而不是让这个模块只剩 Box 兜底。
+      }
+      if (pluginSvg) setModuleIconSvg(contribution.id, pluginSvg);
     }
+
+    // 右键菜单项声明的那张图也要读回来 —— `getPluginContextMenuEntries` 是
+    // **同步**拼条目的，它只能命这个缓存（`pluginIconAssets`），自己发不了 IPC。
+    // 不在这里读，菜单项的 `iconSvg` 就永远是空的。
+    for (const menu of contracts.get(plugin.id)?.contributions.contextMenus ?? []) {
+      const rel = iconIsSvgFile(menu.icon) ? menu.icon.trim() : '';
+      if (rel) await readPluginIconAsset(plugin.id, rel);
+    }
+
     // 让出事件循环：图标不在关键路径上，不该和用户交互抢同一个任务
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
+
+  // 有新图就通知一次插件订阅者（理由见本函数开头）。放在循环之后而不是循环里：
+  // 一趟补全的中间态对界面没有意义，通知一次就够。
+  if (pluginIcons.size !== iconsBefore || pluginIconAssets.size !== assetsBefore) {
+    notify();
+  }
+}
+
+/**
+ * 起一趟**不阻塞调用方**的图标补全。
+ *
+ * 为什么需要它：目录一建立，侧边栏就会立刻开始画，而此刻每个条目的 `iconSvg`
+ * 都还是空的 —— 声明式插件的模块于是先画成宿主 lucide 图标（模块写的是 lucide 名）
+ * 或 `Box` 兜底（模块写的是 `icon.svg`）。用户报告的"插件的图标直接异常了，
+ * 用的是宿主的图标库，有的甚至直接找不到了"就是这两句话，而它们都发生在
+ * **图标补全之前的那段窗口里**。
+ *
+ * 原先只有 `reloadPluginRuntime()` 末尾那一趟（被 `await`），而它在启动路径上意味着：
+ *   * `listOnly` 那一趟（`boot.ts` 的启动第一趟，默认设置 `deferPluginLoading` 为真）
+ *     在 `if (options.listOnly)` 处就 `return` 了，**根本没走到补全**，图标要等到
+ *     后台那一趟才有人管；
+ *   * 后台那一趟又要等所有 eager 插件的 bundle 执行完才走到末尾 —— 那正是启动后
+ *     最忙的一段时间。
+ *
+ * 因此这里在**目录刚建好**时就另起一趟，且不 await 它：界面照旧立刻可用，
+ * 图标在后台错峰补上（`setModuleIconSvg` 会通知目录）。末尾那一趟保留不变，
+ * 因为"装完/启用完立刻就有图标"需要一条确定性的保证 —— 两趟之间靠
+ * `pluginIconAssets` 缓存与 `catalogEpoch` 守卫协同，不会重复读盘、也不会互相打架。
+ */
+function startDeclaredIconPrefetch(): void {
+  const epoch = catalogEpoch;
+  void prefetchDeclaredIcons(epoch).catch((error) => {
+    // 后台任务：抛出去只会变成一条无人处理的 rejection。
+    console.warn('[pluginRuntime] 后台补全插件模块图标失败:', error);
+  });
 }
 
 /**

@@ -148,12 +148,18 @@ const TRAY_ACTION_EVENT = 'modulith://tray-action';
  * 而外壳菜单要的是一个组件。这里必须自带 Suspense 边界 ——
  * `ModuleIcon` 对尚未解析的图标会抛 Promise（它的按需加载约定），而右键菜单
  * 不在任何 Suspense 边界内，让它冒泡出去的结果是整个菜单消失。
+ *
+ * **`iconSvg` 必须一起传。** `contributes.contextMenus[].icon` 在运行时不做 svg
+ * 路径解析：写 `icon.svg` 的插件在这里会被 `ModuleIcon` 判成"没有图标"而落到
+ * `Box`（用户看到的就是"找不到"）。侧边栏与仪表盘读的是模块描述符上的 `iconSvg`，
+ * 而 `getPluginContextMenuEntries()` 现在从**同一份缓存**里取出同一个插件的图
+ * —— 两处因此显示同一个图标。缺失时 `ModuleIcon` 的兜底顺序一个字都没变。
  */
 function pluginMenuEntry(entry: PluginContextMenuEntry): GlobalMenuEntry {
   const Icon = entry.icon
     ? ({ className }: { className?: string }) => (
         <Suspense fallback={null}>
-          <ModuleIcon icon={entry.icon} className={className} />
+          <ModuleIcon icon={entry.icon} iconSvg={entry.iconSvg} className={className} />
         </Suspense>
       )
     : undefined;
