@@ -41,6 +41,16 @@ export type OverlayRequest =
         separator: boolean;
         disabled: boolean;
       }>;
+    }
+  | {
+      kind: 'popover';
+      id: number;
+      tone: string;
+      title: string | null;
+      body: string;
+      actions: Array<{ id: string; label: string }>;
+      timeoutMs: number;
+      at: 'cursor' | 'center';
     };
 
 /** 宿主显示浮层时广播的事件名。必须与 `overlay.rs` 的 `OVERLAY_SHOW` 一致。 */
@@ -60,6 +70,10 @@ async function answer(request: OverlayRequest, payload: Record<string, unknown>)
         id: request.id,
         confirmed: false,
         selected: null,
+        // 结果卡片的回答走**自己的字段**（`action`），不借 `selected`：
+        // 那一个是菜单项的 id，借过来之后一次迟到的菜单回答会被读成
+        // "用户点了卡片上的某个动作"。
+        action: null,
         dismissed: false,
         ...payload,
       },
@@ -78,6 +92,21 @@ async function answer(request: OverlayRequest, payload: Record<string, unknown>)
 const TONE_STYLES: Record<string, { badge: string; label: string }> = {
   info: { badge: 'bg-indigo-500', label: '提示' },
   question: { badge: 'bg-indigo-500', label: '请确认' },
+  warning: { badge: 'bg-amber-500', label: '注意' },
+  error: { badge: 'bg-rose-500', label: '出错了' },
+};
+
+/**
+ * 结果卡片的语气。
+ *
+ * 与对话框那张表**刻意不同**：卡片有 `success`（"已经复制好了"是它最常说的
+ * 好消息），而没有 `question` —— 卡片不提问，要提问请用 `ui.dialog`。
+ * 缺省那一档（`?? TONE_STYLES.info`）仍然指回同一个 `info`，因此宿主侧的白名单
+ * 与这里的两张表不可能给出不同的颜色。
+ */
+const POPOVER_TONE_STYLES: Record<string, { badge: string; label: string }> = {
+  info: { badge: 'bg-indigo-500', label: '结果' },
+  success: { badge: 'bg-emerald-500', label: '完成' },
   warning: { badge: 'bg-amber-500', label: '注意' },
   error: { badge: 'bg-rose-500', label: '出错了' },
 };
@@ -128,7 +157,15 @@ const OverlayRoot: React.FC = () => {
     );
   }, [request]);
 
-  /** Esc = 没回答。菜单与对话框都是。 */
+  /**
+   * Esc = 没回答。菜单与对话框都是。
+   *
+   * 结果卡片有一处**已知的差别**：它不抢焦点（`overlay.rs` 的 `show_popover`），
+   * 而按键只发给**有焦点**的那个窗口 —— 因此用户没点过卡片时，Esc 落在别的
+   * 窗口上，这里收不到。卡片的正常收尾是超时；Escape 只在用户已经点进过这张
+   * 卡片之后有效。要让"任何时候按 Esc 都能收起"成立，就得有一个全局按键通道，
+   * 而那属于宿主自己的能力，不该由这一张卡片顺手带上。
+   */
   const dismiss = useCallback(() => {
     if (!request) return;
     void answer(request, { dismissed: true });
@@ -192,6 +229,71 @@ const OverlayRoot: React.FC = () => {
             </button>
           )
         )}
+      </div>
+    );
+  }
+
+  if (request.kind === 'popover') {
+    // ============================================================
+    // 结果卡片
+    // ============================================================
+    //
+    // 与对话框同一套外观（同一个面板底色、同一圈圆角与阴影、同一行语气点），
+    // 差别只在**没有对话框的按钮行**：卡片上的按钮是插件给的**动作**，它们的
+    // 数量与文案都来自插件。
+    //
+    // **一个 markdown 都不解析。** 正文走 JSX 的文本子节点，因此它永远是文本：
+    // 插件给 `<b>x</b>` 时用户看到的就是这七个字符。文件头第二条说清了为什么
+    // 要让宿主渲染 —— 而"由宿主渲染"这句话只有在宿主**真的**当它是文本时才
+    // 成立，否则插件只是换了一种方式在画宿主界面。
+    const tone = POPOVER_TONE_STYLES[request.tone] ?? POPOVER_TONE_STYLES.info;
+
+    return (
+      <div
+        ref={panelRef}
+        className="flex w-[380px] max-w-full flex-col gap-3 rounded-xl border border-gray-200/50 bg-white/95 p-4 shadow-2xl backdrop-blur-xl"
+      >
+        <div className="flex items-center gap-2">
+          <span className={`h-2 w-2 rounded-full ${tone.badge}`} />
+          <span className="text-[11px] font-medium uppercase tracking-wide text-gray-400">
+            {tone.label}
+          </span>
+        </div>
+
+        {request.title ? (
+          <div className="text-sm font-semibold text-gray-900">{request.title}</div>
+        ) : null}
+
+        {/* `whitespace-pre-wrap`：译文里的换行是内容的一部分（一段一首诗、
+            一份清单），HTML 默认会把它们折成一个空格。 */}
+        <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-gray-600">
+          {request.body}
+        </div>
+
+        {request.actions.length > 0 ? (
+          // 按钮**不 autoFocus**：焦点意味着这个窗口被激活，而卡片刻意不抢焦点
+          // （见 `overlay.rs` 里 `show_popover` 那一段）。对话框那一个 `autoFocus`
+          // 是有意的差别，不是漏了。
+          <div className="mt-1 flex flex-wrap justify-end gap-2">
+            {request.actions.map((action) => (
+              <button
+                key={action.id}
+                type="button"
+                onClick={() => void answer(request, { action: action.id })}
+                className={
+                  // 只有一个动作时它是**主操作**（翻译卡片上的「复制译文」就是这个
+                  // 情形），因此按主按钮画；多个动作时它们是并列的，全部按次按钮画
+                  // —— 宿主不知道哪一个更重要，替插件挑一个"主"的会误导用户。
+                  request.actions.length === 1
+                    ? 'rounded-lg bg-indigo-600 px-3 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-indigo-700'
+                    : 'rounded-lg px-3 py-1.5 text-[13px] text-gray-600 transition-colors hover:bg-gray-100'
+                }
+              >
+                {action.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
       </div>
     );
   }

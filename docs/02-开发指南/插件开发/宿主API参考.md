@@ -28,7 +28,9 @@
 
 **上表是 in-process `window.Modulith` 的完整集合**（真源是 `src/services/pluginRuntime.ts` 的 `ModulithHost` 与 `installHostGlobals()`，成员名单由 `src/services/pluginBoundary.ts` 的 `HOST_MEMBERS` 登记）。
 
-⚠️ **`Modulith.ui` / `Modulith.plugin` / `Modulith.surfaces` 不在这张表里，它们是 `runtime: "sandboxed"` 的桥接层独有的成员。** `Modulith.ui`（`openSurface` / `closeSurface` / `listSurfaces`）、`Modulith.plugin`（`id` / `name` / `version` / `runtime` / `permissions` / `surface`）与 `Modulith.surfaces` 只由 `src-tauri/resources/sandbox-bridge.js` 注入；in-process 插件在 `window.Modulith` 上拿到它们只会是 `undefined`。`Modulith.capabilities` 的 `host` 名单里也没有它们。
+⚠️ **`Modulith.ui` / `Modulith.plugin` / `Modulith.surfaces` 不在这张表里，它们是 `runtime: "sandboxed"` 的桥接层独有的成员。** `Modulith.ui`（`openSurface` / `closeSurface` / `listSurfaces` / `dialog` / `contextMenu` / `badge` / `progress` / `splash`）、`Modulith.plugin`（`id` / `name` / `version` / `runtime` / `permissions` / `surface`）与 `Modulith.surfaces` 只由 `src-tauri/resources/sandbox-bridge.js` 注入；in-process 插件在 `window.Modulith` 上拿到它们只会是 `undefined`。`Modulith.capabilities` 的 `host` 名单里也没有它们。
+
+> **`ctx.ui` 是另一回事，别把两者混起来。** 上表说的是宿主表面（`window.Modulith`），而 `ctx.ui.popover` 是**上下文**（`ctx`）上的成员 —— 它在 in-process 的 `ctx` 上**有**（见第 14 节），沙箱侧那个 `ctx` 恰好是 `Modulith` 本身，因此看起来是同一个对象。`ui` 上两侧的**方法集合不同**：in-process 只有 `popover`，其余 8 个是沙箱独有。这处差异由 `pnpm check:sandbox` 的 `EXPECTED_SANDBOX_ONLY_UI_METHODS` 逐条钉住。
 
 `Modulith.capabilities` 的 `api` 字段是**接口表自身的版本**，当前为 `1`。它描述的是"宿主认识哪些成员"，
 不是"你这个插件用第几版接口" —— 插件不需要在清单里声明 api 版本，用哪个入口由插件自己决定。
@@ -159,8 +161,10 @@ var ctx = Modulith.createContext();
 | `clipboard` | object | 读写系统剪贴板（需 `clipboard` 权限，**纯前端强制**）；并可观察它的变化（需 `clipboard-monitor` 权限，**Rust 强制**） |
 | `settings` | object | 读取本插件声明的设置项的当前值（需 `storage` 权限） |
 | `disposables` | object | 收尾登记：`add(dispose)` / `size()`，与 `Modulith.onDeactivate()` 同义 |
+| `secrets` | object | 加密的密钥存储（需 `secrets` 权限），见第 13 节 |
+| `ui` | object | 宿主渲染的**结果卡片**：只有 `popover` 一个方法（需 `notification` 权限），见第 14 节 |
 
-**这是 in-process `ctx` 的完整集合**（真源是 `src/services/pluginBoundary.ts` 的 `CONTEXT_MEMBERS`，当前 20 项）。`ctx.files` **不在其中** —— 它只在沙箱侧存在，见第 12 节。
+**这是 in-process `ctx` 的完整集合**（真源是 `src/services/pluginBoundary.ts` 的 `CONTEXT_MEMBERS`，当前 22 项）。`ctx.files` **不在其中** —— 它只在沙箱侧存在，见第 12 节。`ctx.ui` 在，但**只有 `popover` 一个方法**：它的同族（对话框、右键菜单、多界面、状态指示）是沙箱独有的，见第 14.5 节的对照表与第 6.2 节。
 
 **调用时机是严格受限的**：只能在插件 bundle 执行期间调用，例如 IIFE 顶层。在插件代码之外调用会抛出异常，因为服务需要绑定正在加载的插件 ID。
 
@@ -1004,7 +1008,85 @@ await ctx.secrets.set('apiToken', 'sk-live-...');
 > "用户的笔记"是灾难。反过来，**也不要把令牌放进 `ctx.storage`**：那是明文，而且会
 > 随备份一起被复制到别的机器上。
 
-## 14. 完整示例
+## 14. ui —— 宿主渲染的结果卡片（`ctx.ui.popover`）
+
+把一次结果**交给宿主去显示**：一张贴在光标旁边的小卡片，等一段时间自己消失。用户点卡片上的按钮时返回那个按钮的 id。需要 `notification` 权限。
+
+```js
+var result = await ctx.ui.popover({
+  title: '翻译',
+  body: translated,            // 译文放这里 —— 它永远是**文本**，不是标记
+  tone: 'success',
+  actions: [{ id: 'copy', label: '复制译文' }],
+});
+
+if (result.action === 'copy') {
+  await ctx.clipboard.writeText(translated);
+}
+// result.action === null 表示用户没回答：到点自动收起 / Escape / 点了别处
+```
+
+它在三个运行位置上都有 —— 界面插件、后台插件、in-process 插件。这是 `ctx.ui` 里**唯一**一个三个位置都有的成员：对话框、右键菜单、多界面与状态指示都要"我在哪个界面里"或者一块属于插件的 webview，而后台插件两样都没有（那一族只在沙箱侧存在，见[插件系统架构](插件系统架构.md)第 6.2 节）。
+
+### 14.1 为什么由宿主渲染
+
+插件提供的是**内容**（一段文本、几个按钮文案），**外观全部由宿主决定**：没有 HTML、没有样式、没有图标，`body` 里的标记会被当成普通文字显示出来。
+
+这不是省事，而是这条能力能存在的前提。让插件自己画一个"长得很像宿主提示框"的东西，等于让它可以**冒充宿主界面** —— 一个假的"是否允许？"提示框足以骗到用户。由宿主渲染之后，插件能决定的只有「说什么」，不能决定「长什么样」。同一条理由也适用于宿主渲染的对话框与右键菜单（`src-tauri/src/modules/desktop/overlay.rs` 的文件头）。
+
+### 14.2 参数
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `title` | string，可省略 | 短标题。宿主按 120 个字符截断 |
+| `body` | string，**必填** | 正文。译文放这里。宿主按 **4000 个字符**截断 |
+| `tone` | `'info' \| 'success' \| 'warning' \| 'error'` | 缺省 `info`。宿主白名单化，认不出的取值落到 `info` |
+| `actions` | `Array<{ id, label }>` | **最多 3 个**。见下面的边界 |
+| `timeoutMs` | number | 自动收起的毫秒数，缺省 **8000**，宿主钳制到 **1000..30000** |
+| `at` | `'cursor' \| 'center'` | 缺省 `'cursor'`（贴在光标右下，贴边时拉回工作区内）；`'center'` 摆在光标所在显示器的正中 |
+
+### 14.3 返回值与 `action` 的语义
+
+```ts
+Promise<{ action: string | null }>
+```
+
+`action` 是用户点中的那个按钮的 `id`。以下三种情况都是 `null`：
+
+- 到点**自动收起**（`timeoutMs` 到了）；
+- 用户按了 **Escape**；
+- 用户**点了别处**。
+
+它们都是**「用户没回答」，不是失败**。真正的失败会让 Promise 拒绝：没声明 `notification` 权限、浮层窗口起不来、`body` 为空、`actions` 不合法。因此 `try/catch` 仍然是有意义的。
+
+> **Escape 只在用户已经点进过这张卡片之后有效。** 卡片**不抢焦点**（这正是它与其他浮层不同的地方），而按键只发给有焦点的窗口 —— 用户没碰过它时，Esc 落在别的窗口上。卡片的正常收尾是超时。
+
+### 14.4 边界（宿主强制，写错了会拿到一条能照做的错误）
+
+- **`body` 必填**，为空直接拒绝这一次调用；
+- `title` / `body` / `label` 都**按字符截断**（不是按字节，中文不会被切成半个字）；
+- **`actions` 里的 `id` 是契约，因此形状不对就拒绝整次调用**：只允许 `[a-z0-9-]`、不超过 32 个字符、不能为空、不能重复。理由是它会被原样回给插件，插件据此判断用户点了哪一个 —— 悄悄改掉或丢掉一个按钮，表现是"少了一个按钮"而插件以为它还在，比报错晚得多被发现在；
+- `tone` 与 `at` 是**白名单**：认不出的取值落到缺省值，而不是原样透出（它们会被拼进样式与位置计算）；
+- `timeoutMs` 是**钳制**：它表达的是一个"想让它待多久"的愿望，钳制之后仍然朝着作者想要的方向；
+- **同一时刻只有一张卡片**：第二张到来时，第一张当场以 `action: null` 结束。两张重叠的卡片盖在同一个位置，而"先收起哪一张"没有说法。
+
+### 14.5 它与其他浮层的分工
+
+| 你想要 | 用它 |
+| --- | --- |
+| 说一句结果，用户不用回答 | `ctx.ui.popover`（会自己消失） |
+| 问一个问题，必须拿到回答 | `ctx.ui.dialog`（阻塞到用户选择，**沙箱独有**） |
+| 在光标处给一组动作 | `ctx.ui.contextMenu`（**沙箱独有**） |
+| 持续显示状态（徽标 / 进度 / 启动占位） | `ctx.ui.badge` / `progress` / `splash`（**沙箱独有**） |
+
+```js
+// 一个不读返回值的用法：只是告诉用户"已经好了"
+ctx.ui.popover({ body: '已复制到剪贴板', tone: 'success' });
+```
+
+> **不要把 `popover` 当成日志。** 它每次都会打断用户，而且同一时刻只允许一张 —— 一个循环里调用它，用户只会看到最后一张。要记东西用 `ctx.logger`，要留痕用 `ctx.notifications`。
+
+## 15. 完整示例
 
 一个最小可用的插件代码包：
 
@@ -1060,7 +1142,7 @@ await ctx.secrets.set('apiToken', 'sk-live-...');
 }
 ```
 
-## 15. 约束速查
+## 16. 约束速查
 
 | 约束 | 说明 |
 | --- | --- |
@@ -1073,13 +1155,14 @@ await ctx.secrets.set('apiToken', 'sk-live-...');
 | 必须至少贡献一样东西 | 注册了模块，或在清单里声明了 `contributes` 的 commands / settings / contextMenus 之一，或声明了 `activationEvents`；否则判定为加载失败（见 1.3） |
 | 网络需声明权限 | 外部地址需 `network` 与 `network-external` |
 | 通知需声明权限 | `notification`，否则接口是空实现 |
+| 宿主渲染的浮层需声明权限 | `notification` —— `ctx.ui.popover` 与沙箱侧的 `ctx.ui.dialog` / `ctx.ui.contextMenu` 都要求它（它们都会打断用户） |
 | 跨模块通信需声明权限 | `plugin-communicate` |
 | 后台工作要看 `useModuleActive()` | 标签页保活，切走不会卸载，定时器需自行暂停 |
 | 插件数据用 `storage` | 不要用 `localStorage` |
 | 凭据用 `secrets` | 令牌、API key 用它而**不是** `storage`（后者是明文、插件自己读得到、进备份）；代价是换机器后解不开 |
 | 用户文件只能经 `ctx.files` | 路径不由插件给出，授权随界面关闭失效；**沙箱独有** |
 
-## 16. 相关文档
+## 17. 相关文档
 
 - 加载流程与隔离边界：[插件系统架构](插件系统架构.md)
 - 清单字段：[清单文件参考](清单文件参考.md)

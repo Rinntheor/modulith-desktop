@@ -232,7 +232,7 @@ const HOST_MEMBERS: readonly BoundaryMember[] = [
 // 回答过"它跨不跨得过去"。而 `ctx` 恰恰是边界的主体 —— 权限的实际载体
 // （`http` / `launcher` / `icons` / `shell` / `audio`）全在这里。
 //
-// 值得单独指出的是那 16 个 `handle`：它们**不是资源句柄，而是能力对象**。
+// 值得单独指出的是那 17 个 `handle`：它们**不是资源句柄，而是能力对象**。
 // `ctx.storage` 不是一个"存储连接"，它是一个由若干函数组成的对象。因此把它们标成
 // `handle` 说的是"它代表的是一组消息往返" —— **不是**"它今天已经能跨过去了"。
 // 今天它一个都跨不过去，因为它是个对象。v2 要把它换成 JSON-RPC 式的代理：
@@ -350,13 +350,19 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     migration: 'rpc',
     note: '加密的密钥存储。需要 secrets 权限，Rust 侧强制；密文落在插件数据目录之外，插件代码寻址不到',
   },
+  {
+    name: 'ui',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '宿主渲染的**结果卡片**。三个运行位置都有，但**只有 `popover` 一个方法**：沙箱那一侧还有 dialog / contextMenu / openSurface / closeSurface / listSurfaces / badge / progress / splash，它们要么挂在"我在哪个界面里"、要么要一块属于插件的 webview，因此刻意不进这一份（这一份描述的是 in-process 的 `ctx`）。需要 notification 权限，Rust 侧强制 —— 它与其他几条一样会打断用户',
+  },
 ];
 
 // ============================================================
 // 能力方法
 // ============================================================
 //
-// 这一层是 v2 的真实工作量。16 个能力对象标为 `handle` 只是说"它代表消息往返"；
+// 这一层是 v2 的真实工作量。17 个能力对象标为 `handle` 只是说"它代表消息往返"；
 // 能不能真的换成往返，取决于**每个方法**的参数与返回值。
 //
 // `io` 记的是返回值与回调参数的形态（参数里的普通值不单独记 —— 字符串、数字、
@@ -498,6 +504,23 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
     { name: 'keys', io: 'value', migration: 'as-is', note: '返回 string[]，**只有键名、永远没有值**' },
     { name: 'clear', io: 'value', migration: 'as-is', note: '返回 Promise<void>；只清本插件的密钥' },
   ],
+  ui: [
+    // 这一份登记的是 **in-process 的 `ctx.ui`**，它只有一个方法。沙箱侧那个
+    // 同名对象上还有 8 个方法（dialog / contextMenu / 多界面三条 / 状态指示
+    // 三条），它们按设计不进 in-process —— 那处差异由 `check:sandbox` 里
+    // `EXPECTED_SANDBOX_ONLY_UI` 逐条写着，而不是靠读者从这里推断。
+    //
+    // `popover` 是**值进值出**：入参是一个纯数据的描述对象（文本与按钮文案），
+    // 返回值也是（`{ action }`）。它没有回调、也不返回任何带方法的宿主对象，
+    // 因此换成消息往返是机械的 —— 这正是"插件提交描述、宿主负责渲染"那条路的
+    // 形状，也是它在 v2 里最不需要改的原因。
+    {
+      name: 'popover',
+      io: 'value',
+      migration: 'as-is',
+      note: '入参是 { title?, body, tone?, actions?, timeoutMs?, at? }，返回 { action }（值为 string 或 null）。**两端都是纯数据**：插件不交函数、也拿不到宿主对象，所以它跨 realm 时一行都不用改',
+    },
+  ],
 };
 
 // ============================================================
@@ -552,7 +575,7 @@ export function capabilityNames(): string[] {
 /**
  * 含函数或宿主对象的方法 —— 也就是 v2 里真正要动的那几条。
  *
- * 这个函数是给门禁与文档用的：它把"51 个方法里到底有几条要改"变成一个具体数字，
+ * 这个函数是给门禁与文档用的：它把"69 个方法里到底有几条要改"变成一个具体数字，
  * 而不是一句"大概不多"。
  */
 export function methodsNeedingWork(): Array<{ capability: string; method: BoundaryMethod }> {

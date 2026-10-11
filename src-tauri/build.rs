@@ -137,6 +137,7 @@ fn main() {
                 "plugin_extract_icon",
                 "plugin_reveal_in_folder",
                 "plugin_pick_audio",
+                "plugin_ui_popover",
                 "get_app_settings",
                 "get_app_info",
                 "update_app_settings",

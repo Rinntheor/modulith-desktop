@@ -2225,6 +2225,39 @@ function pluginSecrets(pluginId: string, manifest: PluginManifest | undefined) {
   };
 }
 
+/**
+ * `ctx.ui.popover` 的入参。
+ *
+ * 这里的每一个字段都是**内容**：一段文本、一组按钮文案。**没有一处能让插件影响
+ * 它长什么样** —— 没有 HTML、没有 class、没有图标。理由与整个浮层窗口的存在
+ * 理由同一条（见 `src-tauri/src/modules/desktop/overlay.rs` 的文件头）：让插件
+ * 自己画等于让它冒充宿主界面，而"长得很像确认框的提示"是这条路上最直白的滥用。
+ */
+export interface PluginPopoverInput {
+  /** 短标题，可省略 */
+  title?: string;
+  /** 正文。这是译文放的地方。宿主按 4000 个字符截断 */
+  body: string;
+  /** 语气，缺省 `info`。宿主白名单化，认不出的取值落到 `info` */
+  tone?: 'info' | 'success' | 'warning' | 'error';
+  /** 最多 3 个按钮。id 只允许 `[a-z0-9-]` 且不超过 32 个字符，文案按 32 截断 */
+  actions?: Array<{ id: string; label: string }>;
+  /** 自动收起的毫秒数，宿主钳制到 1000..30000，缺省 8000 */
+  timeoutMs?: number;
+  /** 贴在光标处（缺省）还是屏幕正中 */
+  at?: 'cursor' | 'center';
+}
+
+/** `ctx.ui.popover` 的返回值：被点中的动作 id，或者 `null`（没回答）。 */
+export interface PluginPopoverResult {
+  /**
+   * 三种情况下是 `null`：到点自动收起、用户按了 Escape、用户点了别处。
+   * **它们都是"用户没回答"，不是错误** —— 错误（比如没声明 `notification`
+   * 权限、或者浮层窗口起不来）会让这个 Promise 直接 reject。
+   */
+  action: string | null;
+}
+
 /** 上下文工厂。插件身份是**显式参数** —— 这是 `api: 2` 能成立的原因 */
 function createContextFor(
   pluginId: string,
@@ -2283,6 +2316,32 @@ function createContextFor(
     audio: pluginAudio(pluginId),
     clipboard: pluginClipboard(pluginId, manifest),
     settings: pluginSettingsAPI(pluginId, manifest),
+    /**
+     * 宿主渲染的**结果卡片**。
+     *
+     * ============================================================
+     * 为什么这个成员在 in-process 上只有**一个**方法
+     * ============================================================
+     *
+     * 沙箱那一侧的 `ui` 还有 `dialog` / `contextMenu` / `openSurface` /
+     * `closeSurface` / `listSurfaces` / `badge` / `progress` / `splash`，它们
+     * **刻意不在这里**：那几条要么挂在沙箱界面那条带令牌的通道上（多界面的三
+     * 条按 `(插件 id, 界面 id)` 签发令牌），要么是"覆盖插件那一块 webview"的
+     * 东西，而 in-process 插件没有令牌、也没有属于它自己的 webview 可覆盖。
+     * 给它们一个永远抛错的桩只会让作者以为它本该能用。
+     *
+     * 卡片是唯一**不需要界面上下文**的那一个：它是一个独立窗口，贴的是屏幕上的
+     * 光标。因此它也是 in-process 插件唯一能用的"把结果拿给用户看"的入口 ——
+     * 文件拖放、剪贴板、SQLite 这些成员的结果本来就没有别的地方可放。
+     *
+     * 它走 **Rust 侧**的 `plugin_ui_popover`，与沙箱和后台插件走的是同一个
+     * `rpc::dispatch` 方法表：长度上限、语气白名单、按钮校验、超时钳制与
+     * `notification` 权限判定因此不可能在三个运行位置之间漂开。
+     */
+    ui: {
+      popover: (input: PluginPopoverInput): Promise<PluginPopoverResult> =>
+        invoke<PluginPopoverResult>('plugin_ui_popover', { id: pluginId, input }),
+    },
     /**
      * 收尾登记的入口。**这是功能型插件的前提**：一个后台服务会创建定时器、
      * 事件监听、观察者、WebSocket —— 宿主一个都不知道，禁用之后它们会一直活着。

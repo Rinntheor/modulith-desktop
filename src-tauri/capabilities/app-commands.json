@@ -118,6 +118,7 @@
     "allow-plugin-extract-icon",
     "allow-plugin-reveal-in-folder",
     "allow-plugin-pick-audio",
+    "allow-plugin-ui-popover",
     "allow-get-app-settings",
     "allow-get-app-info",
     "allow-update-app-settings",

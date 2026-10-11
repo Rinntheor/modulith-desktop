@@ -1104,14 +1104,25 @@ pub async fn dispatch<R: Runtime>(
 
         // ---- 宿主渲染的浮层 --------------------------------------------------
         //
-        // 这两条**会阻塞到用户做出选择**，等待上限是 `overlay.rs` 里那个 5 分钟。
-        // 插件那边就是一次普通的 await。
+        // 这三条**会打断用户**：对话框与卡片出现时用户正在做别的事，而它们
+        // 索取的正是当下的注意力。因此它们要 `notification` 权限 —— 与
+        // `ctx.notifications.show` 同一档，而且理由相同。
+        //
+        // 三条走同一个窗口、同一套配对，因此判定只有一处（`require_ui_permission`）。
+        // 只给其中的一条加门会得到一个**假的门**：想打断用户的插件改用没加门
+        // 的那一条就绕过去了，而对话框比卡片更打断（它一直等到用户回答为止）。
+        //
+        // 状态指示（`ui.badge` / `ui.progress` / `ui.splash`）不在这一列：它们
+        // 说的是"插件现在是什么状态"，不索取用户当下的注意力，而且要有界面才
+        // 挂得上（见 `emit_ui_with`）。
         //
         // 为什么必须由宿主渲染而不是插件自己画：见 `overlay.rs` 的文件头。
-        // 一句话 —— 沙箱插件的界面是原生子 webview，它盖得住宿主的 DOM；
+        // 一句话 —— 沙箱插件的界面是跨源 iframe，插件画的东西出不了那一块；
         // 而让插件自己画对话框等于让它冒充宿主界面。
 
         "ui.dialog" => {
+            require_ui_permission(app, plugin_id).await?;
+
             let Some(title) = arg_str(args, "title") else {
                 return rpc_error("缺少 title");
             };
@@ -1131,6 +1142,8 @@ pub async fn dispatch<R: Runtime>(
         }
 
         "ui.contextMenu" => {
+            require_ui_permission(app, plugin_id).await?;
+
             let mut items: Vec<crate::modules::desktop::overlay::MenuItem> = arg(args, "items")
                 .and_then(|value| serde_json::from_value(value.clone()).ok())
                 .unwrap_or_default();
@@ -1205,6 +1218,50 @@ pub async fn dispatch<R: Runtime>(
             }
 
             json_value(response)
+        }
+
+        // ---- 宿主渲染的结果卡片 ----------------------------------------------
+        //
+        // 与上面两条同一个窗口、同一套配对，但三处不同：**不抢焦点**、**到点
+        // 自己消失**、**同一时刻只有一张**。三条合起来是同一句话 —— 插件能让
+        // 一张卡片出现，但不能把用户正在输入的光标抢走，也不能让它赖着不走。
+        //
+        // 它与其他 `ui.*` 不同的一点：**不需要界面上下文**。卡片是一个独立
+        // 窗口，贴的是屏幕上的光标；而后台插件恰恰是最需要把结果拿出来的那一个
+        // （它没有任何别的出口）。因此这一条对 `surface: None` 也成立。
+
+        "ui.popover" => {
+            require_ui_permission(app, plugin_id).await?;
+
+            let Some(body) = arg_str(args, "body") else {
+                return rpc_error("缺少 body：结果卡片的正文是必填的");
+            };
+            // 截断而不是拒绝：正文可能是用户选中的原文，它有多长不该由插件
+            // 负责 —— 而"卡片显示不下"远比"这次调用直接失败"容易收场。
+            let body = truncate(body.trim(), MAX_POPOVER_BODY_CHARS);
+            if body.is_empty() {
+                return rpc_error("body 不能为空");
+            }
+
+            // 只算一次：卡片里带着的那个数字与真正用的这个上限必须是同一个，
+            // 否则"它写着 8 秒却等了 30 秒"这类问题是查不出来的。
+            let timeout = popover_timeout(args);
+
+            let request = crate::modules::desktop::overlay::OverlayRequest::Popover {
+                // 由 overlay 分配（同 dialog / menu 的理由）
+                id: 0,
+                tone: popover_tone(args).to_string(),
+                title: arg_str(args, "title")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| truncate(value, MAX_POPOVER_TITLE_CHARS)),
+                body,
+                actions: popover_actions(args)?,
+                timeout_ms: timeout.as_millis() as u64,
+                at: popover_anchor(args),
+            };
+
+            ask_popover(app, request, timeout).await
         }
 
         // ---- 宿主渲染的状态指示（徽标 / 进度 / 启动占位）-----------------------
@@ -1685,6 +1742,77 @@ async fn ask_overlay<R: Runtime>(
     }
 }
 
+/// 显示一张结果卡片并把它转成 RPC 的结果。
+///
+/// 与 `ask_overlay` 分开，因为**返回形状不同**：对话框与菜单的调用方要看
+/// `confirmed` / `selected` / `dismissed` 三个字段才知道发生了什么，而卡片只有
+/// 一句话 —— "点了哪一个，或者没点"。共用一个函数就得让插件去读一个它用不上的
+/// 结构，而漏读 `dismissed` 恰好是"用户没回答"与"用户点了取消"混淆的来源。
+async fn ask_popover<R: Runtime>(
+    app: &AppHandle<R>,
+    request: crate::modules::desktop::overlay::OverlayRequest,
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
+    let Some(state) = app.try_state::<crate::modules::desktop::overlay::Overlay>() else {
+        return rpc_error("浮层尚未就绪");
+    };
+
+    match state.popover(app, request, timeout).await {
+        // `null` 是一个**取值**，不是"没有字段"：插件要能区分"用户没点"与
+        // "宿主没回答"（后者是 Err）。省略字段会让 `value.action` 与拼错的名字
+        // 长得一样。
+        Ok(action) => json_value(serde_json::json!({ "action": action })),
+        Err(message) => rpc_error(&message),
+    }
+}
+
+/// `ctx.ui` 里"宿主渲染并且会打断用户"的那三条共用的权限判定。
+///
+/// ============================================================
+/// 为什么复用 `notification`，而不是新加一项
+/// ============================================================
+///
+/// 风险轴是**打断用户**，而这一项权限管的正是它（`ctx.notifications.show`
+/// 同样要求它）。再加一项只会让用户在安装确认页上看到两个意思重叠的名词，
+/// 而他能据此做出的判断不会更多。
+///
+/// ============================================================
+/// 为什么对话框与右键菜单也一起判
+/// ============================================================
+///
+/// 它们此前**没有任何权限门槛**。只给卡片加门会得到一个假的门：想打断用户的
+/// 插件改用 `ui.dialog` 就绕过去了，而对话框**比卡片更打断** —— 它一直等到
+/// 用户回答为止。三条走同一个窗口、同一套配对，因此判定也只有这一处。
+///
+/// 与 `notify` 那一条同一纪律：判定在 Rust 侧，因为这三条的**唯一出口**就是
+/// 宿主这个窗口，插件没有别的办法把一张卡片画到用户眼前。
+async fn require_ui_permission<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+) -> Result<(), String> {
+    // 与 `checked_secrets_dir` 同一条纪律：权限守卫在**内部的作用域里**就被丢掉，
+    // `await` 全部发生在它之外 —— 持着读锁等待一次界面交互会让整个插件系统停摆。
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        if let Err(error) = manager
+            .require_permission(plugin_id, super::types::PluginPermission::Notification)
+        {
+            // 把"缺哪一项"补成一句能照做的话：只说"未声明 notification 权限"
+            // 会让作者去找自己哪里用了通知，而他其实只是想要一张卡片。
+            return Err(format!(
+                "{error} —— ctx.ui 的对话框、右键菜单与结果卡片都会打断用户，\
+                 因此三者也要求 notification 权限"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// 清单声明的右键菜单项在浮层里的 id 前缀。
 ///
 /// 加前缀是因为它们的**执行方式**与临时条目完全不同：临时条目是这一次调用的
@@ -1795,6 +1923,180 @@ const MAX_BADGE_CHARS: usize = 28;
 
 /// 启动占位那句话的长度上限。比徽标宽：它是一整行说明，而不是一个角标。
 const MAX_SPLASH_CHARS: usize = 120;
+
+// ============================================================
+// 结果卡片（`ctx.ui.popover`）的长度与取值上限
+// ============================================================
+//
+// 它们都取"够用且不失控"的那一档，且**全部由宿主截断**（或白名单化）之后才会
+// 到达浮层。理由与徽标那里的同一条：卡片的外观由宿主决定，插件给的是内容 ——
+// 而内容一旦没有上限，一段十万字的正文会让窗口尺寸、量尺寸那一步、以及用户
+// 看到的东西一起失控。
+//
+// 正文的上限刻意给得**宽**：它装的是用户选中的原文，而"翻译一整段"正是这个
+// 成员最主要的用法。4000 个字符大约是一屏半到两屏的正文，再长的东西也不该由
+// 一张会自动消失的卡片来承载。
+
+/// 卡片正文的长度上限。
+const MAX_POPOVER_BODY_CHARS: usize = 4000;
+
+/// 卡片标题的长度上限。标题是**一行**，比正文短得多。
+const MAX_POPOVER_TITLE_CHARS: usize = 120;
+
+/// 卡片按钮文案的长度上限。
+const MAX_POPOVER_ACTION_LABEL_CHARS: usize = 32;
+
+/// 卡片按钮标识的长度上限。
+///
+/// 它不像文案那样截断，而是**拒绝**整次调用：id 是插件与宿主之间的契约
+/// （插件靠它分辨用户点了哪一个），悄悄改掉或丢掉一个按钮的表现是"少了一个
+/// 按钮"，而插件以为它还在。
+const MAX_POPOVER_ACTION_ID_CHARS: usize = 32;
+
+/// 卡片上最多几个按钮。
+const MAX_POPOVER_ACTIONS: usize = 3;
+
+/// 卡片自动收起的缺省毫秒数。
+///
+/// 8 秒：够读完一张卡片上的短译文，又不至于在用户已经看完了之后还赖着不走。
+const POPOVER_TIMEOUT_DEFAULT_MS: u64 = 8_000;
+
+/// 自动收起的下限。低于 1 秒的卡片用户根本来不及看清，那不叫能力。
+const POPOVER_TIMEOUT_MIN_MS: u64 = 1_000;
+
+/// 自动收起的上限。
+///
+/// 30 秒：一张没有关闭按钮、又没有任何东西提示它还在的东西，挂到 30 秒以上
+/// 就已经不是"结果卡片"了（那种需求应当用 `ui.dialog`）。
+const POPOVER_TIMEOUT_MAX_MS: u64 = 30_000;
+
+/// 卡片的语气。白名单而不是原样透出：它会被前端拼进 `className`。
+///
+/// 与 `badge_tone` 的差别只有一处：这里有 `success`（"译文已经放到剪贴板了"
+/// 是一张卡片最常说的好消息），而没有 `question`（卡片不提问 —— 要提问请用
+/// `ui.dialog`）。
+fn popover_tone(args: &Value) -> &'static str {
+    match arg_str(args, "tone") {
+        Some("success") => "success",
+        Some("warning") => "warning",
+        Some("error") => "error",
+        _ => "info",
+    }
+}
+
+/// 卡片贴在哪里。白名单：不认识的取值落到 `cursor`。
+///
+/// 落到 `cursor` 而不是报错：位置是一个**偏好**，猜错了只是位置不完美；而
+/// 让整次调用因为一个写错的枚举值失败，会让作者以为是能力不可用。
+fn popover_anchor(args: &Value) -> crate::modules::desktop::overlay::PopoverAnchor {
+    use crate::modules::desktop::overlay::PopoverAnchor;
+    match arg_str(args, "at") {
+        Some("center") => PopoverAnchor::Center,
+        _ => PopoverAnchor::Cursor,
+    }
+}
+
+/// 自动收起的时长。
+///
+/// **钳制而不是拒绝**，这与 `actions` 那条取舍相反，理由也不同：`timeoutMs` 是
+/// 一个"想让它待多久"的愿望，钳制之后它仍然朝着作者想要的方向（1 秒到 30 秒
+/// 之间），而一张卡片该不该出现与这个数字无关。写着 0 或者 600000 说明作者
+/// 没想清楚，但那不该让整张卡片不出现。
+fn popover_timeout(args: &Value) -> std::time::Duration {
+    let requested = arg(args, "timeoutMs")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(POPOVER_TIMEOUT_DEFAULT_MS);
+
+    std::time::Duration::from_millis(
+        requested.clamp(POPOVER_TIMEOUT_MIN_MS, POPOVER_TIMEOUT_MAX_MS),
+    )
+}
+
+/// 校验并整理卡片上的按钮。
+///
+/// ============================================================
+/// 文本截断，标识拒绝 —— 这条分界不是随手划的
+/// ============================================================
+///
+/// 文案是**给人看的**：截断它，用户仍然看得见一个（短一点的）按钮，插件那边
+/// 什么都不用改。标识是**给代码用的**：它会被原样回给插件，插件据此 `switch`。
+/// 截断一个标识意味着插件永远等不到它以为会来的那个取值，而"悄悄丢掉一个
+/// 按钮"的表现是用户找不到那个动作 —— 两种失败都比"这次调用直接报错"晚得多。
+///
+/// 重复的 id 同样拒绝：两个按钮回同一个取值，插件无法分辨用户点了哪一个。
+fn popover_actions(
+    args: &Value,
+) -> Result<Vec<crate::modules::desktop::overlay::PopoverAction>, String> {
+    use crate::modules::desktop::overlay::PopoverAction;
+
+    let Some(raw) = arg(args, "actions") else {
+        return Ok(Vec::new());
+    };
+
+    let Some(items) = raw.as_array() else {
+        return Err("actions 必须是数组".to_string());
+    };
+
+    if items.len() > MAX_POPOVER_ACTIONS {
+        return Err(format!(
+            "结果卡片最多 {MAX_POPOVER_ACTIONS} 个动作（给了 {} 个）—— \
+             它贴的是光标，再多就把用户要点的东西挤到看不见的地方了",
+            items.len()
+        ));
+    }
+
+    let mut out: Vec<PopoverAction> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(id) = item.get("id").and_then(|value| value.as_str()) else {
+            return Err("actions 里每一项都必须有 id".to_string());
+        };
+        if let Err(reason) = check_popover_action_id(id) {
+            return Err(reason);
+        }
+        if out.iter().any(|action| action.id == id) {
+            return Err(format!(
+                "actions 里的 id `{id}` 重复了 —— 两个按钮回同一个取值，\
+                 插件分不出用户点的是哪一个"
+            ));
+        }
+
+        let Some(label) = item.get("label").and_then(|value| value.as_str()) else {
+            return Err(format!("动作 `{id}` 缺少 label"));
+        };
+
+        out.push(PopoverAction {
+            id: id.to_string(),
+            label: truncate(label.trim(), MAX_POPOVER_ACTION_LABEL_CHARS),
+        });
+    }
+
+    Ok(out)
+}
+
+/// 一个动作 id 的形状判据。
+///
+/// 字符集刻意窄（`[a-z0-9-]`）：这个值会回到插件里参与字符串比较与 `switch`，
+/// 允许任意字符只会让"两个看起来一样的 id"（大小写、不可见字符、全角连字符）
+/// 变成一类无法自查的问题。`[a-z0-9-]` 是能一眼比对的那一档。
+fn check_popover_action_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("动作的 id 不能为空".to_string());
+    }
+    if id.chars().count() > MAX_POPOVER_ACTION_ID_CHARS {
+        return Err(format!(
+            "动作 id `{id}` 太长：最多 {MAX_POPOVER_ACTION_ID_CHARS} 个字符"
+        ));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "动作 id `{id}` 不合法：只允许小写字母、数字与连字符（[a-z0-9-]）"
+        ));
+    }
+    Ok(())
+}
 
 /// 徽标的语气。白名单而不是原样透出：它会被前端拼进 `className`。
 fn badge_tone(args: &Value) -> &'static str {
@@ -2060,5 +2362,168 @@ mod tests {
         assert!(MAX_BADGE_CHARS >= 8, "徽标至少要放得下「12 条新消息」");
         assert!(MAX_SPLASH_CHARS > MAX_BADGE_CHARS, "占位是一整行说明，比徽标宽");
         assert_eq!(truncate("正在建立索引…", MAX_SPLASH_CHARS), "正在建立索引…");
+    }
+
+    // ============================================================
+    // 结果卡片（`ctx.ui.popover`）
+    // ============================================================
+
+    /// 正文的上限必须**装得下一整段翻译**，而标题栏放不下它。
+    #[test]
+    fn the_popover_body_limit_holds_a_whole_paragraph() {
+        // 一段三百多字的中文译文（卡片最主要的用法）必须原样通过
+        let paragraph = "这是一段用来校验长度上限的中文译文。".repeat(20);
+        assert!(paragraph.chars().count() > 300);
+        assert!(
+            paragraph.chars().count() < MAX_POPOVER_BODY_CHARS,
+            "这条测试的前提是它没超过上限，否则测的是截断而不是「不截断」"
+        );
+        assert_eq!(
+            truncate(&paragraph, MAX_POPOVER_BODY_CHARS),
+            paragraph,
+            "一整段正文不该被截断"
+        );
+
+        assert!(MAX_POPOVER_TITLE_CHARS < MAX_POPOVER_BODY_CHARS);
+        assert!(MAX_POPOVER_ACTION_LABEL_CHARS < MAX_POPOVER_TITLE_CHARS);
+    }
+
+    /// 卡片的语气是白名单，而且**没有** `question`。
+    ///
+    /// 卡片不提问 —— 要提问请用 `ui.dialog`。把一个 `question` 语气透出去会让
+    /// 卡片长成一个"请确认"的样子，那正是文件头警告的冒充。
+    #[test]
+    fn popover_tones_are_whitelisted_without_question() {
+        for (input, expected) in [
+            ("info", "info"),
+            ("success", "success"),
+            ("warning", "warning"),
+            ("error", "error"),
+            ("question", "info"),
+            ("危险", "info"),
+            ("", "info"),
+        ] {
+            let args = serde_json::json!({ "tone": input });
+            assert_eq!(popover_tone(&args), expected, "popover_tone({input:?})");
+        }
+        assert_eq!(popover_tone(&serde_json::json!({})), "info");
+    }
+
+    /// 位置同样白名单：不认识的取值落到光标处，而不是让整次调用失败。
+    #[test]
+    fn popover_anchor_is_whitelisted() {
+        use crate::modules::desktop::overlay::PopoverAnchor;
+
+        assert_eq!(
+            popover_anchor(&serde_json::json!({ "at": "center" })),
+            PopoverAnchor::Center
+        );
+        assert_eq!(
+            popover_anchor(&serde_json::json!({ "at": "cursor" })),
+            PopoverAnchor::Cursor
+        );
+        assert_eq!(popover_anchor(&serde_json::json!({})), PopoverAnchor::Cursor);
+        assert_eq!(
+            popover_anchor(&serde_json::json!({ "at": "正中" })),
+            PopoverAnchor::Cursor,
+            "不认识的取值应当落到缺省值，而不是原样透出"
+        );
+    }
+
+    /// 超时**钳制**在 1..30 秒之间，缺省 8 秒。
+    ///
+    /// 三个边界都要钉：0（作者以为"立刻消失"）、600000（作者想让它常驻）、
+    /// 以及一个正常值（不能被钳制改掉）。
+    #[test]
+    fn popover_timeouts_are_clamped() {
+        let ms = |args: serde_json::Value| popover_timeout(&args).as_millis() as u64;
+
+        assert_eq!(ms(serde_json::json!({})), POPOVER_TIMEOUT_DEFAULT_MS);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 3000 })), 3000);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 0 })), POPOVER_TIMEOUT_MIN_MS);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 999 })), POPOVER_TIMEOUT_MIN_MS);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 600000 })), POPOVER_TIMEOUT_MAX_MS);
+        // 非数字（字符串、null）落到缺省值，而不是某个"差不多"的数字
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": "3000" })), POPOVER_TIMEOUT_DEFAULT_MS);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": null })), POPOVER_TIMEOUT_DEFAULT_MS);
+    }
+
+    /// 动作的 id 是**契约**，因此形状不对就拒绝整次调用。
+    #[test]
+    fn popover_action_ids_are_rejected_when_they_are_not_a_contract() {
+        let actions = |value: serde_json::Value| {
+            popover_actions(&serde_json::json!({ "actions": value }))
+        };
+
+        // 合法：小写字母、数字、连字符
+        let ok = actions(serde_json::json!([
+            { "id": "copy", "label": "复制译文" },
+            { "id": "copy-all", "label": "复制全部" },
+            { "id": "dismiss2", "label": "知道了" }
+        ]))
+        .expect("这三个 id 都合法");
+        assert_eq!(ok.len(), 3);
+        assert_eq!(ok[0].id, "copy");
+
+        // 大写字母不行：那会让"两个看起来一样的 id"变成一类无法自查的问题
+        assert!(actions(serde_json::json!([{ "id": "Copy", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "copy it", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "复制", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "a".repeat(33), "label": "复制" }])).is_err());
+        // 重复的 id 无法分辨用户点了哪一个
+        assert!(
+            actions(serde_json::json!([
+                { "id": "copy", "label": "一" },
+                { "id": "copy", "label": "二" }
+            ]))
+            .is_err()
+        );
+        // 缺 label 同样不行：一个没有文案的按钮是用户看不懂的东西
+        assert!(actions(serde_json::json!([{ "id": "copy" }])).is_err());
+        // 超过三个
+        assert!(
+            actions(serde_json::json!([
+                { "id": "a", "label": "一" },
+                { "id": "b", "label": "二" },
+                { "id": "c", "label": "三" },
+                { "id": "d", "label": "四" }
+            ]))
+            .is_err()
+        );
+        // 形状不对
+        assert!(actions(serde_json::json!("copy")).is_err());
+    }
+
+    /// 文案**截断**，而 id **拒绝** —— 这条分界是刻意的。
+    #[test]
+    fn popover_labels_are_truncated_but_ids_are_not() {
+        let long = "复制这一整段译文到剪贴板".repeat(3);
+        assert!(
+            long.chars().count() > MAX_POPOVER_ACTION_LABEL_CHARS,
+            "这条测试的前提是文案确实超长（重复三次得到 {} 个字符）",
+            long.chars().count()
+        );
+
+        let actions = popover_actions(&serde_json::json!({
+            "actions": [{ "id": "copy", "label": long }]
+        }))
+        .expect("文案过长只该被截断");
+
+        assert_eq!(actions[0].id, "copy", "id 一个字符都不许动");
+        assert_eq!(actions[0].label.chars().count(), MAX_POPOVER_ACTION_LABEL_CHARS);
+        assert!(actions[0].label.ends_with('…'));
+    }
+
+    /// 没有 `actions` 是一张**只有正文**的卡片，不是错误。
+    #[test]
+    fn a_popover_without_actions_is_fine() {
+        assert!(popover_actions(&serde_json::json!({})).unwrap().is_empty());
+        assert!(popover_actions(&serde_json::json!({ "actions": [] }))
+            .unwrap()
+            .is_empty());
+        assert!(popover_actions(&serde_json::json!({ "actions": null }))
+            .unwrap()
+            .is_empty());
     }
 }

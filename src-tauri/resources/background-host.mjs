@@ -269,10 +269,27 @@ function createPluginSandbox(identity, _unused) {
   // ctx：后台插件能用的一切
   // ============================================================
   //
-  // **刻意是界面 ctx 的子集**：没有 `ui` / `theme` / `clipboard` / `fileDrop` /
+  // **刻意是界面 ctx 的子集**：没有 `theme` / `clipboard` / `fileDrop` /
   // `icons` / `audio`。它们要么是 DOM，要么是窗口级的东西，而这里没有窗口。
   // 少给一个成员的表现是插件拿到 `undefined`，因此这份清单必须与
   // `pluginRuntime.ts` 的对应关系写清楚（见插件开发文档的"两个运行位置"一节）。
+  //
+  // ============================================================
+  // 唯一的例外：`ctx.ui.popover`
+  // ============================================================
+  //
+  // 它是这条"子集"里**唯一**的 `ui` 成员，而且这个例外是刻意的 —— 它不是
+  // "少给了一个 DOM 对象"，恰恰相反：一个后台插件**最需要**把结果拿给用户看，
+  // 而它本来一条出口都没有。
+  //
+  // 它与其他 `ui.*` 的差别不在强度，而在**它需要什么**：dialog / contextMenu /
+  // openSurface 那一族要么挂在"我在哪个界面里"，要么要一块属于插件的 webview
+  // 可覆盖 —— 后台插件两样都没有，硬给它一个永远拒绝的桩只会让作者以为
+  // "我写错了"。结果卡片是一个独立窗口、贴的是屏幕上的光标，与"我在哪里"
+  // 无关，因此它是这一族里唯一在三个运行位置上都成立的那一个。
+  //
+  // 它依然要 `notification` 权限（与在界面上调用时**同一条判定**：三者都走
+  // `rpc.rs` 的 `ui.popover`）。
   //
   // **剪贴板监测（`ctx.clipboard.subscribe` 一类）也刻意不在这里**，而且理由与
   // 上面那几种不同，值得单独写一句：它不是"缺一个 DOM 对象"，而是**方向不对**。
@@ -436,6 +453,27 @@ function createPluginSandbox(identity, _unused) {
 
     launcher: {
       launch: (program, args) => callHost('ctx.system.launch', { program, args: args ?? [] }),
+    },
+
+    /**
+     * 宿主渲染的**结果卡片**。**后台位置上唯一的界面成员**（理由见上面 ctx 的
+     * 小标题：它不需要界面上下文，而后台插件恰恰最需要一条把结果拿出来的出口）。
+     *
+     * 形状与 in-process / 沙箱一致：`popover({ title?, body, tone?, actions?,
+     * timeoutMs?, at? })` → `{ action }`，`action` 为 `null` 表示用户没回答
+     * （到点自动收起 / Escape / 点别处）。
+     *
+     * 参数**原样交给宿主**（`ctx.ui.popover`），校验与钳制都在那一侧：三个运行
+     * 位置共用 `rpc.rs` 的同一个方法表，因此"最多 3 个按钮""id 只允许 [a-z0-9-]"
+     * "超时钳制到 1..30 秒"只可能有一份实现。
+     */
+    ui: {
+      popover: (input) =>
+        callHost('ctx.ui.popover', input || {}).then((value) => ({
+          // 字段缺失（更老的宿主）与宿主的 `null` 收敛成同一个取值：契约里
+          // "没回答"就是一个值，不该让插件去分辨 `undefined` 与 `null`。
+          action: value && value.action ? value.action : null,
+        })),
     },
 
     shell: {

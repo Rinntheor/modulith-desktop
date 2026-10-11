@@ -260,6 +260,21 @@ export async function createPluginHost(): Promise<PluginHost> {
   };
 
   /**
+   * 与 Rust 侧 `rpc::require_ui_permission` 对齐（`ctx.ui.popover` 那一族）。
+   *
+   * 与 `requireSecrets` 同一条纪律：桩后端必须如实拒绝。这一项容易被漏掉 ——
+   * 卡片看起来只是"显示一段文本"，但真实宿主把 `ui.popover` 与 `ui.dialog` /
+   * `ui.contextMenu` 一起判在了 `notification` 上（三者都会打断用户）。桩里不检查
+   * 的话，夹具会替一个没声明权限的插件"成功显示"一张卡片。
+   */
+  const requireNotification = (pluginId: string): void => {
+    const permissions = (manifestOf(pluginId)?.permissions as string[] | undefined) ?? [];
+    if (!permissions.includes('notification')) {
+      throw new Error(`插件 "${pluginId}" 的清单里没有声明 "notification" 权限，命令被拒绝`);
+    }
+  };
+
+  /**
    * 夹具的"宿主订阅表"。真实宿主用它决定轮询线程起不起（见
    * `plugins/clipboard.rs` 的"生命周期"一节），而夹具用它回答"这个插件订阅了没有"。
    *
@@ -424,6 +439,27 @@ export async function createPluginHost(): Promise<PluginHost> {
     plugin_clipboard_read_image: ({ id }) => {
       requireClipboardMonitor(String(id));
       return null;
+    },
+
+    /**
+     * `ctx.ui.popover`（宿主渲染的结果卡片）。
+     *
+     * ============================================================
+     * 返回值是 `{ action: null }`，而那是夹具里**唯一如实的答案**
+     * ============================================================
+     *
+     * 卡片要一个真实的浮层窗口与一次真人点击才可能有非空的动作 id。夹具里两样
+     * 都没有 —— 于是这里的正确行为就是契约里那个 `null`（"用户没回答"），
+     * 而不是编一个按钮 id 出来。编出来的话，夹具会测到一个真实运行时永远不会
+     * 出现的结果。
+     *
+     * 权限判定**必须照做**（与 `requireSecrets` 同一条纪律）：真实宿主把
+     * `ui.popover` 判在 `notification` 上，而一个不检查的桩会让夹具替没声明
+     * 权限的插件"成功显示"一张卡片。
+     */
+    plugin_ui_popover: ({ id }) => {
+      requireNotification(String(id));
+      return { action: null };
     },
 
     set_plugin_enabled: ({ id, enabled: next }) => {

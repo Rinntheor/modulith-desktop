@@ -26,6 +26,8 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { collectObjectLiterals, objectKeysAt } from './source-ast.ts';
+
 let failed = 0;
 let total = 0;
 
@@ -1682,6 +1684,9 @@ section('完整 API 表面');
       // 3.4 界面 · 宿主渲染的浮层
       ['ui.dialog', isFunction],
       ['ui.contextMenu', isFunction],
+      // 结果卡片是这一族里唯一**三个运行位置都有**的那一个（见下面
+      // `EXPECTED_SANDBOX_ONLY_UI` 那一节：成员级比对看不出方法级的差异）
+      ['ui.popover', isFunction],
 
       // 3.4 界面 · 多界面（api: 3）
       ['ui.openSurface', isFunction],
@@ -3664,7 +3669,14 @@ section('两侧的成员表');
     'surfaces',
     'theme',
     'shortcuts',
-    'ui',
+    // `ui` **曾经在这一列**，而且它出去的方式值得记一笔：`EXPECTED_SANDBOX_ONLY`
+    // 比的是**成员名**，而 `ctx.ui.popover` 让 `ui` 成了"两侧都有"的成员 ——
+    // 于是它从这里消失，成员级比对从此不再看着这一处。
+    //
+    // 那正是这一节最该警惕的形状："门禁绿了"与"差异消失了"不是同一件事。
+    // `ui` 两侧的**方法集合仍然不同**（in-process 只有一个 popover，沙箱还有 8 个），
+    // 因此下面 `REQUIRED` 里加了 ui，并在文件末尾新增了
+    // `EXPECTED_SANDBOX_ONLY_UI_METHODS` 那条**方法级**断言，把这处差异写下来。
   ].sort();
 
   // `ctx.*` 那一侧的缺口：**空了**。
@@ -4629,6 +4641,10 @@ section('服务对象的方法（白屏两次都出在这里）');
     // 拼不出那个路径），因此这里的六个方法名必须与宿主工厂逐字一致 —— 少一个就是
     // 插件调用时白屏。
     ['secrets', ['isAvailable', 'get', 'set', 'delete', 'keys', 'clear'], 'pluginSecrets'],
+    // `ui` 两侧都有，但**方法集合不同**：这里列的是"沙箱必须有的那一个"，而不是
+    // 全部。多出来的 8 个是沙箱独有，由文件末尾的 `EXPECTED_SANDBOX_ONLY_UI_METHODS`
+    // 逐条钉住（这一张表只保证"绝不少"，那一张负责"多的那些是哪几个"）。
+    ['ui', ['popover'], 'createContextFor'],
   ];
 
   for (const [member, methods, source] of REQUIRED) {
@@ -4663,6 +4679,73 @@ section('服务对象的方法（白屏两次都出在这里）');
     typeof methodsApi?.events?.emit === 'undefined' && typeof methodsApi?.events?.on === 'undefined',
     '旧的 ctx.events.emit / on 已删除（留着就是两套 API）'
   );
+
+  // ============================================================
+  // `ctx.ui`：两侧同名，但**方法集合不同** —— 因此差异必须写在判据里
+  // ============================================================
+  //
+  // ============================================================
+  // 为什么成员级比对在这里会看不见
+  // ============================================================
+  //
+  // 上面那一节（第 20 节）比的是**成员名**。`ctx.ui.popover` 进来之后 `ui` 成了
+  // "两侧都有"的成员，于是它从 `EXPECTED_SANDBOX_ONLY` 里消失，成员级比对从此
+  // 不再看着这一处 —— 而两侧的方法集合并不一样：in-process 只有一个 `popover`，
+  // 沙箱还有 8 个。
+  //
+  // 那 8 个**不是遗漏，是设计**：`dialog` / `contextMenu` 要"我在哪个界面里"
+  // （权限与浮层归属都挂在界面上），`openSurface` / `closeSurface` / `listSurfaces`
+  // 按 `(插件 id, 界面 id)` 签发令牌，而 `badge` / `progress` / `splash` 画的是
+  // 宿主标签栏或插件那一块 webview 的位置 —— in-process 插件没有令牌、也没有属于
+  // 它自己的那一块。
+  //
+  // 但"设计如此"必须是**一行可判定的字**，而不是一句注释：这里把两侧的方法集合
+  // 分别钉住。往 in-process 的 `ctx.ui` 上加一个新方法会让这条红（而
+  // `check:plugin-boundary` 也会红），往沙箱的 `ui` 上少加一个则会由上面那张
+  // `REQUIRED` 表抓住。
+
+  /** 沙箱 `ctx.ui` 上**不该**出现在 in-process 上的那 8 个方法 */
+  const EXPECTED_SANDBOX_ONLY_UI_METHODS = [
+    'dialog',
+    'contextMenu',
+    'openSurface',
+    'closeSurface',
+    'listSurfaces',
+    'badge',
+    'progress',
+    'splash',
+  ].sort();
+
+  const hostUiMethods = objectKeysAt(
+    collectObjectLiterals(read('../src/services/pluginRuntime.ts')),
+    'createContextFor',
+    ['return', 'ui']
+  );
+
+  check(
+    hostUiMethods !== null,
+    '能在 pluginRuntime.ts 里定位到 in-process 的 `ctx.ui` 对象字面量（解析失败会让下面两条变成假通过）'
+  );
+
+  if (hostUiMethods) {
+    check(
+      hostUiMethods.includes('popover'),
+      `in-process 的 ctx.ui 有 popover（实际：${hostUiMethods.join('、') || '（空）'}）`
+    );
+
+    const sandboxOnlyUi = Object.keys(methodsApi?.ui ?? {})
+      .filter((name) => !hostUiMethods.includes(name))
+      .sort();
+
+    check(
+      sandboxOnlyUi.join(',') === EXPECTED_SANDBOX_ONLY_UI_METHODS.join(','),
+      sandboxOnlyUi.join(',') === EXPECTED_SANDBOX_ONLY_UI_METHODS.join(',')
+        ? `ctx.ui 上沙箱独有的 ${sandboxOnlyUi.length} 个方法与预期一致（in-process 只有 popover）`
+        : `★ ctx.ui 上沙箱独有的方法变了。\n      预期：${EXPECTED_SANDBOX_ONLY_UI_METHODS.join('、')}\n      实际：${sandboxOnlyUi.join('、') || '（空）'}` +
+          `\n      多出来的那一个要么该同步进 in-process（那就得改这条与 pluginBoundary 的登记），` +
+          `要么说明它是界面绑定的、不该被搬过去；少掉的那一个是插件白屏的来源。`
+    );
+  }
 }
 
 // ============================================================

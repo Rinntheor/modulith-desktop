@@ -1556,6 +1556,46 @@
       });
     },
 
+    /**
+     * 一张**由宿主渲染的结果卡片**：贴一次结果给用户看，然后自己消失。
+     *
+     * 返回 `{ action }` —— 用户点中的那个动作的 id，或者 `null`（到点自动收起 /
+     * 按了 Escape / 点了别处）。**`null` 是"用户没回答"，不是失败**；失败
+     * （没声明 `notification` 权限、浮层窗口起不来）会让这个 Promise 拒绝。
+     *
+     * 选项 `{ title?, body, tone?, actions?, timeoutMs?, at? }`：
+     *   · `body` 必填，宿主按 4000 个字符截断；`title` 是短标题（120 个字符）；
+     *   · `tone` 取 info / success / warning / error，缺省 info；
+     *   · `actions` 最多 3 个 `{ id, label }`，id 只允许 `[a-z0-9-]` 且不超过
+     *     32 个字符（它是回给你的那个取值，因此形状不对时**整次调用被拒绝**，
+     *     而不是悄悄丢掉一个按钮）；
+     *   · `timeoutMs` 缺省 8000，宿主钳制到 1000..30000；
+     *   · `at` 取 'cursor'（缺省）或 'center'。
+     *
+     * **由宿主渲染**的理由与 dialog 一样，而且这里是它最要紧的一处：卡片会贴在
+     * 用户正在看的地方，因此它必须一眼就是宿主的东西，不能是插件画的一个像
+     * 宿主提示框的东西。
+     *
+     * 与 `dialog` 的两处不同值得记住：卡片**不抢焦点**（插件不能让一张卡片把
+     * 用户正在输入的光标夺走），而且**同一时刻只有一张** —— 新的来时旧的当场
+     * 以 `null` 结束（两张重叠的卡片没有"先收起哪一张"的说法）。
+     */
+    popover: function (input) {
+      var input0 = input || {};
+      return rpc('ui.popover', {
+        title: input0.title === undefined ? null : input0.title,
+        body: input0.body === undefined ? '' : String(input0.body),
+        tone: input0.tone === undefined ? null : input0.tone,
+        actions: input0.actions === undefined ? [] : input0.actions,
+        timeoutMs: input0.timeoutMs === undefined ? null : input0.timeoutMs,
+        at: input0.at === undefined ? null : input0.at,
+      }).then(function (value) {
+        // 把 `{ action }` 收敛成契约里的形状：宿主回 `null` 就是"没回答"，
+        // 而字段缺失（更老的宿主）同样落到 `null`，不留给插件一个 `undefined`。
+        return { action: value && value.action ? value.action : null };
+      });
+    },
+
     // ============================================================
     // 多界面（api: 3）
     // ============================================================
