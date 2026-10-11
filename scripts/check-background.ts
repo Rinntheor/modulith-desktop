@@ -125,6 +125,134 @@ check(
 );
 
 // ============================================================
+// 1b. 启动接线：后端与前端两侧都必须真的把后台插件拉起来
+// ============================================================
+//
+// ============================================================
+// 这一段守的是一次真实的排查：`sync_startup` 在仓库里唯一的调用方是前端
+// ============================================================
+//
+// 「后台插件一个都不跑」这句话有两种完全相反的成因：**宿主起不来**，或者
+// **从来没有人叫它起**。前者有一堆日志，后者一条都没有 —— 而两者在界面上
+// 长得一模一样（一句"当前没有在运行"）。
+//
+// 因此这里把"有人叫它起"这件事钉住：前端的启动流程里必须有一次
+// `syncBackgroundPlugins()`，而且那一次必须**不在**任何"安全模式/失败"的提前
+// 返回之后。这一层断言不能证明它执行了（那要看运行日志），但它能拦住
+// "某个重构顺手删掉了那一行"这种最贵的错误。
+console.log('\n后台插件的启动接线：');
+
+check(
+  /export function syncBackgroundPlugins\(\)/.test(backgroundPluginsTs) &&
+    backgroundPluginsTs.includes("'background_plugins_sync'"),
+  '前端门面里有 syncBackgroundPlugins 并指向 background_plugins_sync 命令'
+);
+check(
+  /async function startBackgroundPlugins/.test(bootTs) &&
+    /await syncBackgroundPlugins\(\)/.test(bootTs),
+  '启动流程里真的调用了一次 syncBackgroundPlugins()'
+);
+// 两次调用点：一次在"延后加载插件"那条分支的 finally 里，一次在正常加载之后。
+// 两条分支都必须有 —— 少了任何一条，那一半用户的插件就永远不起。
+check(
+  (bootTs.match(/void startBackgroundPlugins\(\);/g) ?? []).length === 2,
+  '两条插件加载分支（延后 / 正常）各自都拉起了后台插件'
+);
+check(
+  /state\.inner\(\)\.sync_startup\(&app\)/.test(desktopCommandsRs),
+  'background_plugins_sync 命令调用 sync_startup（命令与实现接线一致）'
+);
+
+// ============================================================
+// 1c. 空闲回收：**拥有插件的宿主不可以被回收**
+// ============================================================
+//
+// 这是本次修复的核心。原来的 `reap_if_idle` 只看"距离最后一次请求多久"，而
+// 后台插件的本职就是坐着等 —— 于是 `interval: 600` 的插件（stand-up）在第一次
+// 检查时就被杀掉，只等热键的插件（translate）同理。收掉它等于毁掉用户的热键
+// 与插件的存活状态，而日志里只有一句"已空闲 300 秒，回收子进程"。
+console.log('\n空闲回收：');
+
+check(
+  /if self\.is_pinned\(\)\s*\{[\s\S]{0,120}?return false;/.test(backgroundModRs),
+  '宿主管着插件时**直接**跳过回收（在算时间之前，而不是算完再判）'
+);
+check(
+  /pub fn set_liveness\(&self, liveness: Liveness\)/.test(backgroundModRs) &&
+    /pub fn is_pinned\(&self\) -> bool/.test(backgroundModRs),
+  'liveness 是一个显式信号（而不是再算一个时间戳）：有设置入口也有查询入口'
+);
+check(
+  /host\.set_liveness\(Liveness::Pinned\);/.test(backgroundPluginsRs),
+  '插件成功加载之后把宿主钉住（否则它的定时器与热键会被"空闲回收"毁掉）'
+);
+check(
+  /running\.host\.set_liveness\(Liveness::OnDemand\);/.test(backgroundPluginsRs),
+  '插件停掉之后置回 OnDemand（否则空壳宿主永远不被回收）'
+);
+
+// ============================================================
+// 1d. 子进程死掉之后必须能**重新拉起**
+// ============================================================
+//
+// 读循环读到 EOF 时原来只结束它自己，没有清掉托管状态里的 child/writer。于是
+// `ensure_started` 判的 `child.is_some()` 永远为真：后续每一次请求都去写一个
+// 断掉的管道，而**重新拉起一次都不会发生**。这是一个"第一次能用、之后永久坏掉"
+// 的缺陷 —— 正好是"后台插件全都跑不起来"的样子。
+console.log('\n子进程退出之后的收尸与重启：');
+
+check(
+  /try_wait\(\)/.test(backgroundModRs),
+  '确保启动时用 try_wait() 确认句柄背后的进程是不是还活着（而不是只看 is_some）'
+);
+check(
+  /lives\.child = None;/.test(backgroundModRs) &&
+    /lives\.output_closed = true;/.test(backgroundModRs),
+  '读循环在 EOF 时清掉 child/writer 并标记输出通道已关（重启的前提）'
+);
+check(
+  /state\.output_closed = false;/.test(backgroundModRs),
+  '重新拉起时把标记清掉（否则新进程会被立刻当成"刚死掉的那个"）'
+);
+check(
+  /let running = state\.child\.is_some\(\) && !state\.output_closed;/.test(backgroundModRs),
+  'status() 把"输出已关"算作"没在跑"（否则界面会一直显示一个早已不存在的进程）'
+);
+
+// ============================================================
+// 1e. 诊断：失败原因必须能到达界面
+// ============================================================
+//
+// 三种完全不同的故障（脚本没打包、Node 起不来、问候超时）原来在界面上都只是
+// 一句"当前没有在运行"—— 因为原因只进了日志。8 秒的 STARTUP_TIMEOUT 不产出
+// 任何可见消息时，用户看到的与"node 没有运行"无法区分。
+console.log('\n失败原因的可见性：');
+
+check(
+  /self\.record_error\(error\.clone\(\)\);/.test(backgroundModRs),
+  '启动失败被记进宿主状态（调用方只写日志，而用户看的是插件详情页）'
+);
+check(
+  /reason: status\.reason\.or_else\(\|\| failures\.get\(id\)\.cloned\(\)\)/.test(
+    backgroundPluginsRs
+  ),
+  '插件状态里的 reason 同时带上宿主的原因与"从未启动成功"的原因'
+);
+check(
+  /stderr\(Stdio::piped\(\)\)/.test(backgroundModRs) &&
+    !/stderr\(Stdio::inherit\(\)\)/.test(backgroundModRs),
+  '子进程 stderr 走管道并由转发任务写日志（继承的无效句柄会让 CreateProcess 直接失败）'
+);
+check(
+  /fn spawn_stderr_forwarder\(stderr: tokio::process::ChildStderr\)/.test(backgroundModRs),
+  'stderr 管道有人读（没有人读会在缓冲区写满时把子进程卡死）'
+);
+check(
+  /fn floor_char_boundary\(text: &str, limit: usize\) -> usize/.test(backgroundModRs),
+  '日志截断按字符边界（在中文 stderr 上按字节切会 panic，那会吃掉整条诊断）'
+);
+
+// ============================================================
 // 2. 协议版本两侧一致（没有任何编译器会帮我们检查这个）
 // ============================================================
 console.log('\n协议版本：');

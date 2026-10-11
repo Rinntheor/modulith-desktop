@@ -67,7 +67,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
-use super::{BackgroundHost, BackgroundMethod, HostSpec, Inbound};
+use super::{BackgroundHost, BackgroundMethod, HostSpec, Inbound, Liveness};
 use crate::modules::plugins::{rpc, PluginState};
 
 /// Node 从哪个大版本开始有可用的权限模型。
@@ -145,6 +145,23 @@ pub struct BackgroundPluginStatus {
 #[derive(Default)]
 pub struct BackgroundPlugins {
     running: Mutex<HashMap<String, Running>>,
+    /// **起不来的那些插件，以及它们各自的原因。**
+    ///
+    /// ============================================================
+    /// 为什么失败也要被记下来（而不是只写日志）
+    /// ============================================================
+    ///
+    /// `sync_startup` 对每一个起不来的插件只记一条 `log::warn!`。而用户与维护者
+    /// 看的地方是**插件详情页**，那里读的是 `background_plugins_status` —— 于是
+    /// "起不来"的插件在界面上永远只是一句"当前没有在运行"，而真正的原因（宿主
+    /// 脚本没打包、Node 起不来、问候超时、加载失败）全都在日志里。
+    ///
+    /// 那正是"后台插件不跑"最难排查的地方，因此这里把原因留下来，并由 `status()`
+    /// 带出去。它**不是**"运行中"表的另一份：那个只装成功的，这个只装失败的。
+    ///
+    /// 一个插件成功启动时它对应的条目被清掉（见 `start`），因此"时好时坏"的插件
+    /// 不会留下一句过期的错。
+    failures: Mutex<HashMap<String, String>>,
     /// Node 是否支持权限模型。缓存 —— 它是"启动一次子进程问版本"，不该每次拉起都问。
     permission_model: Mutex<Option<bool>>,
     /// Node 的权限模型**有没有网络那一项**（`--allow-net`）。同样缓存。
@@ -157,7 +174,35 @@ impl BackgroundPlugins {
     }
 
     /// 拉一个后台插件起来。已经在跑时是**幂等**的。
+    ///
+    /// ============================================================
+    /// 失败原因要**既返回、又留下**
+    /// ============================================================
+    ///
+    /// 真实的启动流程写在 `start_inner` 里，它有十来条 `?` 与提前返回（Node 找不到、
+    /// 清单没有后台入口、宿主脚本缺失、子进程起不来、问候超时、加载被插件自己
+    /// 拒绝……）。那些路径**只**返回错误，而调用方（`sync_startup`）只把它写进日志。
+    ///
+    /// 于是每一个失败原因最终都只活在 `modulith.log` 里，而用户打开插件详情页看到
+    /// 的永远是一句"当前没有在运行"。这一层把原因**同时**记进 `failures`，由
+    /// `status()` 带给界面 —— 修法只有一处，而不是在十来条返回路径上各补一遍。
     pub async fn start(&self, app: &AppHandle, plugin_id: &str) -> Result<(), String> {
+        match self.start_inner(app, plugin_id).await {
+            Ok(()) => {
+                self.failures.lock().unwrap().remove(plugin_id);
+                Ok(())
+            }
+            Err(reason) => {
+                self.failures
+                    .lock()
+                    .unwrap()
+                    .insert(plugin_id.to_string(), reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
+    async fn start_inner(&self, app: &AppHandle, plugin_id: &str) -> Result<(), String> {
         if self.running.lock().unwrap().contains_key(plugin_id) {
             return Ok(());
         }
@@ -345,6 +390,19 @@ impl BackgroundPlugins {
 
         let pid = host.status().pid;
 
+        // ============================================================
+        // 从这一刻起，这个宿主"拥有一个插件"，因此**不可以被空闲回收**
+        // ============================================================
+        //
+        // 置位放在插入 `running` 之前：置位只影响将来的回收判断，而"插件已经在
+        // 这个进程里加载好了"这件事在下一行就是事实。反过来（先插入再置位）会留下
+        // 一个窗口：回收任务恰好在中间醒来，看到 `last_used` 已经超过 5 分钟
+        // （插件加载可能很慢），于是把这个刚加载好的进程收掉 —— 而 `running`
+        // 里还留着它的条目，下一次 `sync_startup` 会以为"已经在跑"而不再拉起。
+        //
+        // 那个组合正是本次要修的缺陷的**最坏形式**：一个永远起不来的插件。
+        host.set_liveness(Liveness::Pinned);
+
         self.running.lock().unwrap().insert(
             launch.id.clone(),
             Running {
@@ -391,6 +449,11 @@ impl BackgroundPlugins {
         let Some(mut running) = self.running.lock().unwrap().remove(plugin_id) else {
             return Ok(());
         };
+
+        // 这个宿主不再拥有插件了。**必须在移除条目时立刻置回**，理由与 `start`
+        // 里那一处置位相对：留着 `Pinned` 会让这个宿主永远不被回收，而它现在已经
+        // 是一个空壳 —— "停用插件之后内存没降下来"就是这条路径漏掉的表现。
+        running.host.set_liveness(Liveness::OnDemand);
 
         if let Some(ticker) = running.ticker.take() {
             ticker.abort();
@@ -479,6 +542,17 @@ impl BackgroundPlugins {
 
     /// 当前状态。**不启动任何东西。**
     ///
+    /// ============================================================
+    /// 它同时报告**起不来的那些**，而不只是活着的那些
+    /// ============================================================
+    ///
+    /// 只列 `running` 的话，一个从没成功启动过的后台插件在界面上**根本不存在** ——
+    /// 插件详情页读到的是一份空列表，于是它显示"当前没有在运行"，而没有任何原因。
+    /// 那正是本次要修的缺陷在界面上的样子。
+    ///
+    /// 因此这里把 `failures` 里那条原因也带出去：`running: false` + 一句真正的
+    /// 原因，比一句沉默的"没有在运行"有用得多。
+    ///
     /// ⚠️ `net_restricted` 需要问一次 Node 的能力（`--help`），而这是一个 `sync`
     /// 函数。因此它**只读缓存**：缓存里没有就报 `false`（"没被管住"）。
     /// 这个方向是刻意的 —— 在拿到证据之前，界面不该宣称网络已被限制。
@@ -486,6 +560,7 @@ impl BackgroundPlugins {
     pub fn status(&self, _app: &AppHandle) -> Vec<BackgroundPluginStatus> {
         let running = self.running.lock().unwrap();
         let net_scope = *self.net_scope.lock().unwrap();
+        let failures = self.failures.lock().unwrap();
 
         let mut items: Vec<BackgroundPluginStatus> = running
             .iter()
@@ -501,10 +576,32 @@ impl BackgroundPlugins {
                     // 那正是这一位存在的理由。
                     net_restricted: entry.isolated && net_scope.unwrap_or(false),
                     uptime_ms: entry.started_at.elapsed().as_millis() as u64,
-                    reason: status.reason,
+                    // 宿主自己报的原因（子进程中途退出、启动失败、Node 解析失败）
+                    // 优先于我们记下的那条启动失败：它更新。
+                    reason: status.reason.or_else(|| failures.get(id).cloned()),
                 }
             })
             .collect();
+
+        // 起不来的那些。已经在 `items` 里的（正在跑的）不重复 —— 它们的原因由上面
+        // 那条分支负责，而两份原因同时出现只会让人不知道该信哪一个。
+        for (id, reason) in failures.iter() {
+            if running.contains_key(id) {
+                continue;
+            }
+            items.push(BackgroundPluginStatus {
+                id: id.clone(),
+                running: false,
+                pid: None,
+                // 一个没跑起来的插件谈不上隔离：报 `false`（"没有引擎级隔离"）
+                // 比报 `true` 诚实 —— 后者会让界面显示一个绿色的安全标记，
+                // 而那个进程根本不存在。
+                isolated: false,
+                net_restricted: false,
+                uptime_ms: 0,
+                reason: Some(reason.clone()),
+            });
+        }
 
         items.sort_by(|a, b| a.id.cmp(&b.id));
         items
@@ -513,6 +610,22 @@ impl BackgroundPlugins {
     /// 某个后台插件在不在跑。
     pub fn is_running(&self, plugin_id: &str) -> bool {
         self.running.lock().unwrap().contains_key(plugin_id)
+    }
+
+    /// 有没有**任何进程**（或曾经尝试过的插件）值得在退出时收尾。
+    ///
+    /// ============================================================
+    /// 为什么不能改判 `status().is_empty()`
+    /// ============================================================
+    ///
+    /// 退出路径（`desktop/mod.rs` 的 `stop`）用 `status()` 判"要不要建一个运行时
+    /// 去收尾"。而 `status()` 现在**也包含失败记录** —— 于是"有一次启动失败"会让
+    /// 退出路径以为"有东西要停"，多建一个 tokio 运行时而实际无事可做。
+    ///
+    /// 那本身没有危害，但它是那种会随着时间变成真问题的松动：判据说的是"有没有
+    /// 值得收尾的东西"，那就该直接问这件事，而不是问一个碰巧相关的列表。
+    pub fn has_live_processes(&self) -> bool {
+        !self.running.lock().unwrap().is_empty()
     }
 
     /// 把一条跨插件事件投递给**订阅了它**的后台插件。
