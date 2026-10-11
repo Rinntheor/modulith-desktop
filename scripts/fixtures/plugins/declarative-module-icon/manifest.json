@@ -1,0 +1,18 @@
+{
+  "name": "fixture.declarative-module-icon",
+  "displayName": "模块自带图标的声明式插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具：模块级 icon 写成插件包内路径时，各模块读各自那张图",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "modulith": ">=1.6.0" },
+  "main": "index.js",
+  "icon": "icon.svg",
+  "contributes": {
+    "modules": [
+      { "id": "brand-panel", "name": "品牌图标面板" },
+      { "id": "own-icon-panel", "name": "自带图标面板", "icon": "panels/own.svg" }
+    ]
+  },
+  "activationEvents": ["onModule:brand-panel", "onModule:own-icon-panel"]
+}

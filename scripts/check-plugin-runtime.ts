@@ -19,6 +19,7 @@
 import { createPluginHost, fixtureIds } from './harness/plugin-host.ts';
 import { settingStorageKey } from '../src/services/pluginContributions.ts';
 import { normalizeCombo } from '../src/services/shortcutRegistry.ts';
+import { resolveModuleIconSource } from '../src/components/moduleIconResolver.ts';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -362,7 +363,7 @@ console.log('\n规模（全部夹具一起装）：');
   const lazyFixtures = ['fixture.declarative-module', 'fixture.command-only', 'fixture.duplicate-module'];
   const ranLazy = ran.filter((id) => lazyFixtures.includes(id));
 
-  check(all.length === 9, `夹具数量为 9（当前 ${all.length}）`);
+  check(all.length === 10, `夹具数量为 10（当前 ${all.length}）`);
   check(
     ranLazy.length === 0,
     `★ 按需激活的插件一个都没执行（实际执行了：${ranLazy.join('、') || '无'}）`
@@ -437,6 +438,164 @@ console.log('\nSVG 图标在目录重建后的存活：');
     host.backendCalls.filter((command) => command === 'read_plugin_asset').length > 0,
     '★ 重新启用后**重新读了图标文件** —— 说明卸载时缓存被清掉了，用的不是上一份'
   );
+}
+
+// ============================================================
+// 9b. 路径型 `icon` 与**启动路径**上的图标补全
+// ============================================================
+//
+// 上一节守的是「插件级 `icon.svg` 在目录重建之后不丢」。这一节守的是用户报过的
+// 另外两句话，它们是同一个缺陷的两个面：
+//
+//   「插件没有使用其自身自带的图标，而是使用宿主的图标库」
+//   「有的图标甚至直接找不到了」
+//
+// 根因是**图标补全之前的那段窗口**。模块描述符建立时 `iconSvg` 必然是空的
+// （SVG 内容要异步读，见 `prefetchPluginIcon`），而启动的第一趟是 `listOnly`
+// ——它在建完目录后直接 `return`，从前**根本不会走到补图标那一步**。于是启动后
+// 第一眼看到的侧边栏里：
+//
+//   * 模块写 lucide 名（`Rocket`）→ 走宿主的 lucide 图标（第一句话）；
+//   * 模块写包内路径（`icon.svg`）→ 查不到名字、也没有 `iconSvg` → `Box`（第二句话）。
+//
+// 这一节因此断言两件事：
+//   (a) 路径型 `icon`（模块自己声明的那张图）**不会**落到 `Box`，而且用的是那个
+//       模块自己那张图，不是插件级图标；
+//   (b) 图标补全在**启动路径**（`listOnly` 那一趟与后台那一趟）上确实发生了。
+console.log('\n路径型模块图标与启动路径：');
+
+{
+  const id = 'fixture.declarative-module-icon';
+  /** 目录里的条目只用到这两个字段，这里按用到的形状取，避免 `any` 漏掉拼写错误 */
+  const descriptorOf = (moduleId: string): { icon?: string; iconSvg?: string } | undefined =>
+    catalog.getCatalogFlatMap().get(moduleId) as { icon?: string; iconSvg?: string } | undefined;
+  const svgOf = (moduleId: string): string | undefined => descriptorOf(moduleId)?.iconSvg;
+
+  /**
+   * 等图标被补上。
+   *
+   * `listOnly` 那一趟是**故意不 await 图标补全**的（它的全部意义就是"不等 I/O"），
+   * 因此这里必须轮询；轮不到就是缺陷本身，不是测试写法的妥协 —— 上界给足 2 秒，
+   * 夹具里一次读盘是 0 毫秒级。
+   */
+  const waitIcon = async (moduleId: string): Promise<string | undefined> => {
+    for (let i = 0; i < 400; i += 1) {
+      const svg = svgOf(moduleId);
+      if (svg) return svg;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return svgOf(moduleId);
+  };
+
+  // --- (b) 启动的第一趟：只读清单，不执行任何 bundle ---
+  await loadCatalog([id]);
+  check(!executed().includes(id), '启动第一趟没有执行任何插件代码（图标只能来自资源读取）');
+
+  const ownIcon = await waitIcon('own-icon-panel');
+  check(
+    typeof ownIcon === 'string' && ownIcon.includes('fixture-panel-own'),
+    '★ 启动第一趟（listOnly）之后，模块级 icon.svg 已经补进了目录'
+  );
+  check(
+    typeof ownIcon === 'string' && !ownIcon.includes('fixture-plugin-brand'),
+    '★ 它用的是**那个模块自己**那张图，而不是插件级图标'
+  );
+
+  const brandIcon = await waitIcon('brand-panel');
+  check(
+    typeof brandIcon === 'string' && brandIcon.includes('fixture-plugin-brand'),
+    '★ 没写 icon 的模块回落到插件级图标（清单顶层 icon.svg）'
+  );
+
+  // 更精确的一条：模块级那张图必须**按它自己在包内的路径**去读。
+  // 只看"补进去了"是不够的 —— 插件级图标恰好也在同一个包里，读错了路径同样能填上值。
+  check(
+    host.backendCallsWithArgs.some(
+      (call) =>
+        call.command === 'read_plugin_asset' &&
+        call.args.id === id &&
+        call.args.rel === 'panels/own.svg'
+    ),
+    '★ 宿主是按模块自己那个路径（panels/own.svg）读的图'
+  );
+
+  // --- (a) `ModuleIcon` 的判定：路径型 icon 不会落到 Box ---
+  //
+  // 判定被抽到 `moduleIconResolver.ts` 才可能被断言：Node 的类型擦除不转换 JSX，
+  // `.tsx` 里的逻辑没有任何脚本能加载（见 scripts/harness/loader.mjs 的说明）。
+  const hasBuiltinIcon = (name: string): boolean => name === 'Package';
+
+  const ownDescriptor = descriptorOf('own-icon-panel');
+  check(
+    ownDescriptor?.icon === 'panels/own.svg',
+    '描述符里的 icon 就是清单里那个**包内路径**（不是图标名）'
+  );
+
+  const fromCatalog = resolveModuleIconSource({
+    icon: ownDescriptor?.icon,
+    iconSvg: ownDescriptor?.iconSvg,
+    hasBuiltinIcon,
+  });
+  check(
+    fromCatalog.kind === 'inline-svg',
+    `★ 目录里的条目（icon 是包内路径）走内联 SVG —— 不会落到 Box（实际：${fromCatalog.kind}）`
+  );
+
+  const decisions: Array<[string, string, boolean]> = [
+    [
+      'icon 是路径且没有 iconSvg → 兜底 Box（宿主没补上时也不空白）',
+      resolveModuleIconSource({ icon: 'icon.svg', hasBuiltinIcon }).kind,
+      resolveModuleIconSource({ icon: 'icon.svg', hasBuiltinIcon }).kind === 'fallback',
+    ],
+    [
+      'icon 是内置模块用过的名字 → 构建期映射表（内置行为不变）',
+      resolveModuleIconSource({ icon: 'Package', hasBuiltinIcon }).kind,
+      resolveModuleIconSource({ icon: 'Package', hasBuiltinIcon }).kind === 'builtin',
+    ],
+    [
+      'icon 是 lucide 名 → 按需加载',
+      resolveModuleIconSource({ icon: 'Rocket', hasBuiltinIcon }).kind,
+      resolveModuleIconSource({ icon: 'Rocket', hasBuiltinIcon }).kind === 'lucide',
+    ],
+    [
+      'iconSvg 在场时压过一切（插件自己的图标优先）',
+      resolveModuleIconSource({ icon: 'Package', iconSvg: '<svg/>', hasBuiltinIcon }).kind,
+      resolveModuleIconSource({ icon: 'Package', iconSvg: '<svg/>', hasBuiltinIcon }).kind ===
+        'inline-svg',
+    ],
+    [
+      'icon 是路径时绝不去查 lucide（它不是图标名）',
+      resolveModuleIconSource({ icon: 'icons/a.svg', hasBuiltinIcon }).kind,
+      resolveModuleIconSource({ icon: 'icons/a.svg', hasBuiltinIcon }).kind === 'fallback',
+    ],
+  ];
+  for (const [label, actual, ok] of decisions) {
+    check(ok, `${label}（实际：${actual}）`);
+  }
+
+  // --- (b) 启动的第二趟：真实的后台加载入口 ---
+  //
+  // 这一趟会把目录整个清空重建（`clearDynamicModules`），因此它同时证明：
+  // 图标不是靠第一趟的残留，而是重建**之后**又补了一次。
+  const beforeRebuild = descriptorOf('own-icon-panel');
+  host.useOnly([id]);
+  await runtime.loadPluginsInBackground();
+  const afterRebuild = descriptorOf('own-icon-panel');
+
+  check(
+    Boolean(beforeRebuild) && Boolean(afterRebuild) && beforeRebuild !== afterRebuild,
+    '后台加载那一趟把目录清空重建了（描述符是新的对象，不是上一趟的残留）'
+  );
+  check(
+    (afterRebuild?.iconSvg ?? '').includes('fixture-panel-own'),
+    '★ 后台加载那一趟之后，模块自己的图标重新补在了新条目上'
+  );
+  check(
+    !executed().includes(id),
+    '它仍然没有被执行（按需激活）—— 因此上面那些图标只可能来自资源读取'
+  );
+
+  host.useAll();
 }
 
 // ------------------------------------------------------------
