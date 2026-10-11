@@ -169,6 +169,60 @@
   // 为什么放在这里而不是等插件来问：插件不一定会问，而这件事不该由插件决定
   // 自己要不要被检查。
 
+  // ============================================================
+  // 掐断是**静默的**，不是"大声拒绝"
+  // ============================================================
+  //
+  // 上一版把那个替换函数写成一个抛 `Error` 的 `deny`，而维护者的日志给出了它的
+  // 直接后果：
+  //
+  //     [Modulith] 插件里有一个 Promise 被拒绝且没有 catch：
+  //     Error: [Modulith] 沙箱插件不能通过宿主 IPC 通道发消息
+  //         at Object.deny [as postMessage] (…/bridge.js:199:17)
+  //         at Object.postMessage (<anonymous>:1:102)
+  //         at sendIpcMessage (<anonymous>:130:18)
+  //         at <anonymous>:113:13
+  //
+  // 那两个 `<anonymous>` 帧**全是 Tauri 自己的引导脚本**，不是插件：
+  //
+  //   * `:130:18` 是 `tauri-2.11.5/scripts/ipc-protocol.js` 回退分支里那一行
+  //     `window.ipc.postMessage(data)`（把 `process-ipc-message-fn.js` 内联进去
+  //     之后渲染出来的行号，与 `:113` 是同一份脚本）；
+  //   * `:113:13` 是同一份脚本里 fetch 失败之后那一次重试
+  //     `sendIpcMessage(message)` —— 也就是说**第一条传输
+  //     （`fetch('http://ipc.localhost/<命令>')`）先被文档的 CSP 挡掉了，Tauri 按
+  //     它自己的设计回退到 `postMessage`**，然后撞上了我们的桩。
+  //
+  // 这个栈没有、也给不出"谁最初调了 invoke" —— 那一次重试发生在一个 promise 的
+  // 拒绝回调里，同步栈到那里就断了。但它已经说明两件事，而它们决定了这一版怎么写：
+  //
+  //   * 调用方**不是**插件在乱调。`invoke` 对任何走到它的人开放，而"任何人"里包括
+  //     Tauri 自己注入的脚本，也包括**它接管的浏览器 API**：`tauri-plugin-dialog`
+  //     的 `init-iife.js` 把 `window.confirm` / `window.alert` 换成了走 IPC 的版本
+  //     （`window.confirm = async i => await n("plugin:dialog|confirm", …)`）。
+  //     插件以为自己在调标准 API，而那条 promise 是**注入脚本**丢掉的（插件确实
+  //     没 await 它，但它本来也没有理由要 await 一个标准的 `confirm`）。
+  //   * 抛错没有让任何人做出更好的决定。它把"到不了宿主"变成"到不了宿主、而且
+  //     控制台上多一条没人能处理的拒绝"，还把矛头指向插件的代码行 —— 排查的人
+  //     于是会去改一个没写错的插件。这正是上面那句"每天都喊的警报最后只会被无视"。
+  //
+  // 因此要的性质是"**这个文档到不了宿主**"，而它由"那一跳不存在"本身满足，
+  // 不需要、也不该由一次抛错来表达。桩是**静默的空操作**：不抛、不返回拒绝、
+  // 不记日志（这里的输入不可信，写进宿主日志等于把插件内容抄一份出去）。
+  //
+  // 被否决的替代方案：**返回 `Promise.reject(...)`**。那只是把一个未处理的拒绝
+  // 换成另一个 —— Tauri 的 `invoke` 由 `sendIpcMessage` 同步驱动，谁调它都不保证
+  // 会 catch；而我们要的是"什么也没发生"，不是"有事发生但被吞掉"。
+
+  /**
+   * 换上去的那个桩。
+   *
+   * 它必须是一个**能按引用比较**的东西：`hostIpcIsReachable()` 靠它回答
+   * "这一跳还在不在"（理由见那个函数）。**空函数体是刻意的** —— 这个桩能做的事
+   * 只有一件，就是什么都不做。
+   */
+  var HOST_IPC_STUB = null;
+
   /**
    * 掐断宿主 IPC 的**最后那一跳**。返回掐掉了什么（空数组 = 一个都没掐掉）。
    *
@@ -177,13 +231,21 @@
    *
    *   * `window.__TAURI_INTERNALS__` 与 `window.ipc` 都是
    *     `Object.defineProperty(..., { value })` 定义的，也就是**不可重定义、
-   *     不可写** —— 删不掉也换不掉。但 `window.ipc` 里那个 `postMessage` 是
+   *     不可写** —— 删不掉也换不掉。这不是猜的：把 Tauri 那几个初始化脚本原文
+   *     在 Node 里跑一遍，`Object.getOwnPropertyDescriptor` 给的是
+   *     `writable: false, configurable: false, enumerable: false`（四个名字全都
+   *     一样），`delete window.ipc` 在严格模式里直接抛
+   *     `Cannot delete property 'ipc'`，`Object.defineProperty(window,
+   *     '__TAURI_INTERNALS__', …)` 抛 `Cannot redefine property`。
+   *     **因此这一层删不掉那个 API 面，只能掐掉它的出口。**
+   *     但 `window.ipc` 里那个 `postMessage` 是
    *     `s => window.chrome.webview.postMessage(s)`：它在**调用时**才去取最后
    *     那一跳。换掉那一跳，两条路（`ipc` 与 `__TAURI_INTERNALS__.postMessage`）
    *     就一起断了。
    *   * 另一条传输（`fetch('http://ipc.localhost/…')`）由文档的 CSP 挡着：
    *     `connect-src` 只留了插件自己的来源，而那一份 CSP 由宿主生成。**引擎
-   *     执行它**，插件改不掉。
+   *     执行它**，插件改不掉。维护者那份日志本身就是这条成立的**正面证据**：
+   *     回退分支只会在 fetch 真的被拒之后才走（见上面那一节对 `:113` 的解释）。
    *
    * 这一切都裹在 try/catch 里，而且**拿不准就什么都不做**：任何一个属性在不同
    * 的 WebView2 版本上形状不同，都不该让插件界面起不来 —— 那比"多一条通道"
@@ -195,15 +257,18 @@
     try {
       var webview = window.chrome && window.chrome.webview;
       if (webview && typeof webview.postMessage === 'function') {
-        var deny = function () {
-          throw new Error('[Modulith] 沙箱插件不能通过宿主 IPC 通道发消息');
-        };
+        // 静默的空操作。**不要改回抛错或 `Promise.reject`** —— 理由与那次真实的
+        // 日志见上面那一节，`check:sandbox` 也有断言钉着这一点。
+        var stub = function () {};
         try {
-          webview.postMessage = deny;
+          webview.postMessage = stub;
         } catch (error) {
           // 只读（或被冻结）：掐不掉。下面的判据会如实把它说出来。
         }
-        if (webview.postMessage === deny) neutralized.push('chrome.webview.postMessage');
+        if (webview.postMessage === stub) {
+          HOST_IPC_STUB = stub;
+          neutralized.push('chrome.webview.postMessage');
+        }
       }
     } catch (error) {
       // 拿不到那个对象（非 Windows、或引擎改了形状）：什么都不做。
@@ -215,15 +280,35 @@
   /**
    * 从这个文档出发，还有没有一条能到宿主的 IPC 通道。
    *
-   * 判据落在**最后那一跳**上，因为 Tauri 的两条传输最终都要经过它，而
-   * `fetch` 那条被 CSP 挡着。取不到那个对象时按**最坏情况**算：宁可多报一次，
-   * 也不要因为"读不到"而把一条真通道报成不存在。
+   * ============================================================
+   * 判据是"这一跳现在是不是那个桩"，**不是**"它是不是一个函数"
+   * ============================================================
+   *
+   * 上一版的判据是 `typeof webview.postMessage === 'function'`，而**桩本身也是
+   * 一个函数** —— 于是掐断成功之后它照样返回 true，`assertNoHostIpc()` 反而在每
+   * 一个插件界面上把一条 ERROR 打出来。这就是"判据测的是形状、不是效果"的代价：
+   * 它给出的答案与事实**正好相反**。
+   *
+   * 为什么不能"真调一次，看它通不通"：那一次调用本身就是我们要阻止的那件事，
+   * 而且这一侧根本观测不到"宿主收没收到" —— 等能看到时它已经出去了。能观测的
+   * 等价物只有一个：**唯一能到宿主的那个函数还在不在这个位置上**。Tauri 的两条
+   * 传输（`window.ipc.postMessage` 与 `__TAURI_INTERNALS__.postMessage`）都是
+   * **调用时**才去取这一跳，因此"位置上是我们那个桩"就等于"调用到不了宿主"。
+   * （桩是**按引用**比较的，所以它只能是上面那一个函数对象。）
+   *
+   * 取不到那个对象时按**最坏情况**算：宁可多报一次，也不要因为"读不到"而把一条
+   * 真通道报成不存在。
    */
   function hostIpcIsReachable() {
     try {
       var webview = window.chrome && window.chrome.webview;
-      if (webview && typeof webview.postMessage === 'function') return true;
+      if (webview && typeof webview.postMessage === 'function') {
+        // 这一跳在：它是两条传输唯一的汇合点。还是那个桩 = 通不了。
+        return webview.postMessage !== HOST_IPC_STUB;
+      }
 
+      // 这一跳根本不在（非 Windows / 引擎换了形状）：剩下的只有 fetch 那条，
+      // 它由文档的 CSP 挡着，而 CSP 是引擎执行的 —— 这一侧验不了，按最坏情况算。
       return (
         typeof window.ipc !== 'undefined' ||
         typeof window.__TAURI_INTERNALS__ !== 'undefined'
@@ -246,12 +331,18 @@
     // 名字还在、但掐断成功了：这是 Windows 上的**预期状态**。
     // 记一条 info（而不是 error）是刻意的 —— 见上面那两段说明：
     // 一个恒为真的判据只会训练人无视日志。
+    //
+    // 措辞里那两句也是刻意的：**名字在是平台事实**（wry 不理会
+    // for_main_frame_only），**掐断是纵深防御**（这一层不是引擎给的隔离，
+    // Windows 不提供那个 API）。两件都说出来，读日志的人才不会把"名字在"
+    // 当成又一次失效，也不会把"掐断了"当成沙箱的全部。
     if (found.length > 0 && !hostIpcIsReachable()) {
       console.info(
         '[Modulith] 这个文档里出现了宿主 IPC 的名字（' +
           found.join('、') +
           '），但它们已经**不通**了：wry 在 Windows 上不理会 for_main_frame_only，' +
-          '注入是平台行为；桥接层已经把最后那一跳换成了桩。'
+          '注入是平台行为；桥接层已经把最后那一跳换成静默的桩（这一层是纵深防御，' +
+          '不是引擎给的隔离）。'
       );
       return true;
     }
@@ -261,8 +352,8 @@
     var detail =
       '这个插件文档里出现了宿主 IPC（' + found.join('、') + '），而且它**还能用**。' +
       '插件界面本应跑在一个拿不到 IPC 的跨源 iframe 里 —— 现在它拿得到。' +
-      '（名字出现在 Windows 上是正常的：wry 不理会 for_main_frame_only。' +
-      '这一条报的是"桥接层没能掐断最后那一跳"。）';
+      '（名字出现在 Windows 上是正常的：wry 不理会 for_main_frame_only，那是平台事实。' +
+      '这一条报的是"桥接层没能掐断最后那一跳" —— 那一步是纵深防御，它没能生效。）';
     console.error('[Modulith] 沙箱边界失效：' + detail);
 
     // 也交给宿主写进文件日志：控制台在 release 版里看不到，而这一条恰恰是最不该

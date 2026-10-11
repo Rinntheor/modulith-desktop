@@ -4714,6 +4714,208 @@ section('桥接层的运行时守卫');
       /found\.length > 0 && !hostIpcIsReachable\(\)/.test(assertCode),
       '名字在、而通道已死 = 预期（只记 info）；只在通道**还活着**时报 ERROR'
     );
+    // 判据必须与那个**桩**按引用比较。只看 `typeof === 'function'` 是不行的：
+    // 桩本身也是一个函数，于是"掐断成功"会被报成"通道还活着" —— 上一版正是
+    // 这样，在每一个插件界面上打出一条与事实相反的 ERROR。
+    check(
+      /webview\.postMessage !== HOST_IPC_STUB/.test(reachableCode),
+      '「还通不通」与那个桩**按引用**比较（桩也是函数，只看类型会得到相反的答案）'
+    );
+    check(
+      bridgeJs.indexOf('HOST_IPC_STUB = stub') > -1,
+      '桩被记进 HOST_IPC_STUB（判据要靠它，忘了赋值 = 那条判据恒为"可达"）'
+    );
+  }
+
+  // ---- 1b. 掐断必须是**静默的**：这一条守的是一次真实回归 ----
+  //
+  // ============================================================
+  // 为什么单独钉这一条
+  // ============================================================
+  //
+  // 26ac934 把替换函数写成了抛 `Error` 的 `deny`。维护者的日志给出了后果：
+  //
+  //     [Modulith] 插件里有一个 Promise 被拒绝且没有 catch：
+  //     Error: [Modulith] 沙箱插件不能通过宿主 IPC 通道发消息
+  //         at Object.deny [as postMessage] (…/bridge.js:199:17)
+  //         at Object.postMessage (<anonymous>:1:102)
+  //         at sendIpcMessage (<anonymous>:130:18)
+  //         at <anonymous>:113:13
+  //
+  // 那两帧 `<anonymous>` 全是 **Tauri 自己的引导脚本**：把
+  // `scripts/process-ipc-message-fn.js` 内联进 `scripts/ipc-protocol.js` 之后，
+  // `:113` 是 fetch 被 CSP 挡下之后那一次 `sendIpcMessage(message)` 重试、
+  // `:130` 是回退分支的 `window.ipc.postMessage(data)`（两者相差 46 行，
+  // 与内联进来的 46 行逐字吻合）。也就是说**调用方不是插件**：
+  // `tauri-plugin-dialog` 的 `init-iife.js` 把 `window.confirm` 换成了走 IPC 的
+  // 版本，而插件（clipboard-history）只是调了一个标准浏览器 API，那条 promise
+  // 由注入脚本自己丢掉。
+  //
+  // 要的性质是"这个文档到不了宿主"，不是"尝试会被大声拒绝"。判据分三层，
+  // 缺任何一层都会留下一个能悄悄退回去的口子：
+  //
+  //   1. **源码**：替换体里不许有 `throw`、不许有 `Promise.reject`（剥注释后再查，
+  //      否则解释"为什么不能这么做"的注释本身会把门禁判成违规）；
+  //   2. **运行时**：直接调那一跳、以及经 Tauri 的两条传输调它，都必须正常返回，
+  //      并且什么都不发出去；
+  //   3. **那盏灯必须仍然会亮**：把那一跳做成不可写（替换必然失败）时，
+  //      `assertNoHostIpc()` 必须报 ERROR，而且通道**确实**还是通的 ——
+  //      少了这一层，一个"永远返回 false"的探针能让上面两层全绿。
+  {
+    const neutralizeBody = strip(
+      /function neutralizeHostIpc\(\) \{[\s\S]*?\n  \}/.exec(bridgeJs)?.[0] ?? ''
+    );
+    check(
+      !/\bthrow\b/.test(neutralizeBody) && !/Promise\.reject/.test(neutralizeBody),
+      '掐断不抛错、也不返回拒绝（抛错会变成 Tauri `invoke` 上一条没人能处理的拒绝）'
+    );
+
+    /**
+     * 把渲染后的桥接层装进一个假的插件文档。
+     *
+     * `writable` 为 false 时那一跳**不可写** —— 那正是"掐不断"的那一种平台形状
+     * （属性只读/被冻结），用来验第三层判据。
+     */
+    function bootIpcProbe(writable: boolean): {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      window: Record<string, any>;
+      hosted: string[];
+      errors: string[];
+      infos: string[];
+    } {
+      const hosted: string[] = [];
+      const errors: string[] = [];
+      const infos: string[] = [];
+
+      // 那一跳。类型上写成可调用的形状，属性本身由 `defineProperty` 给 ——
+      // 第三层判据要的就是"不可写"这一种形状。
+      const webview = {} as { postMessage: (message: unknown) => void };
+      Object.defineProperty(webview, 'postMessage', {
+        value: (message: unknown) => {
+          hosted.push(String(message));
+        },
+        writable,
+        configurable: writable,
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const fakeWindow: Record<string, any> = {
+        addEventListener: () => {},
+        document: { getElementById: () => null, addEventListener: () => {} },
+        location: { pathname: '/0123456789abcdef0123456789abcdef/' },
+        parent: { postMessage: () => {} },
+        chrome: { webview },
+        // 宿主那一份 React。缺了它桥接层会**自己**记一条 console.error，
+        // 而下面两条断言数的就是 console 的条数 —— 那样它们测到的会是
+        // "React 没送来"，而不是"边界报了什么"。
+        __MODULITH_PLUGIN_REACT__: {
+          version: '19.2.7',
+          reactDomVersion: '19.2.7',
+          React: { createElement: () => null },
+          JsxRuntime: { jsx: () => null, jsxs: () => null, Fragment: Symbol('Fragment') },
+          JsxDevRuntime: { jsxDEV: () => null },
+          ReactDomClient: { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
+        },
+      };
+      Object.defineProperty(fakeWindow, 'isTauri', { value: true });
+      // Tauri 的两条传输都汇到那一跳，而且**都是调用时才去取它**：
+      //   * `window.ipc` —— wry 注入的 `s => window.chrome.webview.postMessage(s)`；
+      //   * `__TAURI_INTERNALS__.postMessage` —— `ipc-protocol.js` 的
+      //     `sendIpcMessage`，回退分支就是 `window.ipc.postMessage(data)`。
+      // 这里按同一形状接上，因此"调用到不了那一跳"可以被真的测出来。
+      Object.defineProperty(fakeWindow, 'ipc', {
+        value: Object.freeze({
+          postMessage: (message: unknown) => webview.postMessage(message),
+        }),
+      });
+      Object.defineProperty(fakeWindow, '__TAURI_INTERNALS__', {
+        value: Object.defineProperty({}, 'postMessage', {
+          value: (message: unknown) => fakeWindow.ipc.postMessage(message),
+        }),
+      });
+
+      const info = console.info;
+      const error = console.error;
+      console.info = (...args: unknown[]) => {
+        infos.push(args.map(String).join(' '));
+      };
+      console.error = (...args: unknown[]) => {
+        errors.push(args.map(String).join(' '));
+      };
+      try {
+        const factory = new Function(
+          'window',
+          'document',
+          'fetch',
+          'navigator',
+          `${renderedForIpc}\nreturn window;`
+        );
+        factory(
+          fakeWindow,
+          fakeWindow.document,
+          () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, value: null }) }),
+          { clipboard: { readText: async () => '', writeText: async () => {} } }
+        );
+      } finally {
+        console.info = info;
+        console.error = error;
+      }
+
+      return { window: fakeWindow, hosted, errors, infos };
+    }
+
+    /** 调一次那一跳，返回是抛了还是正常返回。 */
+    function callHop(fn: () => unknown): string {
+      try {
+        const value = fn();
+        return value === undefined ? 'undefined' : String(value);
+      } catch (error) {
+        return `throw: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+
+    const renderedForIpc = renderBridge({
+      permissions: '["storage"]',
+      theme: '{}',
+      shortcuts: '{}',
+    });
+
+    // ---- 第二层：掐断成功时，两条传输都发不出去、而且都不抛 ----
+    const closed = bootIpcProbe(true);
+    check(
+      closed.hosted.length === 0 && closed.errors.length === 0 && closed.infos.length === 1,
+      closed.errors.length > 0
+        ? `★ 掐断成功之后还在报 ERROR：${closed.errors[0]}`
+        : closed.infos.length === 1
+          ? '掐断成功时只记一条 info（名字在是 Windows 上的平台事实，通道已死）'
+          : `掐断成功时记录的 info 条数为 ${closed.infos.length}（应当是 1）`
+    );
+    check(
+      callHop(() => closed.window.chrome.webview.postMessage('直接调那一跳')) === 'undefined' &&
+        closed.hosted.length === 0,
+      '那一跳的替换**正常返回 undefined**，而且什么都不发（上一版在这里抛 Error）'
+    );
+    check(
+      callHop(() => closed.window.ipc.postMessage('经 window.ipc')) === 'undefined' &&
+        callHop(() => closed.window.__TAURI_INTERNALS__.postMessage('经 __TAURI_INTERNALS__')) ===
+          'undefined' &&
+        closed.hosted.length === 0,
+      'Tauri 的两条传输（window.ipc / __TAURI_INTERNALS__.postMessage）也都不抛、都发不出去'
+    );
+
+    // ---- 第三层：那一跳掐不断时，那盏灯必须亮，而且它说的是实话 ----
+    const open = bootIpcProbe(false);
+    check(
+      callHop(() => open.window.ipc.postMessage('掐不断的这一跳')) === 'undefined' &&
+        open.hosted.length === 1,
+      '这一跳不可写时消息**真的**发得出去（假探针在这里就露馅了）'
+    );
+    check(
+      open.errors.length === 1 && open.errors[0].includes('沙箱边界失效'),
+      open.errors.length === 1
+        ? '掐不断时报 ERROR（"名字在、通道还活着"才是那条 ERROR）'
+        : `掐不断时报了 ${open.errors.length} 条 ERROR（应当是 1）`
+    );
   }
 
   // ---- 2. 同一个来源带来的共享存储必须封掉 ----

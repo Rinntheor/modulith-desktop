@@ -38,9 +38,18 @@
 //
 //      真正能用的那一半现在是**桥接层**承担：它是宿主的一部分、先于插件代码加载，
 //      因此它把最后那一跳（`window.chrome.webview.postMessage`，两条传输的汇合点）
-//      换成了桩。`__TAURI_INTERNALS__` / `window.ipc` 本身不可重定义、删不掉，
-//      但它们的实现体是**调用时**才去取那一跳的，因此换掉它就够了。判据与理由
-//      见 `resources/sandbox-bridge.js` 的 `neutralizeHostIpc` / `hostIpcIsReachable`。
+//      换成**静默的空操作**。`__TAURI_INTERNALS__` / `window.ipc` 本身不可重定义、
+//      删不掉（`tauri-2.11.5/src/manager/webview.rs:166-194` 与 `scripts/ipc.js`、
+//      `scripts/core.js` 里那几处 `Object.defineProperty` 用的是默认属性，即
+//      `writable: false, configurable: false`），但它们的实现体是**调用时**
+//      才去取那一跳的，因此换掉它就够了。判据与理由见
+//      `resources/sandbox-bridge.js` 的 `neutralizeHostIpc` / `hostIpcIsReachable`。
+//
+//      ⚠️ **那个桩必须是静默的，不能抛错。** 它一度写成抛 `Error`，于是 Tauri 的
+//      `invoke` 返回的 Promise 被拒绝 —— 而调用方不保证 catch（`invoke` 对任何走到
+//      它的人开放，包括 Tauri 自己注入的脚本与它接管的 `window.confirm`），
+//      结果是每个插件界面的控制台上多出一条没人能处理的拒绝，矛头还指向插件代码。
+//      要的性质是"这个文档到不了宿主"，而它由"那一跳不存在"本身满足。
 //   2. **手工拼一条 IPC 也不行。** IPC 处理器第一件事是比对 `invoke_key`
 //      （每次运行随机、只注入主框架），不匹配就**静默丢弃**。
 //      见 tauri-2.11.5/src/webview/mod.rs 的 `on_message`。
