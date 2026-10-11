@@ -253,6 +253,151 @@ check(
 );
 
 // ============================================================
+// 1f. 后台入口的路径：交给子进程的那个值必须是**能打开的文件**
+// ============================================================
+//
+// ============================================================
+// 这一节守的是一次真实故障：每一个后台插件都起不来，错误是裸盘符
+// ============================================================
+//
+// 维护者机器上的 modulith.log（Node v24.15.0，发行版）：
+//
+//     WARN 后台插件 com.modulith.sample.stand-up 未能启动：
+//          EISDIR: illegal operation on a directory, lstat 'C:'
+//     WARN 后台插件 com.rinntheor.modulith.translate 未能启动：
+//          EISDIR: illegal operation on a directory, lstat 'D:'
+//
+// 宿主与子进程握手是成功的（协议 2），因此问题不在拉起、权限旗标、清空的环境
+// 变量、stderr 管道或脚本查找上 —— 它在 `plugin.load` 的 `entry` 里。
+//
+// 机制：Windows 上 `Path::canonicalize` 返回**逐字路径** `\\?\D:\…`，而 Node 的
+// `fs.realpathSync` 不认这个前缀（libuv 把它当普通目录名剥掉），于是路径塌缩成
+// **裸盘符** `D:`，`lstat` 到一个目录上并报 EISDIR。实测（Node 24.9.0）：
+//
+//     realpathSync('\\\\?\\D:\\…\\package.json')  →  EISDIR，lstat 'D:'
+//     realpathSync('D:\\…\\package.json')          →  正常
+//     realpathSync('\\\\?\\UNC\\server\\share\\x') →  同样塌缩
+//
+// 同一个前缀还有第二个后果，而且更难查：Node 的权限模型按真实路径比对放行目标，
+// 实测 `--allow-fs-read=\\?\<dir>` 之下读该目录里的文件得到 `ERR_ACCESS_DENIED`
+// （普通写法才通过）。因此 `root` 也必须在过界之前把前缀剥掉。
+//
+// ============================================================
+// 为什么这一段必须是**源码级**断言
+// ============================================================
+//
+// 这条缺陷没有任何编译期信号，在开发机上也不一定复现（取决于插件目录长什么样）。
+// 它唯一的信号是子进程的一句系统错误，而那句话里既没有插件 id 也没有清单内容 ——
+// 维护者是靠 `'C:'` / `'D:'` 恰好等于两个插件所在盘才推断出成因的。
+// 因此把"`canonicalize` 的产物不许直接过界"钉在构造请求的那一段代码上。
+console.log('\n后台入口的路径（逐字前缀不许过界）：');
+
+{
+  const managerRs = read('src-tauri/src/modules/plugins/manager.rs');
+
+  // 只取测试模块**之前**的正文：测试里需要显式写 `\\?\` 来钉住剥前缀这件事，
+  // 不切掉的话下面那条反面断言会被测试自己的字面量打红（这个仓里已经踩过一次
+  // 同样的坑，见上面 `stripComments` 的说明）。
+  const managerBeforeTests = managerRs.slice(0, managerRs.indexOf('#[cfg(test)]'));
+  check(managerBeforeTests.length > 0, '能在 manager.rs 里定位到测试模块之前的正文');
+
+  // 求值顺序在这里是被检查的一件事：`&*` 借用一整个临时值，因此**只有**把这个
+  // 表达式整体当作 `resolve_background_entry` 的实参，它才不需要一个 `let` 绑定
+  // 就能编译。也就是说"入口是那个函数算出来的"与"它确实被调用过"是同一条断言。
+  check(
+    /let\s*\(\s*\w+\s*,\s*\w+\s*\)\s*=\s*resolve_background_entry\([\s\S]{0,120}?\)\s*\?/.test(
+      managerBeforeTests
+    ),
+    'background_launch 的 root 与 entry 都由 resolve_background_entry 算出（不是各算一次）'
+  );
+
+  // `--allow-fs-read` 的放行根也必须落在**后台启动**那一段里、并且是那个解析出来的
+  // root。少了它，逐字前缀会从"入口打不开"变成"入口读不到"（ERR_ACCESS_DENIED），
+  // 两种表现都指向不了真正的原因。
+  const pluginsRs = read('src-tauri/src/modules/desktop/background/plugins.rs');
+  const launchStart = pluginsRs.indexOf('let launch = {');
+  const launchEnd = pluginsRs.indexOf('node_args.push("--permission"', launchStart);
+  const launch = launchStart >= 0 && launchEnd > launchStart
+    ? pluginsRs.slice(launchStart, launchEnd)
+    : '';
+  check(
+    launch.includes('background_launch(plugin_id)'),
+    '能定位到 set_spec 之前那一段（它读的是 background_launch 算出来的 launch）'
+  );
+  check(
+    /--allow-fs-read=\{\}[\s\S]{0,80}?launch\.root\.display\(\)/.test(pluginsRs),
+    '--allow-fs-read 用的是 launch.root（逐字前缀已在解析时剥掉）'
+  );
+
+  // 三道路径检查：越界、元数据、是文件。
+  //
+  // 第三条是**这次修复的关键**："不是文件"必须在宿主侧就失败，而不是把这条路径
+  // 交给子进程去抛一个与插件无关的系统错误。少了它，`EISDIR` / `ENOENT` 会重新
+  // 出现在子进程的 stderr 里，而那句错误的可行动性是零。
+  check(
+    /fn resolve_background_entry\(\s*id:\s*&str,\s*root:\s*&Path,\s*relative_entry:\s*&str,?\s*\)/.test(
+      managerBeforeTests
+    ),
+    '入口解析是一个有名字的纯函数（因此它可以被临时目录上的单测钉住）'
+  );
+  check(
+    /if\s*!metadata\.is_file\(\)\s*\{[\s\S]*?PluginError::InvalidManifest/.test(managerBeforeTests),
+    '入口不是文件时在宿主侧失败并返回 InvalidManifest（绝不交给子进程去炸）'
+  );
+  check(
+    /"插件 \{id\} 的后台入口不是文件/.test(managerBeforeTests) &&
+      /"插件 \{id\} 的后台入口无法打开/.test(managerBeforeTests),
+    '错误里点名**哪个插件**（子进程那句 EISDIR 里没有这个信息）'
+  );
+  check(
+    /清单里写的是 \{relative_entry\}/.test(managerBeforeTests),
+    '错误里带上清单里写的那段相对路径（否则用户不知道该改哪里）'
+  );
+
+  // 逐字前缀必须被**剥掉**：这一条是本节的正题。
+  check(
+    /fn strip_verbatim_path\(/.test(managerBeforeTests),
+    '有一个专门剥逐字前缀的函数（`\\?\` 是这次缺陷的成因）'
+  );
+  check(
+    /let root_out = strip_verbatim_path\(&canonical_root\);/.test(managerBeforeTests),
+    '规范化之后的根在拼入口、交给子进程**之前**剥掉了逐字前缀'
+  );
+  {
+    // 剥前缀的实现里必须**显式写出**那两个前缀字面量。写在别处的注释里不算 ——
+    // 判据落在函数自己的那几百个字符上，否则这条断言会被文件里解释这件事的那段
+    // 注释喂饱（"反面判据要对着剥干净/限定范围的代码做"，见 `stripComments`）。
+    const stripStart = managerBeforeTests.indexOf('fn strip_verbatim_path(');
+    const stripBody = managerBeforeTests.slice(stripStart, stripStart + 900);
+    check(
+      stripBody.includes(String.raw`r"\\?\UNC\"`) && stripBody.includes(String.raw`r"\\?\"`),
+      '剥前缀的实现显式认这两个前缀（盘符形态与 UNC 形态），而不是靠猜 Path 的行为'
+    );
+  }
+
+  // ============================================================
+  // 反面判据：这两个函数的**签名**不许再出现在别处
+  // ============================================================
+  //
+  // 上面几条是"正面要求"（该有的调用都在）。它们拦不住最常见的回归方式：有人把
+  // 入口那三行**再内联回去**（`root.canonicalize()` 之后直接 `join`），此时正面
+  // 断言仍然全绿 —— 因为 `resolve_background_entry` 还在文件里，只是没人调它了。
+  //
+  // 因此这里数一次定义次数：`resolve_background_entry` 恰好一份，
+  // `strip_verbatim_path` 恰好两份（windows / not(windows)，这是刻意的）。
+  const entryDefs = (managerBeforeTests.match(/fn resolve_background_entry\(/g) ?? []).length;
+  check(
+    entryDefs === 1,
+    `入口解析只有一处实现（实际 ${entryDefs} 处；两份实现迟早会在某个边界上分叉）`
+  );
+  const stripDefs = (managerBeforeTests.match(/fn strip_verbatim_path\(/g) ?? []).length;
+  check(
+    stripDefs === 2,
+    `剥前缀恰好两份（windows / 非 windows），实际 ${stripDefs} 份`
+  );
+}
+
+// ============================================================
 // 2. 协议版本两侧一致（没有任何编译器会帮我们检查这个）
 // ============================================================
 console.log('\n协议版本：');

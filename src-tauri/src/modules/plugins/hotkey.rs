@@ -1453,6 +1453,82 @@ mod tests {
     }
 
     // ============================================================
+    // 面板的录制控件与宿主：**产出**的那一侧必须被这一侧接受
+    // ============================================================
+    //
+    // ============================================================
+    // 这一条守的是"第三份实现"的边界
+    // ============================================================
+    //
+    // `translate` 插件面板里有一个录制控件（用户按组合键，而不是手写字符串）。
+    // 那是一个**独立仓**里的单文件 IIFE，不许 import，因此它抄了这套语法 ——
+    // 也就是说同一个语法现在有三份实现：
+    //
+    //   1. `src/services/shortcutRegistry.ts`（起源，界面侧的冲突判定）
+    //   2. 这个文件（真正 `RegisterHotKey` 的那一侧）
+    //   3. `modulith-plugins/plugins/translate/index.js`（面板录制控件）
+    //
+    // (1)↔(2) 由 `check:plugin-runtime` 用共享语料钉住；(3) 跨仓，**没有门禁能钉**。
+    // 因此这里钉住它唯一必须成立的那件事：**录制控件能产出的每一种字符串，宿主都
+    // 必须接受**（否则用户"按下去"得到的是一次注册失败，而那一刻他做不了什么）。
+    //
+    // 这张表是 `index.js` 里 `comboFromEvent` 的**值域**，逐条抄过来：
+    //   · 修饰符只有 mod / shift / alt，顺序固定 mod+shift+alt；
+    //   · 主键只有那几类（字母数字、F1..F24、以及 `named_virtual_key` 认的名字）；
+    //   · 修饰符一个都没有时**只有** F1..F24 能过（裸普通键被 `key_may_be_bare` 拒，
+    //     而 `comboFromEvent` 也会返回 null —— 两侧拒绝的是同一批）。
+    #[test]
+    fn everything_the_panel_recorder_can_produce_is_registrable_here() {
+        // 面板能产出的（必须全部被接受）。
+        // 这份清单与 `translate/index.js` 的 `comboFromEvent` 一一对应；插件的
+        // 单测/脚手架把那一侧的每一类都跑过一遍，这里是另一侧。
+        for combo in [
+            // 一个修饰符 + 字母/数字
+            "mod+k", "mod+1", "shift+k", "alt+k",
+            // 多个修饰符（顺序固定）
+            "mod+shift+k", "mod+alt+k", "mod+shift+alt+k",
+            // 命名键（`event.key` 的形态 → 宿主认的名字）
+            "mod+tab", "mod+shift+tab", "mod+enter", "mod+space", "mod+backspace",
+            "mod+escape", "alt+escape", "mod+pageup", "mod+pagedown", "mod+home",
+            "mod+end", "mod+insert", "mod+delete",
+            // 方向键
+            "mod+left", "mod+up", "mod+right", "mod+down", "mod+shift+down",
+            // 功能键：带修饰符与**裸的**都允许
+            "mod+f9", "alt+f24", "mod+shift+alt+f1", "f9", "f24",
+        ] {
+            assert!(
+                accelerator(combo).is_ok(),
+                "面板录制控件会产出 `{combo}`，而宿主拒绝注册它 —— 用户按下去只会得到一次\
+                 注册失败。两侧的判据必须一起改（`translate/index.js::comboFromEvent`）"
+            );
+            // 顺带钉住：规范化之后的形态必须**就是它自己**（录制控件产出的已经是
+            // 规范形态，宿主不该再改写它 —— 改写了说明两边的顺序规则不一致）。
+            assert_eq!(
+                normalize_combo(combo).as_deref(),
+                Some(combo),
+                "`{combo}` 已经是规范形态，宿主不该再改写它"
+            );
+        }
+    }
+
+    /// 面板**拒绝**的那些必须在这里也被拒绝 —— 否则用户会在面板上看到一个
+    /// "按不了"的键，而宿主其实会接受（或者反过来，这里接受、面板拒绝）。
+    ///
+    /// `comboFromEvent` 对"零修饰符 + 非功能键"返回 `null`，理由是
+    /// `key_may_be_bare`。这一条把那个理由钉在这里：这些组合**确实**会毁掉用户的键盘。
+    #[test]
+    fn bare_ordinary_keys_are_rejected_by_both_sides() {
+        for combo in ["a", "k", "1", "enter", "tab", "space", "escape", "up"] {
+            let error = accelerator(combo)
+                .expect_err("裸的普通键不该能注册：它会把这个键从整台机器上拿走");
+            assert!(
+                error.contains("整台机器") || error.contains("F1..F24"),
+                "拒绝的理由必须说清「整台机器」这件事：{error}"
+            );
+        }
+    }
+
+    // ============================================================
     // 虚拟键码
     // ============================================================
 
