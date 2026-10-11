@@ -260,6 +260,50 @@ export async function createPluginHost(): Promise<PluginHost> {
   };
 
   /**
+   * 与 Rust 侧 `hotkey::require_permission` 对齐。
+   *
+   * 与 `requireSecrets` 同一条纪律，而这一项有个特别之处：它在真实宿主里会**占用
+   * 一个系统级独占资源**。夹具里没有真实的 `RegisterHotKey`，因此这里能如实验证的
+   * 只有两件可判定的事 —— **权限对不对**、以及**调用形状对不对**。真正的注册/
+   * 解绑语义由 `hotkey.rs` 的单测覆盖（冲突消息、4 条上限、只能解绑自己的组合）。
+   */
+  const requireHotkey = (pluginId: string): void => {
+    const permissions = (manifestOf(pluginId)?.permissions as string[] | undefined) ?? [];
+    if (!permissions.includes('global-hotkey')) {
+      throw new Error(`插件 "${pluginId}" 的清单里没有声明 "global-hotkey" 权限，命令被拒绝`);
+    }
+  };
+
+  /**
+   * 与 Rust 侧 `selection::require_permission` 对齐。
+   *
+   * 桩**必须如实拒绝**，而且比别的几项更要紧：这一项读的是用户在任何程序里选中的
+   * 内容。夹具里没有剪贴板、没有前台窗口，因此"能不能读到"无从验证 —— 但"没声明
+   * 权限就拒绝"是这一项在真实运行时**最不该被放宽**的那一条。
+   */
+  const requireSelection = (pluginId: string): void => {
+    const permissions = (manifestOf(pluginId)?.permissions as string[] | undefined) ?? [];
+    if (!permissions.includes('read-selection')) {
+      throw new Error(`插件 "${pluginId}" 的清单里没有声明 "read-selection" 权限，命令被拒绝`);
+    }
+  };
+
+  /**
+   * 与 Rust 侧 `rpc::require_ui_permission` 对齐（`ctx.ui.popover` 那一族）。
+   *
+   * 与 `requireSecrets` 同一条纪律：桩后端必须如实拒绝。这一项容易被漏掉 ——
+   * 卡片看起来只是"显示一段文本"，但真实宿主把 `ui.popover` 与 `ui.dialog` /
+   * `ui.contextMenu` 一起判在了 `notification` 上（三者都会打断用户）。桩里不检查
+   * 的话，夹具会替一个没声明权限的插件"成功显示"一张卡片。
+   */
+  const requireNotification = (pluginId: string): void => {
+    const permissions = (manifestOf(pluginId)?.permissions as string[] | undefined) ?? [];
+    if (!permissions.includes('notification')) {
+      throw new Error(`插件 "${pluginId}" 的清单里没有声明 "notification" 权限，命令被拒绝`);
+    }
+  };
+
+  /**
    * 夹具的"宿主订阅表"。真实宿主用它决定轮询线程起不起（见
    * `plugins/clipboard.rs` 的"生命周期"一节），而夹具用它回答"这个插件订阅了没有"。
    *
@@ -268,6 +312,17 @@ export async function createPluginHost(): Promise<PluginHost> {
    * "重复订阅"在夹具里看起来有问题、在真机上没有问题。
    */
   const clipboardSubscribers = new Set<string>();
+
+  /**
+   * 全局热键在夹具里的两张表：`规范化组合键 → 插件 id`、以及 `谁订阅了触发`。
+   *
+   * **夹具不做任何真实注册**（没有消息窗口，也没有系统热键名额），因此这两张表
+   * 是这一项在夹具里**唯一**能被断言的东西：权限有没有判、组合键有没有被规范化、
+   * 解绑是不是只动自己的、订阅有没有登记。真正的注册/解绑语义在 `hotkey.rs` 的
+   * 单测里，而"用户按下去有没有反应"只能在真机上验 —— 这里不假装能验它。
+   */
+  const hotkeys = new Map<string, string>();
+  const hotkeySubscribers = new Set<string>();
 
   /** 设置的可变状态。夹具自己持有；**默认值交给前端的 normalize 补** */
   const appSettings: Record<string, any> = {};
@@ -424,6 +479,90 @@ export async function createPluginHost(): Promise<PluginHost> {
     plugin_clipboard_read_image: ({ id }) => {
       requireClipboardMonitor(String(id));
       return null;
+    },
+
+    // ------------------------------------------------------------
+    // 全局热键（`ctx.hotkey`）
+    // ------------------------------------------------------------
+    //
+    // 夹具里**没有真正的消息窗口、也没有系统热键名额**，因此这里不做任何注册 ——
+    // 它只记两张表（每条组合归谁、谁订阅了），让夹具能断言"权限与调用形状对不对"。
+    // 在桩里伪造一次注册会让夹具显示"热键装上了"，而那正是真实运行时唯一重要的
+    // 那件事（用户按下去有没有反应）—— 伪造成立比不测更糟。
+    //
+    // `plugin_hotkey_can_register` 返回 `true`：夹具跑在开发机上，而这个值决定前端
+    // 的 `ctx.hotkey.isAvailable()`。返回 `false` 会让所有热键调用在夹具里走降级
+    // 分支，于是"注册确实交给了宿主"这件事根本没被测到（与剪贴板那条同一个理由）。
+    plugin_hotkey_can_register: () => true,
+
+    plugin_hotkey_register: ({ id, combo }) => {
+      requireHotkey(String(id));
+      const normalized = String(combo).trim().toLowerCase();
+      hotkeys.set(normalized, String(id));
+      return normalized;
+    },
+
+    // 解绑**不检查权限**（与真实宿主一致）：一条解不掉的绑定就是一个泄漏。
+    plugin_hotkey_unregister: ({ id, combo }) => {
+      const normalized = String(combo).trim().toLowerCase();
+      // 只能解自己的 —— 与 `hotkey.rs` 的 `unregister` 同一条判据。
+      if (hotkeys.get(normalized) === String(id)) hotkeys.delete(normalized);
+      return null;
+    },
+
+    plugin_hotkey_list: ({ id }) =>
+      [...hotkeys.entries()].filter(([, owner]) => owner === String(id)).map(([combo]) => combo),
+
+    plugin_hotkey_subscribe: ({ id }) => {
+      requireHotkey(String(id));
+      hotkeySubscribers.add(String(id));
+      return null;
+    },
+
+    plugin_hotkey_unsubscribe: ({ id }) => {
+      hotkeySubscribers.delete(String(id));
+      return null;
+    },
+
+    // ------------------------------------------------------------
+    // 读取选中文本（`ctx.selection`）
+    // ------------------------------------------------------------
+    //
+    // `plugin_selection_can_read` 返回 `false`，而这与上面那条**刻意相反**：
+    // 这里没有前台窗口、没有真实剪贴板，一次捕获在夹具里**根本不可能成功** ——
+    // 返回 `true` 会让夹具里的 `read()` 走进一条永远失败的路径，而那不是
+    // "这项能力可用"的演示，只是一次必然而无意义的报错。返回 `false` 是夹具里
+    // 唯一如实的答案（与 `plugin_clipboard_read_image` 返回 null 同一个理由）。
+    plugin_selection_can_read: () => false,
+
+    plugin_selection_read: ({ id }) => {
+      requireSelection(String(id));
+      // 权限判完仍然要说清"夹具里读不到"：返回 null 会被读成"用户没有选中东西"，
+      // 而真实原因是这里没有可读的对象。
+      throw new Error(
+        '检查夹具里没有前台窗口与剪贴板，因此无法读取选中的文本（这不是权限问题）'
+      );
+    },
+
+    /**
+     * `ctx.ui.popover`（宿主渲染的结果卡片）。
+     *
+     * ============================================================
+     * 返回值是 `{ action: null }`，而那是夹具里**唯一如实的答案**
+     * ============================================================
+     *
+     * 卡片要一个真实的浮层窗口与一次真人点击才可能有非空的动作 id。夹具里两样
+     * 都没有 —— 于是这里的正确行为就是契约里那个 `null`（"用户没回答"），
+     * 而不是编一个按钮 id 出来。编出来的话，夹具会测到一个真实运行时永远不会
+     * 出现的结果。
+     *
+     * 权限判定**必须照做**（与 `requireSecrets` 同一条纪律）：真实宿主把
+     * `ui.popover` 判在 `notification` 上，而一个不检查的桩会让夹具替没声明
+     * 权限的插件"成功显示"一张卡片。
+     */
+    plugin_ui_popover: ({ id }) => {
+      requireNotification(String(id));
+      return { action: null };
     },
 
     set_plugin_enabled: ({ id, enabled: next }) => {

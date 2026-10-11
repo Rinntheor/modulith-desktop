@@ -206,6 +206,40 @@ check(
   '用 run_return 时补上了 cleanup_before_exit（漏掉它托盘与窗口资源不会被清理）'
 );
 
+// ============================================================
+// 宿主托管的插件状态：**模板必须是生成结果的超集**
+// ============================================================
+//
+// `lib.rs` 是**生成**的：`pnpm dev` / `pnpm build` 的第一步就跑
+// `scripts/generate-backend-module.ts` 重新生成它。因此任何只写在 `lib.rs` 里、
+// 却没有写进模板的 `app.manage(...)` / `app.state::<...>()` 会在下一次生成时被
+// **静默删掉**。
+//
+// 这条断言是实测换来的：`HotkeyRegistry` 的托管与退出解绑曾经只存在于 `lib.rs`，
+// 于是每跑一次 `pnpm dev` 就被删一次，`ctx.hotkey` 整体失效（`try_state` 取不到
+// → 「热键注册表尚未就绪」），而插件面板把这件事报成"后台插件可能没在跑"，
+// 把排查引向 Node。**没有编译器、也没有任何运行期检查会拦住它**，只有源码级断言可以。
+{
+  const pluginManages = [...libRs.matchAll(/app\.manage\((modules::plugins::[^)]*)\)/g)].map(
+    (match) => match[1]
+  );
+  const pluginStates = [
+    ...libRs.matchAll(/app\.state::<(modules::plugins::[A-Za-z_:]+)>\(\)/g),
+  ].map((match) => match[1]);
+
+  check(
+    pluginManages.length > 0,
+    `lib.rs 里解析出 ${pluginManages.length} 处插件状态的托管（解析失败会让下面的断言变成假通过）`
+  );
+
+  for (const target of [...new Set([...pluginManages, ...pluginStates])]) {
+    check(
+      generateTs.includes(target),
+      `生成器模板里有 "${target}" —— 只写在 lib.rs 里的话，下一次 gen:backend 会把它删掉`
+    );
+  }
+}
+
 // 生成器模板必须与生成结果一致，否则下次 `gen:backend` 会把这些改回去。
 check(
   generateTs.includes('registry.start_all('),

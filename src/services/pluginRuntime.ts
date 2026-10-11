@@ -42,6 +42,14 @@ import {
   refreshClipboardMonitorSupport,
   subscribeClipboardChanges,
 } from './pluginClipboardMonitor';
+import {
+  clearHotkeySubscriptions,
+  hotkeySupported,
+  refreshHotkeySupport,
+  refreshSelectionSupport,
+  selectionSupported,
+  subscribeHotkeyFired,
+} from './pluginHotkey';
 import type {
   ActivationEvent,
   CommandContribution,
@@ -1620,6 +1628,201 @@ function pluginClipboard(pluginId: string, manifest: PluginManifest | undefined)
 }
 
 /**
+ * `ctx.hotkey`：全局热键。
+ *
+ * ============================================================
+ * 为什么它**只能**经宿主，而 `ctx.clipboard` 的读写不是
+ * ============================================================
+ *
+ * `RegisterHotKey` 在宿主进程里，而浏览器里没有任何 API 能让一个页面在**别的程序**
+ * 聚焦时收到按键（`addEventListener('keydown')` 只在本文档聚焦时有效）。因此这一项
+ * 没有"绕过 ctx 直接调浏览器 API"那条替代路径 —— 与 `secrets`、`clipboard-monitor`
+ * 同一形态，也就是说前端这一层的降级**不是**边界，Rust 侧的 `require_permission`
+ * 才是。
+ *
+ * 这一层仍然要做两件事，而它们都不是安全机制：
+ *   1. **缺权限时给出可读的拒绝**，而不是让插件去读一句宿主内部的错误；
+ *   2. **订阅**要在前端留一张表 —— 宿主推来的触发只有这一侧知道该交给谁。
+ */
+function pluginHotkey(pluginId: string, manifest: PluginManifest | undefined) {
+  const allowed = pluginHasPermission(manifest, 'global-hotkey');
+
+  let warned = false;
+  const warnOnce = () => {
+    if (warned) return;
+    warned = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 使用了全局热键，但清单里没有声明 ` +
+        `"global-hotkey" 权限，注册与订阅都被拒绝（后续同类调用不再重复提示）`
+    );
+  };
+
+  /**
+   * 缺权限时统一抛出的一句话。
+   *
+   * **不返回空结果、也不静默成功。** `register()` 静默成功会让插件以为热键装上了，
+   * 而用户按下去没有任何反应 —— 插件这一侧全绿，却没有一个地方说得出"它根本没注册"。
+   */
+  const denied = (what: string): never => {
+    warnOnce();
+    throw new Error(
+      `插件未声明 "global-hotkey" 权限，无法${what}。` +
+        `这一项必须显式声明：占用的组合键会从这台机器上所有其它程序手里被拿走`
+    );
+  };
+
+  let warnedUnsupported = false;
+  const warnUnsupportedOnce = () => {
+    if (warnedUnsupported) return;
+    warnedUnsupported = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 订阅了全局热键，但当前平台不支持` +
+        `（它依赖 Win32 的 RegisterHotKey，只在 Windows 上可用）。订阅被忽略 —— ` +
+        `调用 ctx.hotkey.isAvailable() 可以在代码里先判断`
+    );
+  };
+
+  return {
+    /**
+     * 现在能不能注册全局热键。**同步**，用于特性探测。
+     *
+     * 两个条件都满足才为真：清单里声明了 `global-hotkey`，**且**这个平台支持
+     * （只有 Windows 有 `RegisterHotKey`）。
+     */
+    isAvailable: (): boolean => allowed && hotkeySupported(),
+
+    /**
+     * 注册一条组合键。返回**宿主实际绑定的**规范化组合键。
+     *
+     * 返回规范化结果而不是回显输入：`Ctrl+Q` 与 `cmd+q` 都会被绑成 `mod+q`，
+     * 而插件拿它去 `unregister` 或显示给用户时，应当看到真正生效的那一条。
+     *
+     * 冲突时**拒绝**，而且消息里点名是谁占着它（宿主快捷键 / 另一个插件 / 系统里
+     * 的别的程序）—— 那三种情况下用户能做的事完全不同。宿主负责把那句话写清楚，
+     * 这一层**原样透出**，不改写。
+     */
+    register: async (combo: string): Promise<string> => {
+      if (!allowed) denied('注册全局热键');
+      if (typeof combo !== 'string') {
+        throw new Error('ctx.hotkey.register() 需要字符串形式的组合键，例如 "mod+q"');
+      }
+      return invoke<string>('plugin_hotkey_register', { id: pluginId, combo });
+    },
+
+    /**
+     * 解绑一条组合键。
+     *
+     * **不做权限检查**：一条解不掉的绑定就是一个泄漏 —— 而热键泄漏的后果比订阅
+     * 泄漏严重得多（它偷的是用户整台机器上的一个按键）。
+     */
+    unregister: async (combo: string): Promise<void> => {
+      await invoke('plugin_hotkey_unregister', { id: pluginId, combo: String(combo) });
+    },
+
+    /** 这个插件当前注册的组合键（规范化形式）。 */
+    list: async (): Promise<string[]> => {
+      return invoke<string[]>('plugin_hotkey_list', { id: pluginId });
+    },
+
+    /**
+     * 订阅"我注册的组合键被按下了"。返回取消订阅函数。
+     *
+     * 处理函数收到 `{ combo }` —— 契约里的 `handler()` 说的是"不要求参数"，而一个
+     * 插件最多能注册 4 条组合，因此多给这一个字段；否则处理函数分不清是哪一条。
+     *
+     * 与 `ctx.clipboard.subscribe` 同一条规矩：**平台不支持时降级成空订阅 + 一次
+     * 告警**，而不是抛错。抛错会让一个只是想在 Windows 上做特性的插件整体加载失败，
+     * 而它是可以 `isAvailable()` 自查的。
+     */
+    subscribe: (handler: (fired: { combo: string }) => void): (() => void) => {
+      if (typeof handler !== 'function') {
+        throw new TypeError('ctx.hotkey.subscribe 需要一个函数');
+      }
+      if (!allowed) {
+        warnOnce();
+        return () => {};
+      }
+      if (!hotkeySupported()) {
+        warnUnsupportedOnce();
+        return () => {};
+      }
+      return subscribeHotkeyFired(pluginId, handler);
+    },
+  };
+}
+
+/**
+ * `ctx.selection`：读取**前台应用程序**里当前选中的文本。
+ *
+ * ============================================================
+ * 它在宿主那一侧会**改用户的剪贴板**
+ * ============================================================
+ *
+ * 实现是"合成 Ctrl+C → 读剪贴板 → 把原内容写回"（见 `selection.rs` 的文件头）。
+ * 因此签名里那三种结果必须被调用方分开处理：
+ *
+ *   * `string` —— 读到了；
+ *   * **`null`** —— 捕获成功了，但剪贴板上最终没有文本；
+ *   * **抛错** —— 这次捕获根本没成功（前台窗口是本应用、没有前台窗口、那个程序
+ *     不响应 Ctrl+C —— 宿主会说明是哪一种）。
+ *
+ * 把后两者混成 `null` 是最糟的处理：作者会写"没有选中就提示用户先选一段"，
+ * 而用户明明选中了 —— 那个分支永远走不到，也没有任何线索。
+ */
+function pluginSelection(pluginId: string, manifest: PluginManifest | undefined) {
+  const allowed = pluginHasPermission(manifest, 'read-selection');
+
+  let warned = false;
+  const warnOnce = () => {
+    if (warned) return;
+    warned = true;
+    console.warn(
+      `[pluginRuntime] 插件 "${pluginId}" 读取了选中文本，但清单里没有声明 ` +
+        `"read-selection" 权限，调用被拒绝（后续同类调用不再重复提示）`
+    );
+  };
+
+  return {
+    /**
+     * 现在能不能读取选中文本。**同步**，用于特性探测。
+     *
+     * 两个条件都满足才为真：清单里声明了 `read-selection`，**且**这个平台支持
+     * （只有 Windows 有 `SendInput`）。
+     */
+    isAvailable: (): boolean => allowed && selectionSupported(),
+
+    /**
+     * 读一次前台应用程序里选中的文本。
+     *
+     * ⚠️ 它会**短暂覆盖用户的剪贴板**。文本会被还原，而图片、富文本、文件这类
+     * 非文本内容**无法还原** —— 那是"合成 Ctrl+C"这条实现的真实代价，写在权限
+     * 描述与用户文档里，不是可以藏起来的细节。
+     */
+    read: (): Promise<string | null> => {
+      if (!allowed) {
+        warnOnce();
+        return Promise.reject(
+          new Error(
+            '插件未声明 "read-selection" 权限，无法读取选中的文本。' +
+              '这一项必须显式声明：它读的是你在**任何程序**里选中的内容，' +
+              '而且会短暂覆盖你的剪贴板'
+          )
+        );
+      }
+      if (!selectionSupported()) {
+        return Promise.reject(
+          new Error(
+            '当前平台不支持读取选中文本（它需要合成 Ctrl+C，只在 Windows 上可用）。' +
+              '调用 ctx.selection.isAvailable() 可以在代码里先判断'
+          )
+        );
+      }
+      return invoke<string | null>('plugin_selection_read', { id: pluginId });
+    },
+  };
+}
+
+/**
  * `document.execCommand('copy')` 回退：临时建一个文本框、选中、复制、再撤掉。
  *
  * **必须有用户手势**（浏览器限制），因此它是回退而不是首选。
@@ -2225,6 +2428,39 @@ function pluginSecrets(pluginId: string, manifest: PluginManifest | undefined) {
   };
 }
 
+/**
+ * `ctx.ui.popover` 的入参。
+ *
+ * 这里的每一个字段都是**内容**：一段文本、一组按钮文案。**没有一处能让插件影响
+ * 它长什么样** —— 没有 HTML、没有 class、没有图标。理由与整个浮层窗口的存在
+ * 理由同一条（见 `src-tauri/src/modules/desktop/overlay.rs` 的文件头）：让插件
+ * 自己画等于让它冒充宿主界面，而"长得很像确认框的提示"是这条路上最直白的滥用。
+ */
+export interface PluginPopoverInput {
+  /** 短标题，可省略 */
+  title?: string;
+  /** 正文。这是译文放的地方。宿主按 4000 个字符截断 */
+  body: string;
+  /** 语气，缺省 `info`。宿主白名单化，认不出的取值落到 `info` */
+  tone?: 'info' | 'success' | 'warning' | 'error';
+  /** 最多 3 个按钮。id 只允许 `[a-z0-9-]` 且不超过 32 个字符，文案按 32 截断 */
+  actions?: Array<{ id: string; label: string }>;
+  /** 自动收起的毫秒数，宿主钳制到 1000..30000，缺省 8000 */
+  timeoutMs?: number;
+  /** 贴在光标处（缺省）还是屏幕正中 */
+  at?: 'cursor' | 'center';
+}
+
+/** `ctx.ui.popover` 的返回值：被点中的动作 id，或者 `null`（没回答）。 */
+export interface PluginPopoverResult {
+  /**
+   * 三种情况下是 `null`：到点自动收起、用户按了 Escape、用户点了别处。
+   * **它们都是"用户没回答"，不是错误** —— 错误（比如没声明 `notification`
+   * 权限、或者浮层窗口起不来）会让这个 Promise 直接 reject。
+   */
+  action: string | null;
+}
+
 /** 上下文工厂。插件身份是**显式参数** —— 这是 `api: 2` 能成立的原因 */
 function createContextFor(
   pluginId: string,
@@ -2282,7 +2518,42 @@ function createContextFor(
     fileDrop: pluginFileDrop(pluginId, manifest),
     audio: pluginAudio(pluginId),
     clipboard: pluginClipboard(pluginId, manifest),
+    /**
+     * 全局热键与读取选中文本。
+     *
+     * 两者都不是"多一个方法"级别的能力：它们把一个插件从"用户在我的界面里操作"
+     * 扩展到"用户在任何程序里操作"。因此它们各有一项权限、各有一段代价说明，
+     * 也各自在三个运行位置上给出同一副形状。
+     */
+    hotkey: pluginHotkey(pluginId, manifest),
+    selection: pluginSelection(pluginId, manifest),
     settings: pluginSettingsAPI(pluginId, manifest),
+    /**
+     * 宿主渲染的**结果卡片**。
+     *
+     * ============================================================
+     * 为什么这个成员在 in-process 上只有**一个**方法
+     * ============================================================
+     *
+     * 沙箱那一侧的 `ui` 还有 `dialog` / `contextMenu` / `openSurface` /
+     * `closeSurface` / `listSurfaces` / `badge` / `progress` / `splash`，它们
+     * **刻意不在这里**：那几条要么挂在沙箱界面那条带令牌的通道上（多界面的三
+     * 条按 `(插件 id, 界面 id)` 签发令牌），要么是"覆盖插件那一块 webview"的
+     * 东西，而 in-process 插件没有令牌、也没有属于它自己的 webview 可覆盖。
+     * 给它们一个永远抛错的桩只会让作者以为它本该能用。
+     *
+     * 卡片是唯一**不需要界面上下文**的那一个：它是一个独立窗口，贴的是屏幕上的
+     * 光标。因此它也是 in-process 插件唯一能用的"把结果拿给用户看"的入口 ——
+     * 文件拖放、剪贴板、SQLite 这些成员的结果本来就没有别的地方可放。
+     *
+     * 它走 **Rust 侧**的 `plugin_ui_popover`，与沙箱和后台插件走的是同一个
+     * `rpc::dispatch` 方法表：长度上限、语气白名单、按钮校验、超时钳制与
+     * `notification` 权限判定因此不可能在三个运行位置之间漂开。
+     */
+    ui: {
+      popover: (input: PluginPopoverInput): Promise<PluginPopoverResult> =>
+        invoke<PluginPopoverResult>('plugin_ui_popover', { id: pluginId, input }),
+    },
     /**
      * 收尾登记的入口。**这是功能型插件的前提**：一个后台服务会创建定时器、
      * 事件监听、观察者、WebSocket —— 宿主一个都不知道，禁用之后它们会一直活着。
@@ -2793,6 +3064,14 @@ function cleanupPluginResources(pluginId: string): void {
   // 宿主那一侧的表按插件 id 记，因此这里一次撤干净。
   const removedClipboardSubscriptions = clearClipboardSubscriptions(pluginId);
 
+  // 热键触发的订阅同样单独摘，理由与上面那一条逐字相同。
+  //
+  // ⚠️ 这里摘掉的是**回调**，不是**注册**。一个被停用的插件若还占着一个组合键，
+  // 用户按那个键时这台机器上任何程序都不会有反应。把那件事做掉的是宿主侧的
+  // `sandbox::close_all_surfaces` → `hotkey::forget_plugin`，因为停用插件时它的
+  // 代码一行都不会执行 —— 包括本函数。
+  const removedHotkeySubscriptions = clearHotkeySubscriptions(pluginId);
+
   // 已提供但未落进目录的组件也要一并丢弃：它们闭包指向的旧 bundle 已经作废
   for (const key of [...providedModules.keys()]) {
     if (key.startsWith(`${pluginId}::`)) providedModules.delete(key);
@@ -2814,7 +3093,8 @@ function cleanupPluginResources(pluginId: string): void {
     removedSubscriptions > 0 ||
     removedCommands > 0 ||
     removedDisposables > 0 ||
-    removedClipboardSubscriptions > 0
+    removedClipboardSubscriptions > 0 ||
+    removedHotkeySubscriptions > 0
   ) {
     console.info(
       `[pluginRuntime] 已清理插件 "${pluginId}" 的资源：事件订阅 ${removedSubscriptions} 个，` +
@@ -3095,6 +3375,11 @@ export async function reloadPluginRuntime(
   //
   // 失败同样不抛出：探测失败按"不支持"处理，插件走它自己的降级路径。
   await refreshClipboardMonitorSupport();
+  // 全局热键与读取选中文本的平台能力。与上面那一条**必须并排**：三者都是
+  // "同步的 isAvailable() 背后的一次探测"，而漏掉任意一条会让插件在 bundle 顶层
+  // 读到 `false` —— 它会据此决定"不注册热键"，而那是一次静默的功能缺失。
+  await refreshHotkeySupport();
+  await refreshSelectionSupport();
 
   installed = await invoke<InstalledPlugin[]>('list_plugins');
   runtimeLoadedOnce = true;

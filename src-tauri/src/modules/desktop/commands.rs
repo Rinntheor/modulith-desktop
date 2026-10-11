@@ -268,6 +268,7 @@ pub fn overlay_respond(
     state: State<'_, super::overlay::Overlay>,
     response: super::overlay::OverlayResponse,
 ) -> Result<bool, String> {
+    let id = response.id;
     let delivered = state.inner().respond(response);
 
     if !delivered {
@@ -278,7 +279,11 @@ pub fn overlay_respond(
 
     // 回答之后**立即隐藏**。让前端自己再发一条 hide 会多一次往返，
     // 而中间那一小段时间里浮层还挂在屏幕上。
-    super::overlay::hide(&app);
+    //
+    // 只收掉**它自己**那一张：窗口只有一个，而这条回答可能是一次迟到的
+    // （用户先按了 Esc、前端随后又答了一次），此时窗口上已经是别人的内容了 ——
+    // 无条件隐掉会顺手关掉那个"别人"。
+    state.inner().dismiss_window_of(&app, id);
     Ok(delivered)
 }
 

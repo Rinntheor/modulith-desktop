@@ -172,6 +172,25 @@ pub fn run() -> Result<(), tauri::Error> {
         // 一个空表是安全的 —— 没有订阅者时它什么都不做，连一次系统调用都没有。
         app.manage(modules::plugins::clipboard::ClipboardMonitor::default());
 
+        // 全局热键的注册表与它的消息窗口线程（`ctx.hotkey`）。
+        //
+        // **必须在 `setup` 里托管，不能懒加载。** 这一条是实测出来的：
+        // `rpc.rs` 的 `hotkey.register` / `hotkey.subscribe` 都走
+        // `try_state::<HotkeyRegistry>()`，取不到时返回的是「热键注册表尚未就绪」——
+        // 一个**运行期**才会出现的错误。它一发生，`ctx.hotkey` 就整体不可用：插件
+        // 注册不上任何组合键（界面侧与后台侧都是），而按下的键也不会投递给任何人。
+        //
+        // 界面上的表现尤其具有误导性：`translate` 那类插件的面板读的是后台进程写进
+        // 存储的运行状态，而"注册失败"与"后台进程没在跑"在那一页上长得几乎一样 ——
+        // 于是排查会朝着"Node 没起来"这个方向走，而真正的原因在宿主这里。
+        //
+        // ⚠️ **这一段属于模板，不属于手写代码。** 它曾经只存在于 `lib.rs` 里，而
+        // `pnpm dev` / `pnpm build` 的第一步就是跑本脚本重新生成 `lib.rs` ——
+        // 于是每一次生成都把它（连同下面那个 `.stop()`）静默删掉，症状是热键整体失效。
+        // 新增任何"宿主托管的插件状态"或"退出钩子"时**必须同时改这里**，否则它会在
+        // 下一次生成时消失。`check:boot-order` 有一条断言守着这件事。
+        app.manage(modules::plugins::hotkey::HotkeyRegistry::default());
+
         // 沙箱自检**不在启动路径上**。
         //
         // 它曾经在这里起一个 4 秒后的异步任务，无条件弹出一块 560×420 的诊断面板。
@@ -312,11 +331,20 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_clipboard_unsubscribe,
         plugin_clipboard_formats,
         plugin_clipboard_read_image,
+        plugin_hotkey_can_register,
+        plugin_hotkey_register,
+        plugin_hotkey_unregister,
+        plugin_hotkey_list,
+        plugin_hotkey_subscribe,
+        plugin_hotkey_unsubscribe,
+        plugin_selection_can_read,
+        plugin_selection_read,
         plugin_http_request,
         plugin_launch_program,
         plugin_extract_icon,
         plugin_reveal_in_folder,
         plugin_pick_audio,
+        plugin_ui_popover,
         get_app_settings,
         get_app_info,
         update_app_settings,
@@ -385,6 +413,19 @@ pub fn run() -> Result<(), tauri::Error> {
             // 因此不需要排在模块收尾之后；而排在前面能保证模块开始拆除时不会再有
             // 新的剪贴板事件推出去。
             app.state::<modules::plugins::clipboard::ClipboardMonitor>()
+                .stop();
+
+            // 把**全部**全局热键还给系统。
+            //
+            // 理由比上面那条更硬：热键是**系统级独占**的资源，被占用时用户在那个组合键上
+            // 按什么都没有反应。进程退出时内核会回收它们，但 `stop_all` 与
+            // `cleanup_before_exit` 之间还有一个可观测的窗口 —— 显式解绑把那个窗口消掉。
+            //
+            // 放在 `stop_all` **之前**：模块收尾会拆除插件系统，而热键的投递路径要经过
+            // 它；先解绑能保证拆除期间不会再有热键事件推出去。
+            //
+            // 同样属于模板：见上面 `app.manage(HotkeyRegistry)` 那段说明。
+            app.state::<modules::plugins::hotkey::HotkeyRegistry>()
                 .stop();
 
             // 停止模块：**逆序**（依赖方先停），见 ModuleRegistry::stop_all。

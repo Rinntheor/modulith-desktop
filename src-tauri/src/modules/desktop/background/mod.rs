@@ -52,6 +52,22 @@ pub use protocol::{BackgroundMethod, ProtocolError, PROTOCOL_VERSION};
 ///
 /// 5 分钟：比任何合理的"用户离开一会儿"都长，又短到不会让一个忘了关的后台进程
 /// 挂一整晚。它只在"已经拉起过"之后才有意义 —— 没拉起来的话这个数字没有作用。
+///
+/// ============================================================
+/// 这个数字**只适用于"按需拉起的通用宿主"**
+/// ============================================================
+///
+/// 它判的是"距离最后一次请求多久"。对一次性的能力查询（设置页点一下、探一次
+/// 存活）那正是要的：没有人在等它，收掉它只是把内存还回去。
+///
+/// 对一个**后台插件进程**它完全错了：那种进程的本职就是**坐着不动等** —— 等它
+/// 下一次 `interval`，或者等一个全局热键被按下。空闲是它的正常状态，不是可以
+/// 回收的信号。把它当"空闲"收掉会同时毁掉三件事：内存里登记的热键订阅、插件
+/// 自己的定时器、以及它写到存储里的存活状态 —— 用户看到的是"按了热键没反应"，
+/// 而日志里只有一句"已空闲 300 秒，回收子进程"。
+///
+/// 因此这条超时**只在 `liveness == OnDemand` 时生效**（见 `BackgroundHost::liveness`
+/// 与 `reap_if_idle`）。插件宿主在插件成功加载之后被永久钉住，直到插件被停掉。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 空闲回收的**检查间隔**。
@@ -59,6 +75,12 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// 它与 `IDLE_TIMEOUT` 是两件事：这个决定"回收最晚晚多久被发现"，
 /// 那个才是"多久没被用算空闲"。取 60 秒是因为判据本身是"距离最后一次请求多久"，
 /// 请求随时可能来 —— 精确定时反而要不停重置计时器，而晚一分钟回收没有代价。
+///
+/// ⚠️ **它比 `IDLE_TIMEOUT` 小，而这一点在过去是一个真实缺陷。** 后台插件的
+/// 清单可以声明 `interval: 600`（`stand-up` 就是），也可以只等热键（`translate`
+/// 空闲时不发任何请求）。这两种插件的"最后一次请求"都停在启动握手那一刻 ——
+/// 于是这个 60 秒一跳的定时器会在第一次检查（第 60~120 秒之间）就把它判成空闲
+/// 并杀掉。回收任务本身没有错，错的是它被挂到了"拥有定时器或热键的宿主"上。
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 单次启动握手（读取问候行）的超时。
@@ -138,6 +160,47 @@ struct State {
     last_error: Option<String>,
     /// 累计请求数
     requests: u64,
+    /// 读循环是否已经读到 EOF（也就是这个子进程的输出通道已经关了）。
+    ///
+    /// ============================================================
+    /// 为什么需要它，而不是直接信 `try_wait()`
+    /// ============================================================
+    ///
+    /// `ensure_started` 会调 `try_wait()` 来确认进程是不是还活着。但那一次调用
+    /// 只在**要发请求**的时候发生，而子进程退出到下一次请求之间可以隔着几小时 ——
+    /// 这段时间里 `status()` 会一直说 "running: true"，插件详情页上显示的是一个
+    /// 早就不存在的进程。
+    ///
+    /// 读循环是**唯一**能立刻知道"对面没了"的地方（它读到了 EOF），因此由它在这里
+    /// 留一个标记，`status()` 与 `ensure_started` 都读它。
+    output_closed: bool,
+}
+
+/// 这个宿主**为什么活着** —— 决定它能不能被空闲回收。
+///
+/// ============================================================
+/// 为什么必须是显式的，而不是再算一个时间戳
+/// ============================================================
+///
+/// 直觉上的修法是"把 `IDLE_TIMEOUT` 调大"或者"有热键订阅就重置 `last_used`"。
+/// 两条都不成立：
+///
+///   * 调大只是把"什么时候坏"往后推。`interval: 600` 的插件加一个十分钟的阈值
+///     就变成十五分钟坏，换汤不换药；
+///   * 拿"最近一次热键"当使用证据是**循环论证**：热键正是要等的东西，没有按键
+///     就没有"使用"，而这与"这个进程还需不需要存在"无关。
+///
+/// 真正决定"能不能收"的是一件**已知的事实**，而不是一个推测的阈值：这个宿主
+/// 里有没有加载着一个插件。有 —— 它拥有定时器与热键订阅，收掉它就是毁掉用户
+/// 已经建立起来的能力；没有（只服务一次性查询）—— 收掉它没有任何代价。
+///
+/// 因此这里把那个事实写成一个状态，由**知道答案的那一侧**（`plugins.rs`）设置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// 按需拉起的一次性宿主：没有人在等它就可以收。
+    OnDemand,
+    /// 托管着一个已加载的插件：**永远不回收**，直到插件被停掉。
+    Pinned,
 }
 
 /// 后台宿主
@@ -145,7 +208,13 @@ struct State {
 /// 用 `Mutex` 而不是 `RwLock`：这里没有"多读"的场景，而拉起/回收/发请求
 /// 都要改状态。一个更简单的锁比一个分类更细的锁更不容易写错。
 pub struct BackgroundHost {
-    state: Mutex<State>,
+    /// 子进程的运行状态。
+    ///
+    /// `Arc` 而不是裸的 `Mutex`：**读循环也要改它**。读循环是一个 `'static` 的
+    /// tokio 任务（它必须在宿主之外活着，否则它自己的存活就成了宿主的存活条件），
+    /// 而它需要在自己读到 EOF 时把 `child`/`writer` 清掉 —— 那是"重启能发生"的
+    /// 前提，见 `spawn_reader`。一个 `Arc` 换来的是这条路径，而不是并发性能。
+    lives: Arc<Mutex<State>>,
     pending: PendingMap,
     next_id: AtomicU64,
     /// Node 可执行文件的解析结果。`None` 表示"还没找过"，`Some(Err)` 表示找过但失败
@@ -166,6 +235,11 @@ pub struct BackgroundHost {
     /// 与 `BackgroundHost` 分开保存而不是塞进 `State`：它是**配置**，
     /// 在一次子进程的整个生命周期里不变，也不参与任何状态转换。
     spec: Mutex<HostSpec>,
+    /// 见 `Liveness`：这个宿主能不能被空闲回收。
+    ///
+    /// 与 `spec` 一样是**配置**而不是运行状态，因此不放在 `State` 里 ——
+    /// 它不参与任何状态转换，只是"谁在用它"的一个声明。
+    liveness: Mutex<Liveness>,
 }
 
 /// 一次子进程启动的**形状**：多给哪些参数、给什么样的环境。
@@ -190,19 +264,21 @@ pub struct HostSpec {
 impl BackgroundHost {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(State {
+            lives: Arc::new(Mutex::new(State {
                 child: None,
                 writer: None,
                 last_used: Instant::now(),
                 last_error: None,
                 requests: 0,
-            }),
+                output_closed: false,
+            })),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             node: Mutex::new(None),
             configured_node: Mutex::new(String::new()),
             inbound: Mutex::new(None),
             spec: Mutex::new(HostSpec::default()),
+            liveness: Mutex::new(Liveness::OnDemand),
         }
     }
 
@@ -212,6 +288,42 @@ impl BackgroundHost {
     /// 而插件在那一刻的状态（定时器、内存里的数据）会无声地消失。
     pub fn set_spec(&self, spec: HostSpec) {
         *self.spec.lock().unwrap() = spec;
+    }
+
+    /// 声明这个宿主**为什么活着**（见 `Liveness`）。
+    ///
+    /// 由**知道答案的那一侧**调用，而不是由这里猜：
+    ///   * `plugins.rs` 在一个插件成功加载之后置 `Pinned`（它拥有定时器与热键）；
+    ///   * 插件停掉时置回 `OnDemand`。
+    ///
+    /// 它**不影响已经跑着的子进程**：置位只改变"未来要不要回收"这个判断，
+    /// 因此不存在"改一个标记导致进程被替换"的静默副作用。
+    pub fn set_liveness(&self, liveness: Liveness) {
+        *self.liveness.lock().unwrap() = liveness;
+    }
+
+    /// 现在这个宿主是不是"拥有一个已加载的插件"（因此不可以被回收）。
+    pub fn is_pinned(&self) -> bool {
+        *self.liveness.lock().unwrap() == Liveness::Pinned
+    }
+
+    /// 记下一条**启动路径上的失败原因**。
+    ///
+    /// ============================================================
+    /// 为什么必须留在这里，而不是只返回给调用方
+    /// ============================================================
+    ///
+    /// `call()` 把启动失败原样返回给当时那个调用方，而调用方（`plugins.rs`）只
+    /// 把它写进日志。可是用户与维护者看的地方是**插件详情页** —— 那里读的是
+    /// `status()`，而 `status()` 在此之前只会报 Node 解析失败或"最后一次请求失败"。
+    ///
+    /// 于是"脚本没打包进去 / 子进程被创建标志挡住起不来 / 问候超时"这三种
+    /// **完全不同的**故障，在界面上长得一模一样：一句"当前没有在运行"。那是这一
+    /// 整条链路上最没有价值的一句话 —— 而它恰好是唯一被显示出来的。
+    ///
+    /// 因此启动失败要被**存下来**，并由 `status().reason` 带出去。
+    pub fn record_error(&self, reason: String) {
+        self.lives.lock().unwrap().last_error = Some(reason);
     }
 
     /// 注册"子进程问我们的话"的处理者。
@@ -224,24 +336,41 @@ impl BackgroundHost {
 
     /// 当前状态（不启动任何东西）
     pub fn status(&self) -> BackgroundStatus {
-        let state = self.state.lock().unwrap();
+        let state = self.lives.lock().unwrap();
         let node = self.node.lock().unwrap().clone();
 
         let node_path = match &node {
             Some(Ok(path)) => Some(path.display().to_string()),
             _ => None,
         };
+        // 顺序是刻意的：Node 解析失败是**根因**，它比"最后一次启动失败"更该被
+        // 显示出来；两者都存在时先报前者。
         let reason = match &node {
             Some(Err(reason)) => Some(reason.clone()),
             _ => state.last_error.clone(),
         };
 
+        // "在跑" = 句柄在 **且** 输出通道还开着。
+        //
+        // 后一半不能省：子进程退出之后句柄会一直留在 `child` 里，直到下一次要发
+        // 请求时 `ensure_started` 才把它清掉（`try_wait` 只在那一刻被调用）。少了
+        // 这一半，插件详情页会在子进程早已死掉之后继续显示"运行中"，而那是"用户
+        // 以为后台在跑、实际什么都没在跑"的又一种样子。
+        let running = state.child.is_some() && !state.output_closed;
+
         BackgroundStatus {
-            available: node.as_ref().is_some_and(|n| n.is_ok()) && state.child.is_some(),
-            running: state.child.is_some(),
+            // `available` 的含义是"现在就能用它"，因此它要求**子进程活着**。
+            // 只找到 Node 不算可用 —— 那正是"设置里说找到了 Node、后台插件却一个
+            // 都没跑起来"时最容易被误读的一格。
+            available: node.as_ref().is_some_and(|n| n.is_ok()) && running,
+            running,
             reason,
             node_path,
-            pid: state.child.as_ref().and_then(|child| child.id()),
+            pid: if running {
+                state.child.as_ref().and_then(|child| child.id())
+            } else {
+                None
+            },
             requests: state.requests,
         }
     }
@@ -296,6 +425,36 @@ impl BackgroundHost {
         method: BackgroundMethod,
         params: Option<serde_json::Value>,
     ) -> CallOutcome {
+        self.call_within(
+            method,
+            params,
+            Duration::from_millis(protocol::REQUEST_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    /// 同 `call`，但换一个等待上限。
+    ///
+    /// ============================================================
+    /// 为什么需要这个参数：有一类方法的时长**不由我们决定**
+    /// ============================================================
+    ///
+    /// `REQUEST_TIMEOUT_MS`（10 秒）是给"宿主发起、宿主知道要多久"的那些调用用的。
+    /// `plugin.dispatch` 不是那一类：它是把一件事**投给插件的处理器**，而处理器
+    /// 可以合法地等一个用户动作 —— 比如 `ctx.ui.popover`，它缺省**没有截止时间**。
+    ///
+    /// 用 10 秒去卡它，得到的是：宿主这边记一句"后台宿主在 10000 毫秒内没有响应"
+    /// （`outcome.ok == false`，而插件那一侧其实好好地跑着），随后子进程回话时再
+    /// 记一句"收到没有等待者的后台响应"—— 两条日志都指向一个不存在的问题。
+    /// 它与卡片那一条传输预算（`ctx.ui.popover` 豁免 `HOST_CALL_TIMEOUT_MS`）
+    /// 是同一个道理的两半：**不能让一个"等到用户做出动作"的等待被一个固定的
+    /// 秒数单方面作废。**
+    pub async fn call_within(
+        &self,
+        method: BackgroundMethod,
+        params: Option<serde_json::Value>,
+        budget: std::time::Duration,
+    ) -> CallOutcome {
         let node = match self.probe_node() {
             Ok(path) => path,
             Err(reason) => {
@@ -308,6 +467,10 @@ impl BackgroundHost {
         };
 
         if let Err(error) = self.ensure_started(&node).await {
+            // 顺手把它记进状态：调用方只会把它写进日志，而用户看的是插件详情页。
+            // 不记的话，"脚本没打包进去"与"Node 启动被挡住"在界面上无法区分 ——
+            // 那正是这一整条链路最难排查的地方（见 `record_error`）。
+            self.record_error(error.clone());
             return CallOutcome {
                 ok: false,
                 result: None,
@@ -315,7 +478,7 @@ impl BackgroundHost {
             };
         }
 
-        self.send(method, params).await
+        self.send(method, params, budget).await
     }
 
     /// 把一条请求写到子进程并等它的响应。**不负责拉起子进程。**
@@ -326,6 +489,7 @@ impl BackgroundHost {
         &self,
         method: BackgroundMethod,
         params: Option<serde_json::Value>,
+        budget: std::time::Duration,
     ) -> CallOutcome {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = protocol::Request {
@@ -355,7 +519,7 @@ impl BackgroundHost {
         // 克隆而不是把写入端取出来：取出来会让另一个写入者（读循环回答子进程的
         // 请求时）看到一个 `None`，而那会表现成一次随机的"后台宿主未在运行"。
         let writer = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lives.lock().unwrap();
             state.requests += 1;
             state.last_used = Instant::now();
             state.writer.clone()
@@ -393,10 +557,10 @@ impl BackgroundHost {
             };
         }
 
-        match tokio::time::timeout(Duration::from_millis(protocol::REQUEST_TIMEOUT_MS), receiver).await {
+        match tokio::time::timeout(budget, receiver).await {
             Ok(Ok(response)) => match response.validate() {
                 Ok(()) => {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.lives.lock().unwrap();
                     state.last_error = None;
                     CallOutcome {
                         ok: response.error.is_none(),
@@ -423,7 +587,7 @@ impl BackgroundHost {
                     result: None,
                     error: Some(format!(
                         "后台宿主在 {} 毫秒内没有响应",
-                        protocol::REQUEST_TIMEOUT_MS
+                        budget.as_millis()
                     )),
                 }
             }
@@ -437,7 +601,7 @@ impl BackgroundHost {
     /// 重试的依据，重复投递一个可能已经执行过的副作用调用更糟。
     pub async fn respond(&self, id: u64, result: Result<serde_json::Value, String>) {
         let writer = {
-            let state = self.state.lock().unwrap();
+            let state = self.lives.lock().unwrap();
             state.writer.clone()
         };
         let Some(writer) = writer else {
@@ -473,12 +637,53 @@ impl BackgroundHost {
     }
 
     /// 确保子进程在运行（已运行则直接返回）
+    ///
+    /// ============================================================
+    /// 死掉的子进程必须被**认成死掉**，否则重启永远不会发生
+    /// ============================================================
+    ///
+    /// 这里原来只判 `child.is_some()`。而读循环读到子进程的 EOF 时只结束了它自己，
+    /// **没有把 `child` 清掉** —— 于是一个已经退出（崩溃、被系统回收、被别的程序
+    /// 结束）的进程会让这个判断一直为真：
+    ///
+    ///   1. 后续的每一次请求都走"已经跑着"这条捷径，直接去写一个已经断掉的管道；
+    ///   2. 写失败只报一句"写入后台宿主失败"（`Broken pipe`），而那句错误在界面上
+    ///      看起来就像一次偶发的通信故障，完全看不出"这个进程早就不在了"；
+    ///   3. **重新拉起一次都没有发生过** —— 而重新拉起是这里本该做的事。
+    ///
+    /// 这正是"后台插件全都跑不起来"的一个自洽解释：第一次启动可能成功，之后任何
+    /// 原因（被空闲回收、被外部结束、脚本自己崩了）都会让这个宿主**永久**进入
+    /// 那个状态，直到应用重启。因此 `spawn_reader` 在读到 EOF 时会清掉这两个字段。
     async fn ensure_started(&self, node: &PathBuf) -> Result<(), String> {
-        {
-            let state = self.state.lock().unwrap();
-            if state.child.is_some() {
-                return Ok(());
+        // 先在同一个临界区里判断"它到底还在不在"，并且**取走那个已经不存在的
+        // 句柄**。两件事一起做（而不是"先看 is_some、再单独 take"）是因为中间不能
+        // 让出锁：两个并发的调用都可能看到 `Some`，然后一个 take 成功、另一个
+        // take 到 `None` —— 后者会以为"没有进程"于是**再拉起一个**，于是同一份
+        // 插件代码跑到两个进程里，热键被注册两次（第二次失败），而日志看起来像
+        // 随机的重启。
+        let dead = {
+            let mut state = self.lives.lock().unwrap();
+            match state.child.as_mut() {
+                None => None,
+                Some(child) => match child.try_wait() {
+                    // 还在跑，且输出通道没关：这是唯一一条可以安全走开的路径。
+                    Ok(None) if !state.output_closed => return Ok(()),
+                    // 输出通道关了（读循环读到了 EOF）或者进程已经退出：
+                    // 这个句柄不能再用了，下面重新拉起一个。
+                    Ok(status) => Some(ExitStatus::from_optional(status)),
+                    // 问不出来（句柄已经不合法一类）：按"不在了"处理。
+                    // 反过来的话我们会永远认为它活着，而那正是这一节要消灭的状态。
+                    Err(error) => Some(ExitStatus::Unknown(Some(error.to_string()))),
+                },
             }
+        };
+
+        if let Some(exit) = dead {
+            let mut state = self.lives.lock().unwrap();
+            state.child = None;
+            state.writer = None;
+            state.output_closed = false;
+            log::warn!("后台宿主已不在运行（{exit}），重新拉起一个");
         }
 
         let script = host_script_path()?;
@@ -496,12 +701,30 @@ impl BackgroundHost {
             .arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // stderr 继承：子进程的崩溃与 `console.error` 会直接进应用日志，
-            // 而不是被吞掉。这条通道只有 stdout 是协议专用的。
+            // ============================================================
+            // stderr：**管道**，并由一个任务转发进应用日志
+            // ============================================================
             //
-            // 它与上面的 `CREATE_NO_WINDOW` 不冲突：那个标志不分配控制台，
-            // 但继承来的标准句柄照旧有效。
-            .stderr(Stdio::inherit())
+            // 这里原来是 `Stdio::inherit()`，意图是"子进程的崩溃与 console.error
+            // 直接进应用日志"。意图没错，机制选错了，而且错在**发行版专属**的一条路上：
+            //
+            //   * 本应用是 GUI 子系统，它自己不持有控制台。由安装器、开始菜单或
+            //     文件管理器启动时，进程的标准句柄可能是**无效句柄**（而不是"一个
+            //     指向空设备的东西"）；
+            //   * `Stdio::inherit()` 把选中的原生句柄原样放进 `STARTUPINFO`；
+            //     句柄无效时 `CreateProcessW` 会以 `ERROR_INVALID_HANDLE` 直接失败。
+            //     那一刻的表现**不是**"stderr 没接上"，而是**子进程根本没有被创建**：
+            //     `ensure_started` 返回"无法启动后台宿主（…）：句柄无效"，而这条
+            //     错误此前只进日志、不进界面（见 `record_error`）。
+            //
+            // 因此改成管道 + 转发。它与继承**信息量完全一致**（`console.error` 与
+            // Node 的崩溃栈照样进同一份日志），但不再依赖"父进程恰好拿着一个有效的
+            // stderr 句柄"这个在发行版里不成立的前提。
+            //
+            // 管道**必须有人读**：写满内核缓冲区之后子进程会阻塞在写 stderr 上，
+            // 而它同时正等着我们回答 `ctx.*` —— 那就是一个死锁。因此下面
+            // `spawn_stderr_forwarder` 是这套改动的**必需部分**，不是可选优化。
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         if spec.clear_env {
@@ -523,15 +746,39 @@ impl BackgroundHost {
             command.env(key, value);
         }
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("无法启动后台宿主（{node:?}）：{error}"))?;
+        let mut child = command.spawn().map_err(|error| {
+            // 这条错误是"后台功能整个不可用"时用户与维护者能拿到的**唯一**线索，
+            // 因此不能只是一句"启动失败"。四种原因需要完全不同的动作，而它们
+            // 在 `std::io::Error` 里长得几乎一样：
+            //
+            //   * 找不到 Node 可执行文件（路径变过、被杀毒隔离）→ 去设置里重选；
+            //   * 句柄无效（父进程没有有效的标准句柄，见上面 stderr 那一段的说明）
+            //     → 这是**宿主的缺陷**，不是用户配错了；
+            //   * 参数非法（`--permission` 之类的开关不被这个 Node 认识）
+            //     → 换一个 Node 版本；
+            //   * 权限不足（安全软件拦了进程创建）→ 与用户的环境有关。
+            //
+            // 这里只做一件事：把**原始的系统错误**逐字带上，并指明尝试的是哪一个
+            // 可执行文件。归类留给读这段日志的人 —— 猜错的归类比不归类更坏。
+            format!(
+                "无法启动后台宿主进程（可执行文件 {node:?}）：{error}。\
+                 常见原因：那个文件不存在或被杀毒软件隔离、Node 版本与启动参数不匹配、\
+                 或系统策略拦下了进程创建。"
+            )
+        })?;
 
         let stdin = child.stdin.take().ok_or_else(|| "无法取得子进程的标准输入".to_string())?;
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| "无法取得子进程的标准输出".to_string())?;
+
+        // stderr 必须先接上转发任务（见 `stderr(Stdio::piped())` 那一段的说明：
+        // 没有人读它的后果是子进程卡死在写 stderr 上）。取不到句柄时不算失败 ——
+        // 那只是失去一条诊断通道，后台功能本身照常可用。
+        if let Some(stderr) = child.stderr.take() {
+            spawn_stderr_forwarder(stderr);
+        }
 
         let mut reader = BufReader::new(stdout);
 
@@ -545,12 +792,19 @@ impl BackgroundHost {
         .await
         {
             Ok(Ok(0)) => {
-                // 读到 EOF：子进程立刻退出了。把它的退出码带上，
-                // 那通常是唯一的线索（例如 Node 报"找不到脚本"）。
-                let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+                // 读到 EOF：子进程立刻退出了。把它的**退出状态**带上 ——
+                // 那通常是唯一的线索（例如 Node 报"找不到脚本"是 1、被信号/强杀
+                // 是另一种）。子进程自己打印的 stderr 已经由转发任务写进了日志，
+                // 因此这里只需要指路，不需要（也无法）复述它。
+                let status = child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .map(|status| ExitStatus::from_status(&status))
+                    .unwrap_or(ExitStatus::Unknown(None));
                 return Err(format!(
-                    "后台宿主启动后立即退出（退出码 {}）。请检查 Node 运行时与宿主脚本是否完整。",
-                    code.map(|c| c.to_string()).unwrap_or_else(|| "未知".to_string())
+                    "后台宿主启动后立即退出（{status}）。stderr 已写进应用日志 \
+                     （搜索「后台宿主 stderr」），它通常直接写着原因。"
                 ));
             }
             Ok(Ok(_)) => {}
@@ -578,10 +832,13 @@ impl BackgroundHost {
         }
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lives.lock().unwrap();
             state.child = Some(child);
             state.writer = Some(Arc::new(tokio::sync::Mutex::new(stdin)));
             state.last_error = None;
+            // 新进程是活的。读循环上一次留下的那个标记必须清掉，否则
+            // `ensure_started` 会立刻把它当成"刚死掉的那个"再拉一次。
+            state.output_closed = false;
         }
 
         self.spawn_reader(reader);
@@ -593,11 +850,19 @@ impl BackgroundHost {
     ///
     /// 这是一个 **async 任务**而不是"读线程"：它只做 `read_line` 与一次查表，
     /// 全程没有阻塞式系统调用，因此不需要独占一个线程。
+    ///
+    /// 它同时承担**收尸**：读到 EOF 时把托管状态里的 `child`/`writer` 清掉。
+    /// 少了这一步，一个已经退出的子进程会让 `ensure_started` 永远认为"它在跑"
+    /// —— 于是**重新拉起永远不会发生**，而后台插件在用户眼里就是"死了"。
     fn spawn_reader(&self, mut reader: BufReader<ChildStdout>) {
         let pending = Arc::clone(&self.pending);
         // 读循环只把这类消息**转发**出去：它不认识业务，也不该认识 ——
         // 认识 `PluginManager` 的那部分是 `plugins.rs` 里的一个独立任务。
         let inbound = self.inbound.lock().unwrap().clone();
+
+        // 收尸要改 `State`，而读循环是一个 `'static` 任务 —— 因此把状态做成
+        // 共享的 `Arc`，而不是把 `&self` 借进去。
+        let lives = Arc::clone(&self.lives);
 
         tokio::spawn(async move {
             let mut line = String::new();
@@ -677,8 +942,38 @@ impl BackgroundHost {
                 }
             }
 
-            // 读循环结束 = 子进程不再可用。把全部等待者放掉，
-            // 让它们立刻失败，而不是各自等到 10 秒超时。
+            // 读循环结束 = 子进程不再可用。三件事都要做，而且顺序有理由：
+            //
+            //   1. **清掉托管状态**（`child`/`writer`）。这是"重新拉起"能发生的
+            //      前提：`ensure_started` 判的正是 `child.is_some()`，不清的话它会
+            //      永远为真。**这一条是本次修复的核心** —— 少了它，一个退出过的
+            //      宿主会永久停在"看起来在跑、实际写不进任何东西"的状态，
+            //      而后台插件在用户眼里就是"死了，而且怎么都不再起来"。
+            //   2. 把 `output_closed` 置上，让 `status()` 立刻如实报告"没在跑"，
+            //      不必等到下一次 `try_wait()`。
+            //   3. 放掉全部等待者，让它们立刻失败，而不是各自等到 10 秒超时。
+            let mut lives = lives.lock().unwrap();
+            if lives.child.is_some() {
+                let reason = lives
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.try_wait().ok().flatten())
+                    .map(|status| ExitStatus::from_status(&status).to_string())
+                    .unwrap_or_else(|| "输出通道关闭（进程已退出）".to_string());
+
+                lives.child = None;
+                lives.writer = None;
+                lives.output_closed = true;
+                // 这条日志是"后台插件为什么没在跑"的第一手证据：它给出了**退出状态**。
+                // 子进程自己的 stderr 由转发任务独立写进同一份日志。
+                log::warn!("后台宿主已退出：{reason}");
+            }
+
+            // 先放锁再 drain：`pending` 与 `lives` 是两把不同的锁，而持有 `lives`
+            // 期间去 await 任何东西都会把"发请求"那条路径一起堵住（它也要拿
+            // `lives` 去更新时间戳）。这里没有 await，但保持一致的顺序更好推理。
+            drop(lives);
+
             let drained: Vec<_> = pending.lock().unwrap().drain().collect();
             if !drained.is_empty() {
                 log::warn!("后台宿主退出，{} 个待处理请求被中断", drained.len());
@@ -688,16 +983,36 @@ impl BackgroundHost {
 
     /// 空闲回收：连续一段时间没有被使用就关掉子进程。
     ///
-    /// 由模块的 `start` 起一个低频定时器调用。判据是"距离最后一次请求多久"，
-    /// 而**不是**"界面是否可见" —— 后台能力恰恰要在界面不可见时工作，
-    /// 拿可见性当判据会把功能关掉。
+    /// ============================================================
+    /// 它**不回收托管着插件的宿主**
+    /// ============================================================
     ///
-    /// 有请求在飞时**不回收**：那会让调用方等一个永远不会来的响应。
-    /// 这种情况下把计时重置，下一轮再说。
+    /// 判据原本只有"距离最后一次请求多久"。那条判据对一次性的能力查询是对的，
+    /// 对后台插件是**灾难**：后台插件的本职就是坐着等 —— 等下一次 `interval`，
+    /// 或者等一个全局热键被按下。也就是说"很久没有请求"恰恰是它正常工作的样子。
+    ///
+    /// 收掉它会毁掉三样东西：内存里登记的热键订阅（宿主解绑了）、插件自己的
+    /// 定时器、以及它写到存储里的存活状态。用户看到的是"按了热键没反应、面板上
+    /// 说后台没在跑"，而日志里只有一句"已空闲 300 秒，回收子进程"。
+    ///
+    /// 因此这里先问一个**已知事实**（见 `Liveness`）：这个宿主里有没有加载着插件。
+    /// 有就永远不收 —— 它的生命周期由插件决定，而不由一个时间阈值决定。
+    ///
+    /// 有请求在飞时同样**不回收**：那会让调用方等一个永远不会来的响应。
     pub async fn reap_if_idle(&self) -> bool {
+        // 先看 liveness：它是**配置**，不需要拿 `lives` 的锁。
+        if self.is_pinned() {
+            return false;
+        }
+
         let should_reap = {
-            let state = self.state.lock().unwrap();
+            let state = self.lives.lock().unwrap();
             if state.child.is_none() {
+                return false;
+            }
+            if state.output_closed {
+                // 已经退出了。收尸由读循环负责，这里不重复劳动 ——
+                // 而"回收"这个动作对一个已经不在的进程没有意义。
                 return false;
             }
             if !self.pending.lock().unwrap().is_empty() {
@@ -731,7 +1046,12 @@ impl BackgroundHost {
     /// 则可能永远等下去（脚本里有死循环时）。
     pub async fn shutdown(&self) {
         let (mut child, writer) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lives.lock().unwrap();
+            // `output_closed` 一起重置：这是"下一次被拉起时从干净状态开始"的前提。
+            // 忘了它的话，下一次 `spawn_reader` 之前的那一小段时间里 `status()`
+            // 会报"没在跑"，而这恰好是刚被拉起来的那个进程 —— 一个会误导排查的
+            // 假状态。
+            state.output_closed = false;
             (state.child.take(), state.writer.take())
         };
 
@@ -741,8 +1061,16 @@ impl BackgroundHost {
             log::warn!("后台宿主被关闭，{} 个待处理请求被中断", drained.len());
         }
 
-        let Some(mut child) = child.take() else {
-            return;
+        let mut child = match child.take() {
+            Some(child) => child,
+            // 本来就没在跑（或已经被读循环收过尸）。置上"输出通道已关"是为了让
+            // `status()` 与 `reap_if_idle()` 看到的状态一致：没有子进程就等于
+            // 通道是关的，两者不能出现"child 是 None 但 output_closed 是 false"
+            // 这种自相矛盾的组合。
+            None => {
+                self.lives.lock().unwrap().output_closed = true;
+                return;
+            }
         };
 
         // 优雅请求：给它一点时间自己退出
@@ -771,7 +1099,153 @@ impl BackgroundHost {
                 let _ = child.kill().await;
             }
         }
+
+        // 进程已经收干净了。把"通道已关"的标记定下来：否则下一个 `status()` 会
+        // 报 running=false（child 是 None）而 `reap_if_idle` 也判不出"已经不在了"。
+        self.lives.lock().unwrap().output_closed = true;
     }
+}
+
+/// 子进程的退出状态，用于**日志与错误消息**里那句"为什么它没了"。
+///
+/// 不直接用 `std::process::ExitStatus` 的 `Display`：它不会区分"退出码未知"
+/// 与"被信号结束"这两件事（POSIX 上后者没有退出码），而这里必须能区分 ——
+/// "退出码 1"（脚本报错）与"被强杀"（安全软件、任务管理器、系统中的内存压力）
+/// 指向完全不同的下一步。
+#[derive(Debug, Clone)]
+enum ExitStatus {
+    /// 正常的退出码
+    Code(i32),
+    /// 被信号结束（POSIX）。
+    ///
+    /// 它只在 Unix 上被构造（Windows 的 `ExitStatus::code()` 对强杀也会给出一个
+    /// 退出码），因此那一边要显式允许"没有构造点" —— 否则编译器会报一条
+    /// `variant is never constructed` 的警告，而那条警告会淹没在噪声里，
+    /// 让真正的新警告不再显眼。
+    #[cfg_attr(windows, allow(dead_code))]
+    Signal(i32),
+    /// 问不出来：句柄已经不合法，或平台没有对应信息
+    Unknown(Option<String>),
+}
+
+impl ExitStatus {
+    fn from_status(status: &std::process::ExitStatus) -> Self {
+        if let Some(code) = status.code() {
+            return ExitStatus::Code(code);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return ExitStatus::Signal(signal);
+            }
+        }
+
+        ExitStatus::Unknown(None)
+    }
+
+    /// `try_wait()` 的两种"不在了"：已经退出（`Some`）与问不出来（`None`）。
+    fn from_optional(status: Option<std::process::ExitStatus>) -> Self {
+        match status {
+            Some(status) => ExitStatus::from_status(&status),
+            None => ExitStatus::Unknown(Some("进程句柄已失效".to_string())),
+        }
+    }
+}
+
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExitStatus::Code(code) => write!(formatter, "退出码 {code}"),
+            ExitStatus::Signal(signal) => write!(formatter, "被信号 {signal} 结束"),
+            ExitStatus::Unknown(Some(detail)) => write!(formatter, "退出状态未知（{detail}）"),
+            ExitStatus::Unknown(None) => write!(formatter, "退出状态未知"),
+        }
+    }
+}
+
+/// 把子进程的 stderr 逐行转进应用日志。
+///
+/// ============================================================
+/// 为什么必须存在（而不是"也可以没有"）
+/// ============================================================
+///
+/// 子进程的 stderr 是**管道**（见 `ensure_started` 里那一段说明：`Stdio::inherit()`
+/// 在发行版上会因为一个无效的原生句柄让 `CreateProcessW` 直接失败）。管道必须有人
+/// 读：内核缓冲区写满之后，子进程会**阻塞在写 stderr 上** —— 而它同时正等着我们
+/// 回答它的 `ctx.*` 调用。两边互相等，那就是一个直到超时才暴露的死锁。
+///
+/// 因此这个任务是那套改动的**必需部分**，不是可选的诊断增强。
+///
+/// ============================================================
+/// 它有界，而且绝不 panic
+/// ============================================================
+///
+/// 子进程可以无限地往 stderr 写。这里逐行转发，并且：
+///   * 超过 `STDERR_LINE_LIMIT` 的一行被截断 —— 一句被截断的日志远好过让转发
+///     任务把内存吃光（那种失控发生在**宿主**里，比在子进程里更糟）；
+///   * 读失败只记一次并结束任务 —— 与"stdin 关闭 = 宿主走了"同一条纪律：
+///     这条通道断了只意味着失去诊断信息，不应该影响任何别的东西。
+fn spawn_stderr_forwarder(stderr: tokio::process::ChildStderr) {    /// 单行 stderr 进日志的上限。取 8 KiB：足够装下一个完整的 Node 崩溃栈，
+    /// 又远小于任何会让日志本身变成问题的规模。
+    const STDERR_LINE_LIMIT: usize = 8 * 1024;
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                // EOF：子进程走了（stderr 通常比 stdout 先关）。
+                Ok(0) => break,
+                Ok(_) => {
+                    let text = line.trim_end();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    // 前缀是刻意的、也是唯一的出口：用户与维护者都要能一眼看出
+                    // 这一行**来自子进程**，而不是宿主自己说的。
+                    //
+                    // 只记结构、不加工内容：这一行是子进程自己写的，可能是 Node 的
+                    // 崩溃栈，也可能是插件的 console.error。宿主不能（也不该）在这里
+                    // 做任何过滤 —— 过滤规则会随着插件而漂，而漏掉的那一行通常正是
+                    // 唯一有用的那一行。
+                    if text.len() > STDERR_LINE_LIMIT {
+                        log::warn!(
+                            "后台宿主 stderr（已截断，原长 {}）：{}",
+                            text.len(),
+                            &text[..floor_char_boundary(text, STDERR_LINE_LIMIT)]
+                        );
+                    } else {
+                        log::warn!("后台宿主 stderr：{text}");
+                    }
+                }
+                Err(error) => {
+                    log::debug!("读取后台宿主 stderr 失败（只影响诊断信息）：{error}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// 找一个**不超过** `limit` 的 UTF-8 字符边界。
+///
+/// 直接对 `String` 按字节切片会在多字节字符中间切断，而那会 panic ——
+/// 日志代码 panic 是这里最不能接受的一种失败：它会把一次"某一行有点长"
+/// 变成"读循环的那个任务死了"。中文的 stderr（Node 的错误消息经常是英文，
+/// 但插件自己写的未必）正好会踩到这一点。
+fn floor_char_boundary(text: &str, limit: usize) -> usize {
+    if limit >= text.len() {
+        return text.len();
+    }
+    let mut boundary = limit;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
 }
 
 impl Default for BackgroundHost {
@@ -1419,6 +1893,77 @@ mod live_tests {
 
         assert!(!status.running, "状态查询不该启动子进程");
         assert_eq!(status.requests, 0, "没有发过请求就不该有请求计数");
+    }
+
+    /// **一个托管着插件的宿主永远不被空闲回收。**
+    ///
+    /// 这条守的是本次修复的核心缺陷。造前提的方式是"假装这个子进程已经空闲了很久"：
+    /// 直接把它那把 `last_used` 改成远超 `IDLE_TIMEOUT` 的时刻，再让一个**假的**
+    /// 子进程句柄占住 `child`（回收判据的第一关就是"有没有子进程"）。
+    ///
+    /// 用真的 Node 来造这个前提会让这条测试依赖机器上装没装 Node，而它要验的是
+    /// **判据**，不是进程管理 —— 后者已经由 `live_tests` 那一组真的拉起进程来验了。
+    ///
+    /// 反向的那一半（`OnDemand` 的宿主要在超时后被回收）**没有**在这里断言：
+    /// `shutdown()` 会去操作那个假句柄，而一个假句柄上的行为不是这条测试要证明的
+    /// 东西。它的判据可以在这条测试里读到：`if self.is_pinned() { return false }`
+    /// 之外的那几条就是原来的回收条件，未改动。
+    #[test]
+    fn a_pinned_host_is_never_reaped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试用的运行时应当能建立");
+
+        runtime.block_on(async {
+            let host = BackgroundHost::new();
+
+            // 假装它跑着一个子进程，而且最后一次被使用是很久以前。
+            host.set_liveness(Liveness::Pinned);
+            {
+                let mut lives = host.lives.lock().unwrap();
+                lives.last_used = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(60);
+                // 见上面：这里只需要"有一个子进程"这个事实，因此放一个真的
+                // （已经退出的）子进程句柄进去。用 `child` 之外的任何东西都不行 ——
+                // 判据第一关问的就是 `child.is_none()`。
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command.arg("--definitely-not-a-real-flag");
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+                lives.child = command.spawn().ok();
+            }
+
+            assert!(host.is_pinned(), "置位之后必须报告为已钉住");
+            assert!(
+                !host.reap_if_idle().await,
+                "托管着插件的宿主**不可以**被空闲回收：它的定时器与热键订阅都会随之消失"
+            );
+
+            // 复位，避免这个刚退出的子进程句柄影响后面的断言。
+            host.set_liveness(Liveness::OnDemand);
+        });
+    }
+
+    /// 子进程的 stderr 行太长时，截断点必须落在**字符边界**上。
+    ///
+    /// 直接按字节切会在多字节字符中间切断并 panic —— 而这段代码跑在一个 tokio
+    /// 任务里，panic 的结果是"诊断信息没了"，而那种失败本身是最难被注意到的。
+    /// 中文的 stderr（插件自己写的错误消息）正好会踩到这一点。
+    #[test]
+    fn clipping_a_long_stderr_line_never_splits_a_character() {
+        // 每个汉字 3 字节：取长度不是 3 的倍数的限制，就一定落在字符中间。
+        let text = "错".repeat(10);
+        assert_eq!(text.len(), 30);
+
+        let cut = floor_char_boundary(&text, 10);
+        assert_eq!(cut, 9, "10 字节落在一个字符中间，应当回退到 9");
+        assert!(text.is_char_boundary(cut));
+
+        // 边界本身合法时不动它。
+        assert_eq!(floor_char_boundary(&text, 9), 9);
+        // 超过长度时就是全长，而不是越界。
+        assert_eq!(floor_char_boundary(&text, 999), 30);
+        // ASCII 上就是它自己。
+        assert_eq!(floor_char_boundary("abcdef", 3), 3);
     }
 
     // ============================================================

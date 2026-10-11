@@ -156,7 +156,7 @@ impl Module for DesktopModule {
 
         let needs_runtime = plugins
             .as_ref()
-            .map(|state| !state.inner().status(app).is_empty())
+            .map(|state| state.inner().has_live_processes())
             .unwrap_or(false)
             || generic
                 .as_ref()

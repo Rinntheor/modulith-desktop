@@ -89,6 +89,12 @@
   // `ctx.clipboard.canMonitor()` 是**同步**方法（插件用它做顶层特性探测），
   // 而 RPC 是异步的 —— 等它回来时插件的顶层早就跑完了。
   var CLIPBOARD_MONITOR_SUPPORTED = __PLUGIN_CLIPBOARD_MONITOR__;
+  // 全局热键与读取选中文本的平台能力。与上面那条**同一个理由**：两者的
+  // `isAvailable()` 都是**同步**方法（插件在顶层用它决定要不要注册热键、
+  // 要不要画一个"翻译选中文本"的按钮），而 RPC 是异步的 —— 等它回来时插件的
+  // 顶层早就跑完了。
+  var HOTKEY_SUPPORTED = __PLUGIN_HOTKEY__;
+  var SELECTION_SUPPORTED = __PLUGIN_SELECTION__;
   var SURFACES = __PLUGIN_SURFACES__;
   // 整份清单与设置项快照。两者都是 **JSON 字面量**（源文件里不带引号，宿主直接
   // 把序列化结果替换进来）—— 与上面那几条字符串占位符的区别就在这里：包成字符串
@@ -115,18 +121,203 @@
   var DATA_ROOT = '/' + TOKEN + '/data/';
 
   // ============================================================
-  // 守卫：这个文档里**不该**有宿主的 IPC
+  // 守卫：这个文档里**还有没有一条通到宿主的 IPC**
   // ============================================================
   //
-  // 沙箱依赖 Tauri 一侧的两件事：它不给子框架注入 IPC 初始化脚本，且 IPC 处理器
-  // 要求一个只注入主框架的随机键。这两件事**都会静默失效** —— 哪一天不成立了，
-  // 这里不会报错、不会变慢、没有任何症状，只是插件忽然能 invoke 全部应用命令。
+  // ============================================================
+  // 先纠正一句曾经写在这里、而且写错了的话
+  // ============================================================
   //
-  // 所以这里主动查一次，查到就大声说出来。**它不是一道拦截**（插件也不该靠它），
-  // 它是一盏灯：正常运行时什么都不做，边界塌了的时候立刻进日志与自检页。
+  // 这里与 `sandbox.rs` 的文件头都曾写着"Tauri 的每一个内部初始化脚本都带
+  // `for_main_frame_only`，因此 iframe 里没有这些全局"。**那句话在 Windows 上
+  // 是错的**，而且错得很安静：
+  //
+  //   * wry 0.55.1 自己的文档就写着 ——
+  //     "Windows: scripts are always added to subframes regardless of the
+  //      `for_main_frame_only` option. This will be the case until Webview2
+  //      implements a proper API to inject a script only on the main frame."
+  //     （`wry-0.55.1/src/lib.rs`，`InitializationScript::for_main_frame_only`，
+  //     以及 `webview2/mod.rs`：Windows 那一侧用的是
+  //     `AddScriptToExecuteOnDocumentCreated`，它对**每一个 frame** 生效）；
+  //   * 而 `tauri-runtime-wry` 把每一个初始化脚本原样交给 wry
+  //     （`tauri-runtime-wry-2.11.4/src/lib.rs:5174`，`with_initialization_script_for_main_only`）
+  //     —— 也就是说 `for_main_frame_only` 这个标志在 Windows 上**被忽略**。
+  //
+  // 结论：`__TAURI_INTERNALS__`、`isTauri`、**那条带 invoke key 的 IPC 脚本**
+  // 以及 ISOLATION 相关脚本，全都会落进插件 iframe；再加上 wry 自己注入的
+  // `window.ipc`（`Object.defineProperty(window,'ipc',{value:Object.freeze({...})})`）。
+  //
+  // 因此维护者日志里那些「沙箱边界失效」ERROR **不是误报，也不是开发链接插件
+  // 特有的** —— 每一个插件界面在 Windows 上都是这样，装好的插件与开发链接的
+  // 插件走的是同一份入口文档（`sandbox.rs::entry_document_html`）。
+  // 真正错的是把这条断言写成"名字在不在"：那个判据在 Windows 上**恒为真**，
+  // 于是它既永远正确又永远没用 —— 一句每天都在喊的警报最后只会被无视。
+  //
+  // ============================================================
+  // 因此分两步：先尽力掐死，再如实报告"还能不能用"
+  // ============================================================
+  //
+  // 第一步是**真的把通道掐掉**，而不是只把它记下来。桥接层是宿主的一部分，
+  // 而且**先于插件代码**加载（入口文档里的脚本顺序由宿主写死，见
+  // `sandbox.rs::entry_document_html`），因此它有机会做这件事。
+  //
+  // 第二步的判据换了一个更诚实的问题：**从这个文档出发，还有没有一条能到宿主的
+  // IPC 通道。** 名字还在、而通道已经死了（第一步成功）属于预期，只留一句
+  // `console.info`；名字还在**且通道还活着**才是那条 ERROR —— 它现在只在真的
+  // 出事时亮。**它不是一道拦截（插件也不该靠它），它是一盏灯。**
   //
   // 为什么放在这里而不是等插件来问：插件不一定会问，而这件事不该由插件决定
   // 自己要不要被检查。
+
+  // ============================================================
+  // 掐断是**静默的**，不是"大声拒绝"
+  // ============================================================
+  //
+  // 上一版把那个替换函数写成一个抛 `Error` 的 `deny`，而维护者的日志给出了它的
+  // 直接后果：
+  //
+  //     [Modulith] 插件里有一个 Promise 被拒绝且没有 catch：
+  //     Error: [Modulith] 沙箱插件不能通过宿主 IPC 通道发消息
+  //         at Object.deny [as postMessage] (…/bridge.js:199:17)
+  //         at Object.postMessage (<anonymous>:1:102)
+  //         at sendIpcMessage (<anonymous>:130:18)
+  //         at <anonymous>:113:13
+  //
+  // 那两个 `<anonymous>` 帧**全是 Tauri 自己的引导脚本**，不是插件：
+  //
+  //   * `:130:18` 是 `tauri-2.11.5/scripts/ipc-protocol.js` 回退分支里那一行
+  //     `window.ipc.postMessage(data)`（把 `process-ipc-message-fn.js` 内联进去
+  //     之后渲染出来的行号，与 `:113` 是同一份脚本）；
+  //   * `:113:13` 是同一份脚本里 fetch 失败之后那一次重试
+  //     `sendIpcMessage(message)` —— 也就是说**第一条传输
+  //     （`fetch('http://ipc.localhost/<命令>')`）先被文档的 CSP 挡掉了，Tauri 按
+  //     它自己的设计回退到 `postMessage`**，然后撞上了我们的桩。
+  //
+  // 这个栈没有、也给不出"谁最初调了 invoke" —— 那一次重试发生在一个 promise 的
+  // 拒绝回调里，同步栈到那里就断了。但它已经说明两件事，而它们决定了这一版怎么写：
+  //
+  //   * 调用方**不是**插件在乱调。`invoke` 对任何走到它的人开放，而"任何人"里包括
+  //     Tauri 自己注入的脚本，也包括**它接管的浏览器 API**：`tauri-plugin-dialog`
+  //     的 `init-iife.js` 把 `window.confirm` / `window.alert` 换成了走 IPC 的版本
+  //     （`window.confirm = async i => await n("plugin:dialog|confirm", …)`）。
+  //     插件以为自己在调标准 API，而那条 promise 是**注入脚本**丢掉的（插件确实
+  //     没 await 它，但它本来也没有理由要 await 一个标准的 `confirm`）。
+  //   * 抛错没有让任何人做出更好的决定。它把"到不了宿主"变成"到不了宿主、而且
+  //     控制台上多一条没人能处理的拒绝"，还把矛头指向插件的代码行 —— 排查的人
+  //     于是会去改一个没写错的插件。这正是上面那句"每天都喊的警报最后只会被无视"。
+  //
+  // 因此要的性质是"**这个文档到不了宿主**"，而它由"那一跳不存在"本身满足，
+  // 不需要、也不该由一次抛错来表达。桩是**静默的空操作**：不抛、不返回拒绝、
+  // 不记日志（这里的输入不可信，写进宿主日志等于把插件内容抄一份出去）。
+  //
+  // 被否决的替代方案：**返回 `Promise.reject(...)`**。那只是把一个未处理的拒绝
+  // 换成另一个 —— Tauri 的 `invoke` 由 `sendIpcMessage` 同步驱动，谁调它都不保证
+  // 会 catch；而我们要的是"什么也没发生"，不是"有事发生但被吞掉"。
+
+  /**
+   * 换上去的那个桩。
+   *
+   * 它必须是一个**能按引用比较**的东西：`hostIpcIsReachable()` 靠它回答
+   * "这一跳还在不在"（理由见那个函数）。**空函数体是刻意的** —— 这个桩能做的事
+   * 只有一件，就是什么都不做。
+   */
+  var HOST_IPC_STUB = null;
+
+  /**
+   * 掐断宿主 IPC 的**最后那一跳**。返回掐掉了什么（空数组 = 一个都没掐掉）。
+   *
+   * 最后那一跳是 WebView2 的原生桥 `window.chrome.webview.postMessage`。
+   * 选它而不是删那几个全局，有两个具体理由：
+   *
+   *   * `window.__TAURI_INTERNALS__` 与 `window.ipc` 都是
+   *     `Object.defineProperty(..., { value })` 定义的，也就是**不可重定义、
+   *     不可写** —— 删不掉也换不掉。这不是猜的：把 Tauri 那几个初始化脚本原文
+   *     在 Node 里跑一遍，`Object.getOwnPropertyDescriptor` 给的是
+   *     `writable: false, configurable: false, enumerable: false`（四个名字全都
+   *     一样），`delete window.ipc` 在严格模式里直接抛
+   *     `Cannot delete property 'ipc'`，`Object.defineProperty(window,
+   *     '__TAURI_INTERNALS__', …)` 抛 `Cannot redefine property`。
+   *     **因此这一层删不掉那个 API 面，只能掐掉它的出口。**
+   *     但 `window.ipc` 里那个 `postMessage` 是
+   *     `s => window.chrome.webview.postMessage(s)`：它在**调用时**才去取最后
+   *     那一跳。换掉那一跳，两条路（`ipc` 与 `__TAURI_INTERNALS__.postMessage`）
+   *     就一起断了。
+   *   * 另一条传输（`fetch('http://ipc.localhost/…')`）由文档的 CSP 挡着：
+   *     `connect-src` 只留了插件自己的来源，而那一份 CSP 由宿主生成。**引擎
+   *     执行它**，插件改不掉。维护者那份日志本身就是这条成立的**正面证据**：
+   *     回退分支只会在 fetch 真的被拒之后才走（见上面那一节对 `:113` 的解释）。
+   *
+   * 这一切都裹在 try/catch 里，而且**拿不准就什么都不做**：任何一个属性在不同
+   * 的 WebView2 版本上形状不同，都不该让插件界面起不来 —— 那比"多一条通道"
+   * 严重得多。
+   */
+  function neutralizeHostIpc() {
+    var neutralized = [];
+
+    try {
+      var webview = window.chrome && window.chrome.webview;
+      if (webview && typeof webview.postMessage === 'function') {
+        // 静默的空操作。**不要改回抛错或 `Promise.reject`** —— 理由与那次真实的
+        // 日志见上面那一节，`check:sandbox` 也有断言钉着这一点。
+        var stub = function () {};
+        try {
+          webview.postMessage = stub;
+        } catch (error) {
+          // 只读（或被冻结）：掐不掉。下面的判据会如实把它说出来。
+        }
+        if (webview.postMessage === stub) {
+          HOST_IPC_STUB = stub;
+          neutralized.push('chrome.webview.postMessage');
+        }
+      }
+    } catch (error) {
+      // 拿不到那个对象（非 Windows、或引擎改了形状）：什么都不做。
+    }
+
+    return neutralized;
+  }
+
+  /**
+   * 从这个文档出发，还有没有一条能到宿主的 IPC 通道。
+   *
+   * ============================================================
+   * 判据是"这一跳现在是不是那个桩"，**不是**"它是不是一个函数"
+   * ============================================================
+   *
+   * 上一版的判据是 `typeof webview.postMessage === 'function'`，而**桩本身也是
+   * 一个函数** —— 于是掐断成功之后它照样返回 true，`assertNoHostIpc()` 反而在每
+   * 一个插件界面上把一条 ERROR 打出来。这就是"判据测的是形状、不是效果"的代价：
+   * 它给出的答案与事实**正好相反**。
+   *
+   * 为什么不能"真调一次，看它通不通"：那一次调用本身就是我们要阻止的那件事，
+   * 而且这一侧根本观测不到"宿主收没收到" —— 等能看到时它已经出去了。能观测的
+   * 等价物只有一个：**唯一能到宿主的那个函数还在不在这个位置上**。Tauri 的两条
+   * 传输（`window.ipc.postMessage` 与 `__TAURI_INTERNALS__.postMessage`）都是
+   * **调用时**才去取这一跳，因此"位置上是我们那个桩"就等于"调用到不了宿主"。
+   * （桩是**按引用**比较的，所以它只能是上面那一个函数对象。）
+   *
+   * 取不到那个对象时按**最坏情况**算：宁可多报一次，也不要因为"读不到"而把一条
+   * 真通道报成不存在。
+   */
+  function hostIpcIsReachable() {
+    try {
+      var webview = window.chrome && window.chrome.webview;
+      if (webview && typeof webview.postMessage === 'function') {
+        // 这一跳在：它是两条传输唯一的汇合点。还是那个桩 = 通不了。
+        return webview.postMessage !== HOST_IPC_STUB;
+      }
+
+      // 这一跳根本不在（非 Windows / 引擎换了形状）：剩下的只有 fetch 那条，
+      // 它由文档的 CSP 挡着，而 CSP 是引擎执行的 —— 这一侧验不了，按最坏情况算。
+      return (
+        typeof window.ipc !== 'undefined' ||
+        typeof window.__TAURI_INTERNALS__ !== 'undefined'
+      );
+    } catch (error) {
+      return true;
+    }
+  }
+
   function assertNoHostIpc() {
     var found = [];
 
@@ -137,11 +328,32 @@
     // 它是"fetch 那条被 connect-src 挡住了"之后还会剩下的那一条路。
     if (typeof window.ipc !== 'undefined') found.push('ipc');
 
+    // 名字还在、但掐断成功了：这是 Windows 上的**预期状态**。
+    // 记一条 info（而不是 error）是刻意的 —— 见上面那两段说明：
+    // 一个恒为真的判据只会训练人无视日志。
+    //
+    // 措辞里那两句也是刻意的：**名字在是平台事实**（wry 不理会
+    // for_main_frame_only），**掐断是纵深防御**（这一层不是引擎给的隔离，
+    // Windows 不提供那个 API）。两件都说出来，读日志的人才不会把"名字在"
+    // 当成又一次失效，也不会把"掐断了"当成沙箱的全部。
+    if (found.length > 0 && !hostIpcIsReachable()) {
+      console.info(
+        '[Modulith] 这个文档里出现了宿主 IPC 的名字（' +
+          found.join('、') +
+          '），但它们已经**不通**了：wry 在 Windows 上不理会 for_main_frame_only，' +
+          '注入是平台行为；桥接层已经把最后那一跳换成静默的桩（这一层是纵深防御，' +
+          '不是引擎给的隔离）。'
+      );
+      return true;
+    }
+
     if (found.length === 0) return true;
 
     var detail =
-      '这个插件文档里出现了宿主 IPC（' + found.join('、') + '）。插件界面本应跑在一个' +
-      '拿不到 IPC 的跨源 iframe 里 —— 出现这些名字意味着它不在。';
+      '这个插件文档里出现了宿主 IPC（' + found.join('、') + '），而且它**还能用**。' +
+      '插件界面本应跑在一个拿不到 IPC 的跨源 iframe 里 —— 现在它拿得到。' +
+      '（名字出现在 Windows 上是正常的：wry 不理会 for_main_frame_only，那是平台事实。' +
+      '这一条报的是"桥接层没能掐断最后那一跳" —— 那一步是纵深防御，它没能生效。）';
     console.error('[Modulith] 沙箱边界失效：' + detail);
 
     // 也交给宿主写进文件日志：控制台在 release 版里看不到，而这一条恰恰是最不该
@@ -155,7 +367,11 @@
     return false;
   }
 
-  /** 这个文档里有没有宿主 IPC。自检页会读它。 */
+  // 顺序不能反：先掐断，再问"还通不通"。反过来的话，判据会稳定地报出一件
+  // 桥接层马上就要修好的事。
+  var NEUTRALIZED_HOST_IPC = neutralizeHostIpc();
+
+  /** 这个文档里有没有**可用**的宿主 IPC。自检页会读它。 */
   var HOST_IPC_ABSENT = assertNoHostIpc();
 
   // ============================================================
@@ -745,6 +961,235 @@
       readImage: function () {
         if (!allowedMonitor) return deniedMonitor('读取剪贴板图片');
         return rpc('clipboard.readImage', {});
+      },
+    };
+  })();
+
+  // ============================================================
+  // 全局热键（`ctx.hotkey`）
+  // ============================================================
+  //
+  // ============================================================
+  // 它与 `ctx.clipboard` 的监测那一半是同一形态
+  // ============================================================
+  //
+  // 两者都**只能经宿主**：`RegisterHotKey` 在宿主进程里，而浏览器里没有任何 API
+  // 能让一个页面在**别的程序**聚焦时收到按键（`addEventListener('keydown')` 只在
+  // 本文档聚焦时有效）。因此权限是 Rust 侧强制的，而这一层能做的只是"没声明时
+  // 给出可读的降级 + 一次告警"。
+  //
+  // ============================================================
+  // 触发是**宿主 → 插件**方向的，因此需要一条推送通道
+  // ============================================================
+  //
+  // 热键触发天生是"用户按了键"，而按键发生在别的程序里 —— 这一侧没有任何东西
+  // 能观察到它。因此 `subscribe` 除了登记一个处理函数，还要告诉宿主"请往我这里推"，
+  // 而宿主推回来时走 `PUSH_HANDLERS.hotkey`（与 clipboard / file-drop 同一个形状：
+  // 扇出给插件自己注册的那些处理函数，而不是转发给某个全局钩子）。
+
+  /** 热键触发的订阅者。见 `PUSH_HANDLERS['hotkey']`。 */
+  var HOTKEY_HANDLERS = new Set();
+
+  var hotkey = (function () {
+    var allowed = has('global-hotkey');
+
+    var warned = false;
+    function warnOnce() {
+      if (warned) return;
+      warned = true;
+      console.warn(
+        '[Modulith] 插件使用了全局热键，但清单里没有声明 "global-hotkey" 权限，' +
+          '注册与订阅都被拒绝（后续同类调用不再重复提示）'
+      );
+    }
+
+    /**
+     * 缺权限时统一抛出的那句话。
+     *
+     * **不返回一个空结果。** `register()` 静默成功会让插件以为热键装上了，
+     * 而用户按下去没有任何反应 —— 那是最难查的一类缺陷：插件这一侧全绿，
+     * 而没有任何地方说得出"它根本没注册"。
+     */
+    function denied(what) {
+      warnOnce();
+      return Promise.reject(
+        new Error(
+          '插件未声明 "global-hotkey" 权限，无法' +
+            what +
+            '。这一项必须显式声明：占用的组合键会从这台机器上所有其它程序手里被拿走'
+        )
+      );
+    }
+
+    return {
+      /**
+       * 现在能不能注册全局热键。**同步**，用于特性探测。
+       *
+       * 两个条件都满足才为真：清单里声明了 `global-hotkey`，**且**这个平台支持
+       * （只有 Windows 有 `RegisterHotKey`）。非 Windows 上它恒为假，注册会走
+       * 降级分支。
+       */
+      isAvailable: function () {
+        return allowed && HOTKEY_SUPPORTED;
+      },
+
+      /**
+       * 注册一条组合键。返回**宿主实际绑定的**规范化组合键（`Ctrl+Q` 会变成
+       * `mod+q`）—— 插件拿它去 `unregister` 或显示给用户，都该用这一个。
+       *
+       * 冲突时**拒绝**，而且消息里点名是谁占着它（宿主快捷键 / 另一个插件 /
+       * 系统里的别的程序）。那三种情况下用户能做的事完全不同，因此这一层
+       * 绝不能把宿主的错误消息改写成一句笼统的"注册失败"。
+       */
+      register: function (combo) {
+        if (!allowed) return denied('注册全局热键');
+        if (!HOTKEY_SUPPORTED) {
+          return Promise.reject(
+            new Error(
+              '当前平台不支持全局热键（它依赖 Win32 的 RegisterHotKey / ' +
+                'UnregisterHotKey，只在 Windows 上可用）。调用 ctx.hotkey.isAvailable() ' +
+                '可以在代码里先判断'
+            )
+          );
+        }
+        return rpc('hotkey.register', { combo: String(combo) });
+      },
+
+      /** 解绑一条组合键。**不做权限检查**：一条解不掉的绑定就是一个泄漏。 */
+      unregister: function (combo) {
+        return rpc('hotkey.unregister', { combo: String(combo) });
+      },
+
+      /** 这个插件当前注册的组合键（规范化形式）。 */
+      list: function () {
+        return rpc('hotkey.list', {}).then(function (value) {
+          return value || [];
+        });
+      },
+
+      /**
+       * 订阅"我注册的组合键被按下了"。返回取消订阅函数。
+       *
+       * 处理函数收到一个参数 `{ combo }` —— 契约里的 `handler()` 说的是"不要求
+       * 参数"，而一个插件最多能注册 4 条组合（`MAX_COMBOS_PER_PLUGIN`），
+       * 因此多给这一个字段，否则处理函数分不清是哪一条触发了。
+       */
+      subscribe: function (handler) {
+        if (typeof handler !== 'function') {
+          throw new TypeError('hotkey.subscribe 需要一个函数');
+        }
+        if (!allowed) {
+          warnOnce();
+          return function () {};
+        }
+        if (!HOTKEY_SUPPORTED) {
+          // 与剪贴板那一条同一条规矩：**空订阅 + 一次告警**，而不是抛错。
+          // 抛错会让一个只是想在 Windows 上做特性的插件整体加载失败，而它是可以
+          // `isAvailable()` 自查的。
+          console.warn(
+            '[Modulith] 订阅了全局热键，但当前平台不支持（只在 Windows 上可用）。' +
+              '订阅被忽略 —— 调用 ctx.hotkey.isAvailable() 可以在代码里先判断'
+          );
+          return function () {};
+        }
+
+        var isFirst = HOTKEY_HANDLERS.size === 0;
+        HOTKEY_HANDLERS.add(handler);
+        if (isFirst) {
+          rpc('hotkey.subscribe', {}).catch(function (error) {
+            // 失败**必须说出来**：插件会以为自己订阅成功了（`subscribe()` 没有抛），
+            // 而宿主那边一次触发都不会来。
+            console.warn('[Modulith] 全局热键订阅没有登记成功，将收不到触发：' + error);
+          });
+        }
+
+        var released = false;
+        return function () {
+          // 幂等：插件把它存进 `disposables` 之后又自己调一次是常见写法。
+          if (released) return;
+          released = true;
+          HOTKEY_HANDLERS.delete(handler);
+
+          // **只有最后一个处理函数离开时才通知宿主。**
+          if (HOTKEY_HANDLERS.size === 0) {
+            rpc('hotkey.unsubscribe', {}).catch(function () {});
+          }
+        };
+      },
+    };
+  })();
+
+  // ============================================================
+  // 读取选中文本（`ctx.selection`）
+  // ============================================================
+  //
+  // ============================================================
+  // 为什么它只有一个方法，而且只能经宿主
+  // ============================================================
+  //
+  // 它要的是"**前台应用程序**里选中的文本" —— 而前台程序可能是任何一个程序。
+  // 这一侧的 `window.getSelection()` 只覆盖本文档，`navigator.clipboard` 读不到
+  // 别的程序的选区。宿主用的是"合成 Ctrl+C 再读剪贴板"（见 `selection.rs`），
+  // 因此它会**短暂覆盖用户的剪贴板** —— 那个代价写在权限描述与用户文档里，
+  // 而这一层能做的是在缺权限时给出可读的拒绝，而不是一个看起来正常的 `null`。
+
+  var selection = (function () {
+    var allowed = has('read-selection');
+
+    var warned = false;
+    function warnOnce() {
+      if (warned) return;
+      warned = true;
+      console.warn(
+        '[Modulith] 插件读取了选中文本，但清单里没有声明 "read-selection" 权限，' +
+          '调用被拒绝（后续同类调用不再重复提示）'
+      );
+    }
+
+    return {
+      /**
+       * 现在能不能读取选中文本。**同步**，用于特性探测。
+       *
+       * 两个条件都满足才为真：清单里声明了 `read-selection`，**且**这个平台支持
+       * （只有 Windows 有 `SendInput`）。
+       */
+      isAvailable: function () {
+        return allowed && SELECTION_SUPPORTED;
+      },
+
+      /**
+       * 读一次前台应用程序里选中的文本。
+       *
+       * 三种结果必须分得开，调用方要照各自的含义处理：
+       *   * `string` —— 读到了；
+       *   * **`null`** —— 捕获成功了，但剪贴板上最终没有文本（用户选中的是一段
+       *     空白，或者那个程序放了一份没有文本的东西）；
+       *   * **抛错** —— 这次捕获根本没成功（前台窗口是本应用、没有前台窗口、
+       *     那个程序不响应 Ctrl+C —— 宿主会说明是哪一种）。
+       *
+       * 把后两者混成 `null` 是最糟的处理：作者会写"没有选中就提示用户先选一段"，
+       * 而用户明明选中了 —— 那个分支永远走不到，也没有任何线索。
+       */
+      read: function () {
+        if (!allowed) {
+          warnOnce();
+          return Promise.reject(
+            new Error(
+              '插件未声明 "read-selection" 权限，无法读取选中的文本。' +
+                '这一项必须显式声明：它读的是你在**任何程序**里选中的内容，' +
+                '而且会短暂覆盖你的剪贴板'
+            )
+          );
+        }
+        if (!SELECTION_SUPPORTED) {
+          return Promise.reject(
+            new Error(
+              '当前平台不支持读取选中文本（它需要合成 Ctrl+C，只在 Windows 上可用）。' +
+                '调用 ctx.selection.isAvailable() 可以在代码里先判断'
+            )
+          );
+        }
+        return rpc('selection.read', {});
       },
     };
   })();
@@ -1556,6 +2001,46 @@
       });
     },
 
+    /**
+     * 一张**由宿主渲染的结果卡片**：贴一次结果给用户看，然后自己消失。
+     *
+     * 返回 `{ action }` —— 用户点中的那个动作的 id，或者 `null`（到点自动收起 /
+     * 按了 Escape / 点了别处）。**`null` 是"用户没回答"，不是失败**；失败
+     * （没声明 `notification` 权限、浮层窗口起不来）会让这个 Promise 拒绝。
+     *
+     * 选项 `{ title?, body, tone?, actions?, timeoutMs?, at? }`：
+     *   · `body` 必填，宿主按 4000 个字符截断；`title` 是短标题（120 个字符）；
+     *   · `tone` 取 info / success / warning / error，缺省 info；
+     *   · `actions` 最多 3 个 `{ id, label }`，id 只允许 `[a-z0-9-]` 且不超过
+     *     32 个字符（它是回给你的那个取值，因此形状不对时**整次调用被拒绝**，
+     *     而不是悄悄丢掉一个按钮）；
+     *   · `timeoutMs` 缺省 8000，宿主钳制到 1000..30000；
+     *   · `at` 取 'cursor'（缺省）或 'center'。
+     *
+     * **由宿主渲染**的理由与 dialog 一样，而且这里是它最要紧的一处：卡片会贴在
+     * 用户正在看的地方，因此它必须一眼就是宿主的东西，不能是插件画的一个像
+     * 宿主提示框的东西。
+     *
+     * 与 `dialog` 的两处不同值得记住：卡片**不抢焦点**（插件不能让一张卡片把
+     * 用户正在输入的光标夺走），而且**同一时刻只有一张** —— 新的来时旧的当场
+     * 以 `null` 结束（两张重叠的卡片没有"先收起哪一张"的说法）。
+     */
+    popover: function (input) {
+      var input0 = input || {};
+      return rpc('ui.popover', {
+        title: input0.title === undefined ? null : input0.title,
+        body: input0.body === undefined ? '' : String(input0.body),
+        tone: input0.tone === undefined ? null : input0.tone,
+        actions: input0.actions === undefined ? [] : input0.actions,
+        timeoutMs: input0.timeoutMs === undefined ? null : input0.timeoutMs,
+        at: input0.at === undefined ? null : input0.at,
+      }).then(function (value) {
+        // 把 `{ action }` 收敛成契约里的形状：宿主回 `null` 就是"没回答"，
+        // 而字段缺失（更老的宿主）同样落到 `null`，不留给插件一个 `undefined`。
+        return { action: value && value.action ? value.action : null };
+      });
+    },
+
     // ============================================================
     // 多界面（api: 3）
     // ============================================================
@@ -2172,6 +2657,27 @@
         } catch (error) {
           // 与宿主侧的前端扇出同一条规矩：一个处理器出错不该让别的收不到。
           console.error('[Modulith] clipboard 处理器抛出异常，已隔离：' + error);
+        }
+      });
+    },
+
+    // 全局热键触发。与 `clipboard` / `file-drop` **同一条形状**：扇出给插件自己
+    // 注册的那些处理函数 —— 因为 `ctx.hotkey.subscribe(handler)` 的形态就是这样。
+    //
+    // 权限**不在这里判**：宿主只在订阅登记成功之后才推（那一步已经过了
+    // `require_permission`），因此走到这里的每一条都是该收的。在这里再查一遍
+    // `PERMISSIONS` 只会让人以为那是一道边界。
+    //
+    // 负载是 `{ combo }`：一个插件最多能注册 4 条组合，处理函数必须能分辨是哪一条。
+    hotkey: function (payload) {
+      // 快照后再遍历：处理器里退订是合法用法，边遍历边删会让 Set 的迭代行为
+      // 变得难以推理（某些实现会因此跳过一项）。
+      Array.from(HOTKEY_HANDLERS).forEach(function (handler) {
+        try {
+          handler(payload || null);
+        } catch (error) {
+          // 与宿主侧的前端扇出同一条规矩：一个处理器出错不该让别的收不到。
+          console.error('[Modulith] hotkey 处理器抛出异常，已隔离：' + error);
         }
       });
     },
@@ -3065,6 +3571,22 @@
     },
 
     clipboard: clipboard,
+
+    /**
+     * 全局热键。**与剪贴板的监测那一半同一形态**：宿主进程里的 Win32 是唯一
+     * 出口，因此权限由 Rust 侧强制，这一层只负责缺权限时的降级与一次告警。
+     */
+    hotkey: hotkey,
+
+    /**
+     * 读取**前台应用程序**里选中的文本。
+     *
+     * ⚠️ 它在宿主那一侧会向前台程序**合成一次 Ctrl+C**，因此会短暂覆盖用户的
+     * 剪贴板（文本会被还原，图片/富文本/文件无法还原）。那段代价写在权限描述与
+     * 用户文档里 —— 这里重复一次是因为读这个文件的人多半正在排查"为什么我的
+     * 剪贴板被换掉了"。
+     */
+    selection: selection,
 
     /** 文件拖放。形态与 in-process 一致，语义差别见上面的 `fileDrop`。 */
     fileDrop: fileDrop,

@@ -67,7 +67,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
-use super::{BackgroundHost, BackgroundMethod, HostSpec, Inbound};
+use super::{BackgroundHost, BackgroundMethod, HostSpec, Inbound, Liveness};
 use crate::modules::plugins::{rpc, PluginState};
 
 /// Node 从哪个大版本开始有可用的权限模型。
@@ -85,6 +85,31 @@ const PERMISSION_MODEL_MIN_MAJOR: u64 = 23;
 /// 很坏：拼错成 `--allow-nets` 会让探测永远返回 `false`，于是界面会一直说
 /// "网络没被管住" —— 一个**听起来更安全**的假警报，没人会去查它。
 const NET_SCOPE_FLAG: &str = "--allow-net";
+
+/// `plugin.dispatch` 的等待上限（**不是**那 10 秒的传输预算）。
+///
+/// ============================================================
+/// 为什么这一个方法要另算一个上限
+/// ============================================================
+///
+/// 别的调用（`ping` / `plugin.load` / …）的时长由宿主决定，10 秒是个正经的兜底。
+/// `plugin.dispatch` 不是：它把一件事交给**插件的处理器**，而处理器可以合法地
+/// 等到用户做出动作 —— `ctx.ui.popover` 缺省**没有截止时间**，它要等到用户把
+/// 卡片关掉为止。
+///
+/// 用 10 秒去卡它，会发生两件**互为因果、而且都指向一个不存在的问题**的事：
+/// 宿主记一句"后台宿主在 10000 毫秒内没有响应"（像是子进程卡死了），随后子进程
+/// 回话时再记一句"收到没有等待者的后台响应"（像是协议实现有问题）。而插件那一侧
+/// 一直好好地跑着。
+///
+/// 5 分钟与浮层的 `RESPONSE_TIMEOUT`（对话框/菜单那一条）取同一个数量级：
+/// 长到"用户读完一张卡片、点一下"绰绰有余，短到一条真正挂住的投递不会永远留着。
+/// 它不是"允许多久"，而是"超过它我们就可以断定这次投递不对劲了"。
+///
+/// 写成毫秒而不是 `Duration::from_secs`：它与 `protocol::REQUEST_TIMEOUT_MS`
+/// 是同一把尺子上的两个刻度，而 `check:sandbox` 会把它们读出来比一次 ——
+/// 那个判据要能在常量被改小、或被删掉时真的变红。
+const DISPATCH_TIMEOUT_MS: u64 = 300_000;
 
 /// 一个正在跑的后台插件。
 struct Running {
@@ -145,6 +170,23 @@ pub struct BackgroundPluginStatus {
 #[derive(Default)]
 pub struct BackgroundPlugins {
     running: Mutex<HashMap<String, Running>>,
+    /// **起不来的那些插件，以及它们各自的原因。**
+    ///
+    /// ============================================================
+    /// 为什么失败也要被记下来（而不是只写日志）
+    /// ============================================================
+    ///
+    /// `sync_startup` 对每一个起不来的插件只记一条 `log::warn!`。而用户与维护者
+    /// 看的地方是**插件详情页**，那里读的是 `background_plugins_status` —— 于是
+    /// "起不来"的插件在界面上永远只是一句"当前没有在运行"，而真正的原因（宿主
+    /// 脚本没打包、Node 起不来、问候超时、加载失败）全都在日志里。
+    ///
+    /// 那正是"后台插件不跑"最难排查的地方，因此这里把原因留下来，并由 `status()`
+    /// 带出去。它**不是**"运行中"表的另一份：那个只装成功的，这个只装失败的。
+    ///
+    /// 一个插件成功启动时它对应的条目被清掉（见 `start`），因此"时好时坏"的插件
+    /// 不会留下一句过期的错。
+    failures: Mutex<HashMap<String, String>>,
     /// Node 是否支持权限模型。缓存 —— 它是"启动一次子进程问版本"，不该每次拉起都问。
     permission_model: Mutex<Option<bool>>,
     /// Node 的权限模型**有没有网络那一项**（`--allow-net`）。同样缓存。
@@ -157,7 +199,35 @@ impl BackgroundPlugins {
     }
 
     /// 拉一个后台插件起来。已经在跑时是**幂等**的。
+    ///
+    /// ============================================================
+    /// 失败原因要**既返回、又留下**
+    /// ============================================================
+    ///
+    /// 真实的启动流程写在 `start_inner` 里，它有十来条 `?` 与提前返回（Node 找不到、
+    /// 清单没有后台入口、宿主脚本缺失、子进程起不来、问候超时、加载被插件自己
+    /// 拒绝……）。那些路径**只**返回错误，而调用方（`sync_startup`）只把它写进日志。
+    ///
+    /// 于是每一个失败原因最终都只活在 `modulith.log` 里，而用户打开插件详情页看到
+    /// 的永远是一句"当前没有在运行"。这一层把原因**同时**记进 `failures`，由
+    /// `status()` 带给界面 —— 修法只有一处，而不是在十来条返回路径上各补一遍。
     pub async fn start(&self, app: &AppHandle, plugin_id: &str) -> Result<(), String> {
+        match self.start_inner(app, plugin_id).await {
+            Ok(()) => {
+                self.failures.lock().unwrap().remove(plugin_id);
+                Ok(())
+            }
+            Err(reason) => {
+                self.failures
+                    .lock()
+                    .unwrap()
+                    .insert(plugin_id.to_string(), reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
+    async fn start_inner(&self, app: &AppHandle, plugin_id: &str) -> Result<(), String> {
         if self.running.lock().unwrap().contains_key(plugin_id) {
             return Ok(());
         }
@@ -345,6 +415,19 @@ impl BackgroundPlugins {
 
         let pid = host.status().pid;
 
+        // ============================================================
+        // 从这一刻起，这个宿主"拥有一个插件"，因此**不可以被空闲回收**
+        // ============================================================
+        //
+        // 置位放在插入 `running` 之前：置位只影响将来的回收判断，而"插件已经在
+        // 这个进程里加载好了"这件事在下一行就是事实。反过来（先插入再置位）会留下
+        // 一个窗口：回收任务恰好在中间醒来，看到 `last_used` 已经超过 5 分钟
+        // （插件加载可能很慢），于是把这个刚加载好的进程收掉 —— 而 `running`
+        // 里还留着它的条目，下一次 `sync_startup` 会以为"已经在跑"而不再拉起。
+        //
+        // 那个组合正是本次要修的缺陷的**最坏形式**：一个永远起不来的插件。
+        host.set_liveness(Liveness::Pinned);
+
         self.running.lock().unwrap().insert(
             launch.id.clone(),
             Running {
@@ -391,6 +474,11 @@ impl BackgroundPlugins {
         let Some(mut running) = self.running.lock().unwrap().remove(plugin_id) else {
             return Ok(());
         };
+
+        // 这个宿主不再拥有插件了。**必须在移除条目时立刻置回**，理由与 `start`
+        // 里那一处置位相对：留着 `Pinned` 会让这个宿主永远不被回收，而它现在已经
+        // 是一个空壳 —— "停用插件之后内存没降下来"就是这条路径漏掉的表现。
+        running.host.set_liveness(Liveness::OnDemand);
 
         if let Some(ticker) = running.ticker.take() {
             ticker.abort();
@@ -479,6 +567,17 @@ impl BackgroundPlugins {
 
     /// 当前状态。**不启动任何东西。**
     ///
+    /// ============================================================
+    /// 它同时报告**起不来的那些**，而不只是活着的那些
+    /// ============================================================
+    ///
+    /// 只列 `running` 的话，一个从没成功启动过的后台插件在界面上**根本不存在** ——
+    /// 插件详情页读到的是一份空列表，于是它显示"当前没有在运行"，而没有任何原因。
+    /// 那正是本次要修的缺陷在界面上的样子。
+    ///
+    /// 因此这里把 `failures` 里那条原因也带出去：`running: false` + 一句真正的
+    /// 原因，比一句沉默的"没有在运行"有用得多。
+    ///
     /// ⚠️ `net_restricted` 需要问一次 Node 的能力（`--help`），而这是一个 `sync`
     /// 函数。因此它**只读缓存**：缓存里没有就报 `false`（"没被管住"）。
     /// 这个方向是刻意的 —— 在拿到证据之前，界面不该宣称网络已被限制。
@@ -486,6 +585,7 @@ impl BackgroundPlugins {
     pub fn status(&self, _app: &AppHandle) -> Vec<BackgroundPluginStatus> {
         let running = self.running.lock().unwrap();
         let net_scope = *self.net_scope.lock().unwrap();
+        let failures = self.failures.lock().unwrap();
 
         let mut items: Vec<BackgroundPluginStatus> = running
             .iter()
@@ -501,10 +601,32 @@ impl BackgroundPlugins {
                     // 那正是这一位存在的理由。
                     net_restricted: entry.isolated && net_scope.unwrap_or(false),
                     uptime_ms: entry.started_at.elapsed().as_millis() as u64,
-                    reason: status.reason,
+                    // 宿主自己报的原因（子进程中途退出、启动失败、Node 解析失败）
+                    // 优先于我们记下的那条启动失败：它更新。
+                    reason: status.reason.or_else(|| failures.get(id).cloned()),
                 }
             })
             .collect();
+
+        // 起不来的那些。已经在 `items` 里的（正在跑的）不重复 —— 它们的原因由上面
+        // 那条分支负责，而两份原因同时出现只会让人不知道该信哪一个。
+        for (id, reason) in failures.iter() {
+            if running.contains_key(id) {
+                continue;
+            }
+            items.push(BackgroundPluginStatus {
+                id: id.clone(),
+                running: false,
+                pid: None,
+                // 一个没跑起来的插件谈不上隔离：报 `false`（"没有引擎级隔离"）
+                // 比报 `true` 诚实 —— 后者会让界面显示一个绿色的安全标记，
+                // 而那个进程根本不存在。
+                isolated: false,
+                net_restricted: false,
+                uptime_ms: 0,
+                reason: Some(reason.clone()),
+            });
+        }
 
         items.sort_by(|a, b| a.id.cmp(&b.id));
         items
@@ -513,6 +635,22 @@ impl BackgroundPlugins {
     /// 某个后台插件在不在跑。
     pub fn is_running(&self, plugin_id: &str) -> bool {
         self.running.lock().unwrap().contains_key(plugin_id)
+    }
+
+    /// 有没有**任何进程**（或曾经尝试过的插件）值得在退出时收尾。
+    ///
+    /// ============================================================
+    /// 为什么不能改判 `status().is_empty()`
+    /// ============================================================
+    ///
+    /// 退出路径（`desktop/mod.rs` 的 `stop`）用 `status()` 判"要不要建一个运行时
+    /// 去收尾"。而 `status()` 现在**也包含失败记录** —— 于是"有一次启动失败"会让
+    /// 退出路径以为"有东西要停"，多建一个 tokio 运行时而实际无事可做。
+    ///
+    /// 那本身没有危害，但它是那种会随着时间变成真问题的松动：判据说的是"有没有
+    /// 值得收尾的东西"，那就该直接问这件事，而不是问一个碰巧相关的列表。
+    pub fn has_live_processes(&self) -> bool {
+        !self.running.lock().unwrap().is_empty()
     }
 
     /// 把一条跨插件事件投递给**订阅了它**的后台插件。
@@ -539,7 +677,7 @@ impl BackgroundPlugins {
 
         for (id, host) in targets {
             let outcome = host
-                .call(
+                .call_within(
                     BackgroundMethod::PluginDispatch,
                     Some(serde_json::json!({
                         "id": id,
@@ -547,6 +685,7 @@ impl BackgroundPlugins {
                         "name": name,
                         "payload": { "source": source, "payload": payload },
                     })),
+                    Duration::from_millis(DISPATCH_TIMEOUT_MS),
                 )
                 .await;
 
@@ -556,6 +695,59 @@ impl BackgroundPlugins {
                     outcome.error.unwrap_or_default()
                 );
             }
+        }
+    }
+
+    /// 把一次**全局热键触发**投递给正在跑的那个后台插件。
+    ///
+    /// ============================================================
+    /// 它与 `dispatch_event` 的分工
+    /// ============================================================
+    ///
+    /// `dispatch_event` 面向的是"某个插件发了事件，所有订阅了它的插件都要收到"；
+    /// 这一条只面向**一个**插件，而且那个插件未必在跑 —— 后台进程是按需拉起的，
+    /// 而一个"没跑"的插件不会因为有人按了热键而被拉起来。
+    ///
+    /// 这个取舍是刻意的，而且必须说清楚：热键触发的语义是"用户现在就要那个结果"，
+    /// 而拉起一个 Node 进程（几百毫秒、上百 MB）再让它做一次翻译，用户等到的会是
+    /// 一次莫名其妙的延迟。它同时意味着**一个后台插件要在启动时就跑起来**
+    /// （清单里 `onStartup`）才能可靠地收到热键。
+    ///
+    /// 由 `hotkey::deliver` 调用（那一条把任务丢给 tokio，自己不 await）。
+    pub async fn dispatch_hotkey(&self, plugin_id: &str, combo: &str) {
+        // 先把宿主持有的一份拿出来，然后**放掉锁**再 await —— 临界区里 await 会让
+        // 一个插件的投递卡住另一个插件的启动（与 `dispatch_event` 同一条纪律）。
+        let host = {
+            let running = self.running.lock().unwrap();
+            running
+                .get(plugin_id)
+                .map(|entry| Arc::clone(&entry.host))
+        };
+        let Some(host) = host else {
+            // 不在跑就是没人在听。**不拉起它**，理由见上面的说明。
+            log::debug!("全局热键 {combo} 触发，但后台插件 {plugin_id} 没有在运行");
+            return;
+        };
+
+        let outcome = host
+            .call_within(
+                BackgroundMethod::PluginDispatch,
+                Some(serde_json::json!({
+                    "id": plugin_id,
+                    // 与 `ctx.background.on('hotkey', handler)` 登记的那个类型逐字
+                    // 相同 —— 类型名对不上时处理器一个都收不到，而那是静默的。
+                    "type": "hotkey",
+                    "payload": { "combo": combo },
+                })),
+                Duration::from_millis(DISPATCH_TIMEOUT_MS),
+            )
+            .await;
+
+        if !outcome.ok {
+            log::debug!(
+                "向后台插件 {plugin_id} 投递热键 {combo} 失败：{}",
+                outcome.error.unwrap_or_default()
+            );
         }
     }
 
@@ -659,6 +851,26 @@ fn parse_major_version(text: &str) -> Option<u64> {
 ///
 /// 与沙箱界面插件走的是同一个 `rpc::dispatch` —— 也就是说"能不能做这件事"
 /// 只有一处定义，两条路径的区别只在传输。
+///
+/// ============================================================
+/// 每一条请求**各自一个任务**，而这不是为了快
+/// ============================================================
+///
+/// 这个循环曾经是串行的：取一条、`rpc::dispatch(...).await`、回话，然后才取
+/// 下一条。那在"每一次调用都会很快结束"的前提下没问题 —— 而**结果卡片**恰好
+/// 不是：`ctx.ui.popover` 缺省**没有截止时间**，它要等到用户把它关掉为止。
+///
+/// 串行的代价因此是：一张卡片挂在屏幕上的那段时间里，**这个插件的每一次 ctx
+/// 调用都排在它后面**。用户看到的是"卡片还开着的时候，定时器不触发、热键按了
+/// 没反应"—— 而两侧的代码读起来都是对的。这正是维护者说的"它不能很快关掉"之外
+/// 的第二个后果：它会把那个插件整个卡住。
+///
+/// 因此循环现在只做收件，每一条请求各自 `spawn`。响应本来就靠 id 配对，
+/// 顺序没有任何东西依赖它（`rpc::dispatch` 自己也是被多个界面、多个插件并发
+/// 调用的）。
+///
+/// 并发度不是无界的：请求只能由那个子进程发出来，而它的每一句话都来自插件
+/// 自己（它没有能力凭空造出无限条 ctx 调用而不被自己拖垮）。
 async fn handle_inbound(
     app: AppHandle,
     host: Arc<BackgroundHost>,
@@ -674,17 +886,45 @@ async fn handle_inbound(
             .unwrap_or(&request.method)
             .to_string();
 
-        let args = request.params.unwrap_or(Value::Null);
+        let mut args = request.params.unwrap_or(Value::Null);
         // 第三个参数是**界面身份**。后台插件没有界面 —— 因此是 `None`，
         // 而不是一个空字符串。`ctx.ui.openSurface` 这类成员在它这里会以
         // "你不在任何一个界面里" 失败，而那正是事实。
-        let result = rpc::dispatch(&app, &plugin_id, None, &method, &args).await;
-
-        if let Err(message) = &result {
-            log::debug!("后台插件 {plugin_id} 的 ctx.{method} 被拒绝：{message}");
+        //
+        // ============================================================
+        // 一个例外：热键订阅
+        // ============================================================
+        //
+        // `ctx.hotkey.subscribe` 在 in-process 与沙箱里都会走到 RPC 的同一个分支，
+        // 而那个分支需要知道"这个订阅属于哪一侧" —— 三种运行位置的投递方式完全不同
+        // （Tauri 事件 / 推进 iframe / 派发进本进程）。界面身份那一栏对后台插件是
+        // `None`，而 in-process 也是 `None`，两者在 RPC 那一层分不开。
+        //
+        // 因此这里补一个 `background` 标注。它与剥掉 `ctx.` 前缀同一层：都是**传输**
+        // 知道、而共用实现不可能知道的事。**只对这两个方法写**，因为只有它们需要
+        // 区分"我是哪一侧"。
+        if matches!(method.as_str(), "hotkey.subscribe" | "hotkey.unsubscribe") {
+            if let Value::Object(map) = &mut args {
+                map.insert("background".to_string(), Value::Bool(true));
+            } else {
+                args = serde_json::json!({ "background": true });
+            }
         }
 
-        host.respond(request.id, result).await;
+        let id = request.id;
+        let task_app = app.clone();
+        let task_host = Arc::clone(&host);
+        let task_plugin = plugin_id.clone();
+
+        tokio::spawn(async move {
+            let result = rpc::dispatch(&task_app, &task_plugin, None, &method, &args).await;
+
+            if let Err(message) = &result {
+                log::debug!("后台插件 {task_plugin} 的 ctx.{method} 被拒绝：{message}");
+            }
+
+            task_host.respond(id, result).await;
+        });
     }
 }
 

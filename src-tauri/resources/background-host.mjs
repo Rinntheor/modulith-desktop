@@ -87,6 +87,16 @@ const LOAD_TIMEOUT_MS = 5_000;
 /** 进程启动时刻，用于 `status` 与 `shutdown` 上报的运行时长。 */
 const startedAt = Date.now();
 
+/**
+ * 这个进程跑在 Windows 上吗。
+ *
+ * 它只服务两个同步的 `isAvailable()`（`ctx.hotkey` 与 `ctx.selection`）：两者的
+ * 底层接口（`RegisterHotKey` / `SendInput`）都只存在于 Windows。**不问宿主**是有
+ * 原因的 —— 那两个方法是同步的（插件在 bundle 顶层用它做特性探测），而这一侧与
+ * 宿主只有请求—应答式的一条通道，等它回来时顶层早就跑完了。
+ */
+const WINDOWS = process.platform === 'win32';
+
 /** 已处理过的请求数 */
 let handled = 0;
 
@@ -136,16 +146,38 @@ let nextCallId = 1;
  * 超时是**必须**的：宿主若因为任何原因没有回答（崩了、卡住了、这条消息丢了），
  * 插件那边的 await 会永远挂着 —— 而"一个永远不 resolve 的 Promise"在插件作者
  * 看来是"我的代码没问题，就是没反应"，比一句错误难查得多。
+ *
+ * ============================================================
+ * 唯一的例外：`untilUserAnswers`
+ * ============================================================
+ *
+ * `ctx.ui.popover` 是**唯一**一条会等到用户做出动作的调用，而它的缺省形态是
+ * "用户不关它就一直等着"。给它套一个 10 秒的计时器等于让那张卡片在用户还在看
+ * 的时候被单方面作废：后台这一侧到点丢掉等待，宿主那一侧十秒之后才回话 ——
+ * 答复落在一条没有人等的通道上（`收到没有等待者的响应 id=17`），
+ * 而插件看到的是"调用宿主超时"，用户看到的是一张还留在屏幕上的卡片。
+ *
+ * 因此这一条**不给计时器**。它换来的代价必须说清楚：如果宿主那一侧永远不回答，
+ * 这次等待就永远不结束。那一侧为此给了四条收场路径（用户关掉它 / 插件被停用
+ * 或卸载 / 第二条卡片顶掉它 / 应用退出），而它们**都在宿主里**，插件不需要做
+ * 任何事。宿主进程若整个消失，这个子进程也会被一起收掉 —— 那是最后一道兜底。
+ *
+ * `true` 只允许出现在一处（`ctx.ui.popover`）。给它再加一处，就意味着某条会
+ * 自己结束的调用也永远不会超时。
  */
-function callHost(method, params) {
+function callHost(method, params, options) {
   const id = nextCallId;
   nextCallId += 1;
 
+  const untilUserAnswers = Boolean(options && options.untilUserAnswers);
+
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pendingCalls.delete(id);
-      reject(new Error(`调用宿主超时（${HOST_CALL_TIMEOUT_MS}ms）：${method}`));
-    }, HOST_CALL_TIMEOUT_MS);
+    const timer = untilUserAnswers
+      ? null
+      : setTimeout(() => {
+          pendingCalls.delete(id);
+          reject(new Error(`调用宿主超时（${HOST_CALL_TIMEOUT_MS}ms）：${method}`));
+        }, HOST_CALL_TIMEOUT_MS);
 
     pendingCalls.set(id, { resolve, reject, timer });
     write({ v: PROTOCOL_VERSION, id, method, params });
@@ -163,7 +195,7 @@ function deliverResponse(message) {
   }
 
   pendingCalls.delete(message.id);
-  clearTimeout(waiter.timer);
+  if (waiter.timer) clearTimeout(waiter.timer);
 
   if (message.error !== undefined) {
     waiter.reject(new Error(String(message.error)));
@@ -220,6 +252,9 @@ function pluginConsole(pluginId) {
 function createPluginSandbox(identity, _unused) {
   const pluginId = identity.id;
 
+  /** 清单里声明了某一项权限吗。与界面两侧的 `has('x')` 是同一条判据。 */
+  const hasPermission = (permission) => identity.permissions.indexOf(permission) !== -1;
+
   // 定时器要**登记**才能被 unload 收掉。不登记的话，一个插件被卸载之后它的
   // setInterval 还在跑 —— 而它已经没有任何办法被停下来了（宿主手里没有句柄）。
   const timers = new Set();
@@ -269,10 +304,50 @@ function createPluginSandbox(identity, _unused) {
   // ctx：后台插件能用的一切
   // ============================================================
   //
-  // **刻意是界面 ctx 的子集**：没有 `ui` / `theme` / `clipboard` / `fileDrop` /
-  // `icons` / `audio`。它们要么是 DOM，要么是窗口级的东西，而这里没有窗口。
+  // **刻意是界面 ctx 的子集**：没有 `theme` / `fileDrop` /
+  // `db` / `icons` / `audio`。它们要么是 DOM，要么是窗口级的东西，而这里没有窗口。
   // 少给一个成员的表现是插件拿到 `undefined`，因此这份清单必须与
   // `pluginRuntime.ts` 的对应关系写清楚（见插件开发文档的"两个运行位置"一节）。
+  //
+  // 两处**部分存在**的成员，都写明了少的是哪一半与为什么：
+  //
+  //   * `clipboard` —— 只有 `writeText`（见下面那一段）。观察那一半要一条
+  //     宿主 → 插件的推送通道，而这里没有界面承载它；
+  //   * `ui` —— 只有 `popover`（它是这一族里唯一不需要界面上下文的那一个）。
+  //
+  // `secrets` 此前也在这份"没有"的清单里，而那**不是**刻意排除 —— 它是遗漏：
+  // 三个运行位置里只有后台少了它，后果是一个无界面插件存令牌只能走明文
+  // `ctx.storage`。它现在与另外两处同形（见下面 `secrets` 那一段）。此后往
+  // 这份清单里加成员时，请先问一句"另外两个运行位置有没有它" —— 两边不一致
+  // 才是需要写理由的那种情况。
+  //
+  // ============================================================
+  // 两个**不是子集**的例外：`ctx.ui.popover` 与 `ctx.hotkey` / `ctx.selection`
+  // ============================================================
+  //
+  // 上面那句话说的是"界面位置有、这里没有"，而下面这三个是反过来的：它们在这里
+  // 不只是"也有"，而是**主要用途就在这里**。`ctx.ui.popover` 是后台插件唯一的
+  // 结果出口，而 `ctx.hotkey` + `ctx.selection` 合起来正是"选中即翻译"型插件的
+  // 全部：一个没有窗口的进程，要在用户**在别的程序里**选中文本并按键时被唤醒。
+  // 把它们当成"界面的子集"来理解会得出错误的结论（"后台少一个能力"），而事实是
+  // 后台位置才是它们最该被用到的地方。
+  //
+  // ============================================================
+  // 唯一的例外：`ctx.ui.popover`
+  // ============================================================
+  //
+  // 它是这条"子集"里**唯一**的 `ui` 成员，而且这个例外是刻意的 —— 它不是
+  // "少给了一个 DOM 对象"，恰恰相反：一个后台插件**最需要**把结果拿给用户看，
+  // 而它本来一条出口都没有。
+  //
+  // 它与其他 `ui.*` 的差别不在强度，而在**它需要什么**：dialog / contextMenu /
+  // openSurface 那一族要么挂在"我在哪个界面里"，要么要一块属于插件的 webview
+  // 可覆盖 —— 后台插件两样都没有，硬给它一个永远拒绝的桩只会让作者以为
+  // "我写错了"。结果卡片是一个独立窗口、贴的是屏幕上的光标，与"我在哪里"
+  // 无关，因此它是这一族里唯一在三个运行位置上都成立的那一个。
+  //
+  // 它依然要 `notification` 权限（与在界面上调用时**同一条判定**：三者都走
+  // `rpc.rs` 的 `ui.popover`）。
   //
   // **剪贴板监测（`ctx.clipboard.subscribe` 一类）也刻意不在这里**，而且理由与
   // 上面那几种不同，值得单独写一句：它不是"缺一个 DOM 对象"，而是**方向不对**。
@@ -289,6 +364,86 @@ function createPluginSandbox(identity, _unused) {
     pluginName: identity.name,
     manifest: identity.manifest,
     activationEvent: identity.activation,
+
+    // ---- 全局热键（`ctx.hotkey`）----
+    //
+    // ============================================================
+    // 后台位置**恰恰是**全局热键最该用的地方
+    // ============================================================
+    //
+    // 这一个成员在界面位置上是"方便"，而在后台位置上是**这项能力成立的前提**：
+    // 用户按 Ctrl+Q 时焦点在别的程序里，而一个没有界面的翻译插件要做到"选中即翻译"，
+    // 它必须能在没有窗口的情况下被唤醒。换句话说，`ctx.hotkey` 是后台运行位置上
+    // **唯一一个**"不是子集、而是主要用途"的能力。
+    //
+    // ============================================================
+    // 触发是宿主 → 这里的，因此有一处与别处不同的形状
+    // ============================================================
+    //
+    // 这一侧唯一与宿主通话的方式是 `callHost`（请求—应答），而"用户按了键"是
+    // **反向**的。因此宿主用 `plugin.dispatch` 的 `hotkey` 类型派发进来（与
+    // `start` / `interval` / `command` / `event` 完全同一条路，见下面的方法表），
+    // 而 `subscribe` 除了登记处理函数，还要**告诉宿主"这个插件想收"** ——
+    // 宿主那一侧的表决定触发时往哪几处投。
+    //
+    // `isAvailable()` 是同步的，因此它只能靠**本地**能知道的两件事：清单里声明了
+    // 没有、以及这个进程跑在哪个平台上（`RegisterHotKey` 只在 Windows 上存在）。
+    // 它与另外两个位置上的同一句话是同一条判据 —— 三处的答案必须一样，否则
+    // "同一个插件换个运行位置"就会表现不同。
+    hotkey: {
+      isAvailable: () => hasPermission('global-hotkey') && WINDOWS,
+
+      register: (combo) => callHost('ctx.hotkey.register', { combo: String(combo) }),
+
+      unregister: (combo) => callHost('ctx.hotkey.unregister', { combo: String(combo) }),
+
+      list: () => callHost('ctx.hotkey.list', {}).then((value) => value || []),
+
+      subscribe: (handler) => {
+        // `subscribe('hotkey', …)` 登记的键与宿主派发时的 `type` 逐字相同 ——
+        // 对不上时处理器一个都收不到，而那是静默的。
+        const release = subscribe('hotkey', handler, 'ctx.hotkey.subscribe');
+
+        // 宿主那一侧的表按插件 id 记，因此**第一个**处理函数到来时才需要通知它。
+        const list = handlers.get('hotkey') || [];
+        if (list.length === 1) {
+          callHost('ctx.hotkey.subscribe', {}).catch((error) => {
+            // 失败**必须说出来**：插件会以为自己订阅成功了（`subscribe()` 没有抛），
+            // 而宿主那边一次触发都不会来。
+            process.stderr.write(
+              `${LOG_PREFIX} [${pluginId}] 热键订阅没有登记成功，将收不到触发：${error}\n`
+            );
+          });
+        }
+
+        let released = false;
+        return () => {
+          // 幂等：插件把它存进 `disposables` 之后又自己调一次是常见写法。
+          if (released) return;
+          released = true;
+          release();
+          if ((handlers.get('hotkey') || []).length === 0) {
+            callHost('ctx.hotkey.unsubscribe', {}).catch(() => {});
+          }
+        };
+      },
+    },
+
+    // ---- 读取选中文本（`ctx.selection`）----
+    //
+    // ============================================================
+    // 它在宿主那一侧会**改用户的剪贴板**
+    // ============================================================
+    //
+    // 实现是"向前台程序合成 Ctrl+C → 读剪贴板 → 把原内容写回"（见宿主侧
+    // `selection.rs` 的文件头）。因此 `read()` 的三种结果必须被分开处理：
+    // `string`（读到了）、`null`（捕获成功但剪贴板上没有文本）、以及**抛错**
+    // （这次捕获根本没成功）。把后两者混成 `null` 会让作者写出一个永远走不到的分支。
+    selection: {
+      isAvailable: () => hasPermission('read-selection') && WINDOWS,
+
+      read: () => callHost('ctx.selection.read', {}),
+    },
 
     // ---- 日志 ----
     logger: {
@@ -320,6 +475,134 @@ function createPluginSandbox(identity, _unused) {
       usage: () => callHost('ctx.storage.usage', {}),
       all: () => callHost('ctx.storage.all', {}),
       clear: () => callHost('ctx.storage.clear', {}),
+    },
+
+    // ---- 加密的密钥存储（`ctx.secrets`）----
+    //
+    // ============================================================
+    // 后台位置**没有**别的路可走，因此这个成员必须在这里
+    // ============================================================
+    //
+    // 后台插件落盘只有两条路：`ctx.storage`（明文 JSON，插件自己拼得出路径、
+    // 而且进「插件数据」备份类别）与 `ctx.dataDir`（同样是插件自己的文件）。
+    // 两者都**不是**放 API key 的地方。在 `ctx.secrets` 于此处缺失的那段时间里，
+    // 一个无界面的翻译插件要把本地模型服务的令牌存下来，除了明文 `ctx.storage`
+    // 没有任何选择 —— 而"把凭据写进会被备份复制走的明文文件"恰恰是这个成员
+    // 存在的全部理由。它此前是这条"后台 ctx 是界面 ctx 的子集"清单里**唯一的
+    // 一处缺口**，不是刻意排除：界面两处（in-process / 沙箱）都有它。
+    //
+    // ============================================================
+    // 这里为什么一行 Rust 都不用改
+    // ============================================================
+    //
+    // `plugins.rs` 把子进程发来的 `ctx.*` 调用剥掉前缀后交给**共用的**
+    // `rpc::dispatch(app, plugin_id, None, method, args)`，而 `secrets.get/set/
+    // delete/keys/clear` 五个分支早就在那张表里，权限判定走
+    // `checked_secrets_dir`（`secrets` 权限 + 按插件 id 拼出的密钥目录）。
+    // 也就是说这项能力在宿主侧**已经完整**，缺的只是后台这一侧把它接出去。
+    // 明确写下来，是因为"看起来像 JS 一行、其实要动 Rust"是这类改动最常见的误判。
+    //
+    // ============================================================
+    // 方法与降级：与另外两个运行位置**逐条同形**
+    // ============================================================
+    //
+    // 六个名字与形状照抄 `sandbox-bridge.js` 的 `secrets` 与
+    // `pluginRuntime.ts` 的 `pluginSecrets`：`isAvailable` / `get` / `set` /
+    // `delete` / `keys` / `clear`。同一个插件换个运行位置就该拿到同一份形状，
+    // 这是本项目在沙箱迁移里反复栽过的那一个坑。
+    //
+    // 未声明 `secrets` 权限时**降级**而不是抛在顶层：与 `storage` / `dataDir`
+    // 同一条规矩（"不够就降级，而不是未知即支持"）。`get` 在降级时也返回拒绝，
+    // 而不是 `null` —— `null` 是一个看起来完全正常的答案，作者会据此以为用户
+    // 还没配置密钥，然后引导他重新输入一遍，而真正的原因是他没有声明权限。
+    secrets: (() => {
+      if (!hasPermission('secrets')) {
+        /** 只提示一次：一个后台插件在 `setInterval` 里读密钥会刷爆日志。 */
+        let warned = false;
+        const deny = () => {
+          if (!warned) {
+            warned = true;
+            process.stderr.write(
+              `${LOG_PREFIX} [${pluginId}] 插件使用了 ctx.secrets，但清单里没有声明 ` +
+                `"secrets" 权限，调用被拒绝（后续同类调用不再重复提示）\n`
+            );
+          }
+          return Promise.reject(new Error('插件未声明 "secrets" 权限，无法读写密钥'));
+        };
+
+        return {
+          /** **同步**布尔。与 `Modulith.has('secrets')` 同义，供插件做特性探测。 */
+          isAvailable: () => {
+            if (!warned) {
+              warned = true;
+              process.stderr.write(
+                `${LOG_PREFIX} [${pluginId}] 插件使用了 ctx.secrets，但清单里没有声明 ` +
+                  `"secrets" 权限，调用被拒绝（后续同类调用不再重复提示）\n`
+              );
+            }
+            return false;
+          },
+          get: deny,
+          set: deny,
+          delete: deny,
+          /** 空列表在这里是**如实的答案**：它一个键都拿不到 */
+          keys: () => {
+            if (!warned) {
+              warned = true;
+              process.stderr.write(
+                `${LOG_PREFIX} [${pluginId}] 插件使用了 ctx.secrets，但清单里没有声明 ` +
+                  `"secrets" 权限，调用被拒绝（后续同类调用不再重复提示）\n`
+              );
+            }
+            return Promise.resolve([]);
+          },
+          clear: deny,
+        };
+      }
+
+      // 密文落在 `<app_data_dir>/plugin_secrets/<id>.json` —— 插件数据目录
+      // **之外**。因此这个进程里没有任何一条路径能拼出它（子进程只被放开读它
+      // 自己的代码目录），下面这五个方法就是这项能力的**全部**入口。
+      //
+      // 加密强度与代价见宿主侧 `plugins/secrets.rs` 的文件头：密文由**本机硬件
+      // 指纹**派生，换机器之后解不开 —— 那时 `get` 会抛错，而不是返回 `null`。
+      return {
+        isAvailable: () => true,
+        /** 未知的键返回 `null`；密文解不开时抛错（值仍在磁盘上）。 */
+        get: (key) => callHost('ctx.secrets.get', { key: String(key) }),
+        set: (key, value) => callHost('ctx.secrets.set', { key: String(key), value: String(value) }),
+        delete: (key) => callHost('ctx.secrets.delete', { key: String(key) }),
+        /** 列出**键名**。值一个都不返回。 */
+        keys: () => callHost('ctx.secrets.keys', {}).then((value) => value || []),
+        /** 清空**本插件**的密钥。别的插件的密钥不受影响。 */
+        clear: () => callHost('ctx.secrets.clear', {}),
+      };
+    })(),
+
+    // ---- 写系统剪贴板（`ctx.clipboard.writeText`）----
+    //
+    // ============================================================
+    // 这里**只有写入**，没有读、没有订阅 —— 三条都缺得有理由
+    // ============================================================
+    //
+    //   * `subscribe` / `canMonitor` / `readFormats` / `readImage` 是**观察**那一半：
+    //     变化由宿主进程里的 Win32 轮询看到，宿主再把它推给订阅者所在的**界面**。
+    //     这个进程没有界面可以承载那条推送，也没有一条从宿主主动回到它的通道
+    //     （这里只有请求—应答式的 `callHost`）。给一个永远收不到东西的 `subscribe`
+    //     只会让作者以为"我订阅上了" —— 需要剪贴板历史的插件必须是界面插件。
+    //   * `readText` **刻意不给**：沙箱那一侧它是 `navigator.clipboard`，而这个
+    //     进程里没有 `document`。宿主这一侧要读就得再开一条 RPC，而"一个后台插件
+    //     去读用户此刻的剪贴板"没有任何正当用途 —— 它连界面都没有，读到的东西
+    //     只能进日志或网络，两者都是这个项目明确拒绝的方向。真要读选中文本，
+    //     那件事有**专属且代价写得清清楚楚**的 `ctx.selection.read`。
+    //   * `writeText` 是**唯一真正需要**的那一个：结果卡片上的按钮只回一个 action
+    //     id，把结果放进剪贴板必须由插件这一侧发起。宿主为此提供了
+    //     `rpc.rs` 的 `clipboard.write`（沙箱那条走浏览器 API，不经过它）。
+    clipboard: {
+      /** 权限已声明**且**这个平台有 Win32 剪贴板。与 `hotkey` / `selection` 同一形状。 */
+      isAvailable: () => hasPermission('clipboard') && WINDOWS,
+
+      writeText: (text) => callHost('ctx.clipboard.write', { text: String(text) }),
     },
 
     dataDir: {
@@ -436,6 +719,30 @@ function createPluginSandbox(identity, _unused) {
 
     launcher: {
       launch: (program, args) => callHost('ctx.system.launch', { program, args: args ?? [] }),
+    },
+
+    /**
+     * 宿主渲染的**结果卡片**。**后台位置上唯一的界面成员**（理由见上面 ctx 的
+     * 小标题：它不需要界面上下文，而后台插件恰恰最需要一条把结果拿出来的出口）。
+     *
+     * 形状与 in-process / 沙箱一致：`popover({ title?, body, tone?, actions?,
+     * timeoutMs?, at? })` → `{ action }`，`action` 为 `null` 表示用户没回答
+     * （到点自动收起 / Escape / 点别处）。
+     *
+     * 参数**原样交给宿主**（`ctx.ui.popover`），校验与钳制都在那一侧：三个运行
+     * 位置共用 `rpc.rs` 的同一个方法表，因此"最多 3 个按钮""id 只允许 [a-z0-9-]"
+     * "给了 `timeoutMs` 才钳制到 1..60 秒"只可能有一份实现。
+     *
+     * **不传 `timeoutMs` 就是"一直待到用户关掉它"**（缺省），因此这一条必须走
+     * `untilUserAnswers` 那条豁免 —— 理由见 `callHost`。
+     */
+    ui: {
+      popover: (input) =>
+        callHost('ctx.ui.popover', input || {}, { untilUserAnswers: true }).then((value) => ({
+          // 字段缺失（更老的宿主）与宿主的 `null` 收敛成同一个取值：契约里
+          // "没回答"就是一个值，不该让插件去分辨 `undefined` 与 `null`。
+          action: value && value.action ? value.action : null,
+        })),
     },
 
     shell: {
@@ -635,9 +942,12 @@ const methods = {
   /**
    * 向一个已加载的插件投递一件事。
    *
-   * `type` 的取值是 `start` / `interval` / `command` / `event`，与清单里
+   * `type` 的取值是 `start` / `interval` / `command` / `event` / `hotkey`，与清单里
    * `contributes.background` 的声明对应。返回处理器的个数 —— 为 0 说明
    * 插件没有登记这一类，那通常意味着清单声明了它却不处理，值得在宿主日志里说一句。
+   *
+   * `hotkey` 是唯一一个**不是**由清单声明驱动的类型：它的"什么时候"由用户按键决定，
+   * 而 `payload` 是 `{ combo }`（一个插件最多能注册 4 条组合，处理函数要能分辨）。
    */
   async 'plugin.dispatch'(params) {
     const id = params?.id;

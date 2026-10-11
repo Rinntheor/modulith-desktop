@@ -344,7 +344,7 @@ section('清单自洽');
 // 4. 能力方法：逐个登记，并对着运行时实现核对
 // ============================================================
 //
-// 这一层是整份检查里**唯一真正对着 v2 的**：`ctx` 上的 16 个能力对象全部标为
+// 这一层是整份检查里**唯一真正对着 v2 的**：`ctx` 上的 17 个能力对象全部标为
 // `handle`，而"换成代理"可行的前提就是"每个方法的参数与返回值都是值"。
 //
 // 两件事分开做，因为它们会失败的原因不同：
@@ -380,6 +380,18 @@ section('能力方法');
     { member: 'dataDir', factory: 'pluginDataDir', path: ['return'] },
     { member: 'db', factory: 'pluginDatabase', path: ['return'] },
     { member: 'secrets', factory: 'pluginSecrets', path: ['return'] },
+    // 全局热键与读取选中文本。两者与 `secrets` / `clipboard-monitor` 同一形态：
+    // 唯一的出口在宿主进程里（`RegisterHotKey` / `SendInput`），因此前端这一层
+    // 的降级不是边界，Rust 侧的 `require_permission` 才是。
+    { member: 'hotkey', factory: 'pluginHotkey', path: ['return'] },
+    { member: 'selection', factory: 'pluginSelection', path: ['return'] },
+    // 唯一一个**方法比同名的沙箱成员少**的能力对象：in-process 的 `ui` 只有
+    // `popover`。少的那 8 个（dialog / contextMenu / 多界面三条 / 状态指示三条）
+    // 要么挂在"我在哪个界面里"，要么要一块属于插件的 webview —— in-process
+    // 插件两样都没有。这处差异由 `check:sandbox` 的 `EXPECTED_SANDBOX_ONLY_UI`
+    // 逐条写着，而这里的覆盖断言仍然有效：往 in-process 的 `ui` 上加任何一个
+    // 方法，都会因为"运行时存在、清单里没登记"而失败。
+    { member: 'ui', factory: 'createContextFor', path: ['return', 'ui'] },
     // 唯一一个没有独立工厂的：它是在上下文工厂的返回对象里直接写出来的字面量
     { member: 'disposables', factory: 'createContextFor', path: ['return', 'disposables'] },
   ];
@@ -512,8 +524,8 @@ section('迁移面');
     `ctx 上没有函数形态的**成员**（当前 ${contextCallables.length} 个）`
   );
   check(
-    contextHandles.length === 16,
-    `ctx 上有 16 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
+    contextHandles.length === 19,
+    `ctx 上有 19 个对象形态成员要换成代理（当前 ${contextHandles.length}）`
   );
   // 这一条是 v1.5 最该被看见的数字：方法层面的真实工作量。
   check(

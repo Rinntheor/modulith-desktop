@@ -232,7 +232,7 @@ const HOST_MEMBERS: readonly BoundaryMember[] = [
 // 回答过"它跨不跨得过去"。而 `ctx` 恰恰是边界的主体 —— 权限的实际载体
 // （`http` / `launcher` / `icons` / `shell` / `audio`）全在这里。
 //
-// 值得单独指出的是那 16 个 `handle`：它们**不是资源句柄，而是能力对象**。
+// 值得单独指出的是那 17 个 `handle`：它们**不是资源句柄，而是能力对象**。
 // `ctx.storage` 不是一个"存储连接"，它是一个由若干函数组成的对象。因此把它们标成
 // `handle` 说的是"它代表的是一组消息往返" —— **不是**"它今天已经能跨过去了"。
 // 今天它一个都跨不过去，因为它是个对象。v2 要把它换成 JSON-RPC 式的代理：
@@ -330,7 +330,7 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     name: 'clipboard',
     kind: 'handle',
     migration: 'rpc',
-    note: '读写系统剪贴板，并（另一个权限）观察它的变化。读写需要 clipboard，**前端强制** —— 那三个方法调的是浏览器 API，后端加门不会让强制变强；canMonitor / subscribe / readFormats / readImage 需要 clipboard-monitor，**Rust 强制** —— 浏览器 API 没有变化通知，也没有格式列表与原始图片，因此那一半绕不过去',
+    note: '读写系统剪贴板，并（另一个权限）观察它的变化。读写需要 clipboard，in-process / 沙箱两侧**前端强制** —— 那三个方法调的是浏览器 API，后端加门不会让强制变强；**后台位置是例外的一条**：它只有 isAvailable / writeText，且写入走 rpc.rs 的 clipboard.write，在 Rust 侧判权限（那里没有 document，浏览器 API 用不上，因此这一条是真强制）。canMonitor / subscribe / readFormats / readImage 需要 clipboard-monitor，**Rust 强制** —— 浏览器 API 没有变化通知，也没有格式列表与原始图片，因此那一半绕不过去，而且后台位置整族都没有（观察需要一条"宿主 → 订阅者界面"的推送通道，那里没有界面承载它）',
   },
   {
     name: 'settings',
@@ -350,13 +350,31 @@ const CONTEXT_MEMBERS: readonly BoundaryMember[] = [
     migration: 'rpc',
     note: '加密的密钥存储。需要 secrets 权限，Rust 侧强制；密文落在插件数据目录之外，插件代码寻址不到',
   },
+  {
+    name: 'ui',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '宿主渲染的**结果卡片**。三个运行位置都有，但**只有 `popover` 一个方法**：沙箱那一侧还有 dialog / contextMenu / openSurface / closeSurface / listSurfaces / badge / progress / splash，它们要么挂在"我在哪个界面里"、要么要一块属于插件的 webview，因此刻意不进这一份（这一份描述的是 in-process 的 `ctx`）。需要 notification 权限，Rust 侧强制 —— 它与其他几条一样会打断用户',
+  },
+  {
+    name: 'hotkey',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '全局热键。需要 global-hotkey 权限，Rust 侧强制 —— `RegisterHotKey` 在宿主进程里，而浏览器里没有任何 API 能让一个页面在**别的程序**聚焦时收到按键。**订阅是回调（`subscribe`），而触发是宿主主动推的**，因此它比 `events.subscribe` 多一件事：v2 要把它写成"宿主按插件 id 推触发、插件按 id 认领"，与 fileDrop / clipboard 的 subscribe 同一条路',
+  },
+  {
+    name: 'selection',
+    kind: 'handle',
+    migration: 'rpc',
+    note: '读取**前台应用程序**里选中的文本。需要 read-selection 权限，Rust 侧强制（`SendInput` 合成 Ctrl+C + 读剪贴板都在宿主进程里）。它**会短暂覆盖用户的剪贴板** —— 文本会被还原，图片/富文本/文件无法还原，那段代价写在权限描述与 `selection.rs` 的文件头里',
+  },
 ];
 
 // ============================================================
 // 能力方法
 // ============================================================
 //
-// 这一层是 v2 的真实工作量。16 个能力对象标为 `handle` 只是说"它代表消息往返"；
+// 这一层是 v2 的真实工作量。17 个能力对象标为 `handle` 只是说"它代表消息往返"；
 // 能不能真的换成往返，取决于**每个方法**的参数与返回值。
 //
 // `io` 记的是返回值与回调参数的形态（参数里的普通值不单独记 —— 字符串、数字、
@@ -498,6 +516,38 @@ const CAPABILITY_METHODS: Readonly<Record<string, readonly BoundaryMethod[]>> = 
     { name: 'keys', io: 'value', migration: 'as-is', note: '返回 string[]，**只有键名、永远没有值**' },
     { name: 'clear', io: 'value', migration: 'as-is', note: '返回 Promise<void>；只清本插件的密钥' },
   ],
+  ui: [
+    // 这一份登记的是 **in-process 的 `ctx.ui`**，它只有一个方法。沙箱侧那个
+    // 同名对象上还有 8 个方法（dialog / contextMenu / 多界面三条 / 状态指示
+    // 三条），它们按设计不进 in-process —— 那处差异由 `check:sandbox` 里
+    // `EXPECTED_SANDBOX_ONLY_UI` 逐条写着，而不是靠读者从这里推断。
+    //
+    // `popover` 是**值进值出**：入参是一个纯数据的描述对象（文本与按钮文案），
+    // 返回值也是（`{ action }`）。它没有回调、也不返回任何带方法的宿主对象，
+    // 因此换成消息往返是机械的 —— 这正是"插件提交描述、宿主负责渲染"那条路的
+    // 形状，也是它在 v2 里最不需要改的原因。
+    {
+      name: 'popover',
+      io: 'value',
+      migration: 'as-is',
+      note: '入参是 { title?, body, tone?, actions?, timeoutMs?, at? }，返回 { action }（值为 string 或 null）。**两端都是纯数据**：插件不交函数、也拿不到宿主对象，所以它跨 realm 时一行都不用改',
+    },
+  ],
+  hotkey: [
+    // `ctx.hotkey` 上有两种东西：同步探测、以及**异步**的注册/解绑/列举。
+    // 后者全部是"字符串进、字符串或数组出"，因此换成消息往返是机械的。
+    { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔：声明了 global-hotkey **且**这个平台支持（只有 Windows 有 RegisterHotKey）' },
+    { name: 'register', io: 'value', migration: 'as-is', note: '返回 Promise<string>，**宿主实际绑定的规范化组合键**（`Ctrl+Q` 回来是 `mod+q`）。冲突时拒绝，消息里点名是谁占着它 —— 那句原样来自宿主，这一层不改写' },
+    { name: 'unregister', io: 'value', migration: 'as-is', note: '返回 Promise<void>。**不做权限检查**：一条解不掉的绑定就是一个泄漏（它偷的是用户整台机器上的一个按键）' },
+    { name: 'list', io: 'value', migration: 'as-is', note: '返回 Promise<string[]>，规范化形式，最多 4 条' },
+    { name: 'subscribe', io: 'callable', migration: 'message', note: '**入参是触发处理函数（收到 `{ combo }`）、返回值是取消订阅函数**。触发方向是**宿主 → 插件**（按键发生在别的程序里，这一侧观察不到），因此 v2 与 `fileDrop.subscribe` / `clipboard.subscribe` 同一条路：改成"宿主推触发、插件按 ID 认领"' },
+  ],
+  selection: [
+    // 只有两个方法，但 `read` 的返回形状是整个 `ctx` 里最需要说清楚的一个：
+    // `null`（捕获成功但剪贴板上没有文本）与抛错（这次捕获根本没成功）必须分得开。
+    { name: 'isAvailable', io: 'value', migration: 'as-is', note: '同步返回布尔：声明了 read-selection **且**这个平台支持（只有 Windows 有 SendInput）' },
+    { name: 'read', io: 'value', migration: 'as-is', note: '返回 Promise<string \\| null>。**`null` 是"捕获成功但没有文本"，而"这次捕获根本没成功"是抛错** —— 两者混成一个会让作者写出一个永远走不到的分支。宿主侧会短暂覆盖用户的剪贴板（文本还原，非文本格式不还原）' },
+  ],
 };
 
 // ============================================================
@@ -552,7 +602,7 @@ export function capabilityNames(): string[] {
 /**
  * 含函数或宿主对象的方法 —— 也就是 v2 里真正要动的那几条。
  *
- * 这个函数是给门禁与文档用的：它把"51 个方法里到底有几条要改"变成一个具体数字，
+ * 这个函数是给门禁与文档用的：它把"69 个方法里到底有几条要改"变成一个具体数字，
  * 而不是一句"大概不多"。
  */
 export function methodsNeedingWork(): Array<{ capability: string; method: BoundaryMethod }> {

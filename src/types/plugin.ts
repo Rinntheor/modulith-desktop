@@ -80,7 +80,9 @@ export type PluginPermission =
   | 'dev-tools'                  // 开发者工具
   | 'process-spawn'              // 启动外部程序（已强制）
   | 'secrets'                    // 加密的密钥存储（宿主强制；密文在插件数据目录之外，不进备份）
-  | 'clipboard-monitor';         // 观察剪贴板变化（宿主强制，风险 high；应用运行期间能看到这台机器上复制的任何内容）
+  | 'clipboard-monitor'           // 观察剪贴板变化（宿主强制，风险 high；应用运行期间能看到这台机器上复制的任何内容）
+  | 'global-hotkey'               // 注册系统级全局热键（宿主强制，风险 medium；占用的组合键在系统里是独占的，应用退出即归还）
+  | 'read-selection';             // 读取前台应用程序里选中的文本（宿主强制，风险 high；读的是任何程序里选中的东西，且会短暂覆盖剪贴板）
 
 /**
  * 插件作者信息

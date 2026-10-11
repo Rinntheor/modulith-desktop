@@ -813,16 +813,26 @@ impl PluginManager {
     /// 与"声明了但有问题"（`Err`）分开：前者是常态，后者要能被界面说出来。
     ///
     /// ============================================================
-    /// 为什么根目录必须规范化
+    /// 为什么根目录必须规范化，而且必须在**过界之前**剥掉逐字前缀
     /// ============================================================
     ///
-    /// `root` 会被当作 Node 的 `--allow-fs-read` 放行目标交给子进程。而权限模型
-    /// 是按**真实路径**比对的：一个指向别处的符号链接会让"看起来在插件目录里"
-    /// 的放行实际打开另一个目录。因此这里 `canonicalize`，并在拼出入口之后再
-    /// 验一次它确实仍在根目录之下。
+    /// `root` 会被当作 Node 的 `--allow-fs-read` 放行目标交给子进程，而 `entry`
+    /// 会作为 `plugin.load` 的参数交给同一个子进程。权限模型是按**真实路径**比对的：
+    /// 一个指向别处的符号链接会让"看起来在插件目录里"的放行实际打开另一个目录。
+    /// 因此这里 `canonicalize`，并在拼出入口之后再验一次它确实仍在根目录之下。
     ///
     /// 两道检查不是冗余：`background_manifest` 验的是**那段相对路径**本身安全，
     /// 这里验的是**拼出来的路径**没跑出去。符号链接恰好只被第二道拦住。
+    ///
+    /// 但 `canonicalize` 在 Windows 上返回的是 `\\?\D:\…`（逐字路径），**这个形态
+    /// 不能过界**：Node 的 `fs.realpathSync` 与权限模型比对都不认它，前者会把路径
+    /// 塌缩成裸盘符并抛 `EISDIR: … lstat 'D:'`，后者会让放行目标对不上而报
+    /// `ERR_ACCESS_DENIED`。因此两个值都会经 `strip_verbatim_path` 处理 ——
+    /// 完整的失败记录与实测见 `resolve_background_entry` 上面那一节。
+    ///
+    /// 三道路径检查（越界 / 元数据 / 是文件）都在 `resolve_background_entry` 里，
+    /// 因为"哪一个值真的交给了子进程"必须与"哪一个值被检查过"是同一个 ——
+    /// 这恰恰是本次缺陷的成因。
     pub fn background_launch(&self, id: &str) -> PluginResult<Option<BackgroundLaunch>> {
         let Some(entry) = self.registry.get(id) else {
             return Err(PluginError::NotFound(format!("插件不存在: {id}")));
@@ -841,22 +851,10 @@ impl PluginManager {
             return Ok(None);
         };
 
-        let root = root.canonicalize().unwrap_or(root);
-        let entry_path = root.join(&contribution.entry);
-
-        if !entry_path.starts_with(&root) {
-            return Err(PluginError::InvalidManifest(format!(
-                "后台入口跳出插件目录：{}",
-                contribution.entry
-            )));
-        }
-        if !entry_path.is_file() {
-            return Err(PluginError::InvalidManifest(format!(
-                "后台入口不存在：{}（清单里写的是 {}）",
-                entry_path.display(),
-                contribution.entry
-            )));
-        }
+        // 根目录与入口都由 `resolve_background_entry` 一次算出来。**分开算是不行的**：
+        // 它必须返回的是"规范化之后的根"与"落在根之下的那个文件"，而这两件事共享
+        // 同一次 `canonicalize` —— 各算一次会得到两个可能不一致的真源（见那个函数）。
+        let (root, entry_path) = resolve_background_entry(id, &root, &contribution.entry)?;
 
         let manifest_json = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
 
@@ -2817,6 +2815,151 @@ fn resolve_asset_root(installed: &Path, dev_source: Option<&str>, expected_id: &
     }
 }
 
+// ============================================================
+// 后台入口：从"插件根目录 + 清单里的相对路径"到"子进程能打开的绝对路径"
+// ============================================================
+//
+// ============================================================
+// 为什么它必须是一个**有名字的**函数，而不是 `background_launch` 里的三行
+// ============================================================
+//
+// 这三行曾经是内联的，而它们错在了一个**只有真机才看得见**的地方：Windows 上
+// `Path::canonicalize` 返回的是**逐字（verbatim）路径** `\\?\D:\…`，而那个前缀
+// 被原样序列化进 `plugin.load` 的 `entry` 之后，Node 侧那一句
+// `fs.realpathSync(entry)` 会得到
+//
+//     EISDIR: illegal operation on a directory, lstat 'D:'
+//
+// —— 注意 `'D:'`：**盘符根，不是那个文件**。libuv 的 `uv_fs_realpath` 不认
+// `\\?\` 前缀，它把这个前缀当普通目录名去剥，于是路径塌缩成裸盘符。实测（本机
+// Node 24.9.0，`lstatSync`/`statSync` 对同一条路径都正常工作）：
+//
+//     realpathSync('\\\\?\\D:\\…\\package.json')  →  抛 EISDIR，lstat 'D:'
+//     realpathSync('D:\\…\\package.json')          →  正常
+//
+// 后果是**每一个**后台插件都起不来，而错误信息指向的是盘符 —— 从用户那一侧完全
+// 无法行动。这正是本次要修的缺陷。
+//
+// ============================================================
+// 为什么 `--allow-fs-read` 那一侧也必须用非逐字路径
+// ============================================================
+//
+// 同一个前缀还有第二个坑，而且它的表现**更像随机故障**：Node 的权限模型按真实
+// 路径比对放行目标，而 `\\?\` 与普通写法在它那里**不是同一条路径**。实测
+// `--allow-fs-read=\\?\<dir>` 之下读该目录里的文件得到 `ERR_ACCESS_DENIED`
+// （`--allow-fs-read=<dir>` 才通过）。因此逐字形态只要泄漏到子进程边界 ——
+// 无论出现在 `entry` 还是出现在 `node_args` 里 —— 都会让插件起不来。
+//
+// 结论只有一个：**凡是跨到子进程去的路径（入口与放行根）都不能带那个前缀**。
+// `canonicalize` 仍然要做（放行目标与越界判定都必须按真实路径比对，见
+// `background_launch` 的注释），只在**过界之前**把它剥掉。
+//
+// 而不是"干脆不 canonicalize"：那会让符号链接把放行目标指到别处，
+// README 与文档里反复写着这一条是刻意保留的安全属性。
+
+/// 一个 [`BackgroundLaunch`] 里的入口（与 `root`）是怎么算出来的。
+///
+/// 参数是**纯输入**（插件 id、插件根目录、清单里的相对路径），因此它可以被单测
+/// 直接喂一个临时目录，而不必先造一个 `PluginManager`（它持有 `AppHandle`，
+/// 单测里造不出来）。
+///
+/// 返回 `(规范化后的根, 入口的绝对路径)`。两者都是**非逐字**路径 —— 它们都会
+/// 跨到 Node 子进程去（`root` 进 `--allow-fs-read`，`entry` 进 `plugin.load`）。
+fn resolve_background_entry(
+    id: &str,
+    root: &Path,
+    relative_entry: &str,
+) -> PluginResult<(PathBuf, PathBuf)> {
+    // 规范化是**先做**的：下面两道检查（越界与存在）都必须按真实路径比对，
+    // 否则一个指向别处的符号链接会让"看起来在插件目录里"的入口实际打开别处。
+    // `canonicalize` 失败时退回原路径：那说明目录本身有问题，而下面"不是文件"
+    // 那一条会给出一句人话，而不是让 here 的 IO 错误把原因吃掉。
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    // 越界检查用的是**规范化之后**的根（`starts_with` 才是可信的），因此它必须在
+    // 剥前缀之前做 —— 剥完 `\\?\` 之后两者仍然是同一个前缀关系，但把安全判定
+    // 建立在"已经为另一件事加工过的值"上是没必要的风险。
+    if !canonical_root.join(relative_entry).starts_with(&canonical_root) {
+        return Err(PluginError::InvalidManifest(format!(
+            "插件 {id} 的后台入口跳出插件目录：清单里写的是 {relative_entry}"
+        )));
+    }
+
+    // 到这里才把逐字前缀剥掉，然后拼出真正的入口。
+    //
+    // 复用 `normalize_source_path`（它底下是 `strip_verbatim_prefix`，另有单测）而
+    // 不是在这里再写一份剥前缀的规则：这个仓里已经因为"同一个判据有两份实现"吃过
+    // 亏，而这两个函数处理的是**同一个** Windows 前缀。`canonicalize` 仍然照做 ——
+    // 剥前缀与规范化是两件不同的事，前者只是让结果能被 Node 读懂。
+    let root_out = strip_verbatim_path(&canonical_root);
+    let entry_path = root_out.join(relative_entry);
+
+    // ============================================================
+    // 不是文件就**在这里失败**，绝不把这条路径交给子进程
+    // ============================================================
+    //
+    // 这条检查原来只写了一句"入口不存在"并返回 `Err`，但它的判据是拼出来的路径；
+    // 而本次缺陷的关键正是"判据与真正交给 Node 的那个值不是同一个东西"。因此
+    // 这里重新取 `metadata`（跟随符号链接，与子进程 `realpathSync` 的语义一致），
+    // 并**在错误里同时给出三件事**：哪个插件、解析到哪个路径、期望什么。
+    //
+    // 交给子进程的代价是具体的：插件那一侧的报错是 `EISDIR: … lstat 'C:'` 或
+    // 一句 `ENOENT`，而列表里是哪个插件、清单里写的是什么，用户完全看不到。
+    let metadata = std::fs::metadata(&entry_path).map_err(|error| {
+        PluginError::InvalidManifest(format!(
+            "插件 {id} 的后台入口无法打开：解析到 {}（清单里写的是 {relative_entry}），\
+             期望它是一个存在的文件，但读取它的元数据失败：{error}",
+            entry_path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "插件 {id} 的后台入口不是文件：解析到 {}（清单里写的是 {relative_entry}），\
+             期望它是一个存在的文件",
+            entry_path.display()
+        )));
+    }
+
+    Ok((root_out, entry_path))
+}
+
+/// 剥掉 Windows 的**逐字（verbatim）路径前缀** `\\?\`。
+///
+/// 为什么需要它、以及不剥会发生什么，见上面那一大节。要点是：`\\?\` 是给 Win32
+/// 的一个"不要做任何规范化"的开关，而 Node 的 `realpathSync` 与权限模型比对都
+/// 不认它 —— 它在这个仓里唯一的作用是让后台插件一个都起不来。
+///
+/// 三条规则：
+///   · `\\?\C:\x` → `C:\x`（盘符形态）；
+///   · `\\?\UNC\server\share` → `\\server\share`（UNC 形态；直接切掉 `\\?\`
+///     会得到 `UNC\server\share`，那是一个**盘符相对**路径，比原样保留更糟）；
+///   · 其余平台与其余形态**原样返回**。
+///
+/// 只对 Windows 目标编译：在别的平台上 `canonicalize` 不产出这种前缀，写一个
+/// 永远走不到的分支只会让它显得像是"跨平台的"。
+#[cfg(windows)]
+fn strip_verbatim_path(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        // 只认 `X:\…` 这一种：`\\?\` 后面还可能是 `Volume{…}\` 或 `GLOBALROOT\`，
+        // 那些形态换成普通路径会指到别处 —— 认不出来就**原样返回**，让下面
+        // "不是文件"那一条给出错误，而不是在这里猜一个可能错的路径。
+        if rest.len() >= 3 && rest.as_bytes()[1] == b':' && (rest.as_bytes()[2] as char) == '\\' {
+            return PathBuf::from(rest);
+        }
+    }
+
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
 /// 读取并规范化插件根目录下的 manifest.json
 fn read_manifest(root: &Path) -> PluginResult<PluginManifest> {
     let path = root.join("manifest.json");
@@ -4330,6 +4473,271 @@ mod tests {
     fn registry_url_rejects_non_http_schemes() {
         for url in ["file:///etc/passwd", "ftp://example.com/index.json", "not a url"] {
             assert!(ensure_registry_url_allowed(url).is_err(), "不该允许: {}", url);
+        }
+    }
+
+    // ============================================================
+    // 后台入口的解析：交给 Node 的那个值必须是一个**真的存在的文件**
+    // ============================================================
+    //
+    // ============================================================
+    // 这一节守的是一次真实故障：每一个后台插件的入口都塌缩成裸盘符
+    // ============================================================
+    //
+    // 维护者机器上的日志（真实的 modulith.log，Node v24.15.0）：
+    //
+    //     WARN 后台插件 com.modulith.sample.stand-up 未能启动：
+    //          EISDIR: illegal operation on a directory, lstat 'C:'
+    //     WARN 后台插件 com.rinntheor.modulith.translate 未能启动：
+    //          EISDIR: illegal operation on a directory, lstat 'D:'
+    //
+    // `'C:'` / `'D:'` 恰好是那两个插件所在盘的**根**。成因是 Windows 上
+    // `Path::canonicalize` 返回逐字路径 `\\?\D:\…`，而那个前缀被原样交给 Node
+    // 之后 `fs.realpathSync` 不认它（libuv 把前缀当普通目录名剥掉，路径塌成裸盘符）。
+    //
+    // 因此下面每一条测试都会**同时**钉住两件事：路径指向那个真实文件，**而且**
+    // 它是 Node 能读懂的形态。只断言 `ends_with("background.js")` 是不行的 ——
+    // 那正是出问题的那个值本身满足的条件。
+    //
+    // 造一个**磁盘上真实存在**的插件目录（而不是拼字符串假装有一个）：
+    // 本次缺陷的全部要害是"路径真的能不能被打开"，纯字符串断言对此一无所知。
+
+    /// 造一个假的插件目录：`<tmp>/<tag>/<plugin-id>/<version>/background.js`。
+    ///
+    /// 形状照着真实安装目录来（`version_dir` 就是 `<plugins_dir>/<id>/<version>`），
+    /// 因此入口是 `root.join("background.js")` 能拼出来的那种。
+    fn fake_plugin_dir(tag: &str, entry_body: &str) -> PathBuf {
+        let dir = temp_dir(tag).join("com.test.background").join("1.0.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("background.js"), entry_body).unwrap();
+        dir
+    }
+
+    /// **主测试。** 解析出来的入口必须是一个真实存在的文件，且是 Node 读得懂的形态。
+    #[test]
+    fn a_background_entry_resolves_to_a_real_file_the_child_can_open() {
+        let dir = fake_plugin_dir("bg-entry-ok", "// 后台入口");
+        let entry_rel = "background.js";
+
+        let (root, entry) = resolve_background_entry("com.test.background", &dir, entry_rel)
+            .expect("一个真实存在的入口不该解析失败");
+
+        // 1. 它指向那个文件，而且**真的存在**。
+        assert!(
+            entry.is_file(),
+            "解析出来的入口必须是一个真实存在的文件：{}",
+            entry.display()
+        );
+        assert_eq!(entry, root.join(entry_rel));
+        assert!(
+            entry.ends_with("background.js"),
+            "入口应当指向清单里写的那个文件：{}",
+            entry.display()
+        );
+
+        // 2. 它**不是**裸盘符，也不是任何一个已有的目录 ——
+        //    这正是线上那句 `EISDIR … lstat 'D:'` 的形态。
+        assert_ne!(
+            entry.components().count(),
+            1,
+            "入口塌缩成了根（裸盘符）：{}",
+            entry.display()
+        );
+        assert!(
+            !entry.is_dir(),
+            "入口解析到了一个目录上（子进程的 realpathSync 会报 EISDIR）：{}",
+            entry.display()
+        );
+
+        // 3. **逐字前缀不许过界。** 它会让 Node 的 realpathSync 抛 EISDIR，
+        //    也会让 `--allow-fs-read` 对不上（见 `resolve_background_entry` 上面那节）。
+        //    `root` 与 `entry` 都要满足 —— 两者都会跨到子进程去。
+        for (label, path) in [("root", &root), ("entry", &entry)] {
+            let text = path.to_string_lossy().to_string();
+            assert!(
+                !text.starts_with(r"\\?\"),
+                "{label} 带着逐字前缀交给子进程会让它打不开：{text}"
+            );
+            assert!(
+                !text.starts_with(r"\\?\UNC\"),
+                "{label} 带着逐字 UNC 前缀交给子进程会让它打不开：{text}"
+            );
+        }
+
+        // 4. 绝对路径：子进程的工作目录与宿主不同，相对路径在那里会指到别处。
+        assert!(entry.is_absolute(), "入口必须是绝对路径：{}", entry.display());
+        assert!(root.is_absolute(), "根必须是绝对路径：{}", root.display());
+    }
+
+    /// 入口的路径必须**原样**走过 `plugin.load` 那条请求的构造路径。
+    ///
+    /// 单测证明"解析函数返回了正确的值"是不够的：本次缺陷发生在**序列化之后**
+    /// （Rust 算对了前缀、`serde_json` 忠实写出，然后 Node 读不懂）。因此这里用
+    /// `plugins.rs` 里那一模一样的 `serde_json::json!` 形状造一次参数，再从
+    /// JSON 里读回 `entry`，断言它仍然是那个存在的文件、且**不含逐字前缀**。
+    ///
+    /// 这一段与 `scripts/check-background.ts` 的源码级断言是**互补**的：那条守住
+    /// "构造请求的那一段代码里不能再出现 `canonicalize` 的产物"，这条守住"在
+    /// 当前这个值上，往返一次不会改变它"。
+    #[test]
+    fn the_entry_survives_the_plugin_load_request_it_is_sent_in() {
+        let dir = fake_plugin_dir("bg-entry-wire", "// 后台入口");
+        let (root, entry) =
+            resolve_background_entry("com.test.background", &dir, "background.js").unwrap();
+
+        // 形状与 `desktop/background/plugins.rs` 里那一段逐字相同（只去掉需要
+        // manifest 的字段）：这里要证明的正是"那一段不会把它改坏"。
+        let params = serde_json::json!({
+            "id": "com.test.background",
+            "entry": entry,
+            "activation": "startup",
+        });
+
+        let wire = params
+            .get("entry")
+            .and_then(|value| value.as_str())
+            .expect("entry 必须序列化成 JSON 字符串（子进程那一侧判的是 typeof === 'string'）");
+
+        assert_eq!(wire, entry.to_string_lossy(), "序列化不该改写这条路径");
+        assert!(
+            !wire.starts_with(r"\\?\"),
+            "交给子进程的 entry 是逐字路径，Node 的 realpathSync 会抛 EISDIR：{wire}"
+        );
+        assert!(
+            Path::new(wire).is_file(),
+            "走完请求构造之后，entry 必须仍然指向那个存在的文件：{wire}"
+        );
+        // 与 `--allow-fs-read` 同一个根：入口不在放行范围里的话，子进程读不到它。
+        assert!(
+            Path::new(wire).starts_with(&root),
+            "入口必须落在放行根之下：{wire} 不在 {} 之下",
+            root.display()
+        );
+    }
+
+    /// 清单里的入口**不存在**时必须在宿主侧失败，并且说清是哪三件事。
+    ///
+    /// 这条路径原来是"把路径交给子进程、由子进程抛一个 ENOENT"。子进程那句错误里
+    /// **没有插件 id、也没有清单里写的那个相对路径** —— 用户从日志里读不出是哪个
+    /// 插件坏了。因此这里同时断言"必须失败"与"错误里必须有这三样"。
+    #[test]
+    fn a_missing_background_entry_fails_on_the_host_side_with_a_useful_message() {
+        let dir = fake_plugin_dir("bg-entry-missing", "// 后台入口");
+
+        let error = resolve_background_entry("com.test.background", &dir, "nope.js")
+            .expect_err("不存在的入口必须在宿主侧就失败，不能交给子进程");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("com.test.background"),
+            "错误里必须点名插件 id：{message}"
+        );
+        assert!(
+            message.contains("nope.js"),
+            "错误里必须说清清单里写的是什么：{message}"
+        );
+        assert!(
+            message.contains("不是文件") || message.contains("无法打开"),
+            "错误里必须说清期望（一个存在的文件）：{message}"
+        );
+        // 失败必须是「清单非法」这一类：界面据此说"这个插件的清单有问题"，
+        // 而不是一句笼统的"启动失败"。
+        assert!(
+            matches!(error, PluginError::InvalidManifest(_)),
+            "应当是 InvalidManifest，实际: {error:?}"
+        );
+    }
+
+    /// 入口指向一个**目录**时必须被拒绝。
+    ///
+    /// 这一条是线上那句 `EISDIR` 的另一种形态：`realpathSync` 与 `readFileSync`
+    /// 都会在一个目录上失败，而"清单里写了 `assets`"这件事在子进程那一侧表现为
+    /// 一句与路径无关的系统错误。宿主必须先把它拦下。
+    #[test]
+    fn a_background_entry_that_is_a_directory_is_rejected() {
+        let dir = fake_plugin_dir("bg-entry-dir", "// 后台入口");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+
+        let error = resolve_background_entry("com.test.background", &dir, "assets")
+            .expect_err("指向目录的入口必须被拒绝");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("不是文件"),
+            "错误应当说清「不是文件」：{message}"
+        );
+        assert!(message.contains("assets"), "错误里应当有清单里写的那一段：{message}");
+    }
+
+    /// `..` 之外的越界（绝对路径 / 符号链接逃逸的形态）仍由"拼出来必须落在根下"挡住。
+    /// `background_manifest::is_safe_relative` 已经拦了 `..` 与盘符，因此这里喂的是
+    /// **它拦不住的那种**：一段会被 `join` 当成"替换整个路径"的绝对路径。
+    /// `Path::join` 在第二个参数是绝对路径时会**丢掉**前面的根 —— 因此这一条
+    /// 必须被 `starts_with` 那道检查拦住，而不是靠清单那一层的语法检查。
+    #[test]
+    fn an_absolute_entry_cannot_escape_the_plugin_root() {
+        let dir = fake_plugin_dir("bg-entry-abs", "// 后台入口");
+        // 一个真实存在的绝对路径：逃逸检查必须拦住它，而不是"因为文件不存在"。
+        let outside = dir.parent().unwrap().join("background.js");
+        std::fs::write(&outside, "// 别人的文件").unwrap();
+
+        let error = resolve_background_entry(
+            "com.test.background",
+            &dir,
+            outside.to_string_lossy().as_ref(),
+        )
+        .expect_err("绝对路径会替换掉插件根目录，必须被拒绝");
+        assert!(
+            error.to_string().contains("跳出插件目录"),
+            "错误应当说清是越界：{error}"
+        );
+    }
+
+    /// 剥逐字前缀的**六种输入**：三种要剥、三种必须原样返回。
+    ///
+    /// 为什么这条值得单独写出来：它是本次缺陷的唯一修法，而它错的方向有两个，
+    /// 两个都很坏：
+    ///   * 该剥没剥 → Node 的 `realpathSync` 把路径塌成裸盘符（线上那句 EISDIR）；
+    ///   * **不该剥的剥了** → `\\?\Volume{…}\` / `\\?\GLOBALROOT\` 会变成一个普通
+    ///     相对路径，指到完全别的地方。第二种比第一种更难发现（它不报错）。
+    ///
+    /// 这条测试在任何平台上都能跑：非 Windows 那一份是恒等函数，而这六条里有
+    /// 三条期望"原样返回" —— 它们在两种实现下都成立。剩下三条只在 Windows 上
+    /// 成立，因此用 `cfg` 分开断言，而不是让它们在任何平台上都"碰巧通过"。
+    #[test]
+    fn the_verbatim_prefix_is_stripped_exactly_when_it_should_be() {
+        // ---- 任何平台都必须原样返回 ----
+        for plain in [
+            r"D:\AgentSpace\x\background.js",
+            r"relative\path.js",
+            "/usr/local/share/x.js",
+        ] {
+            assert_eq!(
+                strip_verbatim_path(Path::new(plain)),
+                PathBuf::from(plain),
+                "没有逐字前缀的路径不该被改写：{plain}"
+            );
+        }
+
+        // ---- Windows：盘符形态与 UNC 形态都要剥掉 ----
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                strip_verbatim_path(Path::new(r"\\?\D:\AgentSpace\x\background.js")),
+                PathBuf::from(r"D:\AgentSpace\x\background.js"),
+                "盘符形态的逐字前缀必须剥掉（留着它 Node 会报 EISDIR lstat 'D:'）"
+            );
+            assert_eq!(
+                strip_verbatim_path(Path::new(r"\\?\UNC\server\share\plugin")),
+                PathBuf::from(r"\\server\share\plugin"),
+                "UNC 形态要还原成 \\\\server\\share\\...，而不是切成 UNC\\server\\share"
+            );
+            // 认不出来的形态**原样返回**：猜一个"看起来更正常"的路径比留着它更糟。
+            assert_eq!(
+                strip_verbatim_path(Path::new(r"\\?\Volume{1234-5678}\x")),
+                PathBuf::from(r"\\?\Volume{1234-5678}\x"),
+                "`Volume{{…}}` 形态不该被切成一个指到别处的相对路径"
+            );
         }
     }
 }

@@ -245,6 +245,41 @@ async fn checked_clipboard_monitor<R: Runtime>(
     Ok(())
 }
 
+/// 校验 `global-hotkey` 权限（沙箱与后台两条路径共用）。
+///
+/// 与 `checked_clipboard_monitor` 同一条纪律：权限守卫在**内部的作用域里**就被
+/// 丢掉，`await` 全部发生在它之外 —— 持着读锁去注册一个系统热键会让整个插件系统
+/// 停摆（注册本身最多要等窗口线程 2 秒）。
+async fn checked_hotkey<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::hotkey::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
+/// 校验 `read-selection` 权限。
+///
+/// 与上面逐字相同的一条纪律，理由更硬：这一次的 `await` 之外是**最多 400 ms 的
+/// 剪贴板等待**，持着插件系统的读锁去等它会让同一时间所有别的插件的调用一起卡住。
+async fn checked_selection<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) -> Result<(), String> {
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        super::selection::require_permission(&manager, plugin_id)?;
+    }
+
+    Ok(())
+}
+
 /// 执行一次 ctx 调用。
 ///
 /// 参数与返回都是 `serde_json::Value` —— 这一层不认识 HTTP，也不认识 stdio。
@@ -1104,14 +1139,25 @@ pub async fn dispatch<R: Runtime>(
 
         // ---- 宿主渲染的浮层 --------------------------------------------------
         //
-        // 这两条**会阻塞到用户做出选择**，等待上限是 `overlay.rs` 里那个 5 分钟。
-        // 插件那边就是一次普通的 await。
+        // 这三条**会打断用户**：对话框与卡片出现时用户正在做别的事，而它们
+        // 索取的正是当下的注意力。因此它们要 `notification` 权限 —— 与
+        // `ctx.notifications.show` 同一档，而且理由相同。
+        //
+        // 三条走同一个窗口、同一套配对，因此判定只有一处（`require_ui_permission`）。
+        // 只给其中的一条加门会得到一个**假的门**：想打断用户的插件改用没加门
+        // 的那一条就绕过去了，而对话框比卡片更打断（它一直等到用户回答为止）。
+        //
+        // 状态指示（`ui.badge` / `ui.progress` / `ui.splash`）不在这一列：它们
+        // 说的是"插件现在是什么状态"，不索取用户当下的注意力，而且要有界面才
+        // 挂得上（见 `emit_ui_with`）。
         //
         // 为什么必须由宿主渲染而不是插件自己画：见 `overlay.rs` 的文件头。
-        // 一句话 —— 沙箱插件的界面是原生子 webview，它盖得住宿主的 DOM；
+        // 一句话 —— 沙箱插件的界面是跨源 iframe，插件画的东西出不了那一块；
         // 而让插件自己画对话框等于让它冒充宿主界面。
 
         "ui.dialog" => {
+            require_ui_permission(app, plugin_id).await?;
+
             let Some(title) = arg_str(args, "title") else {
                 return rpc_error("缺少 title");
             };
@@ -1127,10 +1173,12 @@ pub async fn dispatch<R: Runtime>(
                 cancel_label: arg_str(args, "cancelLabel").map(str::to_string),
             };
 
-            ask_overlay(app, request).await
+            ask_overlay(app, plugin_id, request).await
         }
 
         "ui.contextMenu" => {
+            require_ui_permission(app, plugin_id).await?;
+
             let mut items: Vec<crate::modules::desktop::overlay::MenuItem> = arg(args, "items")
                 .and_then(|value| serde_json::from_value(value.clone()).ok())
                 .unwrap_or_default();
@@ -1191,7 +1239,7 @@ pub async fn dispatch<R: Runtime>(
                 items,
             };
 
-            let response = ask_overlay(app, request).await?;
+            let response = ask_overlay(app, plugin_id, request).await?;
 
             // 选中了清单声明的那一条 → 交给插件的命令机制去执行。
             //
@@ -1205,6 +1253,57 @@ pub async fn dispatch<R: Runtime>(
             }
 
             json_value(response)
+        }
+
+        // ---- 宿主渲染的结果卡片 ----------------------------------------------
+        //
+        // 与上面两条同一个窗口、同一套配对，但两处不同：**缺省没有截止时间**、
+        // **同一时刻只有一张**。卡片会去取焦点（`overlay::show_popover`），
+        // 理由写在那个函数上：焦点是"点别处关闭"与 Esc 在本平台上唯一可能的来源。
+        //
+        // 它与其他 `ui.*` 不同的一点：**不需要界面上下文**。卡片是一个独立
+        // 窗口，贴的是屏幕上的光标；而后台插件恰恰是最需要把结果拿出来的那一个
+        // （它没有任何别的出口）。因此这一条对 `surface: None` 也成立。
+        //
+        // 这一段里**刻意一次都不读 `surface`**，而那不是"忘了"：后台那一条路径
+        // （`background::plugins` → `dispatch(…, None, …)`，以及界面插件走的
+        // `plugin_ui_popover` 命令）都传 `None`。真要给它加一条 `let Some(surface)
+        // = surface else { … }`，卡片在**后台这个最需要它的运行位置**上会立刻变成
+        // 一句"没有界面上下文"，而界面插件那一侧看起来完全正常。`check:sandbox`
+        // 有一条断言钉着这一段里不许出现 `surface` 的判据。
+
+        "ui.popover" => {
+            require_ui_permission(app, plugin_id).await?;
+
+            let Some(body) = arg_str(args, "body") else {
+                return rpc_error("缺少 body：结果卡片的正文是必填的");
+            };
+            // 截断而不是拒绝：正文可能是用户选中的原文，它有多长不该由插件
+            // 负责 —— 而"卡片显示不下"远比"这次调用直接失败"容易收场。
+            let body = truncate(body.trim(), MAX_POPOVER_BODY_CHARS);
+            if body.is_empty() {
+                return rpc_error("body 不能为空");
+            }
+
+            // 只算一次：卡片里带着的那个数字与真正用的这个上限必须是同一个，
+            // 否则"它写着 8 秒却等了 30 秒"这类问题是查不出来的。
+            let deadline = popover_deadline(args);
+
+            let request = crate::modules::desktop::overlay::OverlayRequest::Popover {
+                // 由 overlay 分配（同 dialog / menu 的理由）
+                id: 0,
+                tone: popover_tone(args).to_string(),
+                title: arg_str(args, "title")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| truncate(value, MAX_POPOVER_TITLE_CHARS)),
+                body,
+                actions: popover_actions(args)?,
+                timeout_ms: deadline.map(|value| value.as_millis() as u64),
+                at: popover_anchor(args),
+            };
+
+            ask_popover(app, plugin_id, request, deadline).await
         }
 
         // ---- 宿主渲染的状态指示（徽标 / 进度 / 启动占位）-----------------------
@@ -1657,6 +1756,200 @@ pub async fn dispatch<R: Runtime>(
             }
         }
 
+        // ---- 剪贴板写入（`ctx.clipboard.writeText`）--------------------------
+        //
+        // ============================================================
+        // 这一条**只为后台运行位置存在**
+        // ============================================================
+        //
+        // 沙箱界面的 `ctx.clipboard.writeText` 调的是**浏览器 API**
+        // （`navigator.clipboard`），因此它在权限表里是前端强制，也从不经过这张表。
+        // 后台插件没有 `document`、没有 `navigator`，那个实现它一行都用不上 ——
+        // 而"把结果放回剪贴板"恰恰是它最需要的动作之一：结果卡片上的按钮只回一个
+        // **action id**，真正写入的必须是插件这一侧。
+        //
+        // 于是同一件事在第三个运行位置上由宿主代做。方法名与形状与另外两处
+        // **逐字相同**（`writeText(text)`），差别只在机制 —— 这是"同一个插件换个
+        // 运行位置不必改代码"能成立的前提；反过来，如果这里没有它，插件就只能
+        // 自己探 `typeof ctx.clipboard === 'object'` 再降级，那是把宿主的一处
+        // 缺失变成每个后台插件都要写一遍的分支。
+        //
+        // 权限用 `Clipboard`（读写那一项），不是 `ClipboardMonitor`：这是一次
+        // "插件调一次、写一次"，与"观察用户在**所有程序里**复制的每一样东西"
+        // 是完全不同的作用面（分界写在 `permissions.rs` 与 `types.rs` 里）。
+        //
+        // ⚠️ 它会**覆盖用户的整个剪贴板**（内部是 `EmptyClipboard` + 写 CF_UNICODETEXT，
+        // 非文本格式不会还原）—— 与 `selection.rs` 那条还原路径同一条 Win32 语义。
+        // 这是"复制"这个动作本身的含义，不是副作用；也因此它不该被用在任何
+        // 用户没有主动要求的地方。
+        "clipboard.write" => {
+            let Some(text) = arg_str(&args, "text") else {
+                return rpc_error("缺少 text");
+            };
+
+            // 权限守卫在**内部的作用域里**就被丢掉，`replace_text` 发生在它之外 ——
+            // 与 `checked_secrets_dir` 同一条纪律：握着插件系统的读锁去碰剪贴板，
+            // 会让一次写入把整个插件系统堵住（剪贴板可能被别的进程占着）。
+            {
+                let manager = locked!(app);
+                if let Err(e) = manager
+                    .require_permission(plugin_id, super::types::PluginPermission::Clipboard)
+                {
+                    return rpc_error(&e.to_string());
+                }
+            }
+
+            if !super::clipboard::is_supported() {
+                return rpc_error(super::clipboard::UNSUPPORTED_PLATFORM);
+            }
+
+            match super::clipboard::replace_text(text) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        // ---- 全局热键（`ctx.hotkey`）---------------------------------------
+        //
+        // ============================================================
+        // 为什么这几条必须走 RPC，而且只能在这里强制
+        // ============================================================
+        //
+        // `RegisterHotKey` 在宿主进程里，而浏览器**没有任何**能让一个页面在别的
+        // 程序聚焦时收到按键的 API（`addEventListener('keydown')` 只在本文档聚焦时
+        // 有效）。因此这一项在前端没有等价的绕行路径 —— 与 `clipboard-monitor`、
+        // `secrets` 同一形态，与 `ctx.clipboard.readText` 相反。
+        //
+        // `hotkey.subscribe` 与其它几条的区别是它带 `surface`：订阅是**界面级**的
+        // 资源（一块界面关掉就不该再有人往它推），而热键的**注册**是插件级的
+        // （后台插件没有界面，它却正是最需要热键的那一种）。
+        //
+        // 拒绝的路径有两条，而且必须分开：
+        //   * 没声明 `global-hotkey` —— 那是权限问题，`checked_hotkey` 给的话
+        //     会带着权限名；
+        //   * 平台不支持 —— 那是能力问题，由 `hotkey::register` 自己给出
+        //     `UNSUPPORTED_PLATFORM`。前端也有一个同步的 `isAvailable()` 可以先判。
+
+        "hotkey.register" => {
+            let Some(combo) = arg_str(args, "combo") else {
+                return rpc_error("缺少 combo");
+            };
+            if let Err(e) = checked_hotkey(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+
+            let owned = app.clone();
+            let plugin = plugin_id.to_string();
+            let combo = combo.to_string();
+            // `register` 会**阻塞**到窗口线程回话（最多 2 秒）。放进阻塞线程池，
+            // 而不是让一次 `RegisterHotKey` 把 tokio 的一个工作线程占住。
+            match tauri::async_runtime::spawn_blocking(move || {
+                let state = owned.try_state::<super::hotkey::HotkeyRegistry>()?;
+                Some(state.register(&owned, &plugin, &combo))
+            })
+            .await
+            {
+                Ok(Some(Ok(normalized))) => json_value(serde_json::json!(normalized)),
+                Ok(Some(Err(e))) => rpc_error(&e),
+                Ok(None) => rpc_error("热键注册表尚未就绪"),
+                Err(e) => rpc_error(&format!("注册热键的任务没能完成：{e}")),
+            }
+        }
+
+        // 撤销**不做权限检查**：一条解不掉的绑定就是一个泄漏 —— 而热键泄漏的后果
+        // 比订阅泄漏严重得多（它偷的是用户整台机器上的一个按键）。
+        "hotkey.unregister" => {
+            if let (Some(state), Some(combo)) = (
+                app.try_state::<super::hotkey::HotkeyRegistry>(),
+                arg_str(args, "combo"),
+            ) {
+                state.unregister(plugin_id, combo);
+            }
+            json_ok()
+        }
+
+        "hotkey.list" => {
+            let list = app
+                .try_state::<super::hotkey::HotkeyRegistry>()
+                .map(|state| state.list(plugin_id))
+                .unwrap_or_default();
+            json_value(serde_json::json!(list))
+        }
+
+        "hotkey.subscribe" => {
+            // ============================================================
+            // 同一个方法与两条通道：`background` 是**传输层**的标注
+            // ============================================================
+            //
+            // 订阅要落在哪一侧，只有"谁在调用"知道，而 in-process 与后台插件在这一层
+            // 都是 `surface = None`（两者都没有界面）。让后台那条路径另外叫一个 RPC
+            // 名字会把"同一个操作"拆成两条分支，而它们的区别只有一个布尔 ——
+            // 因此这里读 `background`，由 `background/plugins.rs` 在转发时写上
+            // （与它剥掉 `ctx.` 前缀同一层：那是传输的一部分）。
+            let background = arg(args, "background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if let Err(e) = checked_hotkey(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+
+            let target = if background {
+                None
+            } else {
+                let Some(surface) = surface else {
+                    return rpc_error(
+                        "ctx.hotkey.subscribe 需要界面上下文：后台插件那条通道会带上 \
+                         background 标注，别的调用方必须说明自己在哪一个界面里",
+                    );
+                };
+                Some(surface)
+            };
+
+            let Some(state) = app.try_state::<super::hotkey::HotkeyRegistry>() else {
+                return rpc_error("热键注册表尚未就绪");
+            };
+            match state.subscribe(app, plugin_id, target, background) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e),
+            }
+        }
+
+        "hotkey.unsubscribe" => {
+            let background = arg(args, "background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(state) = app.try_state::<super::hotkey::HotkeyRegistry>() {
+                if background {
+                    state.unsubscribe(plugin_id, None, true);
+                } else {
+                    state.unsubscribe(plugin_id, surface, false);
+                }
+            }
+            json_ok()
+        }
+
+        // ---- 读取选中文本（`ctx.selection`）--------------------------------
+        //
+        // 与热键同一条理由：合成 Ctrl+C（`SendInput`）与读剪贴板都在宿主进程里。
+        // 它还会**阻塞**最多 400 ms（等前台程序复制完），因此必须放进阻塞线程池 ——
+        // 让一次捕获把 tokio 的工作线程占住，会让同一时间别的插件的 RPC 一起变慢，
+        // 而那种关联在排查时几乎看不出来。
+
+        "selection.read" => {
+            if let Err(e) = checked_selection(app, plugin_id).await {
+                return rpc_error(&e);
+            }
+
+            let owned = app.clone();
+            match tauri::async_runtime::spawn_blocking(move || super::selection::read(&owned)).await
+            {
+                Ok(Ok(text)) => json_value(serde_json::json!(text)),
+                Ok(Err(e)) => rpc_error(&e),
+                Err(e) => rpc_error(&format!("读取选中文本的任务没能完成：{e}")),
+            }
+        }
+
         _ => rpc_error(&format!("未知的 RPC 方法：{method}")),
     }
 }
@@ -1667,6 +1960,7 @@ pub async fn dispatch<R: Runtime>(
 /// 而它们的差别只有请求里的 `kind`。
 async fn ask_overlay<R: Runtime>(
     app: &AppHandle<R>,
+    plugin_id: &str,
     request: crate::modules::desktop::overlay::OverlayRequest,
 ) -> Result<Value, String> {
     let Some(state) = app.try_state::<crate::modules::desktop::overlay::Overlay>() else {
@@ -1675,7 +1969,7 @@ async fn ask_overlay<R: Runtime>(
 
     // 浮层窗口是**具体运行时**上声明的那个（`tauri.conf.json`），
     // 而 `Overlay` 的方法本身是泛型的 —— 因此这里不需要任何转换。
-    match state.ask(app, request).await {
+    match state.ask(app, request, plugin_id).await {
         Ok(response) => json_value(serde_json::json!({
             "confirmed": response.confirmed,
             "selected": response.selected,
@@ -1683,6 +1977,94 @@ async fn ask_overlay<R: Runtime>(
         })),
         Err(message) => rpc_error(&message),
     }
+}
+
+/// 显示一张结果卡片并把它转成 RPC 的结果。
+///
+/// 与 `ask_overlay` 分开，因为**返回形状不同**：对话框与菜单的调用方要看
+/// `confirmed` / `selected` / `dismissed` 三个字段才知道发生了什么，而卡片只有
+/// 一句话 —— "点了哪一个，或者没点"。共用一个函数就得让插件去读一个它用不上的
+/// 结构，而漏读 `dismissed` 恰好是"用户没回答"与"用户点了取消"混淆的来源。
+///
+/// ============================================================
+/// `deadline` 是**宿主的截止时间**，不是"建议"；`None` 是缺省
+/// ============================================================
+///
+/// `Some(t)` 时，调用方（`popover_deadline`）已经把它钳制到宿主自己的上限之内
+/// （理由见 `POPOVER_TIMEOUT_MAX_MS`）。到了这个时间还没有回答时，
+/// `Overlay::popover` **一定会**回一条 `{action: null}` 并把窗口收起来：插件因此
+/// 永远拿得到一个确定的结果，而不是一条挂在那里、只能靠传输层超时收场的 await。
+///
+/// `None` 时没有任何兜底计时器 —— 收场只能来自"有人把它关掉"：用户关掉它
+/// （点别处 / × / Esc）、插件被停用或卸载、第二条卡片顶掉它、应用退出。
+/// 四条路径各有一条实现，且**都在宿主这一侧**（插件不需要做任何事）。
+///
+/// 它**不是**错误：契约里 `null` 就是"用户没回答"这一种正常收尾，与"卡片没能
+/// 显示出来"（那一条才是 `Err`）分开。
+async fn ask_popover<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    request: crate::modules::desktop::overlay::OverlayRequest,
+    deadline: Option<std::time::Duration>,
+) -> Result<Value, String> {
+    let Some(state) = app.try_state::<crate::modules::desktop::overlay::Overlay>() else {
+        return rpc_error("浮层尚未就绪");
+    };
+
+    match state.popover(app, request, deadline, plugin_id).await {
+        // `null` 是一个**取值**，不是"没有字段"：插件要能区分"用户没点"与
+        // "宿主没回答"（后者是 Err）。省略字段会让 `value.action` 与拼错的名字
+        // 长得一样。
+        Ok(action) => json_value(serde_json::json!({ "action": action })),
+        Err(message) => rpc_error(&message),
+    }
+}
+
+/// `ctx.ui` 里"宿主渲染并且会打断用户"的那三条共用的权限判定。
+///
+/// ============================================================
+/// 为什么复用 `notification`，而不是新加一项
+/// ============================================================
+///
+/// 风险轴是**打断用户**，而这一项权限管的正是它（`ctx.notifications.show`
+/// 同样要求它）。再加一项只会让用户在安装确认页上看到两个意思重叠的名词，
+/// 而他能据此做出的判断不会更多。
+///
+/// ============================================================
+/// 为什么对话框与右键菜单也一起判
+/// ============================================================
+///
+/// 它们此前**没有任何权限门槛**。只给卡片加门会得到一个假的门：想打断用户的
+/// 插件改用 `ui.dialog` 就绕过去了，而对话框**比卡片更打断** —— 它一直等到
+/// 用户回答为止。三条走同一个窗口、同一套配对，因此判定也只有这一处。
+///
+/// 与 `notify` 那一条同一纪律：判定在 Rust 侧，因为这三条的**唯一出口**就是
+/// 宿主这个窗口，插件没有别的办法把一张卡片画到用户眼前。
+async fn require_ui_permission<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+) -> Result<(), String> {
+    // 与 `checked_secrets_dir` 同一条纪律：权限守卫在**内部的作用域里**就被丢掉，
+    // `await` 全部发生在它之外 —— 持着读锁等待一次界面交互会让整个插件系统停摆。
+    let Some(handle) = plugin_manager(app) else {
+        return Err("插件系统尚未就绪".to_string());
+    };
+
+    {
+        let manager = handle.read().await;
+        if let Err(error) = manager
+            .require_permission(plugin_id, super::types::PluginPermission::Notification)
+        {
+            // 把"缺哪一项"补成一句能照做的话：只说"未声明 notification 权限"
+            // 会让作者去找自己哪里用了通知，而他其实只是想要一张卡片。
+            return Err(format!(
+                "{error} —— ctx.ui 的对话框、右键菜单与结果卡片都会打断用户，\
+                 因此三者也要求 notification 权限"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// 清单声明的右键菜单项在浮层里的 id 前缀。
@@ -1779,6 +2161,23 @@ pub const PLUGIN_UI: &str = "modulith://plugin-ui";
 /// （`clipboard::PUSH_CHANNEL`）。两条都保留，与 `PLUGIN_UI` / 下载进度同一形态。
 pub const CLIPBOARD_CHANGE: &str = "modulith://plugin-clipboard-change";
 
+/// 一条全局热键被按下时，广播给 **in-process** 插件的事件名。
+///
+/// ============================================================
+/// 为什么它是一条广播，而且**只有 in-process 走它**
+/// ============================================================
+///
+/// 观察按键的是**宿主进程里的 Win32**（`RegisterHotKey` + 一个消息窗口，见
+/// `hotkey.rs`）：浏览器里没有任何 API 能让一个页面在**别的程序**聚焦时收到按键。
+/// 因此方向只能是宿主 → 插件，而三条通道各不相同：
+///
+///   * in-process —— 回调就在宿主这个 realm，走这条广播；
+///   * sandboxed —— 回调在另一个 realm，宿主直接推进它的界面
+///     （`hotkey::PUSH_CHANNEL`）；
+///   * background —— 插件在 Node 子进程里，宿主按 `plugin.dispatch` 的
+///     `hotkey` 类型派发进去。
+pub const HOTKEY_FIRED: &str = "modulith://plugin-hotkey";
+
 /// 下载进度广播给**前端**时的事件名。
 ///
 /// 沙箱插件那一条走"推脚本进它的 webview"（`sandbox::deliver_download_progress`），
@@ -1795,6 +2194,208 @@ const MAX_BADGE_CHARS: usize = 28;
 
 /// 启动占位那句话的长度上限。比徽标宽：它是一整行说明，而不是一个角标。
 const MAX_SPLASH_CHARS: usize = 120;
+
+// ============================================================
+// 结果卡片（`ctx.ui.popover`）的长度与取值上限
+// ============================================================
+//
+// 它们都取"够用且不失控"的那一档，且**全部由宿主截断**（或白名单化）之后才会
+// 到达浮层。理由与徽标那里的同一条：卡片的外观由宿主决定，插件给的是内容 ——
+// 而内容一旦没有上限，一段十万字的正文会让窗口尺寸、量尺寸那一步、以及用户
+// 看到的东西一起失控。
+//
+// 正文的上限刻意给得**宽**：它装的是用户选中的原文，而"翻译一整段"正是这个
+// 成员最主要的用法。4000 个字符大约是一屏半到两屏的正文，再长的东西也不该由
+// 一张会自动消失的卡片来承载。
+
+/// 卡片正文的长度上限。
+const MAX_POPOVER_BODY_CHARS: usize = 4000;
+
+/// 卡片标题的长度上限。标题是**一行**，比正文短得多。
+const MAX_POPOVER_TITLE_CHARS: usize = 120;
+
+/// 卡片按钮文案的长度上限。
+const MAX_POPOVER_ACTION_LABEL_CHARS: usize = 32;
+
+/// 卡片按钮标识的长度上限。
+///
+/// 它不像文案那样截断，而是**拒绝**整次调用：id 是插件与宿主之间的契约
+/// （插件靠它分辨用户点了哪一个），悄悄改掉或丢掉一个按钮的表现是"少了一个
+/// 按钮"，而插件以为它还在。
+const MAX_POPOVER_ACTION_ID_CHARS: usize = 32;
+
+/// 卡片上最多几个按钮。
+const MAX_POPOVER_ACTIONS: usize = 3;
+
+/// 显式给出的自动收起时长的下限。低于 1 秒的卡片用户根本来不及看清，那不叫能力。
+const POPOVER_TIMEOUT_MIN_MS: u64 = 1_000;
+
+/// 显式给出的自动收起时长的上限。
+///
+/// ============================================================
+/// 它为什么从 6 秒变成 60 秒，以及为什么还是要有上限
+/// ============================================================
+///
+/// 原先这个数字是 **6000**，而它不是一个产品口味，是**跨进程契约的一半**：
+/// Node 后台插件调一次宿主的等待上限是 `background-host.mjs` 的
+/// `HOST_CALL_TIMEOUT_MS`（10 秒），而两侧各有一个独立的计时器，因此子进程
+/// 那个上限必须明显长于宿主这里这个。6 秒留出 4 秒余量，"宿主的答复永远在
+/// 对方挂断之前到达"。
+///
+/// 那条约束**已经不在了**：`ctx.ui.popover` 是唯一一条豁免传输预算的调用
+/// （`callHost(..., { untilUserAnswers: true })`，见 `background-host.mjs`）
+/// —— 因为卡片缺省的形态就是"一直等到用户回答"，而一个 10 秒的传输计时器
+/// 与它在定义上冲突。传输那一侧不再有计时器，宿主这一侧也就没有理由停在 6 秒。
+///
+/// **缺省没有截止时间**（见 `popover_deadline` 返回 `None` 的那一支），
+/// 因此这个数字管的是"插件**显式**要一个截止时间"的那种调用。
+///
+/// 仍然要有上限，理由是**这个数字的语义**：`timeoutMs` 说的是"到点自己收起来"，
+/// 而一张留着几分钟的卡片与"等用户关掉它"在用户看来没有区别，只是多了一条
+/// 会在中途把它抽走、还让插件拿到 `{action: null}` 的规则 —— 那是一条只制造
+/// 意外的规则。60 秒长到"用户读得完、还来得及点"，又短到它仍然是一条真正的
+/// 截止时间。真想要"一直待到用户关掉"，**不要传 `timeoutMs`**。
+const POPOVER_TIMEOUT_MAX_MS: u64 = 60_000;
+
+/// 卡片的语气。白名单而不是原样透出：它会被前端拼进 `className`。
+///
+/// 与 `badge_tone` 的差别只有一处：这里有 `success`（"译文已经放到剪贴板了"
+/// 是一张卡片最常说的好消息），而没有 `question`（卡片不提问 —— 要提问请用
+/// `ui.dialog`）。
+fn popover_tone(args: &Value) -> &'static str {
+    match arg_str(args, "tone") {
+        Some("success") => "success",
+        Some("warning") => "warning",
+        Some("error") => "error",
+        _ => "info",
+    }
+}
+
+/// 卡片贴在哪里。白名单：不认识的取值落到 `cursor`。
+///
+/// 落到 `cursor` 而不是报错：位置是一个**偏好**，猜错了只是位置不完美；而
+/// 让整次调用因为一个写错的枚举值失败，会让作者以为是能力不可用。
+fn popover_anchor(args: &Value) -> crate::modules::desktop::overlay::PopoverAnchor {
+    use crate::modules::desktop::overlay::PopoverAnchor;
+    match arg_str(args, "at") {
+        Some("center") => PopoverAnchor::Center,
+        _ => PopoverAnchor::Cursor,
+    }
+}
+
+/// 自动收起的时长。**不传就是"没有截止时间"。**
+///
+/// ============================================================
+/// `None` 是缺省，而这不是"少写了一句"
+/// ============================================================
+///
+/// 维护者的原话是"它不能很快关掉，而我讨厌自动关闭"。一张要用户读、要用户点的
+/// 卡片默认不该自己跑掉 —— 因此**不传 `timeoutMs`** 就是"一直待到用户关掉它"，
+/// 收场由那四条路径负责（用户关 / 插件停用 / 第二条卡片 / 应用退出）。
+///
+/// 传了的时候仍然**钳制而不是拒绝**，这与 `actions` 那条取舍相反，理由也不同：
+/// `timeoutMs` 是一个"想让它待多久"的愿望，钳制之后它仍然朝着作者想要的方向
+/// （1 秒到 60 秒之间），而一张卡片该不该出现与这个数字无关。写着 0 或者
+/// 600000 说明作者没想清楚，但那不该让整张卡片不出现。
+///
+/// ⚠️ **它必须与后台那一条传输预算一起看。** `ctx.ui.popover` 是唯一一条豁免
+/// `HOST_CALL_TIMEOUT_MS`（10 秒）的调用 —— 少了那个豁免，任何超过 10 秒的卡片
+/// （更不用说"没有截止时间"这一档）都会在子进程那一侧先挂断，宿主的答复于是
+/// 落在一条没人等的通道上（真实撞上过：`收到没有等待者的响应 id=17`）。
+/// 判据在 `check:sandbox` 里，两处一起改才不会重新撕开这个口子。
+fn popover_deadline(args: &Value) -> Option<std::time::Duration> {
+    let requested = arg(args, "timeoutMs").and_then(|value| value.as_u64())?;
+
+    Some(std::time::Duration::from_millis(
+        requested.clamp(POPOVER_TIMEOUT_MIN_MS, POPOVER_TIMEOUT_MAX_MS),
+    ))
+}
+
+/// 校验并整理卡片上的按钮。
+///
+/// ============================================================
+/// 文本截断，标识拒绝 —— 这条分界不是随手划的
+/// ============================================================
+///
+/// 文案是**给人看的**：截断它，用户仍然看得见一个（短一点的）按钮，插件那边
+/// 什么都不用改。标识是**给代码用的**：它会被原样回给插件，插件据此 `switch`。
+/// 截断一个标识意味着插件永远等不到它以为会来的那个取值，而"悄悄丢掉一个
+/// 按钮"的表现是用户找不到那个动作 —— 两种失败都比"这次调用直接报错"晚得多。
+///
+/// 重复的 id 同样拒绝：两个按钮回同一个取值，插件无法分辨用户点了哪一个。
+fn popover_actions(
+    args: &Value,
+) -> Result<Vec<crate::modules::desktop::overlay::PopoverAction>, String> {
+    use crate::modules::desktop::overlay::PopoverAction;
+
+    let Some(raw) = arg(args, "actions") else {
+        return Ok(Vec::new());
+    };
+
+    let Some(items) = raw.as_array() else {
+        return Err("actions 必须是数组".to_string());
+    };
+
+    if items.len() > MAX_POPOVER_ACTIONS {
+        return Err(format!(
+            "结果卡片最多 {MAX_POPOVER_ACTIONS} 个动作（给了 {} 个）—— \
+             它贴的是光标，再多就把用户要点的东西挤到看不见的地方了",
+            items.len()
+        ));
+    }
+
+    let mut out: Vec<PopoverAction> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(id) = item.get("id").and_then(|value| value.as_str()) else {
+            return Err("actions 里每一项都必须有 id".to_string());
+        };
+        if let Err(reason) = check_popover_action_id(id) {
+            return Err(reason);
+        }
+        if out.iter().any(|action| action.id == id) {
+            return Err(format!(
+                "actions 里的 id `{id}` 重复了 —— 两个按钮回同一个取值，\
+                 插件分不出用户点的是哪一个"
+            ));
+        }
+
+        let Some(label) = item.get("label").and_then(|value| value.as_str()) else {
+            return Err(format!("动作 `{id}` 缺少 label"));
+        };
+
+        out.push(PopoverAction {
+            id: id.to_string(),
+            label: truncate(label.trim(), MAX_POPOVER_ACTION_LABEL_CHARS),
+        });
+    }
+
+    Ok(out)
+}
+
+/// 一个动作 id 的形状判据。
+///
+/// 字符集刻意窄（`[a-z0-9-]`）：这个值会回到插件里参与字符串比较与 `switch`，
+/// 允许任意字符只会让"两个看起来一样的 id"（大小写、不可见字符、全角连字符）
+/// 变成一类无法自查的问题。`[a-z0-9-]` 是能一眼比对的那一档。
+fn check_popover_action_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("动作的 id 不能为空".to_string());
+    }
+    if id.chars().count() > MAX_POPOVER_ACTION_ID_CHARS {
+        return Err(format!(
+            "动作 id `{id}` 太长：最多 {MAX_POPOVER_ACTION_ID_CHARS} 个字符"
+        ));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "动作 id `{id}` 不合法：只允许小写字母、数字与连字符（[a-z0-9-]）"
+        ));
+    }
+    Ok(())
+}
 
 /// 徽标的语气。白名单而不是原样透出：它会被前端拼进 `className`。
 fn badge_tone(args: &Value) -> &'static str {
@@ -2060,5 +2661,311 @@ mod tests {
         assert!(MAX_BADGE_CHARS >= 8, "徽标至少要放得下「12 条新消息」");
         assert!(MAX_SPLASH_CHARS > MAX_BADGE_CHARS, "占位是一整行说明，比徽标宽");
         assert_eq!(truncate("正在建立索引…", MAX_SPLASH_CHARS), "正在建立索引…");
+    }
+
+    // ============================================================
+    // 结果卡片（`ctx.ui.popover`）
+    // ============================================================
+
+    /// 正文的上限必须**装得下一整段翻译**，而标题栏放不下它。
+    #[test]
+    fn the_popover_body_limit_holds_a_whole_paragraph() {
+        // 一段三百多字的中文译文（卡片最主要的用法）必须原样通过
+        let paragraph = "这是一段用来校验长度上限的中文译文。".repeat(20);
+        assert!(paragraph.chars().count() > 300);
+        assert!(
+            paragraph.chars().count() < MAX_POPOVER_BODY_CHARS,
+            "这条测试的前提是它没超过上限，否则测的是截断而不是「不截断」"
+        );
+        assert_eq!(
+            truncate(&paragraph, MAX_POPOVER_BODY_CHARS),
+            paragraph,
+            "一整段正文不该被截断"
+        );
+
+        assert!(MAX_POPOVER_TITLE_CHARS < MAX_POPOVER_BODY_CHARS);
+        assert!(MAX_POPOVER_ACTION_LABEL_CHARS < MAX_POPOVER_TITLE_CHARS);
+    }
+
+    /// 卡片的语气是白名单，而且**没有** `question`。
+    ///
+    /// 卡片不提问 —— 要提问请用 `ui.dialog`。把一个 `question` 语气透出去会让
+    /// 卡片长成一个"请确认"的样子，那正是文件头警告的冒充。
+    #[test]
+    fn popover_tones_are_whitelisted_without_question() {
+        for (input, expected) in [
+            ("info", "info"),
+            ("success", "success"),
+            ("warning", "warning"),
+            ("error", "error"),
+            ("question", "info"),
+            ("危险", "info"),
+            ("", "info"),
+        ] {
+            let args = serde_json::json!({ "tone": input });
+            assert_eq!(popover_tone(&args), expected, "popover_tone({input:?})");
+        }
+        assert_eq!(popover_tone(&serde_json::json!({})), "info");
+    }
+
+    /// 位置同样白名单：不认识的取值落到光标处，而不是让整次调用失败。
+    #[test]
+    fn popover_anchor_is_whitelisted() {
+        use crate::modules::desktop::overlay::PopoverAnchor;
+
+        assert_eq!(
+            popover_anchor(&serde_json::json!({ "at": "center" })),
+            PopoverAnchor::Center
+        );
+        assert_eq!(
+            popover_anchor(&serde_json::json!({ "at": "cursor" })),
+            PopoverAnchor::Cursor
+        );
+        assert_eq!(popover_anchor(&serde_json::json!({})), PopoverAnchor::Cursor);
+        assert_eq!(
+            popover_anchor(&serde_json::json!({ "at": "正中" })),
+            PopoverAnchor::Cursor,
+            "不认识的取值应当落到缺省值，而不是原样透出"
+        );
+    }
+
+    /// 显式给出的时长会被钳制；**不给出就是"没有截止时间"**。
+    ///
+    /// 这里钉的是两件事。第一件：给出了的时候不能被原样采信 —— 0 秒的卡片用户
+    /// 来不及看清，而 600000 毫秒的卡片与"没有截止时间"在用户看来没有区别，
+    /// 只是多了一条会在中途把它抽走、还让插件拿到 `{action: null}` 的规则。
+    ///
+    /// 第二件更关键：`{}`、`{"timeoutMs": null}`、`{"timeoutMs": "3000"}` 三种
+    /// 形态都必须落到 `None`。它们曾经落到一个 6 秒的缺省值上 —— 那意味着
+    /// **一次不带参数的调用会在 6 秒后自己消失**，而"卡片不该自己跑掉"是维护者
+    /// 明确要的行为。把 `None` 与"给了但值不合法"混起来正是这条断言要防的。
+    #[test]
+    fn popover_deadlines_are_clamped_and_absent_means_no_deadline() {
+        let ms = |args: serde_json::Value| popover_deadline(&args).map(|d| d.as_millis() as u64);
+
+        assert_eq!(ms(serde_json::json!({})), None);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": null })), None);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": "3000" })), None);
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": -1 })), None);
+
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 3000 })), Some(3000));
+        assert_eq!(
+            ms(serde_json::json!({ "timeoutMs": 0 })),
+            Some(POPOVER_TIMEOUT_MIN_MS)
+        );
+        assert_eq!(
+            ms(serde_json::json!({ "timeoutMs": 999 })),
+            Some(POPOVER_TIMEOUT_MIN_MS)
+        );
+        assert_eq!(
+            ms(serde_json::json!({ "timeoutMs": 600000 })),
+            Some(POPOVER_TIMEOUT_MAX_MS)
+        );
+        // 真实撞上过的那一个取值：翻译插件写的是 20000 —— 在 6 秒上限的年代
+        // 它会被压到 6 秒，而**现在它是一个合法的愿望**（传输那一侧不再有计时器）。
+        assert_eq!(ms(serde_json::json!({ "timeoutMs": 20000 })), Some(20_000));
+    }
+
+    /// **没有截止时间的卡片必须豁免后台那一条传输预算。**
+    ///
+    /// ============================================================
+    /// 它守的是一条跨进程、跨语言、跨仓库的约束
+    /// ============================================================
+    ///
+    /// 后台宿主那一侧有它自己的调用上限（`resources/background-host.mjs` 的
+    /// `HOST_CALL_TIMEOUT_MS`），而它是**独立计时**的：到点它就丢掉这次等待并报
+    /// "调用宿主超时"。卡片缺省没有任何截止时间，因此只要那一条上限还套在
+    /// `ctx.ui.popover` 上，**每一次**不带 `timeoutMs` 的调用都会在 10 秒时被
+    /// 挂断 —— 用户看到的是一张还留在屏幕上的卡片，插件收到的却是"调用宿主超时"，
+    /// 而那一句 `收到没有等待者的响应 id=17` 就是这么来的。
+    ///
+    /// 两个数字分别在 `.mjs` 与 `.rs` 里，编译器与 TypeScript 都连不起来，因此
+    /// 这条断言把 `.mjs` 当数据读进来，钉住**豁免本身**：
+    ///   1. `HOST_CALL_TIMEOUT_MS` 与 Rust 的 `REQUEST_TIMEOUT_MS` 同值；
+    ///   2. 卡片的调用**显式**要求"等到用户回答"，也就是不给它挂计时器。
+    ///
+    /// 只钉第 (1) 条是不够的：把豁免删掉之后两个常量仍然同值，而那个 bug 会
+    /// 静默地回来 —— 它上一次就是这么进来的。
+    #[test]
+    fn the_card_is_exempt_from_the_background_transport_budget() {
+        let host = include_str!("../../../resources/background-host.mjs");
+        let rust = include_str!("../desktop/background/protocol.rs");
+
+        // 提取 `const <名字> = <数字>;` 的取值。写成一个会在没提到时 panic 的
+        // 辅助函数，而不是 `unwrap_or(0)` —— 后者会让"常量被改名"这种情况
+        // 变成一条永远成立的断言。
+        fn ms(source: &str, name: &str) -> u64 {
+            let at = source
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} 不在这份文件里了：{source:.0}"));
+            source[at..]
+                .split_once('=')
+                .and_then(|(_, rest)| {
+                    let digits: String = rest
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '_')
+                        .collect();
+                    digits.replace('_', "").parse::<u64>().ok()
+                })
+                .unwrap_or_else(|| panic!("{name} 后面不是一个数字：{}", &source[at..]))
+        }
+
+        assert_eq!(
+            ms(rust, "REQUEST_TIMEOUT_MS"),
+            ms(host, "HOST_CALL_TIMEOUT_MS"),
+            "两侧的调用上限必须同值（它们描述的是同一条管道上的同一件事）"
+        );
+
+        // 豁免的实现：`callHost` 接受一个"一直等到用户回答"的开关，而
+        // `ctx.ui.popover` 是唯一使用它的那一条。
+        assert!(
+            host.contains("untilUserAnswers"),
+            "后台宿主那一侧没有『等到用户回答』这条豁免了 —— \
+             不带 timeoutMs 的卡片会在 {budget} 毫秒处被挂断",
+            budget = ms(host, "HOST_CALL_TIMEOUT_MS"),
+        );
+
+        // 位置判据（不用正则：这条链上要跨几十行，而"哪一行是哪一个调用"
+        // 用两次数位置就够了）。`ctx.ui.popover` 那一行**之后**到下一个 `}` 之前
+        // 必须出现那个开关 —— 只看 `contains` 的话，"豁免加在别的调用上"
+        // 这条断言照样会绿。
+        let at = host
+            .find("callHost('ctx.ui.popover'")
+            .expect("`ctx.ui.popover` 必须仍然经过 `callHost`（它是唯一一条等到用户回答的调用）");
+        let call = &host[at..(at + 200).min(host.len())];
+        assert!(
+            call.contains("untilUserAnswers: true"),
+            "`ctx.ui.popover` 没有走那条豁免 —— 不带 timeoutMs 的卡片会被传输层先挂断：{call}"
+        );
+
+        // 反向：豁免只该有这一处。多一处意味着某条会自己结束的调用也永远不超时，
+        // 那正是"一条永远不 resolve 的 Promise"那一类难查的问题。
+        let uses = host.matches("untilUserAnswers: true").count();
+        assert_eq!(
+            uses, 1,
+            "`untilUserAnswers: true` 只该出现在 `ctx.ui.popover` 这一处（实际 {uses} 处）"
+        );
+    }
+
+    /// 动作的 id 是**契约**，因此形状不对就拒绝整次调用。
+    #[test]
+    fn popover_action_ids_are_rejected_when_they_are_not_a_contract() {
+        let actions = |value: serde_json::Value| {
+            popover_actions(&serde_json::json!({ "actions": value }))
+        };
+
+        // 合法：小写字母、数字、连字符
+        let ok = actions(serde_json::json!([
+            { "id": "copy", "label": "复制译文" },
+            { "id": "copy-all", "label": "复制全部" },
+            { "id": "dismiss2", "label": "知道了" }
+        ]))
+        .expect("这三个 id 都合法");
+        assert_eq!(ok.len(), 3);
+        assert_eq!(ok[0].id, "copy");
+
+        // 大写字母不行：那会让"两个看起来一样的 id"变成一类无法自查的问题
+        assert!(actions(serde_json::json!([{ "id": "Copy", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "copy it", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "复制", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "", "label": "复制" }])).is_err());
+        assert!(actions(serde_json::json!([{ "id": "a".repeat(33), "label": "复制" }])).is_err());
+        // 重复的 id 无法分辨用户点了哪一个
+        assert!(
+            actions(serde_json::json!([
+                { "id": "copy", "label": "一" },
+                { "id": "copy", "label": "二" }
+            ]))
+            .is_err()
+        );
+        // 缺 label 同样不行：一个没有文案的按钮是用户看不懂的东西
+        assert!(actions(serde_json::json!([{ "id": "copy" }])).is_err());
+        // 超过三个
+        assert!(
+            actions(serde_json::json!([
+                { "id": "a", "label": "一" },
+                { "id": "b", "label": "二" },
+                { "id": "c", "label": "三" },
+                { "id": "d", "label": "四" }
+            ]))
+            .is_err()
+        );
+        // 形状不对
+        assert!(actions(serde_json::json!("copy")).is_err());
+    }
+
+    /// 文案**截断**，而 id **拒绝** —— 这条分界是刻意的。
+    #[test]
+    fn popover_labels_are_truncated_but_ids_are_not() {
+        let long = "复制这一整段译文到剪贴板".repeat(3);
+        assert!(
+            long.chars().count() > MAX_POPOVER_ACTION_LABEL_CHARS,
+            "这条测试的前提是文案确实超长（重复三次得到 {} 个字符）",
+            long.chars().count()
+        );
+
+        let actions = popover_actions(&serde_json::json!({
+            "actions": [{ "id": "copy", "label": long }]
+        }))
+        .expect("文案过长只该被截断");
+
+        assert_eq!(actions[0].id, "copy", "id 一个字符都不许动");
+        assert_eq!(actions[0].label.chars().count(), MAX_POPOVER_ACTION_LABEL_CHARS);
+        assert!(actions[0].label.ends_with('…'));
+    }
+
+    /// 没有 `actions` 是一张**只有正文**的卡片，不是错误。
+    #[test]
+    fn a_popover_without_actions_is_fine() {
+        assert!(popover_actions(&serde_json::json!({})).unwrap().is_empty());
+        assert!(popover_actions(&serde_json::json!({ "actions": [] }))
+            .unwrap()
+            .is_empty());
+        assert!(popover_actions(&serde_json::json!({ "actions": null }))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// **结果卡片不要求界面上下文**：`surface: None` 必须被接受。
+    ///
+    /// ============================================================
+    /// 为什么它是一条会被人改坏的约定
+    /// ============================================================
+    ///
+    /// 同一个 `ctx` 的调用方有三个运行位置，而后台那一个传的**永远是**
+    /// `surface: None` —— 它没有界面。卡片恰恰是它唯一的出口（它没有标签栏、
+    /// 没有徽标、也没有可覆盖的一块位置），因此这一条在后台这个位置上不是
+    /// "也能用"，而是"主要用途就在这里"。
+    ///
+    /// 真要在这一段里加一句 `let Some(surface) = surface else { … }`，表现是
+    /// 后台插件的卡片**每一次都失败**，而界面插件那一侧完全正常 —— 也就是说，
+    /// 只跑一次界面插件的调试看不出它坏了。这里因此直接把"这一段里不许出现
+    /// `surface` 的判据"钉住（`check:sandbox` 里另有一条同义的断言守着
+    /// TypeScript 那一侧读不到的东西）。
+    #[test]
+    fn the_popover_path_never_asks_for_a_surface() {
+        let source = include_str!("rpc.rs");
+        let start = source
+            .find(r#""ui.popover" => {"#)
+            .expect("`ui.popover` 那一个分支必须还在（方法表被改名会让这条测试失效）");
+        let rest = &source[start..];
+        let end = rest
+            .find("ask_popover(app, plugin_id, request, deadline).await")
+            .expect("那个分支必须仍然以 `ask_popover` 收尾");
+
+        let arm = &rest[..end];
+        assert!(
+            !arm.contains("let Some(surface) = surface"),
+            "结果卡片不许要求在界面上下文里调用（后台插件传的永远是 surface: None）"
+        );
+        assert!(
+            !arm.contains("surface.ok_or"),
+            "结果卡片不许把 surface 当成必填"
+        );
+        assert!(
+            !arm.contains("FILES_NEEDS_A_SURFACE"),
+            "卡片不是文件授权那一条路径"
+        );
     }
 }

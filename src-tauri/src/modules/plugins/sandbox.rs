@@ -19,22 +19,57 @@
 // 三条边界，以及它们各自依赖什么
 // ============================================================
 //
-//   1. **子框架拿不到 IPC。** Tauri 注入的每一个内部初始化脚本
-//      （`__TAURI_INTERNALS__`、invoke 脚本、metadata、IPC 脚本）都经过
-//      `main_frame_script()` 包装，而它设的是 `for_main_frame_only: true` ——
-//      iframe 里没有这些全局。见 tauri-2.11.5/src/manager/webview.rs。
+//   1. ~~**子框架拿不到 IPC。**~~ **这一条在 Windows 上不成立**（下同）。
+//      Tauri 确实把每一个内部初始化脚本都包进 `main_frame_script()`
+//      （`tauri-2.11.5/src/manager/webview.rs:158`，`for_main_frame_only: true`），
+//      也确实把那个标志一路交给了 wry（`tauri-runtime-wry-2.11.4/src/lib.rs:5174`）
+//      —— 但 **wry 在 Windows 上忽略它**，而且把它写进了自己的文档：
+//
+//        "Windows: scripts are always added to subframes regardless of the
+//         `for_main_frame_only` option. This will be the case until Webview2
+//         implements a proper API to inject a script only on the main frame."
+//        （`wry-0.55.1/src/lib.rs`；实现见 `webview2/mod.rs` 的
+//         `AddScriptToExecuteOnDocumentCreated`，它对每一个 frame 生效）
+//
+//      因此 `__TAURI_INTERNALS__`、`isTauri` **以及那条带 invoke key 的 IPC 脚本**
+//      都会出现在插件 iframe 里，再加上 wry 自己注入的 `window.ipc`。这不是
+//      "开发链接插件特有"的：装好的插件与开发链接的插件走的是同一份入口文档。
+//      维护者日志里那些「沙箱边界失效」ERROR 就是它，**它们不是误报**。
+//
+//      真正能用的那一半现在是**桥接层**承担：它是宿主的一部分、先于插件代码加载，
+//      因此它把最后那一跳（`window.chrome.webview.postMessage`，两条传输的汇合点）
+//      换成**静默的空操作**。`__TAURI_INTERNALS__` / `window.ipc` 本身不可重定义、
+//      删不掉（`tauri-2.11.5/src/manager/webview.rs:166-194` 与 `scripts/ipc.js`、
+//      `scripts/core.js` 里那几处 `Object.defineProperty` 用的是默认属性，即
+//      `writable: false, configurable: false`），但它们的实现体是**调用时**
+//      才去取那一跳的，因此换掉它就够了。判据与理由见
+//      `resources/sandbox-bridge.js` 的 `neutralizeHostIpc` / `hostIpcIsReachable`。
+//
+//      ⚠️ **那个桩必须是静默的，不能抛错。** 它一度写成抛 `Error`，于是 Tauri 的
+//      `invoke` 返回的 Promise 被拒绝 —— 而调用方不保证 catch（`invoke` 对任何走到
+//      它的人开放，包括 Tauri 自己注入的脚本与它接管的 `window.confirm`），
+//      结果是每个插件界面的控制台上多出一条没人能处理的拒绝，矛头还指向插件代码。
+//      要的性质是"这个文档到不了宿主"，而它由"那一跳不存在"本身满足。
 //   2. **手工拼一条 IPC 也不行。** IPC 处理器第一件事是比对 `invoke_key`
 //      （每次运行随机、只注入主框架），不匹配就**静默丢弃**。
 //      见 tauri-2.11.5/src/webview/mod.rs 的 `on_message`。
+//      ⚠️ 第 1 条塌掉之后，这一条**也不再承重**：那个脚本连同 key 一起落进了
+//      插件 iframe（`invoke_key` 由 `app.rs:1687` 内联进脚本文本）。因此真正
+//      承重的是上面那个桩，以及下一条。
 //   3. **同源策略。** 插件来源是 `http://modulith-plugin.localhost`，与宿主
 //      不同源，因此插件文档够不到 `parent` —— 也就枚举不出兄弟界面。
 //
-// ⚠️ **第 2 条是承重的，而且它会静默失效。** `webview/mod.rs::is_local_url` 把
-// 自定义协议的 `.localhost` 也算 `Local`，于是主窗口的 capability 在**形式上**
-// 适用于插件来源；真正拦住它的只有 `invoke_key` 那一次比对。Tauri 哪天不再要求
-// 它，沙箱会**无声地**变成假的 —— 没有报错、没有症状。因此桥接层里有一条守卫会
-// 主动检查 `__TAURI_INTERNALS__` / `invoke` / `window.ipc` 在不在，在就大声报出来
-// —— 见 `resources/sandbox-bridge.js` 的 `assertNoHostIpc`。
+// ⚠️ **`invoke_key` 那一次比对并不承重，而这一点曾经被写反。**
+// `webview/mod.rs::is_local_url` 把自定义协议的 `.localhost` 也算 `Local`
+// （`tauri-2.11.5/src/webview/mod.rs:1724` 起的那一支），于是主窗口的 capability
+// 在**形式上**适用于插件来源；而 key 本身与脚本一起落进了 iframe（见第 1 条）。
+// 因此现在唯一拦住"插件直接 invoke 宿主命令"的是**桥接层那个桩**：
+// `resources/sandbox-bridge.js` 的 `neutralizeHostIpc` 换掉最后那一跳，
+// `hostIpcIsReachable` 在它没能换掉时大声报出来。
+//
+// 一盏只检查名字在不在的灯是没有用的：那个判据在 Windows 上恒为真
+// （它就是这样在维护者日志里刷了一整屏 ERROR，而真正的问题另有其物）。
+// 判据必须是"这个文档还够不够得着宿主"，而那正是现在这一条。
 //
 // 顺带一提，**引擎那一侧是支持 iframe 的**：wry 注册自定义协议时会优先用
 // `AddWebResourceRequestedFilterWithRequestSourceKinds(..., SOURCE_KINDS_ALL)`，
@@ -965,6 +1000,22 @@ fn bridge_script<R: Runtime>(
             "__PLUGIN_CLIPBOARD_MONITOR__",
             if super::clipboard::is_supported() { "true" } else { "false" },
         )
+        // 全局热键与读取选中文本的平台能力。与上面两条**同一个理由**：两者的
+        // `isAvailable()` 都是同步方法（插件在 bundle 顶层用它决定要不要注册热键、
+        // 要不要在界面上画一个"翻译选中文本"的按钮），而"这个平台支不支持"只有宿主
+        // 知道 —— 让插件先 await 一次 RPC 就等于要求它把特性探测挪到异步路径里。
+        //
+        // 它们同样**只是"这个平台有没有那套 Win32 接口"，不是权限**：权限由
+        // `has('global-hotkey')` / `has('read-selection')` 在桥接层判、并最终由
+        // RPC 侧的 `require_permission` 强制。
+        .replace(
+            "__PLUGIN_HOTKEY__",
+            if super::hotkey::HotkeyRegistry::is_supported() { "true" } else { "false" },
+        )
+        .replace(
+            "__PLUGIN_SELECTION__",
+            if super::selection::is_supported() { "true" } else { "false" },
+        )
         .replace("__PLUGIN_SURFACES__", &serde_json::Value::from(declared).to_string())
         .replace("'__PLUGIN_ACTIVATION__'", &js_string("open"))
         // 主题快照注入成**字面量**而不是让桥接层先 RPC 一次：插件在顶层同步
@@ -1009,6 +1060,8 @@ fn bridge_script<R: Runtime>(
             && !source.contains("__PLUGIN_SURFACE__")
             && !source.contains("__PLUGIN_PERMISSIONS__")
             && !source.contains("__PLUGIN_DATA_AVAILABLE__")
+            && !source.contains("__PLUGIN_HOTKEY__")
+            && !source.contains("__PLUGIN_SELECTION__")
             && !source.contains("__PLUGIN_SURFACES__")
             && !source.contains("__PLUGIN_RUNTIME__")
             && !source.contains("__PLUGIN_ACTIVATION__")
@@ -1762,6 +1815,9 @@ pub fn close_surface<R: Runtime>(app: &AppHandle<R>, token: &str) {
     if let Some(key) = surfaces.key_of(token) {
         revoke_grants_of_surface(app, &key.plugin_id, &key.surface);
         revoke_clipboard_subscription_of_surface(app, &key.plugin_id, &key.surface);
+        // 热键的**订阅**同样是界面的资源（一块关掉的界面没人再收触发），但热键的
+        // **注册**不是 —— 两者必须分开，见 `close_all_surfaces` 里的说明。
+        revoke_hotkey_subscription_of_surface(app, &key.plugin_id, &key.surface);
     }
 
     surfaces.forget(token);
@@ -1786,8 +1842,35 @@ fn revoke_clipboard_subscription_of_surface<R: Runtime>(
     monitor.unsubscribe(plugin_id, Some(surface));
 }
 
-/// 收回一块界面的全部文件授权。
+/// 撤掉一块界面持有的**热键订阅**。
 ///
+/// ============================================================
+/// 这里撤的是订阅，**不是热键注册**
+/// ============================================================
+///
+/// 这两个东西看起来像一件事，实际上作用面完全不同，而把它们合成一步会造成一个
+/// 很难发现的缺陷：
+///
+///   * **订阅**是界面级的：它说"一块界面想收到触发"。界面关掉之后就没人收了，
+///     留着它只会让宿主往一个不存在的令牌上推。
+///   * **注册**是插件级的：`RegisterHotKey` 绑定的是"这个插件占着这个组合键"。
+///     后台插件根本没有界面，它却正是最需要全局热键的那一种 —— 按界面撤注册会让
+///     一个后台插件在用户切换标签（界面重挂载）时**无声地失去热键**，而它的代码
+///     一行都没跑过。
+///
+/// 因此注册只在**插件被停用 / 卸载 / 应用退出**时撤销，见 `close_all_surfaces`。
+fn revoke_hotkey_subscription_of_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    plugin_id: &str,
+    surface: &str,
+) {
+    let Some(registry) = app.try_state::<super::hotkey::HotkeyRegistry>() else {
+        return;
+    };
+    registry.unsubscribe(plugin_id, Some(surface), false);
+}
+
+/// 收回一块界面的全部文件授权。
 /// 只记一条 debug 日志：界面关闭是**每次切换标签/重挂载**都会发生的事，把它写成
 /// warn 会让真正需要被看见的那几条淹掉。
 fn revoke_grants_of_surface<R: Runtime>(app: &AppHandle<R>, plugin_id: &str, surface: &str) {
@@ -1823,6 +1906,34 @@ pub fn close_all_surfaces<R: Runtime>(app: &AppHandle<R>, plugin_id: &str) {
     // 被撤销的订阅，以及一个永远不退出的轮询线程。
     if let Some(monitor) = app.try_state::<super::clipboard::ClipboardMonitor>() {
         monitor.forget_plugin(plugin_id);
+    }
+
+    // 全局热键在**这里**一次全解绑 —— 而且它是本模块最要紧的一条收尾。
+    //
+    // `RegisterHotKey` 是系统级独占的：一个被停用/卸载的插件若还占着一个组合键，
+    // 用户按那个键时**这台机器上任何程序**都不会有反应，而他能做的唯一一件事是
+    // 关掉本应用。它必须发生在这里（而不是只靠插件的 `unregister`），因为停用
+    // 插件时它的代码**一行都不会执行**。
+    //
+    // 与剪贴板订阅同一取舍：按**插件**收，不是按界面收。
+    if let Some(registry) = app.try_state::<super::hotkey::HotkeyRegistry>() {
+        registry.forget_plugin(plugin_id);
+    }
+
+    // 结果卡片也要跟着插件一起消失，而且**必须在这里**。
+    //
+    // 卡片缺省**没有截止时间**：它的四条收场路径是"用户关掉它 / 插件被停用或
+    // 卸载 / 第二条卡片顶掉它 / 应用退出"，而这一条是其中唯一**不经过用户**的。
+    // 少了它，一个被停用或卸载的插件会把它那张卡片永远留在屏幕上（用户没点过它，
+    // 它也不再自己消失），唯一的补救是重启应用 —— 与上面那些界面完全同一种失败。
+    //
+    // **按插件收，不是 `cancel_all()`**：那会把另一个插件正在等的对话框一起撤掉，
+    // 而那一侧读到的理由是"浮层窗口在回答之前关闭了"——一句不成立的话。
+    if let Some(overlay) = app.try_state::<crate::modules::desktop::overlay::Overlay>() {
+        let dismissed = overlay.forget_plugin(app, plugin_id);
+        if dismissed > 0 {
+            log::debug!("[sandbox] 插件 {plugin_id} 停用/卸载，撤销 {dismissed} 次浮层等待");
+        }
     }
 
     let Some(surfaces) = app.try_state::<SandboxSurfaces>() else {

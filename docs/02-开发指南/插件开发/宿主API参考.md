@@ -28,7 +28,9 @@
 
 **上表是 in-process `window.Modulith` 的完整集合**（真源是 `src/services/pluginRuntime.ts` 的 `ModulithHost` 与 `installHostGlobals()`，成员名单由 `src/services/pluginBoundary.ts` 的 `HOST_MEMBERS` 登记）。
 
-⚠️ **`Modulith.ui` / `Modulith.plugin` / `Modulith.surfaces` 不在这张表里，它们是 `runtime: "sandboxed"` 的桥接层独有的成员。** `Modulith.ui`（`openSurface` / `closeSurface` / `listSurfaces`）、`Modulith.plugin`（`id` / `name` / `version` / `runtime` / `permissions` / `surface`）与 `Modulith.surfaces` 只由 `src-tauri/resources/sandbox-bridge.js` 注入；in-process 插件在 `window.Modulith` 上拿到它们只会是 `undefined`。`Modulith.capabilities` 的 `host` 名单里也没有它们。
+⚠️ **`Modulith.ui` / `Modulith.plugin` / `Modulith.surfaces` 不在这张表里，它们是 `runtime: "sandboxed"` 的桥接层独有的成员。** `Modulith.ui`（`openSurface` / `closeSurface` / `listSurfaces` / `dialog` / `contextMenu` / `badge` / `progress` / `splash`）、`Modulith.plugin`（`id` / `name` / `version` / `runtime` / `permissions` / `surface`）与 `Modulith.surfaces` 只由 `src-tauri/resources/sandbox-bridge.js` 注入；in-process 插件在 `window.Modulith` 上拿到它们只会是 `undefined`。`Modulith.capabilities` 的 `host` 名单里也没有它们。
+
+> **`ctx.ui` 是另一回事，别把两者混起来。** 上表说的是宿主表面（`window.Modulith`），而 `ctx.ui.popover` 是**上下文**（`ctx`）上的成员 —— 它在 in-process 的 `ctx` 上**有**（见第 14 节），沙箱侧那个 `ctx` 恰好是 `Modulith` 本身，因此看起来是同一个对象。`ui` 上两侧的**方法集合不同**：in-process 只有 `popover`，其余 8 个是沙箱独有。这处差异由 `pnpm check:sandbox` 的 `EXPECTED_SANDBOX_ONLY_UI_METHODS` 逐条钉住。
 
 `Modulith.capabilities` 的 `api` 字段是**接口表自身的版本**，当前为 `1`。它描述的是"宿主认识哪些成员"，
 不是"你这个插件用第几版接口" —— 插件不需要在清单里声明 api 版本，用哪个入口由插件自己决定。
@@ -157,10 +159,14 @@ var ctx = Modulith.createContext();
 | `fileDrop` | object | 接收拖入的文件路径（需 `filesystem-read` 权限） |
 | `audio` | object | 导入音频文件（需 `filesystem-read` 权限） |
 | `clipboard` | object | 读写系统剪贴板（需 `clipboard` 权限，**纯前端强制**）；并可观察它的变化（需 `clipboard-monitor` 权限，**Rust 强制**） |
+| `hotkey` | object | 注册系统级全局热键，在用户于**任何程序**里按键时被唤醒（需 `global-hotkey` 权限，**Rust 强制**），见第 11.3 节 |
+| `selection` | object | 读取**前台应用程序**里当前选中的文本（需 `read-selection` 权限，**Rust 强制**），见第 11.4 节 |
 | `settings` | object | 读取本插件声明的设置项的当前值（需 `storage` 权限） |
 | `disposables` | object | 收尾登记：`add(dispose)` / `size()`，与 `Modulith.onDeactivate()` 同义 |
+| `secrets` | object | 加密的密钥存储（需 `secrets` 权限），见第 13 节 |
+| `ui` | object | 宿主渲染的**结果卡片**：只有 `popover` 一个方法（需 `notification` 权限），见第 14 节 |
 
-**这是 in-process `ctx` 的完整集合**（真源是 `src/services/pluginBoundary.ts` 的 `CONTEXT_MEMBERS`，当前 20 项）。`ctx.files` **不在其中** —— 它只在沙箱侧存在，见第 12 节。
+**这是 in-process `ctx` 的完整集合**（真源是 `src/services/pluginBoundary.ts` 的 `CONTEXT_MEMBERS`，当前 24 项）。`ctx.files` **不在其中** —— 它只在沙箱侧存在，见第 12 节。`ctx.ui` 在，但**只有 `popover` 一个方法**：它的同族（对话框、右键菜单、多界面、状态指示）是沙箱独有的，见第 14.5 节的对照表与第 6.2 节。
 
 **调用时机是严格受限的**：只能在插件 bundle 执行期间调用，例如 IIFE 顶层。在插件代码之外调用会抛出异常，因为服务需要绑定正在加载的插件 ID。
 
@@ -714,6 +720,26 @@ try {
 在按钮点击里有效，在定时器或后台回调里无效。失败时会抛出说明原因的错误，
 而不是无声失败 —— 无声失败会让作者以为是自己传的值不对。
 
+### 平台与运行位置
+
+`ctx.clipboard` 在三个运行位置上**不是同一个成员集合**：
+
+| 位置 | 有 | 没有 |
+| --- | --- | --- |
+| in-process / 沙箱界面 | `isAvailable` `readText` `writeText` `canMonitor` `subscribe` `readFormats` `readImage` | — |
+| **后台插件**（`contributes.background`） | `isAvailable` `writeText` | 读、`canMonitor`、`subscribe`、`readFormats`、`readImage` |
+
+后台那一侧少了读与观察，两条理由都很硬：观察依赖一条**宿主 → 订阅者界面**的推送
+通道，而后台插件没有界面承载它；读在界面位置上是 `navigator.clipboard`，而那个进程里
+没有 `document`。
+
+**但 `writeText` 在后台位置上是有的，而且走的是宿主。** 沙箱那条实现是浏览器 API
+（前端强制）；后台这条走 `rpc.rs` 的 `clipboard.write`，在 **Rust 侧判 `clipboard`
+权限**（比前端强制更强一档）。方法名与形状两边**逐字相同**，差别只在机制 ——
+因此"结果卡片上的一个按钮把译文放进剪贴板"这件事在后台上是成立的。这也顺带说明了
+11.1 开头那句话的准确范围：弱的只是**sandbox/in-process 那一条实现**的强制力，
+后台这一条是真强制。
+
 ## 11.2 clipboard 的变化观察 —— 需要 `clipboard-monitor`
 
 做剪贴板历史、或者「我刚复制了什么」这类功能的地方。
@@ -806,6 +832,154 @@ const off = ctx.clipboard.subscribe((change) => {
 理由不是「缺一个 DOM 对象」，而是**方向不对**：变化由宿主观察，宿主把它推给订阅者所在的
 界面，而后台插件没有界面承载那条推送，也没有一条从宿主主动回到它的通道。需要剪贴板历史
 的插件必须是界面插件 —— 那也正是它能展示历史的前提。
+
+## 11.3 hotkey —— 需要 `global-hotkey`
+
+让插件在用户按下某个组合键时被唤醒，**而那个按键发生在别的程序里**。一个「选中即翻译」
+的插件要靠它才能成立：用户选中一段外文、按 `Ctrl+Q`，插件弹出译文。
+
+```json
+"permissions": ["global-hotkey", "read-selection"]
+```
+
+```js
+if (!ctx.hotkey.isAvailable()) return;     // 同步判断：权限 + 平台
+
+try {
+  await ctx.hotkey.register('mod+q');      // 返回宿主实际绑定的规范化组合键
+} catch (err) {
+  // 冲突时这里会说明**是谁占着它** —— 宿主快捷键、另一个插件、还是系统里的别的程序
+  return;
+}
+
+const off = ctx.hotkey.subscribe(({ combo }) => {
+  if (combo === 'mod+q') translateSelection();
+});
+// 停用时：off()，并且记得 await ctx.hotkey.unregister('mod+q')
+```
+
+### 方法
+
+| 方法 | 返回 | 说明 |
+| --- | --- | --- |
+| `isAvailable()` | `boolean` | 同步。声明了 `global-hotkey` **且**平台支持（只有 Windows） |
+| `register(combo)` | `Promise<string>` | 返回**规范化之后**的组合键。冲突时抛错 |
+| `unregister(combo)` | `Promise<void>` | 不做权限检查；解绑一条没注册过的组合键是静默成功 |
+| `list()` | `Promise<string[]>` | 本插件当前注册的组合键，最多 4 条 |
+| `subscribe(handler)` | `() => void` | 处理函数收到 `{ combo }`；返回取消订阅函数 |
+
+### 组合键语法
+
+与宿主自己的快捷键**同一套语法**（真源是 `src/services/shortcutRegistry.ts` 的
+`normalizeCombo`）：`mod`（Windows 上是 Ctrl，macOS 上是 Cmd）、`shift`、`alt`，
+主键恰好一个。规范化顺序恒定，因此 `Ctrl+Shift+Tab` 与 `shift+mod+tab` 是同一个组合。
+
+| 写法 | 规范化结果 |
+| --- | --- |
+| `Ctrl+K` / `cmd+k` / `meta+k` | `mod+k` |
+| `option+x` | `alt+x` |
+| `mod+shift+tab` | `mod+shift+tab` |
+
+**只有普通键、不带修饰符的组合会被拒绝**（例如 `a`、`1`、`space`）。理由是具体的：
+那会把这个键从**整台机器**上拿走 —— 用户在任何一个程序里都打不出它，而屏幕上没有
+任何东西告诉他为什么。`F1`..`F24` 是例外，单独占用它们是被允许的。
+
+### 四条必须知道的行为
+
+**一、一个组合键在系统里是独占的。** 这个插件占用它期间，其它程序收不到同一个组合。
+用户能拿回它的路径只有三条：插件自己解绑、插件被停用/卸载、应用退出。**后两条由宿主
+保证**，因此不要依赖「我记得调用 `unregister`」—— 热重载与界面重挂载都会重跑顶层代码。
+
+**二、每个插件最多 4 条。** 上限的理由是「用户能看懂」：一个插件占掉十几个组合键时，
+用户在系统里按什么都不灵，却没有任何一处能看到是谁拿走的。
+
+**三、按住不放只会触发一次。** 宿主注册时带上了 `MOD_NOREPEAT`，因此不需要自己做防抖。
+
+**四、冲突消息里会点名是谁占着它**，而那三种情况下你能做的事完全不同 —— 宿主快捷键
+（换个组合即可）、另一个插件（让用户停用它）、系统里的别的程序（与本应用无关）。**不要**
+把它改写成一句笼统的「注册失败」。
+
+### 平台与运行位置
+
+只有 Windows 有这套接口（`RegisterHotKey`）。其它平台上 `isAvailable()` 恒为 `false`，
+`subscribe()` 会降级成「空订阅 + 一次控制台告警」，而 `register()` 会抛出一句说明
+「这个平台不支持」的错误 —— 不会静默成功。
+
+**后台插件**（`contributes.background`）**有 `ctx.hotkey`，而且它才是主要的用法**：
+一个没有窗口的翻译插件要做到「选中即翻译」，它必须能在没有界面的情况下被唤醒。宿主用
+`plugin.dispatch` 的 `hotkey` 类型把触发派发进那个 Node 子进程 —— 这意味着**插件要在
+启动时就跑起来**（清单里声明 `onStartup`）才能可靠地收到触发：一个没在跑的后台插件
+不会因为有人按了热键而被拉起来。
+
+## 11.4 selection —— 需要 `read-selection`
+
+读取**前台应用程序**里当前选中的文本。配合第 11.3 节的热键，它构成「选中即翻译」的
+另一半。
+
+```js
+if (!ctx.selection.isAvailable()) return;
+
+try {
+  const text = await ctx.selection.read();
+  if (text === null) return;          // 捕获成功了，但剪贴板上没有文本
+  translate(text);
+} catch (err) {
+  // 这次捕获根本没成功 —— 错误会说清是哪一种（前台窗口是本应用 / 没有前台窗口 /
+  // 那个程序不响应 Ctrl+C / 上一次捕获还没结束）
+}
+```
+
+### ⚠️ 它会改你的剪贴板
+
+**读这个 API 之前先把这一段读完。**
+
+系统上"拿到别的程序里选中的文本"只有两条路：UI Automation（只在实现了 `TextPattern`
+的程序里有效 —— 浏览器、Electron 应用、终端大面积不实现），或者**合成一次 Ctrl+C 再读
+剪贴板**。v1 取第二条，代价是真实的：
+
+| 内容 | 能否还原 |
+| --- | --- |
+| 文本 | ✅ 会被还原（强制步骤，不是优化） |
+| 图片、富文本、文件列表 | ❌ **无法还原**。`Ctrl+C` 的那一刻它们就没了 |
+
+这是「要么接受，要么换 UI Automation」的取舍，不是实现缺陷。权限描述里对用户说的也是
+这一句话。
+
+### 三种结果必须分开处理
+
+| 情况 | 结果 |
+| --- | --- |
+| 读到了 | `string` |
+| 捕获成功了，但剪贴板上最终没有文本 | **`null`** |
+| 这次捕获根本没成功 | **抛错**（消息里说明是哪一种） |
+
+把后两者混成 `null` 是最糟的处理：你会写出「没有选中就提示用户先选一段」，而用户明明
+选中了 —— 那个分支永远走不到，也没有任何线索。
+
+捕获的时限是 **400 ms**（轮询剪贴板序列号，20 ms 一次）。超时意味着那个程序没有响应
+这次 `Ctrl+C`，错误里会说明这一点，而不是让你以为是权限问题。
+
+### 四条限制
+
+**一、前台窗口属于本应用时直接拒绝。** 合成按键会落进宿主自己的界面，而那次复制又会
+触发一次剪贴板变化 —— 这是一个能绕成回路的形状，因此从入口切断。
+
+**二、同一时刻只允许一次捕获。** 两次并发会交错，两次都拿到错的文本（而不报错）。
+第二次并发调用会**被拒绝**（不是排队），错误里说明原因。
+
+**三、合成的复制不会被剪贴板监测看到。** 宿主在捕获期间把 `ctx.clipboard` 的变化
+通道置为抑制态，否则每一次触发都会往用户的剪贴板历史里注入一条**用户从来没有复制过**
+的幻影记录。
+
+**四、前台程序以更高权限运行时会被系统拒绝**（UIPI 不允许低权限进程向它注入输入）。
+错误里会说明这一点。
+
+### 平台与运行位置
+
+只有 Windows 有这套接口（`SendInput`）。其它平台上 `isAvailable()` 恒为 `false`，
+`read()` 会抛出一句说明「这个平台不支持」的错误。
+
+三个运行位置都有 `ctx.selection` —— 后台插件同样是它的主要使用者（见第 11.3 节）。
 
 ## 12. files —— **沙箱独有**
 
@@ -1004,7 +1178,120 @@ await ctx.secrets.set('apiToken', 'sk-live-...');
 > "用户的笔记"是灾难。反过来，**也不要把令牌放进 `ctx.storage`**：那是明文，而且会
 > 随备份一起被复制到别的机器上。
 
-## 14. 完整示例
+### 平台与运行位置
+
+三个运行位置都有 `ctx.secrets`：in-process、沙箱界面插件、以及**后台插件**
+（`contributions.background`）。六方法形状逐条相同 —— 同一个插件换个运行位置不该
+改代码。
+
+**后台位置曾经是缺的**（1.6.x 补上），而它恰恰是最需要这个成员的地方：一个无界面的
+插件没有任何别的落盘方式能避开明文 —— `ctx.storage` 与 `ctx.dataDir` 都是它自己
+读得到的文件，只有 `ctx.secrets` 的密文落在插件数据目录**之外**。这也是为什么
+「本机硬件指纹派生的密文、换机器解不开」这条代价在后台插件上要提前想清楚：用户
+换机器之后 `get` 会抛错，插件必须把那条错误原样展示出来（见 13.3），而不是静默地
+当作"还没配置"。
+
+未声明 `secrets` 权限时三处的降级也一致：`isAvailable()` 返回 `false`，`keys()`
+返回空数组，其余四个方法**抛错**（错误里说明是权限没声明）。别把 `get` 的抛错
+当成"这个键不存在"。
+
+## 14. ui —— 宿主渲染的结果卡片（`ctx.ui.popover`）
+
+把一次结果**交给宿主去显示**：一张贴在光标旁边的小卡片，等用户把它关掉。用户点卡片上的按钮时返回那个按钮的 id。需要 `notification` 权限。
+
+```js
+var result = await ctx.ui.popover({
+  title: '翻译',
+  body: translated,            // 译文放这里 —— 它永远是**文本**，不是标记
+  tone: 'success',
+  actions: [{ id: 'copy', label: '复制译文' }],
+  // 不传 timeoutMs = **它一直待到用户把它关掉**
+});
+
+if (result.action === 'copy') {
+  await ctx.clipboard.writeText(translated);
+}
+// result.action === null 表示用户没回答：点了别处 / 按了 × / 按了 Escape
+// （传了 timeoutMs 时，到点自动收起也是 null）
+```
+
+它在三个运行位置上都有 —— 界面插件、后台插件、in-process 插件。这是 `ctx.ui` 里**唯一**一个三个位置都有的成员：对话框、右键菜单、多界面与状态指示都要"我在哪个界面里"或者一块属于插件的 webview，而后台插件两样都没有（那一族只在沙箱侧存在，见[插件系统架构](插件系统架构.md)第 6.2 节）。
+
+### 14.1 为什么由宿主渲染
+
+插件提供的是**内容**（一段文本、几个按钮文案），**外观全部由宿主决定**：没有 HTML、没有样式、没有图标，`body` 里的标记会被当成普通文字显示出来。
+
+这不是省事，而是这条能力能存在的前提。让插件自己画一个"长得很像宿主提示框"的东西，等于让它可以**冒充宿主界面** —— 一个假的"是否允许？"提示框足以骗到用户。由宿主渲染之后，插件能决定的只有「说什么」，不能决定「长什么样」。同一条理由也适用于宿主渲染的对话框与右键菜单（`src-tauri/src/modules/desktop/overlay.rs` 的文件头）。
+
+### 14.2 参数
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `title` | string，可省略 | 短标题。宿主按 120 个字符截断 |
+| `body` | string，**必填** | 正文。译文放这里。宿主按 **4000 个字符**截断 |
+| `tone` | `'info' \| 'success' \| 'warning' \| 'error'` | 缺省 `info`。宿主白名单化，认不出的取值落到 `info` |
+| `actions` | `Array<{ id, label }>` | **最多 3 个**。见下面的边界 |
+| `timeoutMs` | number，可省略 | **不传 = 没有截止时间**（一直待到用户把它关掉）。传了则宿主钳制到 **1000..60000** |
+| `at` | `'cursor' \| 'center'` | 缺省 `'cursor'`（贴在光标右下，贴边时拉回工作区内）；`'center'` 摆在光标所在显示器的正中 |
+
+### 14.3 返回值与 `action` 的语义
+
+```ts
+Promise<{ action: string | null }>
+```
+
+`action` 是用户点中的那个按钮的 `id`。以下情况都是 `null`：
+
+- 用户**点了别处**（卡片失焦）；
+- 用户按了卡片右上角的 **×**；
+- 用户按了 **Escape**；
+- 传了 `timeoutMs` 时，到点**自动收起**。
+
+它们都是**「用户没回答」，不是失败**。真正的失败会让 Promise 拒绝：没声明 `notification` 权限、浮层窗口起不来、`body` 为空、`actions` 不合法。因此 `try/catch` 仍然是有意义的。
+
+### 14.3.1 用户怎么把它关掉、搬走
+
+| 手段 | 说明 |
+| --- | --- |
+| 点别处 | 卡片出现时会**取得焦点**，因此**第一下**点击就关掉它 |
+| 右上角的 **×** | 常驻可见 |
+| **Escape** | 卡片有焦点时立刻生效 |
+| 拖动 | 按住顶部那条把手（语气标签左边的 `⠿`）把它搬到别处。位置**不记忆**，下一张卡片仍在光标旁 |
+
+> **卡片会取得焦点，这不是缺陷。** 此前它刻意不抢焦点，代价是"点别处关闭"完全不成立：那条路径在本平台上的唯一来源是窗口失焦（`WM_KILLFOCUS`），而一个从未拿到过焦点的窗口永远收不到它 —— 于是用户必须**先点一下卡片**、再点别处。一次焦点切换比一张关不掉的卡片便宜得多，因此现在由宿主在显示卡片时取焦点。反过来说，卡片显示期间你原来的窗口会失去前台，直到你点一下别处（那一下正好就是关掉它）。
+
+> **Escape 不是系统级快捷键。** 按键只发给有焦点的那个窗口，"任何时候按 Esc 都能收起"要求把那个键从系统里其它每一个应用手里抢过来（一个全局热键或一条键盘钩子）—— 为一张卡片付那个代价不成立。诚实的说法是：**× 与点别处是主要手段**，Esc 是给键盘用户的捷径。
+
+### 14.4 边界（宿主强制，写错了会拿到一条能照做的错误）
+
+- **`body` 必填**，为空直接拒绝这一次调用；
+- `title` / `body` / `label` 都**按字符截断**（不是按字节，中文不会被切成半个字）；
+- **`actions` 里的 `id` 是契约，因此形状不对就拒绝整次调用**：只允许 `[a-z0-9-]`、不超过 32 个字符、不能为空、不能重复。理由是它会被原样回给插件，插件据此判断用户点了哪一个 —— 悄悄改掉或丢掉一个按钮，表现是"少了一个按钮"而插件以为它还在，比报错晚得多被发现在；
+- `tone` 与 `at` 是**白名单**：认不出的取值落到缺省值，而不是原样透出（它们会被拼进样式与位置计算）；
+- **`timeoutMs` 是钳制**：它表达的是一个"想让它待多久"的愿望，钳制之后仍然朝着作者想要的方向（1..60 秒）。写着 0 或者 600000 说明没想清楚，但那不该让整张卡片不出现；
+- **不传 `timeoutMs` 就是"一直待到用户把它关掉"，那是缺省。** 一张装着**结果**的卡片是拿来读的，而"读完它要多久"只有用户知道 —— 它自己在几秒后跑掉，用户就只能再触发一次。上限定在 60 秒而不是更大，也不是产品口味：比 60 秒更长的"自动关闭"与"等用户关掉"在用户看来没有区别，只是多了一条会在中途把它抽走、还让你拿到 `{action: null}` 的规则。真想要那样，**不要传这个字段**；
+- **`timeoutMs` 与后台那条传输预算的关系变过，值得知道**：后台插件调一次宿主的缺省上限是 10 秒（`background-host.mjs` 的 `HOST_CALL_TIMEOUT_MS`），而 `ctx.ui.popover` 是**唯一**一条豁免它的调用 —— 否则缺省就没有意义了：不带 `timeoutMs` 的卡片会在 10 秒处被传输层单方面挂断，用户看到的是一张还留在屏幕上的卡片，而你拿到的是"调用宿主超时"。豁免的代价是这一条**没有**传输层兜底，因此宿主给了四条收场路径，它们都在宿主里，你不需要做任何事：用户关掉它、**插件被停用或卸载**、第二条卡片顶掉它、应用退出；
+- **同一时刻只有一张卡片**：第二张到来时，第一张当场以 `action: null` 结束。两张重叠的卡片盖在同一个位置，而"先收起哪一张"没有说法。
+
+### 14.5 它与其他浮层的分工
+
+| 你想要 | 用它 |
+| --- | --- |
+| 说一句结果，用户不用回答 | `ctx.ui.popover`（**默认不自动消失**；想要截止时间就传 `timeoutMs`） |
+| 问一个问题，必须拿到回答 | `ctx.ui.dialog`（阻塞到用户选择，**沙箱独有**） |
+| 在光标处给一组动作 | `ctx.ui.contextMenu`（**沙箱独有**） |
+| 持续显示状态（徽标 / 进度 / 启动占位） | `ctx.ui.badge` / `progress` / `splash`（**沙箱独有**） |
+
+```js
+// 一个不读返回值的用法：只是告诉用户"已经好了"。这一条**刻意**要一个截止时间
+// （它是回执，用户没有东西要读第二遍），因此传了 timeoutMs —— 与"结果卡片不传"
+// 的差别是有意的。
+ctx.ui.popover({ body: '已复制到剪贴板', tone: 'success', timeoutMs: 2500 });
+```
+
+> **不要把 `popover` 当成日志。** 它每次都会打断用户，而且同一时刻只允许一张 —— 一个循环里调用它，用户只会看到最后一张。要记东西用 `ctx.logger`，要留痕用 `ctx.notifications`。
+
+## 15. 完整示例
 
 一个最小可用的插件代码包：
 
@@ -1060,7 +1347,7 @@ await ctx.secrets.set('apiToken', 'sk-live-...');
 }
 ```
 
-## 15. 约束速查
+## 16. 约束速查
 
 | 约束 | 说明 |
 | --- | --- |
@@ -1073,13 +1360,16 @@ await ctx.secrets.set('apiToken', 'sk-live-...');
 | 必须至少贡献一样东西 | 注册了模块，或在清单里声明了 `contributes` 的 commands / settings / contextMenus 之一，或声明了 `activationEvents`；否则判定为加载失败（见 1.3） |
 | 网络需声明权限 | 外部地址需 `network` 与 `network-external` |
 | 通知需声明权限 | `notification`，否则接口是空实现 |
+| 宿主渲染的浮层需声明权限 | `notification` —— `ctx.ui.popover` 与沙箱侧的 `ctx.ui.dialog` / `ctx.ui.contextMenu` 都要求它（它们都会打断用户） |
 | 跨模块通信需声明权限 | `plugin-communicate` |
 | 后台工作要看 `useModuleActive()` | 标签页保活，切走不会卸载，定时器需自行暂停 |
 | 插件数据用 `storage` | 不要用 `localStorage` |
 | 凭据用 `secrets` | 令牌、API key 用它而**不是** `storage`（后者是明文、插件自己读得到、进备份）；代价是换机器后解不开 |
 | 用户文件只能经 `ctx.files` | 路径不由插件给出，授权随界面关闭失效；**沙箱独有** |
+| 全局热键需声明权限 | `global-hotkey`。**组合键在系统里是独占的**，每个插件最多 4 条，停用/卸载/退出时宿主全部解绑 |
+| 读取选中文本需声明权限 | `read-selection`。⚠️ 它会**短暂覆盖用户的剪贴板**（文本还原，图片/富文本/文件不还原） |
 
-## 16. 相关文档
+## 17. 相关文档
 
 - 加载流程与隔离边界：[插件系统架构](插件系统架构.md)
 - 清单字段：[清单文件参考](清单文件参考.md)

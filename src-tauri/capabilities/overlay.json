@@ -1,11 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "overlay",
-  "description": "宿主浮层窗口（对话框与右键菜单）的授权。它是**由宿主渲染**的浮层，跑在独立窗口里 —— 沙箱插件的界面是原生子 webview，层级高于宿主文档的任何元素，因此浮层必须是一个窗口而不是一段 DOM。刻意只给三条：这个窗口的全部职责是「显示内容 → 回答一次 → 收起自己」，而这三条正好是那三件事。它不知道是哪个插件在问，也不需要知道。",
+  "description": "宿主浮层窗口（对话框、右键菜单与结果卡片）的授权。它是**由宿主渲染**的浮层，跑在独立窗口里 —— 沙箱插件的界面是宿主文档里的一个跨源 iframe，浮层要盖在它上面所以必须是一个独立窗口。这里给三类权限，各有依据：(1) 那三条命令——这个窗口的全部职责是「显示内容 → 回答一次 → 收起自己」，而这三条正好是那三件事；(2) `core:event:default`——它必须能**听到**宿主广播的那条内容请求（`modulith://overlay-show`），而 `listen` 是一条走 ACL 的 IPC，清单一旦声明就默认拒绝。少了第 (2) 类时这个窗口永远收不到内容：卡片不出现、那一次 await 挂到超时——而日志里只有一句『调用宿主超时』，看不出根因在这里。(3) `core:window:allow-start-dragging`——卡片要能拖动（维护者的原话是「它不能移动」），而 `data-tauri-drag-region` 不是纯前端行为：tauri 注入的 `drag.js` 调的是 `plugin:window|start_dragging`。少了第 (3) 类时按在把手上**什么都不发生**，日志里一个字都没有——与第 (2) 类当初的失败形态逐字相同。**刻意不授权 `internal-toggle-maximize`**：卡片的标题栏不是一个窗口标题栏，双击它不该把这个窗口最大化；那一次 invoke 被 ACL 拒掉正是想要的结局。它不知道是哪个插件在问，也不需要知道。",
   "webviews": ["overlay"],
   "permissions": [
     "allow-overlay-respond",
     "allow-overlay-resize",
-    "allow-overlay-hide"
+    "allow-overlay-hide",
+    "core:event:default",
+    "core:window:allow-start-dragging"
   ]
 }

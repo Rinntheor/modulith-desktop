@@ -16,6 +16,7 @@ import { installPluginShortcutSync } from './services/pluginShortcutSync';
 import { installPluginSurfaceRequests } from './services/pluginSurfaces';
 import { installPluginUiState } from './services/pluginUiState';
 import { installPluginClipboardMonitor } from './services/pluginClipboardMonitor';
+import { installPluginHotkey } from './services/pluginHotkey';
 import { installPluginCommandDispatch, installPluginDownloadProgress } from './services/pluginRuntime';
 import { primeSound } from './services/sound';
 import "@styles/global/index.css";
@@ -175,6 +176,18 @@ installPluginUiState();
  * —— 宿主的轮询线程由第一个订阅者拉起，最后一个离开时退出。
  */
 installPluginClipboardMonitor();
+
+/*
+ * 接住宿主观察到的**全局热键触发**，交给 in-process 插件注册的处理函数。
+ *
+ * 观察点在 Rust 那一侧的那个消息窗口（`RegisterHotKey` + `WM_HOTKEY`）：浏览器里
+ * 没有任何 API 能让一个页面在**别的程序**聚焦时收到按键。沙箱插件与后台插件不走
+ * 这条路 —— 前者由宿主直接推进它的界面，后者由宿主派发进 Node 子进程。
+ *
+ * 装在最外层：插件可能在界面挂载之前就注册热键并订阅（`onStartup` 里做），而那时
+ * 丢掉的那一条会让用户按了键却毫无反应。**没有插件订阅时这条通道上一句话都不会有**。
+ */
+installPluginHotkey();
 
 /*
  * 接住宿主请求执行某条**插件命令**的广播。

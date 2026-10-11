@@ -281,6 +281,30 @@ pub enum PluginPermission {
     ///
     /// 边界、隐私守卫与全部上限见 `clipboard.rs` 文件头。
     ClipboardMonitor,
+    /// 注册**系统级**热键（`ctx.hotkey`）：让插件在用户按下某个组合键时被唤醒，
+    /// 而那个按键发生在**别的程序**里。
+    ///
+    /// 与 `notification` / `clipboard` 之流不是同一类：这一项占用的是一个**系统级
+    /// 的独占资源**。一个组合键在整台机器上只能有一个主人，因此声明它等于
+    /// "这个插件会从所有其它程序手里拿走一个按键"。风险是 Medium 而不是 High，
+    /// 理由是它**可逆且不留数据**（应用一关就还回去了），而它被显式覆盖的理由写在
+    /// `permissions.rs` 的 `risk_override` 里 —— 公式缺"被拿走的资源本来属于谁"这根轴。
+    GlobalHotkey,
+    /// 读取**前台应用程序里当前选中的文本**（`ctx.selection.read()`）。
+    ///
+    /// ============================================================
+    /// 为什么这一项的风险被显式覆盖成 High
+    /// ============================================================
+    ///
+    /// 它读的是用户在**任意程序**里的选中内容 —— 包括密码框（在密码框里按
+    /// `Ctrl+C` 得到的可能是空串，但宿主**确实**把它复制了）、正在编辑的合同、
+    /// 私聊窗口。而它的实现方式（合成 Ctrl+C 再读剪贴板）意味着它还会**短暂地
+    /// 覆盖用户的剪贴板**。
+    ///
+    /// 这两件事都必须写进描述里，理由与 `ClipboardMonitor` 那一段逐字相同：
+    /// 权限列表是用户唯一能看到的、关于"这个插件到底做了什么"的承诺来源，
+    /// 而写歪的方向（无论高估还是低估）都会让用户基于错误的前提做决定。
+    ReadSelection,
 }
 
 impl PluginPermission {
@@ -307,6 +331,8 @@ impl PluginPermission {
             Self::ProcessSpawn => "process-spawn",
             Self::Secrets => "secrets",
             Self::ClipboardMonitor => "clipboard-monitor",
+            Self::GlobalHotkey => "global-hotkey",
+            Self::ReadSelection => "read-selection",
         }
     }
 
@@ -314,7 +340,7 @@ impl PluginPermission {
     ///
     /// 新增枚举值时必须一并加入 —— 否则上面那个一致性测试覆盖不到新值，
     /// 而"测试通过"会给人已经覆盖了的错觉。
-    pub const ALL: [PluginPermission; 15] = [
+    pub const ALL: [PluginPermission; 17] = [
         Self::Storage,
         Self::PluginData,
         Self::Network,
@@ -330,6 +356,8 @@ impl PluginPermission {
         Self::ProcessSpawn,
         Self::Secrets,
         Self::ClipboardMonitor,
+        Self::GlobalHotkey,
+        Self::ReadSelection,
     ];
 }
 
