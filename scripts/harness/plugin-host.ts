@@ -11,7 +11,7 @@
 // 就只能靠读代码推断；有了它，`shim.executedScripts` 是一份**可断言的观测记录**。
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installDomShim, type DomShim } from './dom-shim.ts';
 
@@ -75,6 +75,14 @@ export interface PluginHost {
   fixtures: Map<string, FixturePlugin>;
   /** 桩后端收到过的命令名（按顺序）—— 用来断言"宿主没有做多余的事" */
   backendCalls: string[];
+  /**
+   * 桩后端收到过的命令**与入参**（按顺序）。
+   *
+   * 与 `backendCalls` 的分工：那一个只记命令名，够用来断言"有没有读盘"；
+   * 而"读的是哪一张图"（模块级的 `panels/own.svg` 还是插件级的 `icon.svg`）
+   * 只有入参能回答 —— 那正是"每个模块用自己那张图标"这条断言的落点。
+   */
+  backendCallsWithArgs: Array<{ command: string; args: Record<string, any> }>;
   /** 被捕获的运行时日志（默认不打到终端，见 createPluginHost 里的说明） */
   logs: { info: string[]; warn: string[]; error: string[] };
   /** 清空日志缓冲 */
@@ -124,6 +132,7 @@ export async function createPluginHost(): Promise<PluginHost> {
   const storage = new Map<string, Map<string, string>>();
   const secrets = new Map<string, Map<string, string>>();
   const backendCalls: string[] = [];
+  const backendCallsWithArgs: Array<{ command: string; args: Record<string, any> }> = [];
 
   // ------------------------------------------------------------
   // 控制台捕获
@@ -360,6 +369,12 @@ export async function createPluginHost(): Promise<PluginHost> {
     // "没开"处理 —— 那条回落路径本身值得被单独测，不该在这里被意外覆盖。
     safe_mode_state: () => ({ active: false, reason: null }),
 
+    // 夹具里没有标记文件系统，但"前端确实在插件那一步之前报了启动成功"这件事
+    // 必须能被喂进去 —— 否则 `boot.ts` 里那句 `invoke('mark_boot_ok')` 会走到
+    // 它自己的 catch 分支，测试看到的是"命令不存在"而不是被测的行为。
+    // 它没有可观察的返回值（宿主侧也只是写一个标记文件），因此桩是空操作。
+    mark_boot_ok: () => undefined,
+
     list_plugin_permissions: () => [],
 
     read_plugin_asset: ({ id, rel }) => {
@@ -368,6 +383,20 @@ export async function createPluginHost(): Promise<PluginHost> {
       if (rel === (fixture.manifest.main ?? 'index.js')) return fixture.code;
       if (fixture.manifest.style && rel === fixture.manifest.style) return fixture.style ?? '';
       if (fixture.manifest.icon && rel === fixture.manifest.icon) return fixture.iconSvg ?? '';
+
+      // 其余资源按**包内相对路径**从夹具目录读。
+      //
+      // 需要这一条是因为清单可以在别处声明资源路径（`contributes.modules[].icon`
+      // 写的就是一个包内路径），而桩如果只认上面那三个已知文件，那条通路在夹具里
+      // 根本走不通 —— 于是"模块自己的图标有没有被读回来"这件事无从断言。
+      //
+      // 越界路径同样要挡：真实宿主只允许读取插件包内的文件，桩比真实宿主宽松
+      // 会让夹具测出一个真机上不成立的结果（与权限那几条同一条纪律）。
+      const target = resolve(fixture.dir, String(rel));
+      if (target.startsWith(fixture.dir + sep) && existsSync(target)) {
+        return readFileSync(target, 'utf8');
+      }
+
       throw new Error(`插件 "${id}" 没有资源 "${rel}"`);
     },
 
@@ -579,6 +608,7 @@ export async function createPluginHost(): Promise<PluginHost> {
   const internals = (shim.window as Record<string, any>)['__TAURI_INTERNALS__'];
   internals.invoke = async (command: string, args: Record<string, any> = {}) => {
     backendCalls.push(command);
+    backendCallsWithArgs.push({ command, args });
     const handler = handlers[command];
     if (!handler) throw new Error(`[plugin-host] 夹具没有为命令 "${command}" 打桩`);
     return handler(args);
@@ -595,6 +625,7 @@ export async function createPluginHost(): Promise<PluginHost> {
     commands,
     fixtures,
     backendCalls,
+    backendCallsWithArgs,
     logs,
     clearLogs() {
       logs.info.length = 0;
@@ -629,6 +660,7 @@ export async function createPluginHost(): Promise<PluginHost> {
     resetObservations() {
       shim.resetObservations();
       backendCalls.length = 0;
+      backendCallsWithArgs.length = 0;
     },
   };
 }

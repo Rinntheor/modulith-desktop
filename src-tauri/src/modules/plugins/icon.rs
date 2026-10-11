@@ -15,7 +15,7 @@
 // block），因此不需要 deflate 实现，代价是文件偏大；对 64×64 的图标（约 16 KB）
 // 完全可以接受。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::types::PluginResult;
 
@@ -24,6 +24,31 @@ use super::types::PluginResult;
 /// 64 是卡片缩略图在 2x 屏下的合理取值：32 放大后发虚，256 会让每个条目的
 /// data URL 膨胀到数百 KB。Windows 会按这个尺寸缩放图标。
 pub const ICON_SIZE: i32 = 64;
+
+/// 交给 `SHGetFileInfoW` 的路径 —— **这里必须先剥掉逐字前缀**。
+///
+/// 存在的理由有两个，缺一不可：
+///
+/// 1. **正确性（跨版本的不变式，不是对某个版本的赌注）。** 入口的
+///    `resolve_file_argument` 走 `canonicalize()`，在 Windows 上它返回逐字路径
+///    `\\?\C:\…\Brave.lnk`。`PrivateExtractIconsW` 是普通 Win32 文件 API，文档上
+///    就接受这种形态；而 `SHGetFileInfoW` 走的是 **shell 命名空间**，它对逐字前缀
+///    **没有任何契约**。本机（Win11 25H2 / build 26200）实测它碰巧也接受，但那不
+///    构成保证 —— 换个 Windows 版本、UNC 路径或别的区域设置就可能返回 0，而且
+///    **不报错、静默失败**，那正是"回退等于白加"的形状。详见 `win::shell_icon`。
+///
+/// 2. **可测试性。** `shell_icon()` 是拿不到返回值的 `unsafe` FFI，单测没法断言
+///    "它收到的那个字符串"；把"剥前缀"这一步抽成这个纯函数之后，断言就有了落点
+///    （见 `tests::shell_icon_path_strips_the_verbatim_prefix`）。
+///
+/// 实现**刻意转交给** `manager::strip_verbatim_path`，不在这里另写一份：UNC 形态
+/// （`\\?\UNC\s\share`）与认不出来的形态（`\\?\Volume{…}`）都有既定处理，两份
+/// 实现迟早会在某个边界上分叉。
+///
+/// 只在 Windows 上才有实际效果；其他平台上 `strip_verbatim_path` 是恒等函数。
+pub(crate) fn shell_icon_path(path: &Path) -> PathBuf {
+    super::manager::strip_verbatim_path(path)
+}
 
 // ============================================================
 // PNG 编码（平台无关）
@@ -299,10 +324,14 @@ mod win {
         };
 
         if extracted == 0 || hicon.is_null() {
-            return Err(PluginError::IconExtractionFailed(format!(
-                "该文件没有可提取的图标: {}",
-                path.display()
-            )));
+            // 内嵌图标资源那条路走不通（快捷方式、`.url`、文档都会走到这里），
+            // 退到 shell 去问 —— 见 `shell_icon` 的说明。
+            hicon = unsafe { shell_icon(path) }.ok_or_else(|| {
+                PluginError::IconExtractionFailed(format!(
+                    "该文件没有可提取的图标: {}",
+                    path.display()
+                ))
+            })?;
         }
 
         // HICON 必须被销毁，否则每提取一次就泄漏一个 GDI 对象 ——
@@ -310,6 +339,104 @@ mod win {
         let result = unsafe { hicon_to_rgba(hicon, path) };
         unsafe { DestroyIcon(hicon) };
         result
+    }
+
+    /// 走 shell 取图标。**快捷方式、`.url`、文档、目录只有这一条路。**
+    ///
+    /// `PrivateExtractIconsW` 读的是 PE 文件里的图标资源，因此它只对 `.exe` /
+    /// `.dll` / `.ico` 有效。而"快捷启动"这类插件最需要显示的东西恰恰是 `.lnk`
+    /// —— 它是一份**给 shell 看的数据**，本身没有图标资源，于是上面那条路必然
+    /// 失败（而且它失败得很安静：返回 0，不报错）。
+    ///
+    /// `SHGetFileInfoW` 会先把 `.lnk` 解析到它的目标、再按扩展名关联拿到**用户
+    /// 实际看到的那个图标**，因此这一条同时覆盖快捷方式、`.url`、各种文档与目录。
+    ///
+    /// 代价是尺寸：shell 给的是系统的"大图标"（通常 32×32），比上面那条按
+    /// `ICON_SIZE` 取的 64×64 小。因此它只作为**回退**，不是首选。
+    ///
+    /// **COM 必须初始化。** `SHGetFileInfoW` 取图标时走 shell 命名空间（内部用
+    /// `IShellIcon`），而调用它的是 Tauri 的任意一个工作线程 —— 在没有初始化过
+    /// COM 的线程上这一条不保证可用。返回值要区别对待，否则要么漏掉一次
+    /// `CoUninitialize`（该线程的 COM 引用计数永远不归零），要么多调一次
+    /// （把别的代码的初始化一起拆掉）：
+    ///
+    /// * `S_OK` —— 这次初始化的是我们，必须配一次 `CoUninitialize`；
+    /// * `S_FALSE` —— 该线程已经初始化过**同一种**模式，仍然要配一次；
+    /// * 其余（典型是 `RPC_E_CHANGED_MODE`，异步运行时可能已经把线程开成 MTA）
+    ///   —— 我们**没有**增加引用计数，因此不能 uninit；而 shell 查询在 MTA 下
+    ///   仍然可用，所以继续往下走，不是失败。
+    ///
+    /// # 为什么这里要剥逐字前缀，而上一条路（`PrivateExtractIconsW`）不用
+    ///
+    /// **不要在"顺手统一一下"的时候把下面那行 `shell_icon_path` 删掉。** 这两条路
+    /// 是**两类 API**，对路径形态的保证不一样：
+    ///
+    /// * `PrivateExtractIconsW` 是**普通 Win32 文件 API**，拿的是内核路径，
+    ///   `\\?\` 这个"不要替我规范化"的前缀本来就属于它的输入空间 —— 它照常打开
+    ///   文件、照常读 PE 资源。因此 `extract_rgba` 那条路把 `path` **原样**传进去，
+    ///   是对的，也**不要**去改它（它现在工作正常，改了只会引入新风险）。
+    /// * `SHGetFileInfoW` 走的是 **shell 命名空间**：路径要交给 shell 的解析与扩展名
+    ///   关联逻辑，而 shell 对逐字前缀**没有契约**。契约之外的行为会随版本、路径
+    ///   形态（UNC）、区域设置变化，而它的失败形态是**返回 0、不报错** ——
+    ///   也就是说"这条回退悄悄等于没加"，不是"偶尔取不到图标"。
+    ///
+    /// **实测记录，写在这里免得下一个人重新猜。** 在本机 Windows 11 25H2 /
+    /// build 26200 上，`SHGetFileInfoW` 对 `\\?\` 形态**并没有**失败：`.lnk` 与
+    /// `.url` 都返回了图标，像素与剥过前缀的那一次逐字节相同。所以本机"不剥也
+    /// 能用"是**真的**；这里剥，是为了不把正确性押在一个未文档化的行为上，
+    /// 而代价是零（见 `tests::stripping_the_prefix_never_changes_which_icon_the_shell_gives`）。
+    ///
+    /// 入口之所以会给出逐字路径，是因为 `resolve_file_argument` → `canonicalize()`；
+    /// 同一个坑 `ctx.launcher.open` 也已经踩过一次（那边在 `manager.rs` 里
+    /// `strip_verbatim_path` 之后才交给 `tauri_plugin_opener`）。
+    ///
+    /// `pub(super)` 是为了让单测能直接钉住这条 FFI —— 见
+    /// `tests::stripping_the_prefix_never_changes_which_icon_the_shell_gives`。
+    pub(super) unsafe fn shell_icon(path: &Path) -> Option<HICON> {
+        use windows_sys::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+        };
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+        };
+
+        /// `S_OK`
+        const S_OK: i32 = 0;
+        /// `S_FALSE`
+        const S_FALSE: i32 = 1;
+
+        // windows-sys 把 `COINIT_APARTMENTTHREADED` 声明成 `i32`，而这个函数的
+        // 形参是 `u32`（位标志）—— 转换在这里是安全的：它是一个小的正数常量。
+        let hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let ours = hr == S_OK || hr == S_FALSE;
+
+        // 唯一交给 shell 的那个路径：`\\?\` 在这里被剥掉（理由见上面的小节）。
+        // 上面 `PrivateExtractIconsW` 用的仍是**逐字**的原 `path`，那是刻意的。
+        let shell_path = super::shell_icon_path(path);
+        let wide: Vec<u16> = shell_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut info: SHFILEINFOW = std::mem::zeroed();
+        let ok = SHGetFileInfoW(
+            wide.as_ptr(),
+            0,
+            &mut info,
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        ) != 0;
+
+        // HICON 是 GDI 对象，与 COM 的引用计数无关，因此这里先收尾 COM 再用图标。
+        if ours {
+            CoUninitialize();
+        }
+
+        if ok && !info.hIcon.is_null() {
+            Some(info.hIcon)
+        } else {
+            None
+        }
     }
 }
 
@@ -339,6 +466,23 @@ pub fn extract_icon_data_url(path: &Path) -> PluginResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把所有**真实 Win32 调用**串行化。
+    ///
+    /// 不是洁癖，是被实测逼出来的：`SHGetFileInfoW` 是**公寓内**（apartment-bound）
+    /// 的 shell 命名空间查询，而 `cargo test` 在一个**没有消息泵**的进程里用多个
+    /// 线程并行跑。多个线程同时首次查询 shell 时它会随机返回 0 —— 实测同一份代码
+    /// 并行必挂、`--test-threads=1` 全绿。这类"测试自己打架"的假失败会训练出
+    /// "红了就重跑"的习惯，那才是真正的代价。
+    ///
+    /// 中毒（某条断言 panic）时照常放行：这条锁保护的是线程安全，不是数据一致性。
+    static WIN32_SHELL_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn win32_guard() -> std::sync::MutexGuard<'static, ()> {
+        WIN32_SHELL_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// 从 PNG 字节里切出所有块（类型 + 数据 + 记录的 CRC）
     fn chunks(png: &[u8]) -> Vec<(String, Vec<u8>, u32)> {
@@ -493,6 +637,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn extracts_icon_from_a_real_executable() {
+        let _guard = win32_guard();
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
         let candidates = [
@@ -548,21 +693,224 @@ mod tests {
         assert!(!all_zero, "取到的图标像素全为 0，说明像素读取失败");
     }
 
-    /// 没有图标资源的文件应当明确失败，而不是返回一张空图
+    /// 没有**内嵌**图标资源的文件，现在会退到 shell 拿一张真图标，而不是报错。
+    ///
+    /// 这条断言在 1.7.0 之前是反过来的（"非 PE 文件必须失败"）。它必须改，因为
+    /// 那个旧契约把**实现细节当成了产品语义**："有没有图标"被定义成了"有没有 PE
+    /// 图标资源"，而用户在资源管理器里看到的每一个文件都有图标。快捷方式
+    /// （`.lnk`）是这个契约下第一个被牺牲的对象 —— 它没有图标资源，于是一个
+    /// 快捷启动插件连自己条目的图标都拿不到。
+    ///
+    /// 因此这里守的性质换成了**更强**的一条：要么给出一张能解码、像素非零的
+    /// 真 PNG，要么明确报错。**不允许返回空图或占位图**让调用方以为拿到了图标
+    /// —— 那是原来那条断言真正要防的事，它没有被放宽。
     #[cfg(windows)]
     #[test]
-    fn reports_failure_for_a_file_without_icon_resource() {
+    fn falls_back_to_the_shell_icon_for_files_without_an_embedded_resource() {
+        let _guard = win32_guard();
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
         let plain = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         assert!(plain.is_file(), "样本文件应当存在: {}", plain.display());
 
-        let err = extract_icon_data_url(&plain).expect_err("非 PE 文件不应有图标资源");
+        let url = extract_icon_data_url(&plain)
+            .expect("没有内嵌图标资源时应当退到 shell，而不是失败");
         assert!(
-            matches!(
-                err,
-                super::super::types::PluginError::IconExtractionFailed(_)
-            ),
-            "期望 IconExtractionFailed，实际: {:?}",
-            err
+            url.starts_with("data:image/png;base64,"),
+            "应当返回 PNG data URL，实际前缀: {}",
+            &url[..url.len().min(40)]
         );
+
+        let bytes = BASE64
+            .decode(url.trim_start_matches("data:image/png;base64,"))
+            .expect("data URL 的 base64 部分应当可解码");
+        assert_eq!(&bytes[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], "PNG 签名");
+
+        let parsed = chunks(&bytes);
+        assert!(
+            parsed.len() >= 3,
+            "应当至少有 IHDR / IDAT / IEND，实际: {:?}",
+            parsed.iter().map(|c| c.0.as_str()).collect::<Vec<_>>()
+        );
+
+        let ihdr = &parsed[0].1;
+        let width = u32::from_be_bytes(ihdr[0..4].try_into().unwrap());
+        let height = u32::from_be_bytes(ihdr[4..8].try_into().unwrap());
+        assert!(width > 0 && height > 0, "尺寸不应为零：{width}×{height}");
+
+        // 与上面那条真实 Win32 测试同样的判据：IDAT 里只有滤波器字节与全零像素，
+        // 说明取到的是一张空图 —— 那正是这条测试要挡住的东西。
+        let idat = &parsed[1].1;
+        let all_zero = idat[5..idat.len() - 4].iter().all(|b| *b == 0);
+        assert!(!all_zero, "取到的图标像素全为 0，说明像素读取失败");
+    }
+
+    // ============================================================
+    // 逐字前缀：交给 shell 的路径不许带 `\\?\`
+    // ============================================================
+    //
+    // 入口 `resolve_file_argument` 走 `canonicalize()`，在 Windows 上产出的永远是
+    // `\\?\C:\…`；`PrivateExtractIconsW` 接受这种形态（所以 `.exe` 一直正常），而
+    // `SHGetFileInfoW` 是 shell 命名空间查询 —— 它不在文档保证的范围里。
+    //
+    // **实测记录（不要当成传说）。** 在本机 Windows 11 25H2 / build 26200 上，
+    // `SHGetFileInfoW` 对 `\\?\` 形态**并没有**失败：`.lnk` 与 `.url` 都返回了
+    // 图标，且像素与剥过前缀的那一次逐字节相同。也就是说"不剥前缀 ⇒ 回退等于
+    // 白加"这个推断在本机**不成立**（原始探测输出见提交说明）。
+    //
+    // 那为什么这里还要剥，而且测试还钉着它：
+    //   · 它是一条**不变式**，而不是一次对某个 Windows 版本行为的赌注。shell 命名
+    //     空间对逐字前缀没有契约，本机接受不代表下个版本、UNC 路径、其它区域设置
+    //     下也接受；
+    //   · 代价是零：剥与不剥，在"shell 接受逐字形态"的机器上给出**同一张图**
+    //     （下面第二条测试断言了这件事），不存在任何行为回归；
+    //   · `.exe` 那条路（`PrivateExtractIconsW`）**刻意不动** —— 它本来就正常，
+    //     改它只有风险没有收益。
+    //
+    // 因此下面两条断言各自要守的是：第一条"交给 shell 的路径形态是确定的"，
+    // 第二条"剥与不剥不会给出不同的图标"。
+
+    /// 交给 `SHGetFileInfoW` 的路径必须剥掉逐字前缀。
+    ///
+    /// 输入就是 `canonicalize()` 在 Windows 上真实产出的形态。
+    #[cfg(windows)]
+    #[test]
+    fn shell_icon_path_strips_the_verbatim_prefix() {
+        let verbatim = Path::new(r"\\?\C:\Users\someone\Desktop\Brave.lnk");
+        let for_shell = shell_icon_path(verbatim);
+
+        assert_eq!(
+            for_shell,
+            PathBuf::from(r"C:\Users\someone\Desktop\Brave.lnk"),
+            "盘符形态的逐字前缀必须被剥掉"
+        );
+        assert!(
+            !for_shell.to_string_lossy().contains(r"\\?\"),
+            "交给 shell 的路径不含逐字前缀，实际: {}",
+            for_shell.display()
+        );
+
+        // UNC 形态：直接切掉 `\\?\` 会得到 `UNC\server\…`（一个盘符相对路径），
+        // 比原样保留更糟。这一条保证剥前缀走的是 manager 那份实现，而不是
+        // 某个"看起来差不多"的新实现。
+        let unc = shell_icon_path(Path::new(r"\\?\UNC\server\share\a.lnk"));
+        assert_eq!(unc, PathBuf::from(r"\\server\share\a.lnk"));
+        assert!(!unc.to_string_lossy().contains(r"\\?\"));
+    }
+
+    /// 剥前缀**不改变** shell 给出的那个图标 —— 也就是这次修复不可能造成行为回归。
+    ///
+    /// 这条测试对两种 Windows 行为都成立：
+    ///   · 本机（build 26200）：原始形态也能给出图标，于是两个像素缓冲**必须相等**；
+    ///   · 若某个版本真的拒绝逐字形态：原始形态 `None`，剥过的那次仍然必须给出图标。
+    ///
+    /// 换句话说它只说一件可证伪的事：**剥过前缀的那一条永远能拿到图标**；在 shell
+    /// 也接受逐字形态的机器上，两条路拿到的必须是同一张图（否则"剥前缀"就悄悄改变
+    /// 了语义，而不只是换了个写法）。
+    #[cfg(windows)]
+    #[test]
+    fn stripping_the_prefix_never_changes_which_icon_the_shell_gives() {
+        let _guard = win32_guard();
+        let dir =
+            std::env::temp_dir().join(format!("modulith-icon-invariant-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let link = dir.join("shell-probe.url");
+        std::fs::write(&link, "[InternetShortcut]\r\nURL=https://example.com/\r\n")
+            .expect("应当能写临时 .url 文件");
+
+        let absolute = std::fs::canonicalize(&link).expect("临时文件应当可规范化");
+        assert!(
+            absolute.to_string_lossy().starts_with(r"\\?\"),
+            "前置条件：Windows 的 canonicalize 产出逐字路径，实际: {}",
+            absolute.display()
+        );
+
+        let stripped = shell_icon_path(&absolute);
+        assert!(!stripped.to_string_lossy().contains(r"\\?\"));
+        assert!(
+            stripped.is_file(),
+            "剥前缀不能改变它指向的文件: {}",
+            stripped.display()
+        );
+
+        let Some(from_stripped) = (unsafe { win::shell_icon(&stripped) }) else {
+            panic!(
+                "剥掉逐字前缀之后 SHGetFileInfoW 必须能给出图标: {}",
+                stripped.display()
+            );
+        };
+        let stripped_pixels = unsafe { hicon_pixels(&stripped, from_stripped) };
+
+        // 原始逐字形态：本机也成功，就让两张图逐字节相等；若失败，那也是允许的
+        // ——那正是"必须剥"的那种机器。
+        if let Some(from_raw) = unsafe { win::shell_icon(&absolute) } {
+            let raw_pixels = unsafe { hicon_pixels(&absolute, from_raw) };
+            assert_eq!(
+                raw_pixels, stripped_pixels,
+                "剥前缀只换写法、不换图标：两种形态在 shell 接受逐字路径的机器上必须同图"
+            );
+        } else {
+            eprintln!("注意：本机 SHGetFileInfoW 拒绝了逐字路径 —— 这条回退只有剥过才可用");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取出一个 HICON 的像素快照（用完即销毁 HICON，不泄漏 GDI 对象）。
+    #[cfg(windows)]
+    unsafe fn hicon_pixels(
+        path: &Path,
+        hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON,
+    ) -> (u32, u32, Vec<u8>) {
+        let result = win::hicon_to_rgba(hicon, path);
+        windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon(hicon);
+        result.unwrap_or_else(|e| panic!("应当能读出 {} 的像素: {:?}", path.display(), e))
+    }
+
+    /// 端到端：没有 PE 图标资源的文件走完整条入口，并且**带逐字前缀进来**
+    /// —— 也就是用户拖入快捷方式时的真实形态。
+    ///
+    /// 这里用 `.url` 而不是 `.lnk`：两者都没有 PE 图标资源（因此都会走 shell 回退），
+    /// 而 `.url` 只是一个文本文件，测试可以自己造，`.lnk` 不行（要 COM 的
+    /// `IShellLink`）。用 `.lnk` 手工探测过的结果见本节开头那段实测记录。
+    #[cfg(windows)]
+    #[test]
+    fn extracts_the_shell_icon_when_the_entry_path_is_verbatim() {
+        let _guard = win32_guard();
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        let dir =
+            std::env::temp_dir().join(format!("modulith-icon-e2e-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let link = dir.join("Brave like shortcut.url");
+        std::fs::write(&link, "[InternetShortcut]\r\nURL=https://example.com/\r\n")
+            .expect("应当能写临时 .url 文件");
+
+        // 入口真实拿到的就是这个形态（`resolve_file_argument` → `canonicalize()`）。
+        let verbatim = std::fs::canonicalize(&link).expect("临时文件应当可规范化");
+        assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+        // `.url` 没有 PE 图标资源 —— 这保证测试真的走到回退那条路。判据用文件头：
+        // 不能拿 `extract_rgba` 去问，因为它自己就带着回退，会"成功"。
+        let head = std::fs::read(&link).expect("应当能读回临时文件");
+        assert_ne!(
+            &head[0..2],
+            b"MZ",
+            "前置条件：`.url` 不是 PE 文件，因此私有图标提取必然失败、必然走 shell 回退"
+        );
+
+        let url = extract_icon_data_url(&verbatim)
+            .unwrap_or_else(|e| panic!("带逐字前缀的 {} 应当仍能拿到图标: {}", verbatim.display(), e));
+
+        let bytes = BASE64
+            .decode(url.trim_start_matches("data:image/png;base64,"))
+            .expect("data URL 的 base64 部分应当可解码");
+        assert_eq!(&bytes[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], "PNG 签名");
+
+        let parsed = chunks(&bytes);
+        let idat = &parsed[1].1;
+        let all_zero = idat[5..idat.len() - 4].iter().all(|b| *b == 0);
+        assert!(!all_zero, "取到的图标像素全为 0，说明像素读取失败");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

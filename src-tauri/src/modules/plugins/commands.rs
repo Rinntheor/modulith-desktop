@@ -1317,6 +1317,22 @@ pub async fn plugin_launch_program(
         .map_err(to_msg)
 }
 
+/// 用**系统默认方式**打开一个目标（快捷方式 / 网址 / 文档 / 目录）。
+/// 需要清单声明 `process-spawn` 权限 —— 理由见 `PluginManager::open_target`。
+///
+/// 与 `plugin_launch_program` 分成两条命令而不是给那一条加个开关：两者的
+/// **失败原因完全不同**（"不是有效的 Win32 应用程序" vs "没有关联的程序"），
+/// 合成一条之后调用方就只剩一个错误字符串可看，而它恰恰要靠这个区分该改用哪条。
+#[tauri::command]
+pub async fn plugin_open_target(
+    state: State<'_, PluginState>,
+    id: String,
+    target: String,
+) -> Result<(), String> {
+    let manager = state.inner().0.read().await;
+    manager.open_target(&id, &target).map_err(to_msg)
+}
+
 /// 提取一个文件的图标，返回 PNG data URL。需要 `filesystem-read` 权限。
 #[tauri::command]
 pub async fn plugin_extract_icon(

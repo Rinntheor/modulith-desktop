@@ -698,6 +698,21 @@ pub async fn dispatch<R: Runtime>(
             }
         }
 
+        // 用系统默认方式打开：快捷方式 / 网址 / 文档 / 目录。
+        //
+        // 与 `system.launch` 并存而不是合并，理由见 `plugin_open_target` 的注释：
+        // 两者的失败原因不同，调用方要靠它决定该改用哪一条。
+        "system.open" => {
+            let Some(target) = arg_str(&args, "target") else {
+                return rpc_error("缺少 target");
+            };
+            let manager = locked!(app);
+            match manager.open_target(plugin_id, target) {
+                Ok(()) => json_ok(),
+                Err(e) => rpc_error(&e.to_string()),
+            }
+        }
+
         "system.reveal" => {
             let Some(path) = arg_str(&args, "path") else {
                 return rpc_error("缺少 path");

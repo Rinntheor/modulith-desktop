@@ -1,6 +1,6 @@
 // src/components/ModuleIcon.tsx
 //
-// 模块图标的**唯一**解析入口。
+// 模块图标的**唯一**渲染入口。
 //
 // 背景（这是一处真实缺陷的修复）：
 //   侧边栏与仪表盘原先都是这么取图标的 ——
@@ -19,18 +19,30 @@
 //   而插件管理页里的插件卡片走的是 PluginIcon，那条路径支持 .svg 与内联 SVG，
 //   所以「插件列表里图标正常、侧边栏与仪表盘里是空的」——正是用户观察到的现象。
 //
-// 现在的解析顺序：
+// 现在的解析顺序（判定本身在 `moduleIconResolver.ts`，那里有逐条说明）：
 //   1. 内联 SVG（描述符携带的 `iconSvg`，插件加载时已读取，见 pluginRuntime）；
 //   2. 构建期映射表 `generated/iconMap`（内置模块，静态导入，零运行时成本）；
 //   3. lucide 图标名 → 按需动态加载（覆盖插件注册的任意 lucide 图标）；
 //   4. 兜底：lucide 的 Box 图标（保证永远不出现空白占位）。
 //
-// 第 3 步的代价与取舍见 `resolveLucideIcon`。
+// 为什么判定要抽到 `.ts` 里：本文件是 `.tsx`，而仓库的 check 脚本用 Node 跑 TS，
+// Node 的类型擦除不转换 JSX —— 留在 `.tsx` 里的逻辑没法被任何脚本断言。
+//
+// **路径型 `icon`（`icon.svg`）不会走第 3 步去查 lucide**：它是插件包内的一个
+// 文件，不是图标名；那张图只可能来自第 1 步的 `iconSvg`（宿主在目录建立后读好，
+// 见 pluginRuntime 的 `prefetchDeclaredIcons`）。渲染路径是同步的，因此宿主没补上
+// 时这里落 `Box` 兜底，绝不留空白。
 
 import React, { Suspense, memo } from 'react';
 import { Box } from 'lucide-react';
 import { dynamicIconImports } from 'lucide-react/dynamic';
 import * as BuiltinIcons from '../generated/iconMap';
+import {
+  isSvgMarkup,
+  looksLikeAssetPath,
+  resolveModuleIconSource,
+  toKebabCase,
+} from './moduleIconResolver';
 
 /** lucide 图标组件的最小形状（只需要 className） */
 type IconComponent = React.ComponentType<{ className?: string }>;
@@ -38,7 +50,13 @@ type IconComponent = React.ComponentType<{ className?: string }>;
 interface ModuleIconProps {
   /** 模块的 `icon` 字段：lucide 图标名、或插件包内的相对路径（`icon.svg`） */
   icon?: string;
-  /** 已解析的内联 SVG 源码（`<svg …>` 字符串） */
+  /**
+   * 已解析的内联 SVG 源码（`<svg …>` 字符串）。
+   *
+   * 这是**路径型 `icon` 的唯一来源**，也是"插件模块显示插件自己的图标"的落点：
+   * 宿主在目录建立后把插件包里的图标读进来写在这个字段上（`setModuleIconSvg`）。
+   * 渲染路径是同步的，本组件因此不会自己发 IPC / 读文件。
+   */
   iconSvg?: string;
   /** 模块显示名，仅用于无障碍标签 */
   name?: string;
@@ -47,18 +65,14 @@ interface ModuleIconProps {
 }
 
 // ============================================================
-// 内联 SVG
+// 构建期映射表（内置模块）
 // ============================================================
 
-/**
- * 判定一个字符串是不是「能安全直接注入的 SVG 标记」。
- *
- * 只接受以 `<svg` 开头的内容：插件资源可以是任意文件，若把一段
- * `<script>` 当 SVG 注入就会变成注入点。这里要求严格的开头匹配，
- * 而不是「包含 <svg」，避免 `<!-- <svg -->…` 这类绕过。
- */
-function isSvgMarkup(value: string | undefined): value is string {
-  return typeof value === 'string' && value.trimStart().toLowerCase().startsWith('<svg');
+function getBuiltinIcon(name: string): IconComponent | undefined {
+  const candidate = (BuiltinIcons as unknown as Record<string, IconComponent>)[name];
+  return typeof candidate === 'function' || (candidate && typeof candidate === 'object')
+    ? candidate
+    : undefined;
 }
 
 // ============================================================
@@ -79,21 +93,6 @@ function isSvgMarkup(value: string | undefined): value is string {
  * 仍然保留构建期映射表作为第一优先级，因为内置模块每帧都在渲染，
  * 静态导入没有任何异步开销。
  */
-/**
- * `PascalCase` / `camelCase` → `kebab-case`。
- *
- * lucide 的 `dynamicIconImports` 用小写连字符作键（`sticky-note`），
- * 而 module.toml 与插件注册用组件名（`StickyNote`）。
- * 连续的大写字母要合并处理：`LayoutGrid2` → `layout-grid-2`、
- * `FileJson2` → `file-json-2`。
- */
-function toKebabCase(name: string): string {
-  return name
-    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')
-    .toLowerCase();
-}
-
 /** 已解析的图标组件缓存（含「解析失败」的负缓存，避免反复重试） */
 const lucideCache = new Map<string, Promise<IconComponent | null>>();
 /** 已就绪的图标组件：命中时渲染是同步的，不触发 Suspense */
@@ -110,10 +109,8 @@ function resolveLucideIcon(name: string): Promise<IconComponent | null> {
 
   const promise = (async (): Promise<IconComponent | null> => {
     // 1) 构建期映射表：内置模块走这里，同步可得
-    const builtin = (BuiltinIcons as unknown as Record<string, IconComponent>)[name];
-    if (typeof builtin === 'function' || (builtin && typeof builtin === 'object')) {
-      return builtin;
-    }
+    const builtin = getBuiltinIcon(name);
+    if (builtin) return builtin;
 
     // 2) lucide 按需入口。
     //    映射表本身是**静态**导入（`lucide-react/dynamic`，官方入口）：
@@ -162,9 +159,16 @@ function readLucideIcon(name: string): IconComponent | null | undefined {
   throw promise;
 }
 
-/** 包裹 `use()` 的组件，必须在 Suspense 边界内渲染 */
+/** 包裹 Suspense 约定的组件，必须在 Suspense 边界内渲染 */
 const AsyncLucideIcon: React.FC<{ name: string; className?: string }> = ({ name, className }) => {
-  const Icon = readLucideIcon(name) as IconComponent;
+  const Icon = readLucideIcon(name);
+
+  // 名字不是 lucide 图标（插件写错一个名字就是这种情况）时落到 `Box`。
+  //
+  // 这里必须显式判空：`readLucideIcon` 的负缓存命中时返回 `null`，直接把它当组件
+  // 渲染会让 React 抛 `Element type is invalid` —— 那是整条侧边栏条目的渲染错误，
+  // 比"图标不好看"严重得多，也与"兜底永远是一个图标、绝不空白"这条契约相悖。
+  if (!Icon) return <Box className={className} />;
   return <Icon className={className} />;
 };
 
@@ -173,45 +177,64 @@ const AsyncLucideIcon: React.FC<{ name: string; className?: string }> = ({ name,
 // ============================================================
 
 const ModuleIcon: React.FC<ModuleIconProps> = memo(({ icon, iconSvg, name, className }) => {
-  // 1) 内联 SVG（插件加载时已解析，同步可得）
-  if (isSvgMarkup(iconSvg)) {
-    return (
-      <span
-        aria-label={name}
-        role="img"
-        className={`inline-flex items-center justify-center [&>svg]:h-full [&>svg]:w-full ${className ?? ''}`}
-        // 只接受以 <svg 开头的字符串，见 isSvgMarkup 的说明
-        dangerouslySetInnerHTML={{ __html: iconSvg }}
-      />
-    );
-  }
+  const source = resolveModuleIconSource({ icon, iconSvg, hasBuiltinIcon: (n) => !!getBuiltinIcon(n) });
 
-  // 2) 构建期映射表：内置模块的常见路径，零异步开销
-  if (icon) {
-    const BuiltinIcon = (BuiltinIcons as unknown as Record<string, IconComponent>)[icon];
-    if (typeof BuiltinIcon === 'function' || (BuiltinIcon && typeof BuiltinIcon === 'object')) {
+  switch (source.kind) {
+    // 1) 内联 SVG：插件自己的图标（路径型 `icon` 的唯一来源），同步可得
+    case 'inline-svg':
+      return (
+        <span
+          aria-label={name}
+          role="img"
+          className={`inline-flex items-center justify-center [&>svg]:h-full [&>svg]:w-full ${className ?? ''}`}
+          // 只接受以 <svg 开头的字符串，见 moduleIconResolver 的 isSvgMarkup
+          dangerouslySetInnerHTML={{ __html: source.svg }}
+        />
+      );
+
+    // 2) 构建期映射表：内置模块的常见路径，零异步开销
+    case 'builtin': {
+      const BuiltinIcon = getBuiltinIcon(source.name) ?? Box;
       return <BuiltinIcon className={className} />;
     }
 
-    // 插件常把 `icon` 写成图标文件路径（`icon.svg`）。这类值不是图标名，
-    // 若照旧去查映射表只会得到 undefined 并留下空白格 —— 明确跳过，
-    // 直接落到 Box 兜底，至少视觉上是完整的。
-    const looksLikePath = /\.(svg|png|jpe?g|webp|gif)$/i.test(icon) || icon.includes('/');
-    if (!looksLikePath) {
-      // 3) 按需加载 lucide 图标
+    // 3) 按需加载 lucide 图标
+    case 'lucide':
       return (
         <Suspense fallback={<Box className={className} />}>
-          <AsyncLucideIcon name={icon} className={className} />
+          <AsyncLucideIcon name={source.name} className={className} />
         </Suspense>
       );
-    }
-  }
 
-  // 4) 兜底
-  return <Box className={className} />;
+    // 4) 兜底：内置映射表里没有、也不是可加载的 lucide 名的图标。
+    //    路径型 `icon` 走到这里，说明宿主没能把插件包里那张图补进 `iconSvg`。
+    default:
+      if (import.meta.env?.DEV && icon && looksLikeAssetPath(icon)) {
+        warnMissingPathIcon(icon);
+      }
+      return <Box className={className} />;
+  }
 });
+
+/**
+ * 「路径型 `icon` 却没有 `iconSvg`」—— 这是**宿主**没能补上图标，不是插件写错了。
+ *
+ * 开发模式下每个路径只提示一次：这条通路原先只会安静地画一个 `Box`，
+ * 于是"插件图标没出现"在界面上看不出是"宿主没读回来"还是"插件没带图标"。
+ * 生产构建里不打印 —— 它是宿主侧的排查线索，不该出现在用户机器的日志里。
+ */
+const warnedPathIcons = new Set<string>();
+function warnMissingPathIcon(icon: string): void {
+  if (warnedPathIcons.has(icon)) return;
+  warnedPathIcons.add(icon);
+  console.warn(
+    `[ModuleIcon] 模块的 icon 是插件包内的路径 "${icon}"，但描述符里没有 iconSvg。` +
+      `插件图标应由 pluginRuntime 的 prefetchDeclaredIcons() 补上 —— 这一条说明它没读到那张图。`
+  );
+}
 
 ModuleIcon.displayName = 'ModuleIcon';
 
 export default ModuleIcon;
-export { isSvgMarkup, toKebabCase };
+// 兼容既有出口：判定逻辑的实现在 `moduleIconResolver.ts`，这里只是转发。
+export { isSvgMarkup, looksLikeAssetPath, toKebabCase };

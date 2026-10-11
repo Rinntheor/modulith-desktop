@@ -153,7 +153,7 @@ var ctx = Modulith.createContext();
 | `logger` | object | 带插件前缀的日志 |
 | `notifications` | object | 应用内通知（需 `notification` 权限） |
 | `events` | object | 跨模块事件总线（需 `plugin-communicate` 权限） |
-| `launcher` | object | 启动外部程序（需 `process-spawn` 权限） |
+| `launcher` | object | 启动外部程序 / 用系统默认方式打开（需 `process-spawn` 权限） |
 | `icons` | object | 提取本机文件图标（需 `filesystem-read` 权限） |
 | `shell` | object | 在文件管理器中定位（需 `filesystem-read` 权限） |
 | `fileDrop` | object | 接收拖入的文件路径（需 `filesystem-read` 权限） |
@@ -537,6 +537,7 @@ off();
 | 方法 | 签名 | 说明 |
 | --- | --- | --- |
 | `launch` | `launch(program, args?) => Promise<void>` | 启动一个程序；`program` 必须是绝对路径 |
+| `open` | `open(target) => Promise<void>` | 用**系统默认方式**打开：快捷方式、网址、文档、目录 |
 
 ```js
 // 需要 process-spawn 权限
@@ -544,7 +545,23 @@ await ctx.launcher.launch('C:\\Program Files\\App\\app.exe');
 
 // 带参数：作为独立 argv 项传递，不经过 shell
 await ctx.launcher.launch('C:\\Program Files\\App\\app.exe', ['--profile', 'work']);
+
+// 快捷方式、网址、文档、目录都必须用 open，不要用 launch
+await ctx.launcher.open('C:\\Users\\Public\\Desktop\\Brave.lnk');
+await ctx.launcher.open('https://example.com');
+await ctx.launcher.open('C:\\Users\\me\\Documents\\说明.pdf');
 ```
+
+**`launch` 与 `open` 的分工是"谁来解释这个目标"。** `launch` 直接走
+`CreateProcess`，因此**只认可执行映像**。把 `.lnk` 交给它会得到
+`os error 193`（"%1 不是有效的 Win32 应用程序"）—— 快捷方式不是可执行映像，
+它是**给 shell 看的一份数据**。网址同理：`CreateProcess` 不认识 `https://…`。
+`open` 走 shell 的文件关联（`ShellExecuteExW`），因此用的是用户自己为这种文件
+选定的那个程序。
+
+`open` 同样要求 `process-spawn`：它没有扩大能力面（用 `cmd /c start` 能做到同样的
+事，而那条路还得自己处理引号与 `&` 的注入），单开一项权限只会让"只想打开网址"
+的插件被迫申请最吓人的那一档。
 
 约束：
 
@@ -552,11 +569,16 @@ await ctx.launcher.launch('C:\\Program Files\\App\\app.exe', ['--profile', 'work
   这类依赖 `PATH` 解析的程序名会被拒绝。这条限制不阻止插件启动 `cmd.exe`
   （那同样是绝对路径）—— 它的目的是让「要执行什么」在代码里显式可见，
   而不是一道沙箱。
+- **`open` 的 URL 只放行 `http` / `https` / `mailto` 三种方案**，其余一律按
+  **本机路径**处理（要求绝对路径且存在）。`file:`、`ms-settings:`、`search-ms:`
+  这类方案能触发别的本机处理器，而它们都不必写进插件清单就能碰到系统 ——
+  白名单让"插件能触发什么"保持可枚举。
+- **`open` 接受目录**（`launch` 不接受）：把一个文件夹放上启动面板是合理用法。
 - **参数不经过 shell**：作为独立 argv 项传入，因此不存在引号、`&&`、`|`
-  这类注入问题。
+  这类注入问题。（`open` 不接受参数；要带参数就用 `launch`。）
 - **启动后不等待**：命令在子进程创建后立即返回，宿主不跟踪它的退出状态。
-- 失败原因（路径不存在、非绝对路径、未声明权限）以错误抛出。建议展示给用户 ——
-  静默失败会让人误以为是路径写错了。
+- 失败原因（路径不存在、非绝对路径、未声明权限、没有关联程序）以错误抛出。
+  建议展示给用户 —— 静默失败会让人误以为是路径写错了。
 
 完整可运行示例见插件仓库的 `plugins/quick-launch`（需要原生能力的那一类示例都在那里：
 启动程序、提取图标、在文件管理器中定位、接收拖入的文件）。
@@ -577,9 +599,13 @@ img.src = url;
 约束：
 
 - `path` 必须是绝对路径，且指向一个**已存在的文件**（目录不行）。
-- **没有图标资源的文件会失败**（例如 `.txt` 就走这条路径），因此调用方应当准备好回退图标，不要把它当致命错误。
+- **任何文件都能取到图标**，包括快捷方式（`.lnk`）、`.url`、各种文档：先从文件里
+  的图标资源取（`.exe` / `.dll` / `.ico` 走这条，尺寸 64×64），取不到就退到
+  shell 的文件关联去问（尺寸是系统的"大图标"，通常 32×32）。因此**不要靠它失败
+  来判断"这个文件没有图标"** —— 那种文件在 Windows 上基本不存在。
+- 仍然要准备好回退图标：路径不存在、权限未声明、非 Windows 平台都会失败。
 - **目前只在 Windows 上实现**，其他平台返回明确错误，而不是一张占位图。
-- 结果是 64×64 的 PNG。取一次约几十 KB，建议**缓存** —— 示例插件把它写进自己的存储，键为 `icon.<条目ID>`。
+- 结果是 PNG data URL。取一次约几十 KB，建议**缓存** —— 示例插件把它写进自己的存储，键为 `icon.<条目ID>`。
 - 注意存储键的字符集限制：只允许字母数字与 `.` `_` `-`，所以是 `icon.` 前缀而不是 `icon:`。
 
 ## 9. shell

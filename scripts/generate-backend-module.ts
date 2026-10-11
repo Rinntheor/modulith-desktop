@@ -291,7 +291,10 @@ function updateLibRs(): { moduleCount: number; commandCount: number } {
    * "未解析的路径"，不会静默变成一个没人注册的命令。
    */
   const EXTRA_MODULE_COMMANDS: Readonly<Record<string, readonly string[]>> = {
-    plugins: ['modules::plugins::safe_mode::safe_mode_state'],
+    plugins: [
+      'modules::plugins::safe_mode::safe_mode_state',
+      'modules::plugins::safe_mode::mark_boot_ok',
+    ],
   };
 
   const useStatements = modules.map((id) => `use modules::${id}::commands::*;`).join('\n');

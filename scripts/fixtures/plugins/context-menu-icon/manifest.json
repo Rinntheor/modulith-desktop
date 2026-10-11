@@ -1,0 +1,18 @@
+{
+  "name": "fixture.context-menu-icon",
+  "displayName": "右键菜单自带图标的声明式插件",
+  "version": "1.0.0",
+  "description": "稳定性夹具：插件级图标是 lucide 名、没有任何模块带图，那张图**只有右键菜单项引用**",
+  "author": { "name": "harness" },
+  "license": "MIT",
+  "engines": { "modulith": ">=1.6.0" },
+  "main": "index.js",
+  "icon": "Package",
+  "contributes": {
+    "commands": [{ "id": "run", "title": "运行一次" }],
+    "contextMenus": [
+      { "id": "menu-only", "label": "菜单专属图标", "icon": "panels/menu.svg", "command": "run" }
+    ]
+  },
+  "activationEvents": ["onContextMenu:menu-only"]
+}

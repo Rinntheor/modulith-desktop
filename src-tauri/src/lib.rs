@@ -341,6 +341,7 @@ pub fn run() -> Result<(), tauri::Error> {
         plugin_selection_read,
         plugin_http_request,
         plugin_launch_program,
+        plugin_open_target,
         plugin_extract_icon,
         plugin_reveal_in_folder,
         plugin_pick_audio,
@@ -384,6 +385,7 @@ pub fn run() -> Result<(), tauri::Error> {
         check_app_update,
         install_app_update,
         modules::plugins::safe_mode::safe_mode_state,
+        modules::plugins::safe_mode::mark_boot_ok,
     ]);
 
     // 用 run_return 而不是 run，唯一的理由是**拿到退出事件**。

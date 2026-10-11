@@ -719,6 +719,18 @@ function createPluginSandbox(identity, _unused) {
 
     launcher: {
       launch: (program, args) => callHost('ctx.system.launch', { program, args: args ?? [] }),
+
+      /**
+       * 用系统默认方式打开：快捷方式（`.lnk` / `.url`）、网址、文档、目录。
+       *
+       * 与 `launch` 并存而不是取代它：`launch` 走 `CreateProcess`，只认可执行
+       * 映像 —— 把 `.lnk` 或网址交给它会失败（`.lnk` 会得到 `os error 193`，
+       * "%1 不是有效的 Win32 应用程序"）。这一条走 shell 的关联。
+       *
+       * 后台插件**没有界面**，因此它把结果交出去的路本来就很窄（另一条是
+       * `ctx.ui.popover`）。这个方法在这里尤其要紧。
+       */
+      open: (target) => callHost('ctx.system.open', { target: String(target) }),
     },
 
     /**

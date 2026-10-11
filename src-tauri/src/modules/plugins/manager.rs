@@ -2240,6 +2240,83 @@ impl PluginManager {
         );
         Ok(())
     }
+
+    /// 用**系统默认方式**打开一个目标：快捷方式、网址、文档、目录。
+    ///
+    /// 与 `launch_program` 的分工是"谁来解释这个目标"。`launch_program` 直接
+    /// `CreateProcess`，因此它**只能跑可执行映像** —— 把 `.lnk` 交给它是错的，
+    /// Windows 会回 `os error 193`（"%1 不是有效的 Win32 应用程序"），因为快捷方式
+    /// 不是可执行映像，它是**给 shell 看的**一份数据。网址同理：`CreateProcess`
+    /// 不认识 `https://…`。这一条走 shell 的关联（`ShellExecuteExW`），因此三者
+    /// 都能打开，而且用的是用户自己为这种文件选定的那个程序。
+    ///
+    /// ## 权限仍然是 `process-spawn`
+    ///
+    /// 它没有扩大插件的能力面：`process-spawn` 已经允许插件跑任意本机程序，而
+    /// "用系统默认方式打开一个文件/网址"能做到的事，用 `cmd /c start` 一样做得到
+    /// （而且那条路还得处理引号与 `&` 的注入，见 `validate_launch_args`）。
+    ///
+    /// 反过来给它单开一项权限是**更差**的选择：一个只想打开网址的插件会被迫申请
+    /// 最吓人的那一档，而作者只会把它当成"打开东西要的权限"照填 —— 权限名与实际
+    /// 风险脱节之后，用户在安装页上读到的那句同意就不再是有效同意。
+    ///
+    /// ## URL 只放行三种方案
+    ///
+    /// `http` / `https` / `mailto`。其余一律先按**本机路径**处理。`file:`、
+    /// `ms-settings:`、`search-ms:` 这类方案能触发别的本机处理器，而它们的共同点是
+    /// **不必写进插件清单**就能碰到系统 —— 白名单让"插件能触发什么"保持可枚举。
+    pub fn open_target(&self, id: &str, target: &str) -> PluginResult<()> {
+        self.require_permission(id, PluginPermission::ProcessSpawn)?;
+
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            return Err(PluginError::SandboxViolation("目标为空".to_string()));
+        }
+        if trimmed.contains('\0') {
+            return Err(PluginError::SandboxViolation("目标含 NUL 字符".to_string()));
+        }
+
+        if is_openable_url(trimmed) {
+            log::info!("插件 {} 用系统默认方式打开了网址 {}", id, trimmed);
+            return tauri_plugin_opener::open_url(trimmed, None::<&str>).map_err(|e| {
+                PluginError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("打开网址失败 {}: {}", trimmed, e),
+                ))
+            });
+        }
+
+        // 其余一律当本机路径。**刻意不在这里报"未知的方案"**：`C:\…` 本身带冒号，
+        // 中文文件名里出现冒号也不稀奇 —— 把"带冒号但没有 http 前缀"判成网址，
+        // 会把正常输入挡在门外，而它们本来就该走路径这一条。
+        let path = resolve_existing_path(trimmed)?;
+        // `ShellExecuteExW` **不接受逐字路径**（`\\?\…`）：那是给 Win32 文件 API 的
+        // 形态，shell 会把它当成一个不存在的名字。而 `canonicalize()` 恰好总是给出
+        // 逐字形态，因此这里必须剥掉。同一个坑在启动后台插件时已经踩过一次
+        // （见 `resolve_background_entry` 上面那节）。
+        let path = strip_verbatim_path(&path);
+
+        log::info!("插件 {} 用系统默认方式打开了 {}", id, path.display());
+        tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| {
+            PluginError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("打开失败 {}: {}", path.display(), e),
+            ))
+        })
+    }
+}
+
+/// 允许"用系统默认方式打开"的网址方案。
+///
+/// 白名单而不是黑名单，理由见 `PluginManager::open_target` 里那一段：能被
+/// 触发的处理器因此是可枚举的。
+fn is_openable_url(raw: &str) -> bool {
+    // 自己 trim 一次，不依赖调用方先处理过：这个判断是放行与否的唯一依据，
+    // 让它对"前后有空格的 https://…"给出一致答案，比省一次 trim 重要。
+    let lower = raw.trim().to_ascii_lowercase();
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 // ============================================================
@@ -2937,8 +3014,13 @@ fn resolve_background_entry(
 ///
 /// 只对 Windows 目标编译：在别的平台上 `canonicalize` 不产出这种前缀，写一个
 /// 永远走不到的分支只会让它显得像是"跨平台的"。
+///
+/// **调用方不只有这里。** `icon.rs` 也要用它：那里给 `SHGetFileInfoW` 的路径
+/// 同样不能带 `\\?\`（原因写在那边的 `shell_icon` 上），而它**必须**是这一份
+/// 实现 —— UNC 形态、`Volume{…}` 形态这些边界一旦分叉成两份，两边迟早会给出
+/// 不同的路径。因此它从这里 `pub(crate)` 出去，而不是在 `icon.rs` 里再写一遍。
 #[cfg(windows)]
-fn strip_verbatim_path(path: &Path) -> PathBuf {
+pub(crate) fn strip_verbatim_path(path: &Path) -> PathBuf {
     let text = path.as_os_str().to_string_lossy();
 
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
@@ -2957,7 +3039,7 @@ fn strip_verbatim_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn strip_verbatim_path(path: &Path) -> PathBuf {
+pub(crate) fn strip_verbatim_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 /// 读取并规范化插件根目录下的 manifest.json
@@ -4236,6 +4318,60 @@ mod tests {
         assert!(
             validate_launch_args(&["a\u{0}b".to_string()]).is_err(),
             "含 NUL 的参数必须被拒绝"
+        );
+    }
+
+    /// 只有三种 URL 方案能被"用系统默认方式打开"。
+    ///
+    /// 这是 `open_target` 里唯一的**放行**判断，因此它要挡住的正是那类"不必写进
+    /// 插件清单就能碰到系统"的目标：`file:` / `ms-settings:` / `search-ms:` /
+    /// `shell:` / `javascript:` 都能触发本机处理器，而插件的权限表里没有一样叫
+    /// "触发本机处理器"。白名单让"插件能触发什么"保持**可枚举**。
+    #[test]
+    fn open_only_allows_three_url_schemes() {
+        for allowed in [
+            "https://example.com/a?b=1",
+            "http://127.0.0.1:8080/",
+            "HTTPS://EXAMPLE.COM",
+            "mailto:someone@example.com",
+            "  https://example.com  ",
+        ] {
+            assert!(is_openable_url(allowed), "应当放行: {allowed}");
+        }
+
+        for denied in [
+            "file:///C:/Windows/System32/calc.exe",
+            "ms-settings:privacy",
+            "search-ms:query=secret",
+            "shell:startup",
+            "javascript:alert(1)",
+            "vbscript:msgbox(1)",
+            "ftp://example.com",
+            // 本机路径不是网址：它们必须走路径那一条（由 `resolve_existing_path`
+            // 校验存在性），而不是被这里误判成"网址"直接交给 shell。
+            "C:\\Windows\\System32\\calc.exe",
+            "\\\\server\\share\\x.exe",
+        ] {
+            assert!(!is_openable_url(denied), "必须拒绝: {denied}");
+        }
+    }
+
+    /// "打开"接受目录，而"启动程序"不接受 —— 两者刻意用不同的入口。
+    ///
+    /// 用户把一个文件夹拖进快捷启动是合理用法；而 `launch` 的目标必须是可执行
+    /// 映像，交给它一个目录只会得到一句难懂的 `CreateProcess` 错误。
+    #[test]
+    fn open_accepts_directories_while_launch_does_not() {
+        let dir = std::env::temp_dir();
+        let text = dir.to_string_lossy().to_string();
+
+        resolve_existing_path(&text).expect("目录应当能通过 open 这一侧的校验");
+        assert!(
+            matches!(
+                resolve_file_argument(&text),
+                Err(PluginError::NotFound(_))
+            ),
+            "目录必须被 launch 那一侧拒绝"
         );
     }
 
