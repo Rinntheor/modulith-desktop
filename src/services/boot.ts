@@ -16,6 +16,8 @@
 //   * 失败后 retry() 会整体重跑；所有步骤都设计成幂等的（initialize 有 initialized 守卫、
 //     插件重载会先清理、预热本身有缓存）。
 
+import { invoke } from '@tauri-apps/api/core';
+
 import { getCachedSettings, loadAppSettings } from './appSettings';
 import { getCachedAuth, getAuthStatus, subscribeAuth } from './authStore';
 import { whenBackendReady } from './backendReady';
@@ -208,6 +210,34 @@ const STEPS: BootStepDefinition[] = [
       //
       // `listOnly` 只构建目录与注入宿主 API，**不执行任何插件 bundle**，
       // 正是这里需要的东西。
+      //
+      // ============================================================
+      // 先告诉宿主"启动成功了"（`mark_boot_ok`）
+      // ============================================================
+      //
+      // 这一句是安全模式判据里 `boot_ok` 的**唯一**来源，位置是有讲究的：
+      //
+      //   * 走到这里意味着窗口起来了、后端就绪了、渲染进程已经跑完自己前面的
+      //     全部启动步骤。剩下唯一可能把应用弄到起不来的东西就是**插件** ——
+      //     而"上一次启动成功了没有"要问的正是这件事；
+      //   * 它必须在**任何插件 bundle 执行之前**（也就是这两行的位置），
+      //     否则一个把渲染进程卡死的插件会让 `boot_ok` 照样被写下 —— 那下一次
+      //     启动就不会进安全模式，安全模式恰好失效在它唯一要处理的情形上；
+      //   * 它必须**与插件无关**：安全模式下插件本来就不执行，任何依赖插件的
+      //     判据（"插件加载完了吗"）在安全模式里永远不成立，那会让安全模式
+      //     永远出不来。
+      //
+      // 写入是幂等的（宿主侧 `SafeMode::mark_boot_ok`），因此下面的 `retry()`
+      // 整体重跑启动流程时不需要任何额外处理；它失败也不该拦下启动 ——
+      // 代价只是"下次可能误进一次安全模式"，见宿主侧那一段说明。
+      try {
+        await invoke('mark_boot_ok');
+      } catch (error) {
+        ctx.warn(
+          `无法标记本次启动成功：${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
       const safeMode = await getSafeModeState();
       if (safeMode.active) {
         try {

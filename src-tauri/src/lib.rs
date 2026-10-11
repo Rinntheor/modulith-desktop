@@ -384,6 +384,7 @@ pub fn run() -> Result<(), tauri::Error> {
         check_app_update,
         install_app_update,
         modules::plugins::safe_mode::safe_mode_state,
+        modules::plugins::safe_mode::mark_boot_ok,
     ]);
 
     // 用 run_return 而不是 run，唯一的理由是**拿到退出事件**。
